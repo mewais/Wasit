@@ -6,4 +6,5 @@ members = [
     "crates/wasit-claude",
     "crates/wasit-codex",
     "crates/wasit-opencode",
+    "crates/wasit-smoke",
 ]

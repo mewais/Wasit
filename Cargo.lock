@@ -252,6 +252,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasit-smoke"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "wasit-claude",
+ "wasit-codex",
+ "wasit-core",
+ "wasit-opencode",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
