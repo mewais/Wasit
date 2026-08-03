@@ -177,7 +177,19 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
+ "tokio-macros",
  "windows-sys",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -199,6 +211,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "wasit-core",
 ]
@@ -210,6 +223,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "wasit-core",
 ]
@@ -232,6 +246,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "wasit-core",
 ]
