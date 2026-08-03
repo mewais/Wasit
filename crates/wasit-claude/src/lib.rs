@@ -1140,9 +1140,16 @@ pub fn encode_set_permission_mode(request_id: &str, mode: &str) -> String {
 ///
 /// Shape: `{"role":"user","content":[{"type":"text","text":"…"}]}`
 pub fn encode_user_message(text: &str) -> String {
+    // claude's `--input-format stream-json` keys on a top-level `"type":"user"`
+    // envelope; a bare `{"role":"user",...}` line is silently ignored and the
+    // CLI waits forever for a real turn (observed as a live hang). Match Marsad's
+    // proven `encode_user_input` wire shape exactly.
     serde_json::to_string(&serde_json::json!({
-        "role": "user",
-        "content": [{ "type": "text", "text": text }]
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{ "type": "text", "text": text }]
+        }
     }))
     .expect("always serializable")
 }
@@ -2262,9 +2269,11 @@ mod tests {
     fn encode_user_message_shape() {
         let json = encode_user_message("hello");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["role"], "user");
-        assert_eq!(v["content"][0]["type"], "text");
-        assert_eq!(v["content"][0]["text"], "hello");
+        // Must be the `{"type":"user","message":{...}}` envelope claude requires.
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"][0]["type"], "text");
+        assert_eq!(v["message"]["content"][0]["text"], "hello");
     }
 
     // ── claude_available_modes ───────────────────────────────────────────────
