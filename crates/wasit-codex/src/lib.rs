@@ -166,6 +166,30 @@ pub fn encode_turn_interrupt(id: u64, thread_id: &str, turn_id: &str) -> String 
     .expect("always serializable")
 }
 
+/// Parse the result of a `collaborationMode/list` response into a vec of
+/// `wasit_core::SessionMode`s.
+///
+/// The wire shape is `{"data":[{"mode":"<id>","settings":{...}}, ...]}`.
+/// Each element with a string `"mode"` key becomes a `SessionMode` where
+/// `id == label == mode` and `description` is empty (codex provides none).
+/// Returns an empty vec when `data` is absent or not an array.
+pub fn codex_modes_from_collab_list(result: &serde_json::Value) -> Vec<wasit_core::SessionMode> {
+    let data = match result.get("data").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return vec![],
+    };
+    data.iter()
+        .filter_map(|entry| {
+            let mode = entry.get("mode").and_then(|v| v.as_str())?;
+            Some(wasit_core::SessionMode {
+                id: mode.to_string(),
+                label: mode.to_string(),
+                description: String::new(),
+            })
+        })
+        .collect()
+}
+
 /// Build a `collaborationMode/list` JSON-RPC request.
 pub fn encode_collab_mode_list(id: u64, thread_id: &str) -> String {
     serde_json::to_string(&serde_json::json!({
@@ -2008,5 +2032,63 @@ mod tests {
 
         p.on_message(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
         assert_eq!(p.active_turn_id(), Some("t-2"));
+    }
+
+    // ── codex_modes_from_collab_list ─────────────────────────────────────────
+
+    #[test]
+    fn collab_mode_list_two_modes() {
+        let result = serde_json::json!({
+            "data": [
+                {"mode": "code", "settings": {}},
+                {"mode": "read-only", "settings": {"someKey": "val"}}
+            ]
+        });
+        let modes = codex_modes_from_collab_list(&result);
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].id, "code");
+        assert_eq!(modes[0].label, "code");
+        assert_eq!(modes[0].description, "");
+        assert_eq!(modes[1].id, "read-only");
+        assert_eq!(modes[1].label, "read-only");
+        assert_eq!(modes[1].description, "");
+    }
+
+    #[test]
+    fn collab_mode_list_no_data_yields_empty() {
+        let result = serde_json::json!({"other": "field"});
+        let modes = codex_modes_from_collab_list(&result);
+        assert!(modes.is_empty(), "missing 'data' key must yield empty vec");
+    }
+
+    #[test]
+    fn collab_mode_list_data_not_array_yields_empty() {
+        let result = serde_json::json!({"data": "not-an-array"});
+        let modes = codex_modes_from_collab_list(&result);
+        assert!(modes.is_empty(), "non-array 'data' must yield empty vec");
+    }
+
+    #[test]
+    fn collab_mode_list_skips_entries_without_mode_string() {
+        let result = serde_json::json!({
+            "data": [
+                {"mode": "code", "settings": {}},
+                {"no_mode_key": true},
+                {"mode": 42},
+                {"mode": "plan"}
+            ]
+        });
+        let modes = codex_modes_from_collab_list(&result);
+        // Only "code" and "plan" have string mode values.
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].id, "code");
+        assert_eq!(modes[1].id, "plan");
+    }
+
+    #[test]
+    fn collab_mode_list_empty_data_array_yields_empty() {
+        let result = serde_json::json!({"data": []});
+        let modes = codex_modes_from_collab_list(&result);
+        assert!(modes.is_empty());
     }
 }
