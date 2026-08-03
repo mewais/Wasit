@@ -296,9 +296,9 @@ pub fn encode_user_input_answer(
 #[derive(Debug, Clone)]
 pub struct PendingGate {
     /// Raw JSON-RPC id (may be number or string).
-    raw_id: serde_json::Value,
+    pub raw_id: serde_json::Value,
     /// The codex method that triggered the gate.
-    method: String,
+    pub method: String,
     /// Original gate params (for encoding permissions/user-input answers).
     params: serde_json::Value,
 }
