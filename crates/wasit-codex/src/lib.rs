@@ -82,6 +82,16 @@ pub fn encode_initialize(client_name: &str, client_version: &str) -> String {
             "clientInfo": {
                 "name": client_name,
                 "version": client_version,
+            },
+            // Opt into codex's experimental API. `collaborationMode/list` (how we
+            // discover session modes) is gated behind this capability — without it
+            // codex rejects the request with JSON-RPC -32600 "collaborationMode/list
+            // requires experimentalApi capability", so modes never surface (the
+            // reader's id=5 intercept only ever saw an error response). Verified
+            // against codex 0.146 (InitializeParams.capabilities.experimentalApi,
+            // from `codex app-server generate-json-schema`).
+            "capabilities": {
+                "experimentalApi": true
             }
         }
     }))
@@ -1432,6 +1442,9 @@ mod tests {
         assert_eq!(v["id"], 1);
         assert_eq!(v["method"], "initialize");
         assert_eq!(v["params"]["clientInfo"]["name"], "wasit-codex");
+        // Must opt into the experimental API or `collaborationMode/list` (mode
+        // discovery) is rejected with -32600 by codex app-server.
+        assert_eq!(v["params"]["capabilities"]["experimentalApi"], true);
     }
 
     // ── encode_thread_start ──────────────────────────────────────────────────
