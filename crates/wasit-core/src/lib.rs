@@ -847,8 +847,9 @@ pub enum DriverError {
 
 /// A factory that can spawn or resume sessions for one CLI backend.
 ///
-/// All bodies are `todo!()`. The trait is `async_trait`-flavored — consume it as
-/// `Arc<dyn AgentDriver>` or via a concrete struct.
+/// `async_trait`-flavored — consume it as `Arc<dyn AgentDriver>` or via a concrete
+/// struct. Implemented for real by the per-CLI driver crates (wasit-claude,
+/// wasit-codex, wasit-opencode).
 #[async_trait::async_trait]
 pub trait AgentDriver: Send + Sync {
     /// The fixed capability report for this driver. Constant for the driver's lifetime.
@@ -866,7 +867,7 @@ pub trait AgentDriver: Send + Sync {
 /// nothing else may concurrently call `send_prompt`, `answer_gate`, or
 /// `interrupt` (single-writer invariant). Object-safe.
 ///
-/// All methods are `async`; all bodies are `todo!()`.
+/// All methods are `async`; implemented for real by the per-CLI session types.
 #[async_trait::async_trait]
 pub trait Session: Send {
     // ── Event stream ──────────────────────────────────────────────────────
