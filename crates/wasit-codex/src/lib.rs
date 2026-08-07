@@ -57,15 +57,114 @@ use wasit_core::{
 // 1. argv builder (pure)
 // ============================================================================
 
+/// Translate a `mcp_config` JSON string into `-c` override argv tokens for
+/// `codex app-server`.
+///
+/// `codex app-server` accepts repeatable `-c <key=value>` overrides where the
+/// value is parsed as TOML (dotted paths for nesting). MCP servers live under
+/// `mcp_servers.<name>`, so to register one server we append:
+///
+/// ```text
+/// -c  mcp_servers.<name>.command="<cmd>"
+/// -c  mcp_servers.<name>.args=[]          (or ["x","y"])
+/// -c  mcp_servers.<name>.env.<KEY>="<value>"   (one per env pair)
+/// ```
+///
+/// Input shape: `{"mcpServers": { "<name>": {"command": String,
+///   "args": [String…], "env": {K:V,…}}, … }}`.
+/// Missing `args` → `[]`; missing `env` → no env overrides. Server names and
+/// env keys are emitted in sorted (deterministic) order so the argv is stable
+/// and unit-testable. Returns an empty vec when `json` is empty, `None`, or
+/// fails to parse — never panics; parse failures are logged to stderr.
+///
+/// This is the sole source of truth for the `-c` translation. The argv builder
+/// (`codex_argv`) calls this and extends the result; tests exercise this helper
+/// directly. Do NOT duplicate the translation logic in tests.
+pub fn mcp_config_overrides(json: &str) -> Vec<String> {
+    if json.is_empty() {
+        return vec![];
+    }
+    let root: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wasit-codex: mcp_config parse error (ignoring): {e}");
+            return vec![];
+        }
+    };
+    let servers = match root.get("mcpServers").and_then(|v| v.as_object()) {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    let mut out = Vec::new();
+    // Sort server names for deterministic output.
+    let mut names: Vec<&str> = servers.keys().map(String::as_str).collect();
+    names.sort_unstable();
+
+    for name in names {
+        let server = &servers[name];
+
+        // command (required — skip server if absent)
+        let command = match server.get("command").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => {
+                eprintln!("wasit-codex: mcp_config server {name:?} missing 'command' (skipping)");
+                continue;
+            }
+        };
+        out.push("-c".to_string());
+        out.push(format!(r#"mcp_servers.{name}.command="{command}""#));
+
+        // args (optional, default [])
+        let args_toml = match server.get("args").and_then(|v| v.as_array()) {
+            Some(arr) => {
+                let items: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| format!("\"{s}\""))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
+            None => "[]".to_string(),
+        };
+        out.push("-c".to_string());
+        out.push(format!("mcp_servers.{name}.args={args_toml}"));
+
+        // env (optional — one -c per key, sorted)
+        if let Some(env_obj) = server.get("env").and_then(|v| v.as_object()) {
+            let mut env_keys: Vec<&str> = env_obj.keys().map(String::as_str).collect();
+            env_keys.sort_unstable();
+            for key in env_keys {
+                let val = match env_obj[key].as_str() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                out.push("-c".to_string());
+                out.push(format!(r#"mcp_servers.{name}.env.{key}="{val}""#));
+            }
+        }
+    }
+    out
+}
+
 /// Build the `codex app-server --stdio` invocation for a session launch.
 ///
 /// Model/approval/sandbox are NOT CLI flags here — they are set per-thread via
 /// `thread/start` params. Binary defaults to `"codex"` when not in spec.
 ///
+/// When `spec.mcp_config` is `Some(json)`, the JSON is translated into
+/// `-c mcp_servers.<name>.*` override tokens (via `mcp_config_overrides`) and
+/// appended to the argv. `None` (or unparseable JSON) → byte-identical to a
+/// plain `codex app-server --stdio` invocation (optionality invariant).
+///
 /// Matches Marsad's `codex_appserver_argv`.
 pub fn codex_argv(spec: &SpawnSpec) -> Vec<String> {
     let bin = spec.bin.as_deref().unwrap_or("codex").to_string();
-    vec![bin, "app-server".to_string(), "--stdio".to_string()]
+    let mut argv = vec![bin, "app-server".to_string(), "--stdio".to_string()];
+    if let Some(ref json) = spec.mcp_config {
+        argv.extend(mcp_config_overrides(json));
+    }
+    argv
 }
 
 // ============================================================================
@@ -1389,9 +1488,12 @@ mod tests {
     }
 
     #[test]
-    fn argv_always_three_elements() {
-        let argv = codex_argv(&base_spec());
-        assert_eq!(argv.len(), 3, "codex_argv must always have 3 elements");
+    fn argv_base_three_elements_no_mcp_config() {
+        // Without mcp_config the argv is exactly [bin, "app-server", "--stdio"].
+        let argv = codex_argv(&SpawnSpec::default());
+        assert_eq!(argv.len(), 3, "codex_argv with no mcp_config must have exactly 3 elements");
+        let argv2 = codex_argv(&base_spec());
+        assert_eq!(argv2.len(), 3, "codex_argv with no mcp_config must have exactly 3 elements");
     }
 
     #[test]
@@ -2103,5 +2205,167 @@ mod tests {
         let result = serde_json::json!({"data": []});
         let modes = codex_modes_from_collab_list(&result);
         assert!(modes.is_empty());
+    }
+
+    // ── mcp_config_overrides ─────────────────────────────────────────────────
+
+    /// The canonical Wasl worker config that Marsad injects.
+    fn wasl_mcp_json(wasl_config_path: &str) -> String {
+        serde_json::json!({
+            "mcpServers": {
+                "wasl": {
+                    "command": "wasl-mcpd",
+                    "args": [],
+                    "env": {
+                        "WASL_CONFIG": wasl_config_path
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn mcp_config_overrides_canonical_wasl() {
+        // The canonical wasl config produces exactly the expected -c tokens in order.
+        let json = wasl_mcp_json("/data/wasl.json");
+        let overrides = mcp_config_overrides(&json);
+        // Expected: command, args, then one env key.
+        assert_eq!(
+            overrides,
+            vec![
+                "-c",
+                r#"mcp_servers.wasl.command="wasl-mcpd""#,
+                "-c",
+                "mcp_servers.wasl.args=[]",
+                "-c",
+                r#"mcp_servers.wasl.env.WASL_CONFIG="/data/wasl.json""#,
+            ],
+            "canonical wasl config must produce exactly these -c tokens"
+        );
+    }
+
+    #[test]
+    fn mcp_config_overrides_multiple_servers_deterministic() {
+        // Two servers (beta, alpha) → sorted to alpha then beta. Two env keys each.
+        let json = serde_json::json!({
+            "mcpServers": {
+                "beta": {
+                    "command": "beta-cmd",
+                    "args": ["--flag"],
+                    "env": {"Z_KEY": "zval", "A_KEY": "aval"}
+                },
+                "alpha": {
+                    "command": "alpha-cmd",
+                    "args": [],
+                    "env": {"M_KEY": "mval", "B_KEY": "bval"}
+                }
+            }
+        })
+        .to_string();
+        let overrides = mcp_config_overrides(&json);
+        // alpha comes first (sorted), with B_KEY before M_KEY (sorted).
+        // beta comes second, with A_KEY before Z_KEY (sorted).
+        assert_eq!(
+            overrides,
+            vec![
+                "-c", r#"mcp_servers.alpha.command="alpha-cmd""#,
+                "-c", "mcp_servers.alpha.args=[]",
+                "-c", r#"mcp_servers.alpha.env.B_KEY="bval""#,
+                "-c", r#"mcp_servers.alpha.env.M_KEY="mval""#,
+                "-c", r#"mcp_servers.beta.command="beta-cmd""#,
+                "-c", r#"mcp_servers.beta.args=["--flag"]"#,
+                "-c", r#"mcp_servers.beta.env.A_KEY="aval""#,
+                "-c", r#"mcp_servers.beta.env.Z_KEY="zval""#,
+            ],
+            "multiple servers + multiple env keys must be sorted deterministically"
+        );
+    }
+
+    #[test]
+    fn mcp_config_overrides_none_produces_empty() {
+        // None mcp_config → no overrides (optionality invariant).
+        let spec = SpawnSpec::default(); // mcp_config is None
+        assert!(spec.mcp_config.is_none());
+        let argv = codex_argv(&spec);
+        assert_eq!(argv, vec!["codex", "app-server", "--stdio"],
+            "no mcp_config → argv byte-identical to plain invocation");
+    }
+
+    #[test]
+    fn mcp_config_overrides_empty_string_produces_empty() {
+        let overrides = mcp_config_overrides("");
+        assert!(overrides.is_empty(), "empty string → no overrides");
+    }
+
+    #[test]
+    fn mcp_config_overrides_invalid_json_produces_empty() {
+        let overrides = mcp_config_overrides("not valid json {{{{");
+        assert!(overrides.is_empty(), "parse failure → no overrides, no panic");
+    }
+
+    #[test]
+    fn mcp_config_overrides_no_mcp_servers_key_produces_empty() {
+        let overrides = mcp_config_overrides(r#"{"other": "field"}"#);
+        assert!(overrides.is_empty(), "missing mcpServers → no overrides");
+    }
+
+    #[test]
+    fn mcp_config_overrides_missing_args_defaults_to_empty_array() {
+        // args is optional — missing → "[]" TOML array token.
+        let json = serde_json::json!({
+            "mcpServers": {
+                "myserver": {"command": "mybin"}
+            }
+        })
+        .to_string();
+        let overrides = mcp_config_overrides(&json);
+        assert!(overrides.contains(&"mcp_servers.myserver.args=[]".to_string()),
+            "missing args must default to empty array token");
+    }
+
+    #[test]
+    fn mcp_config_overrides_missing_env_produces_no_env_tokens() {
+        // env is optional — missing → no env -c tokens emitted.
+        let json = serde_json::json!({
+            "mcpServers": {
+                "myserver": {"command": "mybin", "args": []}
+            }
+        })
+        .to_string();
+        let overrides = mcp_config_overrides(&json);
+        assert!(!overrides.iter().any(|t| t.contains(".env.")),
+            "missing env map must not produce env -c tokens");
+    }
+
+    // ── codex_argv golden tests (full argv with and without mcp_config) ───────
+
+    #[test]
+    fn codex_argv_golden_with_mcp_config() {
+        // Full argv golden test: with the canonical wasl mcp_config, the -c tokens
+        // are appended after --stdio.
+        let mut spec = SpawnSpec::default();
+        spec.mcp_config = Some(wasl_mcp_json("/etc/wasl/wasl.json"));
+        let argv = codex_argv(&spec);
+        assert_eq!(argv[0], "codex");
+        assert_eq!(argv[1], "app-server");
+        assert_eq!(argv[2], "--stdio");
+        // -c tokens start at index 3.
+        assert_eq!(argv[3], "-c");
+        assert_eq!(argv[4], r#"mcp_servers.wasl.command="wasl-mcpd""#);
+        assert_eq!(argv[5], "-c");
+        assert_eq!(argv[6], "mcp_servers.wasl.args=[]");
+        assert_eq!(argv[7], "-c");
+        assert_eq!(argv[8], r#"mcp_servers.wasl.env.WASL_CONFIG="/etc/wasl/wasl.json""#);
+        assert_eq!(argv.len(), 9, "3 base + 6 override tokens for one server with one env key");
+    }
+
+    #[test]
+    fn codex_argv_golden_without_mcp_config() {
+        // Without mcp_config the argv is exactly the 3-token base.
+        let spec = SpawnSpec::default();
+        let argv = codex_argv(&spec);
+        assert_eq!(argv, vec!["codex", "app-server", "--stdio"],
+            "no mcp_config → exact 3-token argv, byte-identical to today");
     }
 }
