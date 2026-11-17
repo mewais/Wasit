@@ -1,0 +1,32 @@
+[package]
+name = "wasit-shim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Per-session process holder: owns one CLI child, journals its stdio, serves one controller."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wasit-shim"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures-core = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
