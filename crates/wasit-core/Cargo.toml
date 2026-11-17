@@ -2,10 +2,9 @@
 name = "wasit-core"
 version = "0.1.0"
 edition = "2021"
+description = "Wasit core: the agent event model, the pure Protocol trait, driver descriptors and registry. No I/O."
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-async-trait = "0.1"
-thiserror = "1"
-tokio = { version = "1", features = ["io-util", "process", "sync", "rt", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
