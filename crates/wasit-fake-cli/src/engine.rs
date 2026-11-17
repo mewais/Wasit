@@ -227,6 +227,7 @@ fn run_turn<P: Persona>(
                 }
             }
             Step::AskQuestion(ask) => {
+                stats.tool_calls += 1;
                 let id = p.question(io, ask, &mut stats);
                 let mut answer = None;
                 let w = wait(p, io, queue, None, |inc| match inc {

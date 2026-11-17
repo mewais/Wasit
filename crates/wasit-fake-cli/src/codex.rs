@@ -8,6 +8,7 @@ use crate::scenario::{AskStep, HistoryMessage, PlanEntry, Scenario, ToolStep};
 use crate::util::{alnum, now_ms, now_secs, set, uuid7};
 use serde_json::{json, Value};
 
+#[derive(Clone)]
 struct Thread {
     id: String,
     cwd: String,
@@ -206,7 +207,12 @@ impl Codex {
 
     fn item(&mut self, tmpl_msg: &str, kind: &str) -> Value {
         // Build an item from a recorded `item/<which>` notification of type `kind`.
-        let m = rec("simple", |m| {
+        let file = if kind == "commandExecution" {
+            "tool_allow"
+        } else {
+            "simple"
+        };
+        let m = rec(file, |m| {
             m["method"] == tmpl_msg && m["params"]["item"]["type"] == kind
         });
         m["params"]["item"].clone()
@@ -323,12 +329,7 @@ impl Codex {
                     history: vec![],
                     created: now_secs(),
                 };
-                if !self.sent_remote_status {
-                    self.sent_remote_status = true;
-                    let mut n = rec("simple", |m| m["method"] == "remoteControl/status/changed");
-                    set(&mut n, "emittedAtMs", json!(now_ms()));
-                    io.send(&n);
-                }
+                self.remote_status_once(io);
                 let approval = params["approvalPolicy"]
                     .as_str()
                     .unwrap_or("on-request")
@@ -347,7 +348,7 @@ impl Codex {
             }
             "thread/resume" => {
                 let tid = params["threadId"].as_str().unwrap_or("");
-                match self.find_thread(tid) {
+                match self.find_thread(tid).cloned() {
                     None => {
                         self.error(
                             io,
@@ -357,6 +358,7 @@ impl Codex {
                         );
                     }
                     Some(t) => {
+                        self.remote_status_once(io);
                         let template = rec("resume", |m| {
                             m["id"] == 2 && m["result"]["thread"].is_object()
                         })["result"]
@@ -398,8 +400,12 @@ impl Codex {
                 let tid = params["threadId"].as_str().unwrap_or("");
                 match self.find_thread(tid) {
                     Some(t) => {
-                        let th = self.thread_json(t, true);
-                        self.reply(io, &id, json!({"thread": th}));
+                        let mut r = rec("lifecycle", |m| {
+                            m["id"] == 7 && m["result"]["thread"].is_object()
+                        })["result"]
+                            .clone();
+                        r["thread"] = self.thread_json(t, true);
+                        self.reply(io, &id, r);
                     }
                     None => self.error(io, &id, -32600, &format!("thread not found: {tid}")),
                 }
@@ -472,6 +478,17 @@ impl Codex {
                 Incoming::Handled
             }
         }
+    }
+
+    /// Real codex announces its remote-control status once, around the first thread request.
+    fn remote_status_once(&mut self, io: &mut Io) {
+        if self.sent_remote_status {
+            return;
+        }
+        self.sent_remote_status = true;
+        let mut n = rec("simple", |m| m["method"] == "remoteControl/status/changed");
+        set(&mut n, "emittedAtMs", json!(now_ms()));
+        io.send(&n);
     }
 
     fn request_to_client(&mut self, io: &mut Io, method: &str, params: Value) -> Value {

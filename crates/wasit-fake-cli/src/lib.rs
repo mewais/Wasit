@@ -11,7 +11,8 @@
 //! `env!("CARGO_BIN_EXE_wasit-fake-cli")` only exists for this crate's own integration tests.
 //! Dependents build the binary first (`cargo build -p wasit-fake-cli`, which writes it to
 //! `target/<profile>/wasit-fake-cli`) and then call [`fake_cli_path`], which finds it next to the
-//! running test executable (`target/<profile>/deps/<test>` → `target/<profile>/wasit-fake-cli`),
+//! running test executable (a few directory levels up, so both `target/<profile>/deps/<test>` and
+//! the split `build-dir` layout resolve to `target/<profile>/wasit-fake-cli`),
 //! or at `$WASIT_FAKE_CLI` when set.
 
 pub mod acp;
@@ -39,10 +40,11 @@ pub fn fake_cli_path() -> Option<PathBuf> {
     }
     let name = format!("wasit-fake-cli{}", std::env::consts::EXE_SUFFIX);
     let exe = std::env::current_exe().ok()?;
-    // target/<profile>/deps/<test-exe>  or  target/<profile>/<exe>
+    // target/<profile>/deps/<test-exe>, target/<profile>/<exe>, or (split build-dir layout)
+    // target/<profile>/build/<pkg>/<hash>/out/<test-exe>: look a few levels up for the binary.
     exe.ancestors()
         .skip(1)
-        .take(3)
+        .take(8)
         .map(|dir| dir.join(&name))
         .find(|p| p.is_file())
 }

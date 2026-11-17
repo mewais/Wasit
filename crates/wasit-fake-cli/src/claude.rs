@@ -145,11 +145,12 @@ impl Claude {
         io.send(&json!({"type":"control_response","response":r}));
     }
 
-    fn initialize_response(&self) -> Value {
-        let mut resp = first_where("simple", |m| {
+    fn initialize_response(&self, request_id: &Value) -> Value {
+        let mut full = first_where("simple", |m| {
             ty(m, "control_response") && m["response"]["response"]["commands"].is_array()
-        })["response"]["response"]
-            .clone();
+        });
+        full["response"]["request_id"] = request_id.clone();
+        let mut resp = full["response"]["response"].clone();
         if !self.scenario.commands.is_empty() {
             resp["commands"] = Value::Array(
                 self.scenario
@@ -179,7 +180,8 @@ impl Claude {
                     .collect(),
             );
         }
-        resp
+        full["response"]["response"] = resp;
+        full
     }
 
     fn send_system_init(&mut self, io: &mut Io) {
@@ -198,7 +200,6 @@ impl Claude {
             "scratchpad_path",
             json!(format!("/tmp/claude-fake/{}/scratchpad", self.session_id)),
         );
-        unset(&mut m, "startup_timing");
         if !self.scenario.commands.is_empty() {
             let names: Vec<Value> = self
                 .scenario
@@ -282,7 +283,15 @@ impl Claude {
                 io.send(&e);
             }
         }
-        let a = self.assistant(content, stats);
+        let mut a = self.assistant(content, stats);
+        if kind == "thinking" {
+            set(
+                &mut a,
+                "thinking_duration_ms",
+                json!(stats.usage.output_tokens * 10),
+            );
+            set(&mut a, "thinking_display", json!("updates"));
+        }
         io.send(&a);
         if self.partial {
             let e = self.stream_event(json!({"type":"content_block_stop","index":0}));
@@ -348,6 +357,15 @@ impl Claude {
             set(&mut m, k, v);
         }
         self.envelope(m)
+    }
+
+    fn task_summary(&self, io: &mut Io, detail: &str) {
+        let mut t = first_where("tool_allow", |m| {
+            ty(m, "system") && m["subtype"] == "task_summary" && m["detail"].is_string()
+        });
+        t["detail"] = json!(detail);
+        let t = self.envelope(t);
+        io.send(&t);
     }
 
     fn describe(tool: &ToolStep) -> String {
@@ -423,15 +441,6 @@ impl Claude {
         }
         set(&mut m, "duration_ms", json!(elapsed));
         set(&mut m, "duration_api_ms", json!(elapsed));
-        // Process-internal telemetry that has no meaning for a fake.
-        for k in [
-            "process_cpu_ms_turn",
-            "process_wall_ms_turn",
-            "time_to_request_phases_ms",
-            "process_turn_states",
-        ] {
-            unset(&mut m, k);
-        }
         self.envelope(m)
     }
 }
@@ -452,8 +461,8 @@ impl Persona for Claude {
                             let m = self.envelope(m);
                             io.send(&m);
                         }
-                        let r = self.initialize_response();
-                        self.control_ok(io, &id, r);
+                        let r = self.initialize_response(&id);
+                        io.send(&r);
                         Incoming::Handled
                     }
                     "interrupt" => {
@@ -538,6 +547,14 @@ impl Persona for Claude {
 
     fn turn_begin(&mut self, io: &mut Io, _prompt: &str, _stats: &mut TurnStats) {
         self.send_system_init(io);
+        if self.partial {
+            let mut s = first_where("partial_messages", |m| {
+                ty(m, "system") && m["subtype"] == "status"
+            });
+            set(&mut s, "status", json!("requesting"));
+            let s = self.envelope(s);
+            io.send(&s);
+        }
     }
 
     fn say(&mut self, io: &mut Io, text: &str, chunks: usize, stats: &mut TurnStats) {
@@ -545,6 +562,14 @@ impl Persona for Claude {
     }
 
     fn think(&mut self, io: &mut Io, text: &str, stats: &mut TurnStats) {
+        let tokens = text.split_whitespace().count().max(1) as u64;
+        let mut t = first_where("tool_deny", |m| {
+            ty(m, "system") && m["subtype"] == "thinking_tokens"
+        });
+        set(&mut t, "estimated_tokens", json!(tokens));
+        set(&mut t, "estimated_tokens_delta", json!(tokens));
+        let t = self.envelope(t);
+        io.send(&t);
         self.block(io, "thinking", text, 1, stats);
     }
 
@@ -564,6 +589,7 @@ impl Persona for Claude {
             io.send(&req);
             return Some(id);
         }
+        self.task_summary(io, &Self::describe(tool));
         let content = tool
             .result_if_allowed
             .clone()
@@ -585,6 +611,7 @@ impl Persona for Claude {
 
     fn tool_answered(&mut self, io: &mut Io, tool: &ToolStep, body: &Value, stats: &mut TurnStats) {
         let tuid = self.tool_use_id.clone();
+        self.task_summary(io, &Self::describe(tool));
         if body["behavior"] == "allow" {
             let content = tool
                 .result_if_allowed
@@ -656,10 +683,11 @@ impl Persona for Claude {
     fn question_answered(
         &mut self,
         io: &mut Io,
-        _ask: &AskStep,
+        ask: &AskStep,
         body: &Value,
         _stats: &mut TurnStats,
     ) {
+        self.task_summary(io, &ask.question);
         let answers = body["updatedInput"]["answers"].clone();
         let summary = answers
             .as_object()
@@ -746,13 +774,14 @@ impl Persona for Claude {
                 io.send(&s);
             }
             Outcome::Interrupted => {
-                let m = self.tool_result_message(
-                    "interrupt",
+                let mut m = first_where("interrupt", |m| ty(m, "user"));
+                set(
+                    &mut m,
+                    "message.content",
                     json!([{"type":"text","text":"[Request interrupted by user]"}]),
-                    vec![],
                 );
-                let mut m = m;
-                unset(&mut m, "tool_use_result");
+                set(&mut m, "timestamp", json!(iso_now()));
+                let m = self.envelope(m);
                 io.send(&m);
             }
             Outcome::Failed(msg) => {
@@ -769,11 +798,13 @@ impl Persona for Claude {
         }
         let r = self.result_message(outcome, stats);
         io.send(&r);
-        let mut t = first_where("tool_allow", |m| {
-            ty(m, "system") && m["subtype"] == "task_summary" && m["detail"].is_null()
-        });
-        t["detail"] = Value::Null;
-        let t = self.envelope(t);
-        io.send(&t);
+        if stats.tool_calls > 0 {
+            let mut t = first_where("tool_allow", |m| {
+                ty(m, "system") && m["subtype"] == "task_summary" && m["detail"].is_null()
+            });
+            t["detail"] = Value::Null;
+            let t = self.envelope(t);
+            io.send(&t);
+        }
     }
 }

@@ -362,7 +362,9 @@ impl Acp {
                             if self.models().iter().any(|(m, _)| *m == value) {
                                 self.sessions[i].model = value;
                                 let opts = self.config_options(&self.sessions[i]);
-                                self.update(io, &sid, json!({"sessionUpdate":"config_option_update","configOptions":opts.clone()}));
+                                if self.flavor == Flavor::Opencode {
+                                    self.update(io, &sid, json!({"sessionUpdate":"config_option_update","configOptions":opts.clone()}));
+                                }
                                 self.rpc_result(io, &id, json!({"configOptions": opts}));
                             } else {
                                 let provider = value.split('/').next().unwrap_or("").to_string();
