@@ -13,6 +13,7 @@ pub mod connection;
 pub mod demo;
 pub mod error;
 pub mod hub;
+pub mod mux;
 pub mod server;
 pub mod service;
 pub mod supervised;
@@ -33,6 +34,7 @@ pub use hub::{
     CommandConnector, HostSpec, Hub, HubConfig, HubError, LinkConnector, LinkEvent, Provisioner,
     RoutingService,
 };
+pub use mux::{MuxError, ServiceMux};
 pub use server::ControlServer;
 pub use service::{CallContext, EventStream, NoService, Service};
 pub use supervised::{
