@@ -1053,3 +1053,27 @@ fn transcript_records_both_directions() {
     // Best-effort cleanup of the scratch dir.
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn startup_steps_run_before_any_input_and_hang_ignores_the_handshake() {
+    use wasit_fake_cli::scenario::Step;
+    let sc = Scenario::builder()
+        .startup(Step::Stderr {
+            text: "booting".into(),
+        })
+        .startup(Step::Garbage {
+            line: Some("not json at all".into()),
+        })
+        .startup(Step::Hang)
+        .build();
+    let mut fake = Fake::spawn(&CLAUDE_ARGV, Some("claude"), &sc);
+    assert_eq!(
+        fake.recv_raw(Duration::from_secs(10)).as_deref(),
+        Some("not json at all")
+    );
+    fake.send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
+    assert!(fake.recv_timeout(Duration::from_millis(300)).is_none());
+    assert!(fake.stderr().contains("booting"));
+    fake.close_stdin();
+    assert_eq!(fake.wait_exit().and_then(|s| s.code()), Some(0));
+}

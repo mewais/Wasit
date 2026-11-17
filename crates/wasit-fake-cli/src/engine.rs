@@ -122,6 +122,19 @@ impl Cursor {
 
 /// Serve until stdin closes: take prompts, run their turns.
 pub fn serve<P: Persona>(p: &mut P, io: &mut Io, cursor: &mut Cursor) {
+    for step in cursor.scenario.startup.clone() {
+        match step {
+            Step::Stderr { text } => io.stderr(&text),
+            Step::Garbage { line } => io.send_raw(line.as_deref().unwrap_or("{this is not json")),
+            Step::Exit { code } => std::process::exit(code),
+            Step::Hang => {
+                // Never answer; drain stdin so writers never block; exit when it closes.
+                while io.recv().is_some() {}
+                return;
+            }
+            _ => {}
+        }
+    }
     let mut queue: VecDeque<String> = VecDeque::new();
     loop {
         let prompt = match queue.pop_front() {

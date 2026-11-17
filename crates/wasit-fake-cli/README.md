@@ -58,7 +58,8 @@ scenario.write_to(dir.join("scenario.json"))?;
   "sessions": [{"id": "ses_old", "title": "…", "cwd": "/w",        // exist before start: list / load / resume
                 "history": [{"role": "user", "text": "…"}, {"role": "assistant", "text": "…"}]}],
   "echo_prefix": "echo: ",
-  "turns": [ {"when": "regex on prompt (optional)", "steps": [ … ]} ]
+  "turns": [ {"when": "regex on prompt (optional)", "steps": [ … ]} ],
+  "startup": [ … ]              // steps run before any input: stderr / garbage / hang / exit
 }
 ```
 

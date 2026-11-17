@@ -228,6 +228,10 @@ pub struct Scenario {
     /// Sessions that exist before the fake starts (load / resume / list).
     pub sessions: Vec<SessionInfo>,
     pub turns: Vec<Turn>,
+    /// Steps run once at process start, before any input is read. Only `stderr`, `garbage`,
+    /// `hang` and `exit` are meaningful here (others are ignored); e.g. `hang` models a CLI that
+    /// never completes its handshake.
+    pub startup: Vec<Step>,
     /// Reply for prompts no turn matches is `<echo_prefix><prompt>` (default `echo: `).
     pub echo_prefix: Option<String>,
 }
@@ -316,6 +320,11 @@ impl ScenarioBuilder {
     /// Append a turn (anything convertible with `Into<Turn>`: a [`Turn`] or a [`TurnBuilder`]).
     pub fn turn(mut self, turn: impl Into<Turn>) -> Self {
         self.scenario.turns.push(turn.into());
+        self
+    }
+    /// Append a step run at process start, before any input (see [`Scenario::startup`]).
+    pub fn startup(mut self, step: Step) -> Self {
+        self.scenario.startup.push(step);
         self
     }
     pub fn build(self) -> Scenario {
