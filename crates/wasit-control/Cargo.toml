@@ -1,0 +1,21 @@
+[package]
+name = "wasit-control"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Wasit control protocol: wire types, framing, client, server, link supervisor and router"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+fastrand = "2"
+
+[[bin]]
+name = "wasit-control-demo"
+path = "src/bin/wasit-control-demo.rs"
