@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 use wasit_control::demo::DemoService;
 use wasit_control::{
-    codes, connector, CallError, ClientOptions, CommandConnector, CommandFailureKind, ConnectError,
-    ControlClient, ControlServer, DurableOpts, Hello, HostId, HostSpec, Hub, HubConfig, HubError,
-    LinkConnector, LinkEvent, LinkState, ProvisionError, ProvisionReason, Provisioner, RequestOpts,
+    codes, connector, CallError, ClientOptions, CommandFailureKind, ConnectError, ControlClient,
+    ControlServer, DurableOpts, Hello, HostId, HostSpec, Hub, HubConfig, HubError, LinkConnector,
+    LinkEvent, LinkState, ProvisionError, ProvisionReason, Provisioner, RequestOpts,
     RoutingService, Service, SubscribeOpts, Supervised, SupervisedConfig, SupervisedOptions,
 };
 
@@ -620,7 +620,7 @@ async fn link_loss_closes_forwarded_subscription_and_durable_client_resumes() {
 async fn hub_links_over_real_child_processes() {
     let mut c = hub_cfg("hub", "hub-build");
     c.require_same_build = true; // no provisioner: mismatch is accepted
-    let hub = Hub::new(c, Arc::new(CommandConnector), None);
+    let hub = Hub::new(c, Arc::new(wasit_control::CommandConnector), None);
     let routing: Arc<dyn Service> = Arc::new(RoutingService::new(
         hub.clone(),
         Arc::new(DemoService::new("hub")),
