@@ -1,0 +1,6 @@
+Session ID                      Title                                    Updated
+────────────────────────────────────────────────────────────────────────────────
+ses_e143d1ed0ffegDu0tC9M9CNcF3  Greeting                                 11:06 PM
+ses_e143d2b46ffeZYydrNDtXv8w0v  New session - 2026-11-17T23:06:16.633Z   11:06 PM
+ses_e143daed0ffeeDgojCmYvqQ94G  Request for exact pong reply             11:06 PM
+ses_e143d532dffeN3NnIaA1IuK3oV  Short story about a fox                  11:06 PM

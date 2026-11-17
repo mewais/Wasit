@@ -1,0 +1,35 @@
+[
+  {
+    "id": "ses_e143ca763ffezc0T9lagvb81hY",
+    "title": "New session - 2026-11-17T23:06:50.396Z",
+    "updated": 1794956810520,
+    "created": 1794956810396,
+    "projectId": "global",
+    "directory": "/tmp/ow-kilo",
+    "status": {
+      "type": "idle"
+    }
+  },
+  {
+    "id": "ses_e143cbcafffe2IEQYb7Eto6njx",
+    "title": "New session - 2026-11-17T23:06:44.945Z",
+    "updated": 1794956804945,
+    "created": 1794956804945,
+    "projectId": "global",
+    "directory": "/tmp/ow-kilo",
+    "status": {
+      "type": "idle"
+    }
+  },
+  {
+    "id": "ses_e143d7f35ffeqoXK3HMDW6k2pJ",
+    "title": "New session - 2026-11-17T23:05:55.147Z",
+    "updated": 1794956800185,
+    "created": 1794956755147,
+    "projectId": "global",
+    "directory": "/tmp/ow-kilo",
+    "status": {
+      "type": "idle"
+    }
+  }
+]

@@ -1,0 +1,6 @@
+Session ID                      Title                                   Status  Updated
+───────────────────────────────────────────────────────────────────────────────────────
+ses_e143ca763ffezc0T9lagvb81hY  New session - 2026-11-17T23:06:50.396Z  idle    11:06 PM
+ses_e143cbcafffe2IEQYb7Eto6njx  New session - 2026-11-17T23:06:44.945Z  idle    11:06 PM
+ses_e143d7f35ffeqoXK3HMDW6k2pJ  New session - 2026-11-17T23:05:55.147Z  idle    11:06 PM
+ses_e143d041dffeOn98JOAtLnCME9  New session - 2026-11-17T23:06:26.659Z  idle    11:06 PM

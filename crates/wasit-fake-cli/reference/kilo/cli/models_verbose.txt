@@ -1,0 +1,73 @@
+kilo/~anthropic/claude-fable-latest
+{
+  "id": "~anthropic/claude-fable-latest",
+  "providerID": "kilo",
+  "name": "Anthropic: Claude Fable Latest",
+  "family": "claude",
+  "api": {
+    "id": "~anthropic/claude-fable-latest",
+    "url": "https://ai-gateway.kilo.ai/api/v1/",
+    "npm": "@kilocode/kilo-gateway"
+  },
+  "status": "active",
+  "headers": {},
+  "options": {
+    "description": "This model always redirects to the latest model in the Claude Fable family."
+  },
+  "cost": {
+    "input": 8,
+    "output": 40,
+    "cache": {
+      "read": 0.19999999999999998,
+      "write": 10
+    }
+  },
+  "limit": {
+    "context": 1000000,
+    "output": 128000
+  },
+  "capabilities": {
+    "temperature": false,
+    "reasoning": true,
+    "attachment": true,
+    "toolcall": true,
+    "input": {
+      "text": true,
+      "audio": false,
+      "image": true,
+      "video": false,
+      "pdf": true
+    },
+    "output": {
+      "text": true,
+      "audio": false,
+      "image": false,
+      "video": false,
+      "pdf": false
+    },
+    "interleaved": false
+  },
+  "release_date": "2026-11-17",
+  "variants": {
+    "low": {
+      "reasoning": {
+        "enabled": true,
+        "effort": "low"
+      },
+      "verbosity": "low"
+    },
+    "medium": {
+      "reasoning": {
+        "enabled": true,
+        "effort": "medium"
+      },
+      "verbosity": "medium"
+    },
+    "high": {
+      "reasoning": {
+        "enabled": true,
+        "effort": "high"
+      },
+      "verbosity": "high"
+    },
+    "xhigh"

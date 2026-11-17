@@ -1,0 +1,26 @@
+[
+  {
+    "id": "ses_e143d1ed0ffegDu0tC9M9CNcF3",
+    "title": "Greeting",
+    "updated": 1794956783581,
+    "created": 1794956779823,
+    "projectId": "global",
+    "directory": "/tmp/ow-opencode"
+  },
+  {
+    "id": "ses_e143d2b46ffeZYydrNDtXv8w0v",
+    "title": "New session - 2026-11-17T23:06:16.633Z",
+    "updated": 1794956776633,
+    "created": 1794956776633,
+    "projectId": "global",
+    "directory": "/tmp/ow-opencode"
+  },
+  {
+    "id": "ses_e143daed0ffeeDgojCmYvqQ94G",
+    "title": "Request for exact pong reply",
+    "updated": 1794956774208,
+    "created": 1794956742959,
+    "projectId": "global",
+    "directory": "/tmp/ow-opencode"
+  }
+]
