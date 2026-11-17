@@ -347,7 +347,11 @@ pub fn encode_gate_approve(
     for_session: bool,
 ) -> String {
     let result = if is_command_approval(method) {
-        let d = if for_session { "acceptForSession" } else { "accept" };
+        let d = if for_session {
+            "acceptForSession"
+        } else {
+            "accept"
+        };
         serde_json::json!({"decision": d})
     } else if is_legacy_approval(method) {
         serde_json::json!({"decision": "approved"})
@@ -506,7 +510,10 @@ impl MessageParser {
                 Some(m) => m,
                 None => return vec![],
             };
-            let params = obj.get("params").cloned().unwrap_or(serde_json::Value::Null);
+            let params = obj
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             return self.handle_notification(method, &params);
         }
 
@@ -548,7 +555,10 @@ impl MessageParser {
             Some(m) => m,
             None => return vec![],
         };
-        let params = obj.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        let params = obj
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let raw_id = obj.get("id").cloned().unwrap_or(serde_json::Value::Null);
         let raw_id_str = match &raw_id {
             serde_json::Value::Number(n) => n.to_string(),
@@ -736,7 +746,8 @@ impl MessageParser {
                     None => return vec![],
                 };
                 // Track item_id → command for ToolCallFinished correlation.
-                self.pending_commands.insert(item_id.to_string(), command.to_string());
+                self.pending_commands
+                    .insert(item_id.to_string(), command.to_string());
                 vec![AgentEvent::ToolCallStarted {
                     name: command.to_string(),
                     call_id: item_id.to_string(),
@@ -1093,12 +1104,9 @@ impl AgentDriver for CodexDriver {
             detail: format!("spawn {}: {e}", argv[0]),
         })?;
 
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| DriverError::SpawnFailed {
-                detail: "no stdin".to_string(),
-            })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| DriverError::SpawnFailed {
+            detail: "no stdin".to_string(),
+        })?;
         let stdout = child
             .stdout
             .take()
@@ -1110,15 +1118,19 @@ impl AgentDriver for CodexDriver {
 
         // 1. Send initialize.
         let init_line = encode_initialize("wasit-codex", env!("CARGO_PKG_VERSION"));
-        write_line_to(&mut stdin, &init_line).await.map_err(|e| DriverError::SpawnFailed {
-            detail: format!("initialize write: {e}"),
-        })?;
+        write_line_to(&mut stdin, &init_line)
+            .await
+            .map_err(|e| DriverError::SpawnFailed {
+                detail: format!("initialize write: {e}"),
+            })?;
 
         // 2. Read and skip until we find the initialize response (id=1).
         let mut stdout_reader = BufReader::new(stdout);
-        wait_for_response_id(&mut stdout_reader, 1).await.map_err(|e| DriverError::SpawnFailed {
-            detail: format!("initialize response: {e}"),
-        })?;
+        wait_for_response_id(&mut stdout_reader, 1)
+            .await
+            .map_err(|e| DriverError::SpawnFailed {
+                detail: format!("initialize response: {e}"),
+            })?;
 
         // 3. Send thread/start (or thread/resume).
         let cwd = spawn_spec.cwd.as_deref().unwrap_or(".");
@@ -1162,9 +1174,12 @@ impl AgentDriver for CodexDriver {
 
         // Deliver first_prompt if any.
         if let Some(prompt) = spawn_spec.first_prompt.clone() {
-            session.send_prompt(&prompt).await.map_err(|e| DriverError::SpawnFailed {
-                detail: format!("first_prompt: {e}"),
-            })?;
+            session
+                .send_prompt(&prompt)
+                .await
+                .map_err(|e| DriverError::SpawnFailed {
+                    detail: format!("first_prompt: {e}"),
+                })?;
         }
 
         Ok(Box::new(session))
@@ -1222,7 +1237,10 @@ async fn wait_for_response_id(
                     .unwrap_or("json-rpc error");
                 return Err(msg.to_string());
             }
-            return Ok(val.get("result").cloned().unwrap_or(serde_json::Value::Null));
+            return Ok(val
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
         }
     }
 }
@@ -1295,9 +1313,12 @@ impl CodexSession {
             .map_err(|e| DriverError::Transport {
                 detail: format!("write: {e}"),
             })?;
-        stdin.write_all(b"\n").await.map_err(|e| DriverError::Transport {
-            detail: format!("write newline: {e}"),
-        })?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| DriverError::Transport {
+                detail: format!("write newline: {e}"),
+            })?;
         stdin.flush().await.map_err(|e| DriverError::Transport {
             detail: format!("flush: {e}"),
         })
@@ -1425,7 +1446,8 @@ impl Session for CodexSession {
 
     async fn set_mode(&mut self, _mode_id: &str) -> Result<(), DriverError> {
         Err(DriverError::Unsupported {
-            operation: "set_mode (codex does not expose a mode concept in its protocol)".to_string(),
+            operation: "set_mode (codex does not expose a mode concept in its protocol)"
+                .to_string(),
         })
     }
 
@@ -1491,9 +1513,17 @@ mod tests {
     fn argv_base_three_elements_no_mcp_config() {
         // Without mcp_config the argv is exactly [bin, "app-server", "--stdio"].
         let argv = codex_argv(&SpawnSpec::default());
-        assert_eq!(argv.len(), 3, "codex_argv with no mcp_config must have exactly 3 elements");
+        assert_eq!(
+            argv.len(),
+            3,
+            "codex_argv with no mcp_config must have exactly 3 elements"
+        );
         let argv2 = codex_argv(&base_spec());
-        assert_eq!(argv2.len(), 3, "codex_argv with no mcp_config must have exactly 3 elements");
+        assert_eq!(
+            argv2.len(),
+            3,
+            "codex_argv with no mcp_config must have exactly 3 elements"
+        );
     }
 
     #[test]
@@ -1604,7 +1634,9 @@ mod tests {
         let line = r#"{"method":"thread/started","params":{"thread":{"id":"thread-abc-123","sessionId":"sess-xyz"}}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::SessionInit { native_session_id, .. } => {
+            AgentEvent::SessionInit {
+                native_session_id, ..
+            } => {
                 assert_eq!(native_session_id, Some("thread-abc-123".to_string()));
             }
             other => panic!("expected SessionInit, got {other:?}"),
@@ -1617,7 +1649,10 @@ mod tests {
         let events = parse_all(line);
         // Still emits SessionInit but with None native_session_id.
         assert_eq!(events.len(), 1);
-        if let AgentEvent::SessionInit { native_session_id, .. } = &events[0] {
+        if let AgentEvent::SessionInit {
+            native_session_id, ..
+        } = &events[0]
+        {
             assert!(native_session_id.is_none());
         } else {
             panic!("expected SessionInit");
@@ -1695,9 +1730,13 @@ mod tests {
     #[test]
     fn on_message_item_started_non_command_skipped() {
         // Non-commandExecution items are skipped.
-        let line = r#"{"method":"item/started","params":{"item":{"type":"agentMessage","id":"item-2"}}}"#;
+        let line =
+            r#"{"method":"item/started","params":{"item":{"type":"agentMessage","id":"item-2"}}}"#;
         let events = parse_all(line);
-        assert!(events.is_empty(), "non-commandExecution item/started must be skipped");
+        assert!(
+            events.is_empty(),
+            "non-commandExecution item/started must be skipped"
+        );
     }
 
     // ── on_message: item/completed → ToolCallFinished ────────────────────────
@@ -1712,7 +1751,12 @@ mod tests {
         let events = p.on_message(completed);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            AgentEvent::ToolCallFinished { call_id, name, ok, result } => {
+            AgentEvent::ToolCallFinished {
+                call_id,
+                name,
+                ok,
+                result,
+            } => {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(name, "ls -la");
                 assert!(ok, "exit code 0 → ok=true");
@@ -1755,10 +1799,15 @@ mod tests {
         // Start a command but never complete it.
         p.on_message(r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"call_x","command":"sleep 30"}}}"#);
         // Turn completes (interrupted).
-        p.on_message(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"interrupted"}}}"#);
+        p.on_message(
+            r#"{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"interrupted"}}}"#,
+        );
         // Late item/completed should be ignored.
         let events = p.on_message(r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"call_x","exitCode":0}}}"#);
-        assert!(events.is_empty(), "stale item_id must not survive past turn/completed");
+        assert!(
+            events.is_empty(),
+            "stale item_id must not survive past turn/completed"
+        );
     }
 
     // ── on_message: turn/completed → TurnCompleted ───────────────────────────
@@ -1792,7 +1841,9 @@ mod tests {
         let line = r#"{"method":"turn/completed","params":{"turn":{"id":"t1","status":"failed","error":{"message":"exec failed"}}}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::TurnCompleted { end_reason, reply, .. } => {
+            AgentEvent::TurnCompleted {
+                end_reason, reply, ..
+            } => {
                 assert_eq!(end_reason, Some(EndReason::ExecutionError));
                 assert_eq!(reply.as_deref(), Some("exec failed"));
             }
@@ -1802,7 +1853,8 @@ mod tests {
 
     #[test]
     fn on_message_turn_completed_interrupted() {
-        let line = r#"{"method":"turn/completed","params":{"turn":{"id":"t1","status":"interrupted"}}}"#;
+        let line =
+            r#"{"method":"turn/completed","params":{"turn":{"id":"t1","status":"interrupted"}}}"#;
         let ev = parse_one(line);
         match ev {
             AgentEvent::TurnCompleted {
@@ -1822,7 +1874,9 @@ mod tests {
         let mut p = MessageParser::new();
         p.on_message(r#"{"method":"turn/started","params":{"turn":{"id":"t-007"}}}"#);
         assert_eq!(p.active_turn_id(), Some("t-007"));
-        p.on_message(r#"{"method":"turn/completed","params":{"turn":{"id":"t-007","status":"completed"}}}"#);
+        p.on_message(
+            r#"{"method":"turn/completed","params":{"turn":{"id":"t-007","status":"completed"}}}"#,
+        );
         assert!(p.active_turn_id().is_none());
     }
 
@@ -1833,7 +1887,9 @@ mod tests {
         let line = r#"{"id":3,"error":{"code":-32602,"message":"invalid params"}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::TurnCompleted { end_reason, reply, .. } => {
+            AgentEvent::TurnCompleted {
+                end_reason, reply, ..
+            } => {
                 assert_eq!(end_reason, Some(EndReason::ExecutionError));
                 assert_eq!(reply.as_deref(), Some("invalid params"));
             }
@@ -1881,8 +1937,9 @@ mod tests {
         let mut p = MessageParser::new();
         let events = p.on_message(line);
         assert_eq!(events.len(), 1);
-        if let AgentEvent::GateRequested { gate: GateRequest::Permission { tool_name, .. } } =
-            &events[0]
+        if let AgentEvent::GateRequested {
+            gate: GateRequest::Permission { tool_name, .. },
+        } = &events[0]
         {
             assert_eq!(tool_name, "apply_patch");
         } else {
@@ -1892,12 +1949,16 @@ mod tests {
 
     #[test]
     fn on_message_legacy_exec_approval() {
-        let line = r#"{"id":7,"method":"execCommandApproval","params":{"command":"echo hi","cwd":"/"}}"#;
+        let line =
+            r#"{"id":7,"method":"execCommandApproval","params":{"command":"echo hi","cwd":"/"}}"#;
         let mut p = MessageParser::new();
         let events = p.on_message(line);
         assert_eq!(events.len(), 1);
-        if let AgentEvent::GateRequested { gate: GateRequest::Permission { tool_name, command, .. } } =
-            &events[0]
+        if let AgentEvent::GateRequested {
+            gate: GateRequest::Permission {
+                tool_name, command, ..
+            },
+        } = &events[0]
         {
             assert_eq!(tool_name, "shell");
             assert_eq!(command, "echo hi");
@@ -1914,7 +1975,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             AgentEvent::GateRequested { gate } => match gate {
-                GateRequest::Question { request_id, questions } => {
+                GateRequest::Question {
+                    request_id,
+                    questions,
+                } => {
                     assert!(!request_id.is_empty());
                     assert_eq!(questions.len(), 1);
                     assert_eq!(questions[0].question, "Which approach?");
@@ -2070,7 +2134,10 @@ mod tests {
         assert!(caps.persistent_conversation);
         assert!(caps.resumable, "thread/resume verified live");
         assert!(caps.streaming_output, "item/agentMessage/delta");
-        assert!(!caps.reports_usage, "codex does not report usage — honest gap");
+        assert!(
+            !caps.reports_usage,
+            "codex does not report usage — honest gap"
+        );
         assert!(caps.supports_gates, "REAL gates ported from Marsad");
     }
 
@@ -2106,7 +2173,10 @@ mod tests {
     fn on_message_thread_start_response_ignored() {
         let line = r#"{"id":2,"result":{"thread":{"id":"thread-abc-123","sessionId":"sess-xyz"}}}"#;
         let events = parse_all(line);
-        assert!(events.is_empty(), "thread/start response must be silently ignored");
+        assert!(
+            events.is_empty(),
+            "thread/start response must be silently ignored"
+        );
     }
 
     #[test]
@@ -2142,7 +2212,9 @@ mod tests {
         p.on_message(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
         assert_eq!(p.active_turn_id(), Some("t-1"));
 
-        p.on_message(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"completed"}}}"#);
+        p.on_message(
+            r#"{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"completed"}}}"#,
+        );
         assert!(p.active_turn_id().is_none());
 
         p.on_message(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
@@ -2269,14 +2341,22 @@ mod tests {
         assert_eq!(
             overrides,
             vec![
-                "-c", r#"mcp_servers.alpha.command="alpha-cmd""#,
-                "-c", "mcp_servers.alpha.args=[]",
-                "-c", r#"mcp_servers.alpha.env.B_KEY="bval""#,
-                "-c", r#"mcp_servers.alpha.env.M_KEY="mval""#,
-                "-c", r#"mcp_servers.beta.command="beta-cmd""#,
-                "-c", r#"mcp_servers.beta.args=["--flag"]"#,
-                "-c", r#"mcp_servers.beta.env.A_KEY="aval""#,
-                "-c", r#"mcp_servers.beta.env.Z_KEY="zval""#,
+                "-c",
+                r#"mcp_servers.alpha.command="alpha-cmd""#,
+                "-c",
+                "mcp_servers.alpha.args=[]",
+                "-c",
+                r#"mcp_servers.alpha.env.B_KEY="bval""#,
+                "-c",
+                r#"mcp_servers.alpha.env.M_KEY="mval""#,
+                "-c",
+                r#"mcp_servers.beta.command="beta-cmd""#,
+                "-c",
+                r#"mcp_servers.beta.args=["--flag"]"#,
+                "-c",
+                r#"mcp_servers.beta.env.A_KEY="aval""#,
+                "-c",
+                r#"mcp_servers.beta.env.Z_KEY="zval""#,
             ],
             "multiple servers + multiple env keys must be sorted deterministically"
         );
@@ -2288,8 +2368,11 @@ mod tests {
         let spec = SpawnSpec::default(); // mcp_config is None
         assert!(spec.mcp_config.is_none());
         let argv = codex_argv(&spec);
-        assert_eq!(argv, vec!["codex", "app-server", "--stdio"],
-            "no mcp_config → argv byte-identical to plain invocation");
+        assert_eq!(
+            argv,
+            vec!["codex", "app-server", "--stdio"],
+            "no mcp_config → argv byte-identical to plain invocation"
+        );
     }
 
     #[test]
@@ -2301,7 +2384,10 @@ mod tests {
     #[test]
     fn mcp_config_overrides_invalid_json_produces_empty() {
         let overrides = mcp_config_overrides("not valid json {{{{");
-        assert!(overrides.is_empty(), "parse failure → no overrides, no panic");
+        assert!(
+            overrides.is_empty(),
+            "parse failure → no overrides, no panic"
+        );
     }
 
     #[test]
@@ -2320,8 +2406,10 @@ mod tests {
         })
         .to_string();
         let overrides = mcp_config_overrides(&json);
-        assert!(overrides.contains(&"mcp_servers.myserver.args=[]".to_string()),
-            "missing args must default to empty array token");
+        assert!(
+            overrides.contains(&"mcp_servers.myserver.args=[]".to_string()),
+            "missing args must default to empty array token"
+        );
     }
 
     #[test]
@@ -2334,8 +2422,10 @@ mod tests {
         })
         .to_string();
         let overrides = mcp_config_overrides(&json);
-        assert!(!overrides.iter().any(|t| t.contains(".env.")),
-            "missing env map must not produce env -c tokens");
+        assert!(
+            !overrides.iter().any(|t| t.contains(".env.")),
+            "missing env map must not produce env -c tokens"
+        );
     }
 
     // ── codex_argv golden tests (full argv with and without mcp_config) ───────
@@ -2356,8 +2446,15 @@ mod tests {
         assert_eq!(argv[5], "-c");
         assert_eq!(argv[6], "mcp_servers.wasl.args=[]");
         assert_eq!(argv[7], "-c");
-        assert_eq!(argv[8], r#"mcp_servers.wasl.env.WASL_CONFIG="/etc/wasl/wasl.json""#);
-        assert_eq!(argv.len(), 9, "3 base + 6 override tokens for one server with one env key");
+        assert_eq!(
+            argv[8],
+            r#"mcp_servers.wasl.env.WASL_CONFIG="/etc/wasl/wasl.json""#
+        );
+        assert_eq!(
+            argv.len(),
+            9,
+            "3 base + 6 override tokens for one server with one env key"
+        );
     }
 
     #[test]
@@ -2365,7 +2462,10 @@ mod tests {
         // Without mcp_config the argv is exactly the 3-token base.
         let spec = SpawnSpec::default();
         let argv = codex_argv(&spec);
-        assert_eq!(argv, vec!["codex", "app-server", "--stdio"],
-            "no mcp_config → exact 3-token argv, byte-identical to today");
+        assert_eq!(
+            argv,
+            vec!["codex", "app-server", "--stdio"],
+            "no mcp_config → exact 3-token argv, byte-identical to today"
+        );
     }
 }

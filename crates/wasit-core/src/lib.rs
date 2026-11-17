@@ -438,7 +438,6 @@ pub enum EndReason {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     // ── Session lifecycle ────────────────────────────────────────────────
-
     /// The session process is up and the agent has identified itself. This is the
     /// first event a consumer should wait for before sending prompts.
     ///
@@ -495,7 +494,6 @@ pub enum AgentEvent {
     },
 
     // ── Turn lifecycle ───────────────────────────────────────────────────
-
     /// The agent accepted the prompt and started working on a new turn.
     ///
     /// **Produced by:** claude (implicit: first `assistant` after a user prompt);
@@ -550,7 +548,6 @@ pub enum AgentEvent {
     },
 
     // ── Content stream ───────────────────────────────────────────────────
-
     /// An incremental chunk of the assistant's prose output.
     ///
     /// **Produced by:** all three CLIs.
@@ -578,7 +575,6 @@ pub enum AgentEvent {
     },
 
     // ── Tool calls ───────────────────────────────────────────────────────
-
     /// A tool call started (the assistant invoked a tool).
     ///
     /// **Produced by:** all three CLIs.
@@ -649,7 +645,6 @@ pub enum AgentEvent {
     },
 
     // ── Gates ────────────────────────────────────────────────────────────
-
     /// The agent is blocked on a permission gate or question and needs a human
     /// answer before it can proceed.
     ///
@@ -664,12 +659,9 @@ pub enum AgentEvent {
     /// (the known gap documented in `wasit-codex`). Receiving such a request
     /// causes the driver to emit `TurnCompleted { end_reason: ExecutionError }`
     /// describing the unanswerable request.
-    GateRequested {
-        gate: GateRequest,
-    },
+    GateRequested { gate: GateRequest },
 
     // ── Usage / cost ─────────────────────────────────────────────────────
-
     /// An incremental or periodic usage/cost update. Supplements `TurnCompleted`'s
     /// authoritative cumulative totals with intermediate signals.
     ///
@@ -689,18 +681,14 @@ pub enum AgentEvent {
     },
 
     // ── Plan ─────────────────────────────────────────────────────────────
-
     /// The opencode plan-mode todo list was updated. Each event is a FULL
     /// SNAPSHOT (not a patch) — consumers should replace, not merge.
     ///
     /// **Produced by:** opencode only (from `plan` updates in `session/update`).
     /// Claude and codex do NOT emit plan updates in this model.
-    PlanUpdated {
-        entries: Vec<PlanEntry>,
-    },
+    PlanUpdated { entries: Vec<PlanEntry> },
 
     // ── Mode / model changes ─────────────────────────────────────────────
-
     /// The agent's available mode list or current mode changed.
     ///
     /// **Produced by:**
@@ -726,42 +714,31 @@ pub enum AgentEvent {
     /// **Produced by:** opencode (from `session/set_config_option` result for
     /// `model`). Claude reports model only at init and does not signal
     /// mid-session changes this way. Codex: not produced.
-    ModelChanged {
-        model: String,
-    },
+    ModelChanged { model: String },
 
     /// The available slash commands changed (opencode mid-session catalog
     /// replacement, or claude's init list).
     ///
     /// **Produced by:** opencode (from `available_commands_update`); also emitted
     /// at init for claude's slash_commands list.
-    SlashCommandsUpdated {
-        commands: Vec<SlashCommandInfo>,
-    },
+    SlashCommandsUpdated { commands: Vec<SlashCommandInfo> },
 
     // ── Context compaction ────────────────────────────────────────────────
-
     /// A context compaction event (the context was trimmed to make room).
     ///
     /// **Produced by:** claude only (from `system/compact_boundary`). Opencode's
     /// `context_compaction` update type is mapped here too.
     /// Codex does NOT emit compaction events.
-    Compaction {
-        info: CompactionInfo,
-    },
+    Compaction { info: CompactionInfo },
 
     // ── Rate limiting ─────────────────────────────────────────────────────
-
     /// A rate-limit status notice from the provider.
     ///
     /// **Produced by:** claude only (from the top-level `rate_limit_event` line).
     /// Codex and opencode do NOT emit rate-limit events in this model.
-    RateLimitNotice {
-        info: RateLimitInfo,
-    },
+    RateLimitNotice { info: RateLimitInfo },
 
     // ── Process / transport ───────────────────────────────────────────────
-
     /// The underlying process exited. This is a terminal event for the session.
     ///
     /// **Produced by:** all three CLIs (when the child process terminates or the
@@ -783,9 +760,7 @@ pub enum AgentEvent {
     /// compatibility for free (new CLI subtypes don't crash anything). The
     /// alternative — silently dropping — loses observability. The chosen
     /// approach matches Marsad's `StreamMsg::Unknown`.
-    Unknown {
-        raw: serde_json::Value,
-    },
+    Unknown { raw: serde_json::Value },
 }
 
 // ============================================================================

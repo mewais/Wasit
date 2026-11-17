@@ -225,13 +225,11 @@ impl LineParser {
                 arr.iter()
                     .filter_map(|t| {
                         // tools may be strings or objects with a name field
-                        t.as_str()
-                            .map(|s| s.to_string())
-                            .or_else(|| {
-                                t.get("name")
-                                    .and_then(|n| n.as_str())
-                                    .map(|s| s.to_string())
-                            })
+                        t.as_str().map(|s| s.to_string()).or_else(|| {
+                            t.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
                     })
                     .collect()
             })
@@ -345,17 +343,16 @@ impl LineParser {
         &mut self,
         obj: &serde_json::Map<String, serde_json::Value>,
     ) -> Vec<AgentEvent> {
-        let meta = obj.get("compact_metadata").unwrap_or(&serde_json::Value::Null);
+        let meta = obj
+            .get("compact_metadata")
+            .unwrap_or(&serde_json::Value::Null);
         let info = CompactionInfo {
             trigger: meta
                 .get("trigger")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            pre_tokens: meta
-                .get("pre_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            pre_tokens: meta.get("pre_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
             post_tokens: meta
                 .get("post_tokens")
                 .and_then(|v| v.as_u64())
@@ -529,10 +526,7 @@ impl LineParser {
 
     // ── user messages (tool_result) ────────────────────────────────────────
 
-    fn parse_user(
-        &mut self,
-        obj: &serde_json::Map<String, serde_json::Value>,
-    ) -> Vec<AgentEvent> {
+    fn parse_user(&mut self, obj: &serde_json::Map<String, serde_json::Value>) -> Vec<AgentEvent> {
         let message = match obj.get("message") {
             Some(m) => m,
             None => return vec![],
@@ -587,10 +581,7 @@ impl LineParser {
             .get("was_interrupted")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let num_turns = obj
-            .get("num_turns")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let num_turns = obj.get("num_turns").and_then(|v| v.as_u64()).unwrap_or(0);
 
         let end_reason = if subtype == "error_max_turns" {
             Some(EndReason::MaxTurns)
@@ -674,7 +665,10 @@ impl LineParser {
             Some(r) => r,
             None => return vec![],
         };
-        let subtype = request.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+        let subtype = request
+            .get("subtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         match subtype {
             "can_use_tool" => self.parse_can_use_tool(&request_id, request),
@@ -898,14 +892,8 @@ impl LineParser {
 /// Parse a `Usage` from a JSON object (claude's per-message usage shape).
 fn parse_usage(v: &serde_json::Value) -> Usage {
     Usage {
-        input_tokens: v
-            .get("input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
-        output_tokens: v
-            .get("output_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
+        input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
         cache_read_tokens: v
             .get("cache_read_input_tokens")
             .and_then(|x| x.as_u64())
@@ -971,7 +959,11 @@ pub fn claude_available_modes(version: &str) -> Vec<SessionMode> {
             "Accept edits",
             "Apply edits automatically; commands still ask.",
         ),
-        m("plan", "Plan", "Read-only planning; propose a plan before acting."),
+        m(
+            "plan",
+            "Plan",
+            "Read-only planning; propose a plan before acting.",
+        ),
     ];
     if claude_supports_bypass(version) {
         modes.push(m(
@@ -984,7 +976,11 @@ pub fn claude_available_modes(version: &str) -> Vec<SessionMode> {
 }
 
 fn claude_supports_bypass(version: &str) -> bool {
-    match version.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+    match version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
         Some(major) => major >= 1,
         None => true,
     }
@@ -1041,10 +1037,7 @@ pub fn encode_deny(request_id: &str, reason: Option<String>) -> String {
 /// Encode an MCP elicitation accept response.
 ///
 /// Wire: `{"type":"control_response","response":{"subtype":"success","request_id":"X","response":{"action":"accept","content":{…}}}}`
-pub fn encode_elicitation_accept(
-    request_id: &str,
-    content: Option<serde_json::Value>,
-) -> String {
+pub fn encode_elicitation_accept(request_id: &str, content: Option<serde_json::Value>) -> String {
     let inner = serde_json::json!({
         "action": "accept",
         "content": content.unwrap_or_else(|| serde_json::json!({})),
@@ -1225,12 +1218,9 @@ impl AgentDriver for ClaudeDriver {
             detail: format!("spawn {}: {e}", argv[0]),
         })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| DriverError::SpawnFailed {
-                detail: "no stdin".to_string(),
-            })?;
+        let stdin = child.stdin.take().ok_or_else(|| DriverError::SpawnFailed {
+            detail: "no stdin".to_string(),
+        })?;
         let stdout = child
             .stdout
             .take()
@@ -1319,7 +1309,10 @@ impl ClaudeSession {
             stdin.write_all(b"\n").await?;
             stdin.flush().await
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin closed"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdin closed",
+            ))
         }
     }
 }
@@ -1332,9 +1325,11 @@ impl Session for ClaudeSession {
 
     async fn send_prompt(&mut self, text: &str) -> Result<(), DriverError> {
         let msg = encode_user_message(text);
-        self.write_line(&msg).await.map_err(|e| DriverError::Transport {
-            detail: format!("send_prompt: {e}"),
-        })
+        self.write_line(&msg)
+            .await
+            .map_err(|e| DriverError::Transport {
+                detail: format!("send_prompt: {e}"),
+            })
     }
 
     async fn answer_gate(
@@ -1348,7 +1343,9 @@ impl Session for ClaudeSession {
                 permission_updates,
                 elicitation_content,
             } => {
-                if elicitation_content.is_some() || updated_input.is_none() && permission_updates.is_none() {
+                if elicitation_content.is_some()
+                    || updated_input.is_none() && permission_updates.is_none()
+                {
                     // Could be elicitation accept or plain can_use_tool approve.
                     // We can't distinguish here without context — caller should use
                     // the right variant. Treat as elicitation accept if content present.
@@ -1367,9 +1364,11 @@ impl Session for ClaudeSession {
             }
             GateDecision::Deny { reason } => encode_deny(request_id, reason),
         };
-        self.write_line(&line).await.map_err(|e| DriverError::Transport {
-            detail: format!("answer_gate: {e}"),
-        })
+        self.write_line(&line)
+            .await
+            .map_err(|e| DriverError::Transport {
+                detail: format!("answer_gate: {e}"),
+            })
     }
 
     async fn answer_question(
@@ -1377,12 +1376,14 @@ impl Session for ClaudeSession {
         request_id: &str,
         answer: QuestionAnswer,
     ) -> Result<(), DriverError> {
-        let answers_obj: serde_json::Value = serde_json::to_value(&answer.answers)
-            .unwrap_or_else(|_| serde_json::json!({}));
+        let answers_obj: serde_json::Value =
+            serde_json::to_value(&answer.answers).unwrap_or_else(|_| serde_json::json!({}));
         let line = encode_question_answer(request_id, &serde_json::json!({}), &answers_obj);
-        self.write_line(&line).await.map_err(|e| DriverError::Transport {
-            detail: format!("answer_question: {e}"),
-        })
+        self.write_line(&line)
+            .await
+            .map_err(|e| DriverError::Transport {
+                detail: format!("answer_question: {e}"),
+            })
     }
 
     async fn interrupt(&mut self) -> Result<(), DriverError> {
@@ -1401,9 +1402,11 @@ impl Session for ClaudeSession {
         self.mode_req_counter += 1;
         let req_id = format!("req_mode_{}", self.mode_req_counter);
         let line = encode_set_permission_mode(&req_id, mode_id);
-        self.write_line(&line).await.map_err(|e| DriverError::Transport {
-            detail: format!("set_mode: {e}"),
-        })
+        self.write_line(&line)
+            .await
+            .map_err(|e| DriverError::Transport {
+                detail: format!("set_mode: {e}"),
+            })
     }
 
     async fn shutdown(&mut self) -> Result<(), DriverError> {
@@ -1472,7 +1475,10 @@ mod tests {
     #[test]
     fn argv_model_present() {
         let argv = claude_argv(&base_spec());
-        let idx = argv.iter().position(|a| a == "--model").expect("--model missing");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model missing");
         assert_eq!(argv[idx + 1], "claude-sonnet-4");
     }
 
@@ -1641,7 +1647,10 @@ mod tests {
     fn on_line_system_init_available_modes_version_1() {
         let line = r#"{"type":"system","subtype":"init","session_id":"s","model":"m","cwd":"/","tools":[],"permissionMode":"default","claude_code_version":"1.2.3"}"#;
         let ev = parse_one(line);
-        if let AgentEvent::SessionInit { available_modes, .. } = ev {
+        if let AgentEvent::SessionInit {
+            available_modes, ..
+        } = ev
+        {
             // Version 1 → bypassPermissions included
             assert!(available_modes.iter().any(|m| m.id == "bypassPermissions"));
             assert!(available_modes.iter().any(|m| m.id == "plan"));
@@ -1654,7 +1663,10 @@ mod tests {
     fn on_line_system_init_available_modes_version_0() {
         let line = r#"{"type":"system","subtype":"init","session_id":"s","model":"m","cwd":"/","tools":[],"permissionMode":"default","claude_code_version":"0.9.0"}"#;
         let ev = parse_one(line);
-        if let AgentEvent::SessionInit { available_modes, .. } = ev {
+        if let AgentEvent::SessionInit {
+            available_modes, ..
+        } = ev
+        {
             // Version 0 → bypassPermissions NOT included
             assert!(!available_modes.iter().any(|m| m.id == "bypassPermissions"));
         } else {
@@ -1685,7 +1697,10 @@ mod tests {
         // system/status without permissionMode → nothing emitted
         let line = r#"{"type":"system","subtype":"status","foo":"bar"}"#;
         let events = parse_all(line);
-        assert!(events.is_empty(), "no events for status without permissionMode");
+        assert!(
+            events.is_empty(),
+            "no events for status without permissionMode"
+        );
     }
 
     // ── on_line: system/compact_boundary ────────────────────────────────────
@@ -1713,7 +1728,9 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"id":"msg-1","content":[{"type":"text","text":"Hello!"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#;
         let events = parse_all(line);
         // Expect: TurnStarted, AssistantDelta, UsageUpdate
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnStarted { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnStarted { .. })));
         let delta = events
             .iter()
             .find(|e| matches!(e, AgentEvent::AssistantDelta { .. }))
@@ -1722,7 +1739,9 @@ mod tests {
             assert_eq!(text, "Hello!");
             assert_eq!(message_id.as_deref(), Some("msg-1"));
         }
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::UsageUpdate { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UsageUpdate { .. })));
     }
 
     #[test]
@@ -1732,9 +1751,13 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":1,"output_tokens":1}}}"#;
         let evs1 = p.on_line(line);
         let evs2 = p.on_line(line);
-        assert!(evs1.iter().any(|e| matches!(e, AgentEvent::TurnStarted { .. })));
+        assert!(evs1
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnStarted { .. })));
         assert!(
-            !evs2.iter().any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
+            !evs2
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
             "TurnStarted must not appear on second assistant line"
         );
     }
@@ -1810,7 +1833,10 @@ mod tests {
             .iter()
             .find(|e| matches!(e, AgentEvent::ToolCallStarted { .. }))
             .expect("ToolCallStarted missing");
-        if let AgentEvent::ToolCallStarted { name, is_subagent, .. } = tool {
+        if let AgentEvent::ToolCallStarted {
+            name, is_subagent, ..
+        } = tool
+        {
             assert_eq!(name, "Agent");
             assert!(is_subagent);
         }
@@ -1954,7 +1980,8 @@ mod tests {
         p.on_line(result); // Ends turn.
         let evs = p.on_line(assistant); // Second turn — must produce TurnStarted.
         assert!(
-            evs.iter().any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
+            evs.iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
             "second turn must produce TurnStarted"
         );
     }
@@ -1997,7 +2024,11 @@ mod tests {
         let ev = parse_one(line);
         match ev {
             AgentEvent::GateRequested {
-                gate: GateRequest::Permission { permission_suggestions, .. },
+                gate:
+                    GateRequest::Permission {
+                        permission_suggestions,
+                        ..
+                    },
             } => {
                 assert_eq!(permission_suggestions.len(), 1);
             }
@@ -2040,7 +2071,12 @@ mod tests {
         let ev = parse_one(line);
         match ev {
             AgentEvent::GateRequested {
-                gate: GateRequest::Permission { is_elicitation, elicitation_choices, .. },
+                gate:
+                    GateRequest::Permission {
+                        is_elicitation,
+                        elicitation_choices,
+                        ..
+                    },
             } => {
                 assert!(is_elicitation);
                 assert!(elicitation_choices.is_empty());
@@ -2152,7 +2188,10 @@ mod tests {
         // control_response (initialize ack) → silently ignored, no event.
         let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_init","commands":[]}}"#;
         let events = parse_all(line);
-        assert!(events.is_empty(), "control_response ack must be silently ignored");
+        assert!(
+            events.is_empty(),
+            "control_response ack must be silently ignored"
+        );
     }
 
     // ── gate encoder: allow ──────────────────────────────────────────────────
@@ -2236,7 +2275,10 @@ mod tests {
         assert_eq!(v["type"], "control_response");
         assert_eq!(v["response"]["response"]["behavior"], "allow");
         assert!(v["response"]["response"]["updatedInput"]["questions"].is_array());
-        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["Q1?"], "Option A");
+        assert_eq!(
+            v["response"]["response"]["updatedInput"]["answers"]["Q1?"],
+            "Option A"
+        );
     }
 
     // ── gate encoder: set_permission_mode ───────────────────────────────────
@@ -2341,12 +2383,18 @@ mod tests {
     fn driver_capabilities_honest() {
         let driver = ClaudeDriver::from_path();
         let caps = driver.capabilities();
-        assert!(!caps.interruptible, "interruptible must be false (unverified)");
+        assert!(
+            !caps.interruptible,
+            "interruptible must be false (unverified)"
+        );
         assert!(!caps.model_switchable);
         assert!(caps.mode_switchable);
         assert!(caps.persistent_conversation);
         assert!(caps.resumable);
-        assert!(!caps.streaming_output, "claude delivers whole messages, not token deltas");
+        assert!(
+            !caps.streaming_output,
+            "claude delivers whole messages, not token deltas"
+        );
         assert!(caps.reports_usage);
         assert!(caps.supports_gates);
     }

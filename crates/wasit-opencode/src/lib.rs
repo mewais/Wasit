@@ -197,10 +197,7 @@ pub fn encode_set_mode(id: u64, session_id: &str, mode_id: &str) -> String {
 /// The decision sends back the chosen option id via `optionId`.
 /// Ported from Marsad's gate answer path. `request_id_raw` is the JSON-RPC
 /// id of the incoming gate request (may be number or string).
-pub fn encode_gate_approve(
-    request_id_raw: &serde_json::Value,
-    option_id: Option<&str>,
-) -> String {
+pub fn encode_gate_approve(request_id_raw: &serde_json::Value, option_id: Option<&str>) -> String {
     let result = if let Some(oid) = option_id.filter(|s| !s.is_empty()) {
         serde_json::json!({ "optionId": oid })
     } else {
@@ -260,8 +257,11 @@ pub fn parse_config_modes(container: &serde_json::Value) -> (Vec<SessionMode>, S
                 .filter_map(|o| {
                     let id = o.get("value").and_then(|v| v.as_str())?;
                     let label = o.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                    let description =
-                        o.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let description = o
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     Some(SessionMode {
                         id: id.to_string(),
                         label: label.to_string(),
@@ -279,7 +279,9 @@ pub fn parse_config_modes(container: &serde_json::Value) -> (Vec<SessionMode>, S
 /// Returns the `currentValue` of the `model` config group, or `None` if absent.
 pub fn parse_config_model(container: &serde_json::Value) -> Option<String> {
     let opts = container.get("configOptions")?.as_array()?;
-    let group = opts.iter().find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"))?;
+    let group = opts
+        .iter()
+        .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"))?;
     group.get("currentValue")?.as_str().map(|s| s.to_string())
 }
 
@@ -401,7 +403,10 @@ impl MessageParser {
                 None => return vec![],
             };
             if method == "session/update" {
-                let params = obj.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let params = obj
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 return self.handle_session_update(&params);
             }
             return vec![];
@@ -449,7 +454,10 @@ impl MessageParser {
             return vec![AgentEvent::Unknown { raw: val.clone() }];
         }
 
-        let params = obj.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        let params = obj
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let raw_id = obj.get("id").cloned().unwrap_or(serde_json::Value::Null);
 
         // Build the gate routing id: prefer toolCall.toolCallId (globally unique),
@@ -474,10 +482,19 @@ impl MessageParser {
             .unwrap_or_else(|| format!("{session_id}:acp:{raw_id_str}"));
 
         // Extract gate fields from params.
-        let tool_call = params.get("toolCall").cloned().unwrap_or(serde_json::Value::Null);
+        let tool_call = params
+            .get("toolCall")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let kind = tool_call.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        let title = tool_call.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let raw_input = tool_call.get("rawInput").cloned().unwrap_or(serde_json::Value::Null);
+        let title = tool_call
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let raw_input = tool_call
+            .get("rawInput")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         let tool_name = if kind.is_empty() { "opencode" } else { kind }.to_string();
         let command = if !title.is_empty() {
@@ -496,8 +513,10 @@ impl MessageParser {
                 arr.iter()
                     .filter_map(|opt| {
                         let option_id = opt.get("optionId").and_then(|v| v.as_str())?;
-                        let name =
-                            opt.get("name").and_then(|v| v.as_str()).unwrap_or(option_id);
+                        let name = opt
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(option_id);
                         Some(ElicitationChoice {
                             key: "optionId".to_string(),
                             value: option_id.to_string(),
@@ -564,15 +583,11 @@ impl MessageParser {
                     Some(c) => c,
                     None => return vec![],
                 };
-                let content_type =
-                    content.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let content_type = content.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if content_type != "text" {
                     return vec![];
                 }
-                let text = content
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let text = content.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if text.is_empty() {
                     return vec![];
                 }
@@ -629,10 +644,7 @@ impl MessageParser {
                     .unwrap_or(serde_json::Value::Null);
 
                 // Subagent detection: `task` tool is opencode's subagent launcher.
-                let is_task = update
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    == Some("task");
+                let is_task = update.get("title").and_then(|v| v.as_str()) == Some("task");
 
                 if is_task {
                     // Track this toolCallId as a subagent (initial `task` call
@@ -643,7 +655,8 @@ impl MessageParser {
                 }
 
                 // Track tool name for ToolCallFinished correlation.
-                self.pending_tools.insert(tool_call_id.clone(), tool_name.clone());
+                self.pending_tools
+                    .insert(tool_call_id.clone(), tool_name.clone());
 
                 vec![AgentEvent::ToolCallStarted {
                     name: tool_name,
@@ -741,10 +754,8 @@ impl MessageParser {
                 } else {
                     0.0
                 };
-                let context_used =
-                    update.get("used").and_then(|v| v.as_u64()).unwrap_or(0);
-                let context_size =
-                    update.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                let context_used = update.get("used").and_then(|v| v.as_u64()).unwrap_or(0);
+                let context_size = update.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 let context_pct = if context_size > 0 {
                     Some((context_used as f32 / context_size as f32) * 100.0)
@@ -821,7 +832,9 @@ impl MessageParser {
             "user_message_chunk" => vec![],
 
             // ── unknown update type → Unknown ─────────────────────────────────
-            _ => vec![AgentEvent::Unknown { raw: update.clone() }],
+            _ => vec![AgentEvent::Unknown {
+                raw: update.clone(),
+            }],
         }
     }
 
@@ -862,10 +875,7 @@ impl MessageParser {
                     .unwrap_or(true)
                 {
                     if let Some(obj) = input.as_object_mut() {
-                        obj.insert(
-                            "description".to_string(),
-                            serde_json::json!(n),
-                        );
+                        obj.insert("description".to_string(), serde_json::json!(n));
                     }
                 }
                 events.push(AgentEvent::ToolCallStarted {
@@ -925,13 +935,13 @@ impl MessageParser {
 
         // session/prompt result: carries `stopReason` and optional `usage`.
         if result.get("stopReason").is_some() {
-            let stop_reason =
-                result.get("stopReason").and_then(|v| v.as_str()).unwrap_or("completed");
+            let stop_reason = result
+                .get("stopReason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("completed");
 
             let end_reason = match stop_reason {
-                "completed" | "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" => {
-                    None
-                }
+                "completed" | "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" => None,
                 "cancelled" => Some(EndReason::Cancelled),
                 "auth_required" | "request_limit_exceeded" => Some(EndReason::ExecutionError),
                 _ => None,
@@ -1021,7 +1031,10 @@ impl MessageParser {
 /// response line to write to opencode's stdin.
 fn encode_gate_response(gate: &PendingGate, decision: &GateDecision) -> String {
     match decision {
-        GateDecision::Approve { elicitation_content, .. } => {
+        GateDecision::Approve {
+            elicitation_content,
+            ..
+        } => {
             // Extract the chosen optionId from elicitation_content if present.
             let option_id = elicitation_content
                 .as_ref()
@@ -1117,17 +1130,22 @@ impl AgentDriver for OpencodeDriver {
         let mut stdin = child.stdin.take().ok_or_else(|| DriverError::SpawnFailed {
             detail: "no stdin".to_string(),
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| DriverError::SpawnFailed {
-            detail: "no stdout".to_string(),
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DriverError::SpawnFailed {
+                detail: "no stdout".to_string(),
+            })?;
 
         // ── Perform the ACP handshake ────────────────────────────────────────
 
         // 1. Send initialize.
         let init_line = encode_initialize("wasit-opencode", env!("CARGO_PKG_VERSION"));
-        write_line_to(&mut stdin, &init_line).await.map_err(|e| DriverError::SpawnFailed {
-            detail: format!("initialize write: {e}"),
-        })?;
+        write_line_to(&mut stdin, &init_line)
+            .await
+            .map_err(|e| DriverError::SpawnFailed {
+                detail: format!("initialize write: {e}"),
+            })?;
 
         // 2. Read until we find the initialize response (id=1).
         let mut stdout_reader = BufReader::new(stdout);
@@ -1143,9 +1161,7 @@ impl AgentDriver for OpencodeDriver {
         let session_req_id: u64 = 2;
 
         let session_line = match &spawn_spec.resume {
-            ResumeMode::Resume(session_id) => {
-                encode_session_load(session_req_id, session_id, cwd)
-            }
+            ResumeMode::Resume(session_id) => encode_session_load(session_req_id, session_id, cwd),
             _ => encode_session_new(session_req_id, cwd, model),
         };
         write_line_to(&mut stdin, &session_line)
@@ -1156,12 +1172,11 @@ impl AgentDriver for OpencodeDriver {
 
         // 4. Read until we find the session/new response (id=2) → extract sessionId +
         //    configOptions.
-        let session_result =
-            wait_for_response_id(&mut stdout_reader, session_req_id)
-                .await
-                .map_err(|e| DriverError::SpawnFailed {
-                    detail: format!("session/new response: {e}"),
-                })?;
+        let session_result = wait_for_response_id(&mut stdout_reader, session_req_id)
+            .await
+            .map_err(|e| DriverError::SpawnFailed {
+                detail: format!("session/new response: {e}"),
+            })?;
 
         let native_session_id = session_result
             .get("sessionId")
@@ -1173,8 +1188,7 @@ impl AgentDriver for OpencodeDriver {
 
         // Parse modes and model from configOptions at init.
         let (available_modes, current_mode) = parse_config_modes(&session_result);
-        let init_model = parse_config_model(&session_result)
-            .or_else(|| spawn_spec.model.clone());
+        let init_model = parse_config_model(&session_result).or_else(|| spawn_spec.model.clone());
 
         // Event channel: reader task → session.
         let (tx, rx) = mpsc::channel::<AgentEvent>(256);
@@ -1211,9 +1225,12 @@ impl AgentDriver for OpencodeDriver {
 
         // Deliver first_prompt if any.
         if let Some(prompt) = spawn_spec.first_prompt.clone() {
-            session.send_prompt(&prompt).await.map_err(|e| DriverError::SpawnFailed {
-                detail: format!("first_prompt: {e}"),
-            })?;
+            session
+                .send_prompt(&prompt)
+                .await
+                .map_err(|e| DriverError::SpawnFailed {
+                    detail: format!("first_prompt: {e}"),
+                })?;
         }
 
         Ok(Box::new(session))
@@ -1233,8 +1250,7 @@ async fn wait_for_response_id(
     reader: &mut BufReader<ChildStdout>,
     expected_id: u64,
 ) -> Result<serde_json::Value, String> {
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("timed out waiting for response id={expected_id}"));
@@ -1249,9 +1265,7 @@ async fn wait_for_response_id(
             Ok(Ok(0)) => return Err("EOF".to_string()),
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e.to_string()),
-            Err(_) => {
-                return Err(format!("timed out waiting for response id={expected_id}"))
-            }
+            Err(_) => return Err(format!("timed out waiting for response id={expected_id}")),
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1275,7 +1289,10 @@ async fn wait_for_response_id(
                     .unwrap_or("json-rpc error");
                 return Err(msg.to_string());
             }
-            return Ok(val.get("result").cloned().unwrap_or(serde_json::Value::Null));
+            return Ok(val
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
         }
     }
 }
@@ -1324,12 +1341,18 @@ impl OpencodeSession {
         let stdin = self.stdin.as_mut().ok_or_else(|| DriverError::Transport {
             detail: "stdin closed".to_string(),
         })?;
-        stdin.write_all(line.as_bytes()).await.map_err(|e| DriverError::Transport {
-            detail: format!("write: {e}"),
-        })?;
-        stdin.write_all(b"\n").await.map_err(|e| DriverError::Transport {
-            detail: format!("write newline: {e}"),
-        })?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| DriverError::Transport {
+                detail: format!("write: {e}"),
+            })?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| DriverError::Transport {
+                detail: format!("write newline: {e}"),
+            })?;
         stdin.flush().await.map_err(|e| DriverError::Transport {
             detail: format!("flush: {e}"),
         })
@@ -1541,7 +1564,10 @@ mod tests {
     fn encode_session_new_no_model() {
         let json = encode_session_new(2, "/proj", None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(v["params"]["model"].is_null(), "no model → model must be absent");
+        assert!(
+            v["params"]["model"].is_null(),
+            "no model → model must be absent"
+        );
     }
 
     // ── encode_session_load ──────────────────────────────────────────────────
@@ -1703,7 +1729,13 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call","toolCallId":"toolu_1","title":"glob","kind":"search","status":"pending","rawInput":{"pattern":"*"}}}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::ToolCallStarted { name, call_id, input, is_subagent, .. } => {
+            AgentEvent::ToolCallStarted {
+                name,
+                call_id,
+                input,
+                is_subagent,
+                ..
+            } => {
                 assert_eq!(name, "glob", "name = title, not kind");
                 assert_eq!(call_id, "toolu_1");
                 assert_eq!(input["pattern"], "*");
@@ -1745,9 +1777,18 @@ mod tests {
         p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call","toolCallId":"toolu_task_1","title":"task","kind":"think","status":"pending","rawInput":{}}}}"#);
         // Enriched update with description → ToolCallStarted.
         let events = p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_task_1","title":"Explore repo","kind":"think","status":"in_progress","rawInput":{"description":"Explore repo","prompt":"..."}}}}"#);
-        assert_eq!(events.len(), 1, "enriched update must produce exactly ToolCallStarted");
+        assert_eq!(
+            events.len(),
+            1,
+            "enriched update must produce exactly ToolCallStarted"
+        );
         match &events[0] {
-            AgentEvent::ToolCallStarted { name, call_id, is_subagent, .. } => {
+            AgentEvent::ToolCallStarted {
+                name,
+                call_id,
+                is_subagent,
+                ..
+            } => {
                 assert_eq!(name, "Explore repo");
                 assert_eq!(call_id, "toolu_task_1");
                 assert!(is_subagent, "task tool must have is_subagent=true");
@@ -1762,8 +1803,13 @@ mod tests {
         p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call","toolCallId":"toolu_task_1","title":"task","kind":"think","status":"pending","rawInput":{}}}}"#);
         p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_task_1","title":"Explore repo","status":"in_progress","rawInput":{"description":"Explore repo"}}}}"#);
         let events = p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_task_1","title":"Explore repo","status":"completed","content":[{"type":"content","content":{"type":"text","text":"done"}}]}}}"#);
-        let finished = events.iter().find(|e| matches!(e, AgentEvent::ToolCallFinished { .. }));
-        assert!(finished.is_some(), "completed task update must emit ToolCallFinished");
+        let finished = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolCallFinished { .. }));
+        assert!(
+            finished.is_some(),
+            "completed task update must emit ToolCallFinished"
+        );
         if let Some(AgentEvent::ToolCallFinished { ok, call_id, .. }) = finished {
             assert!(ok);
             assert_eq!(call_id, "toolu_task_1");
@@ -1779,8 +1825,14 @@ mod tests {
         assert_eq!(ev1.len(), 1, "first enriched update = one ToolCallStarted");
         // Second in_progress update → NO duplicate ToolCallStarted.
         let ev2 = p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_task_1","title":"Task A","status":"in_progress","rawInput":{"description":"Task A"}}}}"#);
-        let started_count = ev2.iter().filter(|e| matches!(e, AgentEvent::ToolCallStarted { .. })).count();
-        assert_eq!(started_count, 0, "repeat in_progress must not duplicate ToolCallStarted");
+        let started_count = ev2
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(
+            started_count, 0,
+            "repeat in_progress must not duplicate ToolCallStarted"
+        );
     }
 
     // ── on_message: tool_call_update → ToolCallUpdated / ToolCallFinished ─────
@@ -1794,7 +1846,12 @@ mod tests {
         let events = p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_edit_1","title":"main.rs","status":"in_progress","content":[]}}}"#);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            AgentEvent::ToolCallUpdated { call_id, name, status, .. } => {
+            AgentEvent::ToolCallUpdated {
+                call_id,
+                name,
+                status,
+                ..
+            } => {
                 assert_eq!(call_id, "toolu_edit_1");
                 assert_eq!(name, "main.rs");
                 assert_eq!(status.as_deref(), Some("in_progress"));
@@ -1810,7 +1867,12 @@ mod tests {
         let events = p.on_message(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_edit_2","title":"foo.rs","status":"completed","content":[{"type":"content","content":{"type":"text","text":"edited"}}]}}}"#);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            AgentEvent::ToolCallFinished { call_id, ok, result, .. } => {
+            AgentEvent::ToolCallFinished {
+                call_id,
+                ok,
+                result,
+                ..
+            } => {
                 assert_eq!(call_id, "toolu_edit_2");
                 assert!(ok, "completed → ok=true");
                 assert!(result.is_some(), "content must be present");
@@ -1843,10 +1905,16 @@ mod tests {
         match ev {
             AgentEvent::UsageUpdate { usage, context_pct } => {
                 assert!((usage.cost_usd - 0.0042).abs() < 1e-6);
-                assert!(context_pct.is_some(), "context_pct must be computed from used/size");
+                assert!(
+                    context_pct.is_some(),
+                    "context_pct must be computed from used/size"
+                );
                 // 3/200000 * 100 = 0.0015%
                 let pct = context_pct.unwrap();
-                assert!(pct > 0.0 && pct < 1.0, "context_pct should be ~0.0015, got {pct}");
+                assert!(
+                    pct > 0.0 && pct < 1.0,
+                    "context_pct should be ~0.0015, got {pct}"
+                );
             }
             other => panic!("expected UsageUpdate, got {other:?}"),
         }
@@ -1870,7 +1938,10 @@ mod tests {
         let ev = parse_one(line);
         match ev {
             AgentEvent::UsageUpdate { context_pct, .. } => {
-                assert!(context_pct.is_none(), "zero size → context_pct must be None");
+                assert!(
+                    context_pct.is_none(),
+                    "zero size → context_pct must be None"
+                );
             }
             other => panic!("expected UsageUpdate, got {other:?}"),
         }
@@ -1941,8 +2012,14 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::ModesUpdated { available_modes, current_mode } => {
-                assert!(available_modes.is_empty(), "current_mode_update does not carry mode list");
+            AgentEvent::ModesUpdated {
+                available_modes,
+                current_mode,
+            } => {
+                assert!(
+                    available_modes.is_empty(),
+                    "current_mode_update does not carry mode list"
+                );
                 assert_eq!(current_mode, Some("plan".to_string()));
             }
             other => panic!("expected ModesUpdated, got {other:?}"),
@@ -2033,7 +2110,10 @@ mod tests {
         let mut p = MessageParser::new();
         let events = p.on_message(line);
         assert_eq!(events.len(), 1);
-        if let AgentEvent::GateRequested { gate: GateRequest::Permission { request_id, .. } } = &events[0] {
+        if let AgentEvent::GateRequested {
+            gate: GateRequest::Permission { request_id, .. },
+        } = &events[0]
+        {
             assert!(
                 request_id.contains("acp") || request_id.contains("42"),
                 "fallback routing id must contain acp or rpc id: {request_id}"
@@ -2050,7 +2130,13 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":855}}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::TurnCompleted { end_reason, was_interrupted, num_turns, usage, .. } => {
+            AgentEvent::TurnCompleted {
+                end_reason,
+                was_interrupted,
+                num_turns,
+                usage,
+                ..
+            } => {
                 assert!(end_reason.is_none(), "end_turn → no end_reason");
                 assert!(!was_interrupted);
                 assert_eq!(num_turns, 1);
@@ -2078,7 +2164,11 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled","usage":{}}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::TurnCompleted { end_reason, was_interrupted, .. } => {
+            AgentEvent::TurnCompleted {
+                end_reason,
+                was_interrupted,
+                ..
+            } => {
                 assert_eq!(end_reason, Some(EndReason::Cancelled));
                 assert!(was_interrupted);
             }
@@ -2122,14 +2212,28 @@ mod tests {
         let mut p = MessageParser::new();
         let events = p.on_message(line);
         // Expect both ModelChanged and ModesUpdated.
-        let model_changed = events.iter().find(|e| matches!(e, AgentEvent::ModelChanged { .. }));
-        let modes_updated = events.iter().find(|e| matches!(e, AgentEvent::ModesUpdated { .. }));
-        assert!(model_changed.is_some(), "set_config_option result must emit ModelChanged");
-        assert!(modes_updated.is_some(), "set_config_option result must emit ModesUpdated");
+        let model_changed = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ModelChanged { .. }));
+        let modes_updated = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ModesUpdated { .. }));
+        assert!(
+            model_changed.is_some(),
+            "set_config_option result must emit ModelChanged"
+        );
+        assert!(
+            modes_updated.is_some(),
+            "set_config_option result must emit ModesUpdated"
+        );
         if let Some(AgentEvent::ModelChanged { model }) = model_changed {
             assert_eq!(model, "claude-opus-4");
         }
-        if let Some(AgentEvent::ModesUpdated { available_modes, current_mode }) = modes_updated {
+        if let Some(AgentEvent::ModesUpdated {
+            available_modes,
+            current_mode,
+        }) = modes_updated
+        {
             assert_eq!(current_mode.as_deref(), Some("plan"));
             assert_eq!(available_modes.len(), 2);
             assert_eq!(available_modes[0].id, "build");
@@ -2141,10 +2245,13 @@ mod tests {
 
     #[test]
     fn on_message_jsonrpc_error_response() {
-        let line = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"something broke"}}"#;
+        let line =
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"something broke"}}"#;
         let ev = parse_one(line);
         match ev {
-            AgentEvent::TurnCompleted { end_reason, reply, .. } => {
+            AgentEvent::TurnCompleted {
+                end_reason, reply, ..
+            } => {
                 assert_eq!(end_reason, Some(EndReason::ExecutionError));
                 assert_eq!(reply.as_deref(), Some("something broke"));
             }
@@ -2172,7 +2279,10 @@ mod tests {
     #[test]
     fn on_message_user_message_chunk_skipped() {
         let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_real","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}}}}"#;
-        assert!(parse_all(line).is_empty(), "user_message_chunk must be skipped");
+        assert!(
+            parse_all(line).is_empty(),
+            "user_message_chunk must be skipped"
+        );
     }
 
     #[test]
@@ -2196,7 +2306,10 @@ mod tests {
         // session/new result (has sessionId but no stopReason, no configOptions) → silently ignored.
         let line = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_abc123"}}"#;
         let events = parse_all(line);
-        assert!(events.is_empty(), "session/new response ack must be silently ignored");
+        assert!(
+            events.is_empty(),
+            "session/new response ack must be silently ignored"
+        );
     }
 
     #[test]
@@ -2359,7 +2472,15 @@ mod tests {
         // 3. session/request_permission → GateRequested with routing_id = toolCallId.
         let ev3 = p.on_message(r#"{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"ses_real","toolCall":{"toolCallId":"toolu_perm","title":"/work/x","kind":"other","rawInput":{"filepath":"/work/x"}},"options":[{"optionId":"once","name":"Allow once","kind":"allow_once"},{"optionId":"always","name":"Always allow","kind":"allow_always"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}"#);
         assert_eq!(ev3.len(), 1);
-        if let AgentEvent::GateRequested { gate: GateRequest::Permission { request_id, permission_suggestions, .. } } = &ev3[0] {
+        if let AgentEvent::GateRequested {
+            gate:
+                GateRequest::Permission {
+                    request_id,
+                    permission_suggestions,
+                    ..
+                },
+        } = &ev3[0]
+        {
             assert_ne!(request_id, "0", "routing id must not be the raw ACP id 0");
             assert_eq!(permission_suggestions.len(), 3, "3 ACP options");
         }
@@ -2380,7 +2501,10 @@ mod tests {
         ).unwrap();
 
         let (modes, current) = parse_config_modes(&result);
-        assert_eq!(modes.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec!["build", "plan"]);
+        assert_eq!(
+            modes.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec!["build", "plan"]
+        );
         assert_eq!(current, "build");
 
         let model = parse_config_model(&result);
@@ -2393,9 +2517,15 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":5,"result":{"configOptions":[{"id":"model","name":"Model","currentValue":"amd-anthropic/Claude-Sonnet-5","options":[{"value":"amd-anthropic/Claude-Haiku-4.5","name":"Haiku"},{"value":"amd-anthropic/Claude-Opus-4.8","name":"Opus"}]},{"id":"mode","name":"Session Mode","currentValue":"plan","options":[{"value":"build","name":"build","description":"Default"},{"value":"plan","name":"plan","description":"Plan mode"}]}]}}"#;
         let mut p = MessageParser::new();
         let events = p.on_message(line);
-        let mode_ev = events.iter().find(|e| matches!(e, AgentEvent::ModesUpdated { .. }));
+        let mode_ev = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ModesUpdated { .. }));
         assert!(mode_ev.is_some());
-        if let Some(AgentEvent::ModesUpdated { current_mode, available_modes }) = mode_ev {
+        if let Some(AgentEvent::ModesUpdated {
+            current_mode,
+            available_modes,
+        }) = mode_ev
+        {
             assert_eq!(current_mode.as_deref(), Some("plan"));
             assert_eq!(available_modes.len(), 2);
         }

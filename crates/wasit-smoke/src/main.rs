@@ -228,9 +228,11 @@ async fn decide_gate(gate: &GateRequest, auto_approve: bool) -> GateDecision {
 async fn run_inner(args: Args) -> i32 {
     // Build SpawnSpec.
     let spec = SpawnSpec {
-        cwd: args
-            .cwd
-            .or_else(|| std::env::current_dir().ok().and_then(|p| p.to_str().map(|s| s.to_string()))),
+        cwd: args.cwd.or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+        }),
         model: args.model,
         mode: args.mode,
         bin: args.bin,
