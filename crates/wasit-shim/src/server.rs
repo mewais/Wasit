@@ -100,6 +100,8 @@ struct Written {
 struct JState {
     next_seq: u64,
     pending: Vec<u8>,
+    /// The `exited` record has been appended: no controller notes after it.
+    ended: bool,
 }
 
 struct Shared {
@@ -148,6 +150,35 @@ impl Shared {
 
     fn note(&self, data: serde_json::Value) -> u64 {
         self.append_value(Kind::Note, &data)
+    }
+
+    /// Append the final `exited` record and refuse controller notes from now on.
+    fn append_exited(&self, data: &serde_json::Value) -> u64 {
+        lock(&self.journal).ended = true;
+        self.append_value(Kind::Exited, data)
+    }
+
+    /// Journal a controller note unless the run has ended.
+    fn controller_note(&self, data: &serde_json::Value) -> Result<u64, String> {
+        let text = data.to_string();
+        if text.len() > self.cfg.max_record {
+            return Err(format!("note longer than {} bytes", self.cfg.max_record));
+        }
+        let mut j = lock(&self.journal);
+        if j.ended {
+            return Err("the child has exited".into());
+        }
+        let seq = j.next_seq;
+        j.next_seq += 1;
+        let t = now_ms();
+        // Writing into a Vec cannot fail.
+        let _infallible = writeln!(
+            j.pending,
+            r#"{{"seq":{seq},"t":{t},"kind":"note","data":{text}}}"#
+        );
+        drop(j);
+        self.flush_notify.notify_one();
+        Ok(seq)
     }
 
     fn emit_bytes(&self, kind: Kind, bytes: &[u8], partial: bool) {
@@ -380,6 +411,7 @@ fn err(id: Option<u64>, message: impl Into<String>) -> Out {
 enum WReq {
     Write { id: u64, line: String },
     Close { id: u64 },
+    Note { id: u64, data: serde_json::Value },
 }
 
 async fn write_worker(shared: Arc<Shared>, mut rx: mpsc::Receiver<WReq>, out: mpsc::Sender<Out>) {
@@ -390,6 +422,10 @@ async fn write_worker(shared: Arc<Shared>, mut rx: mpsc::Receiver<WReq>, out: mp
                 Err(m) => err(Some(id), m),
             },
             WReq::Close { id } => match shared.close_stdin().await {
+                Ok(seq) => ack(id, Some(seq)),
+                Err(m) => err(Some(id), m),
+            },
+            WReq::Note { id, data } => match shared.controller_note(&data) {
                 Ok(seq) => ack(id, Some(seq)),
                 Err(m) => err(Some(id), m),
             },
@@ -600,6 +636,7 @@ async fn connection(shared: Arc<Shared>, rd: BoxRead, wr: BoxWrite) {
             }
             ClientFrame::Write { id, line } => wq_tx.send(WReq::Write { id, line }).await.is_ok(),
             ClientFrame::CloseStdin { id } => wq_tx.send(WReq::Close { id }).await.is_ok(),
+            ClientFrame::Note { id, data } => wq_tx.send(WReq::Note { id, data }).await.is_ok(),
             ClientFrame::Signal { id, sig } => {
                 let reply = match shared.signaler.signal(sig) {
                     Ok(()) => {
@@ -734,6 +771,7 @@ async fn start(cfg: Config) -> Result<Running, Error> {
         journal: Mutex::new(JState {
             next_seq,
             pending: Vec::new(),
+            ended: false,
         }),
         flush_notify: Notify::new(),
         written: watch::Sender::new(Written { offset: len }),
@@ -881,7 +919,7 @@ async fn supervise(mut r: Running) -> i32 {
         Err(_) => log!("stdin writer still busy at exit"),
     }
 
-    let final_seq = shared.append_value(Kind::Exited, &json!(exit));
+    let final_seq = shared.append_exited(&json!(exit));
     let (tx, rx) = oneshot::channel();
     let synced: Result<(), String> = match r.sync_tx.send(tx).await {
         Err(_) => Err("journal flusher is gone".into()),

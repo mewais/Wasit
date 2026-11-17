@@ -276,6 +276,15 @@ impl ShimClient {
             .ok_or_else(|| Error::Protocol("close_stdin ack without seq".into()))
     }
 
+    /// Journal a controller `note` record carrying `data`, ordered after every `write` /
+    /// `close_stdin` sent before it on this connection. Fails once the child has exited.
+    /// Returns the seq of the note.
+    pub async fn note(&self, data: serde_json::Value) -> Result<u64, Error> {
+        self.request(|id| ClientFrame::Note { id, data })
+            .await?
+            .ok_or_else(|| Error::Protocol("note ack without seq".into()))
+    }
+
     /// Signal the child's process group (Unix) / job (Windows). Returns the seq of the `note`.
     pub async fn signal(&self, sig: Sig) -> Result<u64, Error> {
         self.request(|id| ClientFrame::Signal { id, sig })

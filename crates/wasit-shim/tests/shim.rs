@@ -606,3 +606,32 @@ async fn spawn_failure_is_reported_and_probe_handles_missing_dirs() {
         ShimState::Dead
     );
 }
+
+/// Controller notes are journaled in order with writes, and refused after `exited`.
+#[tokio::test]
+async fn controller_notes_are_ordered_and_refused_after_exit() {
+    let d = TempDir::new();
+    start(d.path(), "cat", &[]).await;
+    let c = ShimClient::connect(d.path()).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    let n1 = c.note(serde_json::json!({"cmd": 1})).await.unwrap();
+    let w = c.write("hello").await.unwrap();
+    let n2 = c.note(serde_json::json!({"cmd": 2})).await.unwrap();
+    assert!(n1 < w && w < n2);
+    let recs = until(&mut s, |r| r.kind == Kind::Out).await;
+    let note = recs.iter().find(|r| r.seq == n1).unwrap();
+    assert_eq!(note.kind, Kind::Note);
+    assert_eq!(note.data, serde_json::json!({"cmd": 1}));
+    c.close_stdin().await.unwrap();
+    until_exited(&mut s).await;
+    // The shim lingers until we have seen `exited`; a note now must be refused.
+    match c.note(serde_json::json!({"late": true})).await {
+        Err(Error::Remote(m)) => assert!(m.contains("exited"), "{m}"),
+        Err(Error::Disconnected) => {} // the shim already went away
+        other => panic!("late note accepted: {other:?}"),
+    }
+    assert!(matches!(
+        wasit_shim::probe(d.path()).await.unwrap(),
+        wasit_shim::ShimState::Exited(_) | wasit_shim::ShimState::Running
+    ));
+}

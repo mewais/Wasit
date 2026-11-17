@@ -46,6 +46,11 @@ pub enum ClientFrame {
     CloseStdin { id: u64 },
     /// Signal the child's process group / job.
     Signal { id: u64, sig: Sig },
+    /// Journal `data` as a `note` record (a controller annotation, e.g. which command caused
+    /// the writes that follow). Ordered with `write` / `close_stdin` frames of the same
+    /// connection. Refused once the child's `exited` record has been journaled, so `exited`
+    /// stays the last record of a run.
+    Note { id: u64, data: serde_json::Value },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
