@@ -160,3 +160,87 @@ impl std::fmt::Debug for DriverRegistry {
         f.debug_list().entries(self.ids()).finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AgentConfig, Unsupported};
+    use crate::discovery::DiscoveryProbe;
+    use crate::protocol::{Command, DriverError, Encoded, Step};
+
+    struct Fake(&'static str);
+    struct Nop;
+    impl Protocol for Nop {
+        fn start(&mut self, _: &SpawnSpec) -> Step {
+            Step::empty()
+        }
+        fn on_line(&mut self, _: &str) -> Step {
+            Step::empty()
+        }
+        fn encode(&mut self, _: Command) -> Result<Encoded, DriverError> {
+            Ok(Encoded::Queued)
+        }
+    }
+    impl ConfigRenderer for Fake {
+        fn render_config(&self, _: &AgentConfig, _: &mut SpawnSpec) -> Vec<Unsupported> {
+            vec![]
+        }
+    }
+    impl DriverDescriptor for Fake {
+        fn id(&self) -> DriverId {
+            DriverId::new(self.0)
+        }
+        fn display_name(&self) -> &str {
+            self.0
+        }
+        fn default_binary(&self) -> &str {
+            self.0
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<String> {
+            vec![spec.binary_or(self.0).to_string()]
+        }
+        fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
+            spec.env.clone()
+        }
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                interrupt: false,
+                set_model: false,
+                set_mode: false,
+                slash_commands: false,
+                permission_gates: false,
+                questions: false,
+                plan_gate: false,
+                usage: false,
+                cost: false,
+                resume: false,
+                continue_latest: false,
+                streaming_output: false,
+                prompt_while_busy: BusyPrompt::QueuedByProtocol,
+            }
+        }
+        fn new_protocol(&self) -> Box<dyn Protocol> {
+            Box::new(Nop)
+        }
+        fn discovery(&self, _: &DiscoveryContext) -> Vec<DiscoveryProbe> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn registry_order_lookup_and_errors() {
+        let mut r = DriverRegistry::new();
+        r.register(Arc::new(Fake("a"))).unwrap();
+        r.register(Arc::new(Fake("b"))).unwrap();
+        assert_eq!(r.ids(), vec![DriverId::new("a"), DriverId::new("b")]);
+        assert_eq!(r.get(&"b".into()).unwrap().display_name(), "b");
+        assert_eq!(
+            r.get(&"zzz".into()).err(),
+            Some(RegistryError::UnknownDriver("zzz".into()))
+        );
+        assert_eq!(
+            r.register(Arc::new(Fake("a"))),
+            Err(RegistryError::DuplicateDriver("a".into()))
+        );
+    }
+}
