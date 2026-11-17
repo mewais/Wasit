@@ -633,3 +633,15 @@ fn determinism_same_inputs_same_outputs() {
     };
     assert_eq!(run(), run());
 }
+
+#[test]
+fn ready_only_after_the_initialize_response() {
+    let mut p = ClaudeProtocol::new();
+    assert!(!p.is_ready());
+    p.start(&SpawnSpec::default());
+    assert!(!p.is_ready());
+    let (p2, _) = ready();
+    assert!(p2.is_ready());
+    p.on_line(r#"{"type":"control_response","response":{"subtype":"error","request_id":"req_1","error":"no"}}"#);
+    assert!(p.is_ready(), "a failed initialize still ends the handshake");
+}

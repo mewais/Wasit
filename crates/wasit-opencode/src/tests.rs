@@ -416,3 +416,13 @@ fn determinism_same_inputs_same_outputs() {
     };
     assert_eq!(run(), run());
 }
+
+#[test]
+fn ready_only_after_the_session_is_open() {
+    let mut p = AcpProtocol::new("wasit-opencode");
+    assert!(!p.is_ready());
+    p.start(&SpawnSpec::default());
+    p.on_line(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}"#);
+    assert!(!p.is_ready());
+    assert!(ready().is_ready());
+}

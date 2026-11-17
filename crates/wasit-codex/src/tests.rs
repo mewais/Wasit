@@ -464,3 +464,13 @@ fn determinism_same_inputs_same_outputs() {
     };
     assert_eq!(run(), run());
 }
+
+#[test]
+fn ready_only_after_the_thread_is_open() {
+    let mut p = CodexProtocol::new();
+    assert!(!p.is_ready());
+    p.start(&SpawnSpec::default());
+    p.on_line(r#"{"id":1,"result":{"userAgent":"x"}}"#);
+    assert!(!p.is_ready());
+    assert!(ready().is_ready());
+}

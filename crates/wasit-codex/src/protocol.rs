@@ -884,6 +884,10 @@ impl Protocol for CodexProtocol {
         }
     }
 
+    fn is_ready(&self) -> bool {
+        self.phase == Phase::Ready
+    }
+
     fn encode(&mut self, cmd: Command) -> Result<Encoded, DriverError> {
         if self.phase == Phase::Closed {
             return Err(DriverError::Shutdown);

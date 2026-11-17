@@ -180,6 +180,9 @@ mod tests {
         fn encode(&mut self, _: Command) -> Result<Encoded, DriverError> {
             Ok(Encoded::Queued)
         }
+        fn is_ready(&self) -> bool {
+            false
+        }
     }
     impl ConfigRenderer for Fake {
         fn render_config(&self, _: &AgentConfig, _: &mut SpawnSpec) -> Vec<Unsupported> {

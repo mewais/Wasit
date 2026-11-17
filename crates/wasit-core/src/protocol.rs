@@ -155,4 +155,10 @@ pub trait Protocol: Send {
     /// Encode a command. `Err(Unsupported)` only when the descriptor's
     /// capabilities say the operation is unsupported.
     fn encode(&mut self, cmd: Command) -> Result<Encoded, DriverError>;
+
+    /// `true` once the handshake has completed and the CLI accepts commands
+    /// (commands are no longer queued *for the handshake*; they may still be
+    /// queued behind a running turn). A pure query of the protocol state; the
+    /// runtime derives its `Starting → Idle` transition from it.
+    fn is_ready(&self) -> bool;
 }
