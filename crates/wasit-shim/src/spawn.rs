@@ -12,7 +12,8 @@ use crate::{Error, LOG_FILE};
 /// Tunables passed to the shim on its command line.
 #[derive(Debug, Clone)]
 pub struct ShimOptions {
-    /// Keep serving after `exited` is durable until a controller received it, at most this long.
+    /// After `exited` is durable, keep serving until a controller has received it or no record
+    /// was delivered to any controller for this long.
     pub linger: Duration,
     /// Disconnect a controller whose socket stays unwritable this long.
     pub controller_write_timeout: Duration,

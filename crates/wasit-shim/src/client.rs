@@ -18,7 +18,7 @@ use crate::record::Record;
 use crate::wire::{self, ClientFrame, ServerFrame, Sig};
 use crate::{Error, JOURNAL_FILE};
 
-const RECORD_QUEUE: usize = 1024;
+const JOURNAL_QUEUE: usize = 1024;
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// Deadlines for a [`ShimClient`].
@@ -28,6 +28,10 @@ pub struct ClientOptions {
     pub connect_timeout: Duration,
     /// Sending a request and receiving its ack.
     pub request_timeout: Duration,
+    /// Records buffered for a [`RecordStream`].
+    pub record_queue: usize,
+    /// A full record queue that stays full this long ends the stream with [`Error::Lagged`].
+    pub lag_timeout: Duration,
 }
 
 impl Default for ClientOptions {
@@ -35,12 +39,43 @@ impl Default for ClientOptions {
         ClientOptions {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(10),
+            record_queue: 4096,
+            lag_timeout: Duration::from_secs(2),
         }
     }
 }
 
 type Pending = HashMap<u64, oneshot::Sender<Result<Option<u64>, Error>>>;
-type RecordTx = mpsc::Sender<Result<Record, Error>>;
+type Terminal = Arc<Mutex<Option<Error>>>;
+
+/// Producer side of a [`RecordStream`].
+#[derive(Clone)]
+struct RecordTx {
+    tx: mpsc::Sender<Result<Record, Error>>,
+    terminal: Terminal,
+}
+
+impl RecordTx {
+    fn new(cap: usize) -> (Self, RecordStream) {
+        let (tx, rx) = mpsc::channel(cap.max(1));
+        let terminal: Terminal = Arc::new(Mutex::new(None));
+        (
+            RecordTx {
+                tx,
+                terminal: terminal.clone(),
+            },
+            RecordStream {
+                rx,
+                terminal: Some(terminal),
+            },
+        )
+    }
+
+    /// End the stream: it yields `e` after the records already queued, then `None`.
+    fn end(self, e: Error) {
+        *lock(&self.terminal) = Some(e);
+    }
+}
 
 struct Inner {
     writer: tokio::sync::Mutex<BoxWrite>,
@@ -59,9 +94,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A controller connection to one shim. Connecting replaces any previous controller.
 ///
-/// The [`RecordStream`] returned by [`ShimClient::attach`] must be polled concurrently with
-/// requests: records and acks share the connection, and a consumer that stops reading records
-/// is eventually disconnected by the shim (it then re-attaches from its last seq).
+/// Records are delivered with backpressure. Requests are never blocked for longer than
+/// `lag_timeout` by an unconsumed [`RecordStream`]: such a stream ends with [`Error::Lagged`]
+/// and the consumer re-attaches from its last seq.
 pub struct ShimClient {
     inner: Arc<Inner>,
     reader: JoinHandle<()>,
@@ -76,22 +111,32 @@ impl Drop for ShimClient {
 }
 
 /// A stream of journal records. Ends (`None`) when the connection closes (shim exited, or the
-/// shim dropped a controller that could not keep up); yields `Err` for
-/// [`Error::Replaced`] and transport/protocol errors.
+/// shim dropped a controller that could not keep up); its last item is an `Err` for
+/// [`Error::Replaced`], [`Error::Lagged`] and transport/protocol errors.
 pub struct RecordStream {
     rx: mpsc::Receiver<Result<Record, Error>>,
+    terminal: Option<Terminal>,
 }
 
 impl RecordStream {
     pub async fn next(&mut self) -> Option<Result<Record, Error>> {
-        self.rx.recv().await
+        std::future::poll_fn(|cx| self.poll_item(cx)).await
+    }
+
+    fn poll_item(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Record, Error>>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(None) => {
+                Poll::Ready(self.terminal.take().and_then(|t| lock(&t).take()).map(Err))
+            }
+            other => other,
+        }
     }
 }
 
 impl futures_core::Stream for RecordStream {
     type Item = Result<Record, Error>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        self.poll_item(cx)
     }
 }
 
@@ -196,7 +241,7 @@ impl ShimClient {
     /// Start streaming records with `seq >= from_seq` (then live). A second `attach` ends the
     /// previous stream.
     pub async fn attach(&self, from_seq: u64) -> Result<RecordStream, Error> {
-        let (tx, rx) = mpsc::channel(RECORD_QUEUE);
+        let (tx, stream) = RecordTx::new(self.inner.opts.record_queue);
         let id = self.next_id();
         *lock(&self.inner.records) = None;
         *lock(&self.inner.attach_pending) = Some((id, tx));
@@ -208,7 +253,7 @@ impl ShimClient {
             },
         )
         .await?;
-        Ok(RecordStream { rx })
+        Ok(stream)
     }
 
     /// Write one line (without `\n`) to the child's stdin. Returns the seq of its `in` record.
@@ -239,6 +284,37 @@ impl ShimClient {
     }
 }
 
+/// Hand a record to the stream. A consumer that is polling gets plain backpressure; one that
+/// makes no room for `lag_timeout` (e.g. it is itself waiting for an ack queued behind these
+/// records) gets [`Error::Lagged`] and later records are discarded until it re-attaches, so the
+/// connection reader — and with it every ack — never stays blocked.
+async fn deliver(inner: &Inner, record: Record) {
+    let Some(sink) = lock(&inner.records).clone() else {
+        return;
+    };
+    match timeout(inner.opts.lag_timeout, sink.tx.send(Ok(record))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // Consumer dropped the stream.
+            clear_if_current(inner, &sink);
+        }
+        Err(_) => {
+            if clear_if_current(inner, &sink) {
+                sink.end(Error::Lagged);
+            }
+        }
+    }
+}
+
+fn clear_if_current(inner: &Inner, sink: &RecordTx) -> bool {
+    let mut slot = lock(&inner.records);
+    let current = slot.as_ref().is_some_and(|s| s.tx.same_channel(&sink.tx));
+    if current {
+        *slot = None;
+    }
+    current
+}
+
 fn fail_all(inner: &Inner, mk: impl Fn() -> Error) {
     let pending: Vec<_> = lock(&inner.pending).drain().collect();
     for (_, tx) in pending {
@@ -261,11 +337,7 @@ async fn read_loop(inner: Arc<Inner>, mut rd: BufReader<BoxRead>) {
         };
         match frame {
             ServerFrame::Record { record } => {
-                let tx = lock(&inner.records).clone();
-                if let Some(tx) = tx {
-                    // Stream dropped by its owner: records are simply not consumed.
-                    let _ignored = tx.send(Ok(record)).await;
-                }
+                deliver(&inner, record).await;
             }
             ServerFrame::Ack { id, seq, .. } => {
                 {
@@ -289,11 +361,8 @@ async fn read_loop(inner: Arc<Inner>, mut rd: BufReader<BoxRead>) {
                 }
             }
             ServerFrame::Error { id: None, message } => {
-                let tx = lock(&inner.records).clone();
-                if let Some(tx) = tx {
-                    // Stream may be gone.
-                    let _ignored = tx.send(Err(Error::Remote(message))).await;
-                }
+                // The shim's attach pump failed: terminal for this stream.
+                end_stream(&inner, Error::Remote(message));
             }
             ServerFrame::Replaced => break Some(Error::Replaced),
             ServerFrame::Hello { .. } => {}
@@ -307,10 +376,16 @@ async fn read_loop(inner: Arc<Inner>, mut rd: BufReader<BoxRead>) {
             Error::Disconnected
         }
     });
-    let tx = lock(&inner.records).take();
-    if let (Some(tx), Some(e)) = (tx, end) {
-        // Stream may be gone.
-        let _ignored = tx.send(Err(e)).await;
+    match end {
+        Some(e) => end_stream(&inner, e),
+        None => drop(lock(&inner.records).take()),
+    }
+}
+
+/// End the current stream with a terminal error.
+fn end_stream(inner: &Inner, e: Error) {
+    if let Some(sink) = lock(&inner.records).take() {
+        sink.end(e);
     }
 }
 
@@ -330,7 +405,8 @@ pub async fn read_journal(dir: &Path, from_seq: u64) -> Result<RecordStream, Err
     };
     let mut file = tokio::fs::File::open(&path).await?;
     tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await?;
-    let (tx, rx) = mpsc::channel(RECORD_QUEUE);
+    let (tx, rx) = mpsc::channel(JOURNAL_QUEUE);
+    let stream = RecordStream { rx, terminal: None };
     tokio::spawn(async move {
         let mut rd = BufReader::with_capacity(64 * 1024, file);
         let mut line = Vec::new();
@@ -355,7 +431,7 @@ pub async fn read_journal(dir: &Path, from_seq: u64) -> Result<RecordStream, Err
             }
         }
     });
-    Ok(RecordStream { rx })
+    Ok(stream)
 }
 
 fn complete_prefix(path: &Path, len: u64) -> std::io::Result<u64> {

@@ -897,16 +897,15 @@ async fn supervise(mut r: Running) -> i32 {
         code = 1;
     }
 
-    // Linger so a connected controller receives the tail.
+    // Linger so a connected controller receives the tail: until it has received `exited`, or
+    // no record has been delivered to any controller for `linger`.
     let mut delivered = shared.delivered.subscribe();
-    let _lingered = timeout(shared.cfg.linger, async {
-        while *delivered.borrow_and_update() < final_seq {
-            if delivered.changed().await.is_err() {
-                break;
-            }
+    while *delivered.borrow_and_update() < final_seq {
+        match timeout(shared.cfg.linger, delivered.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_)) | Err(_) => break,
         }
-    })
-    .await;
+    }
 
     // Release liveness first so that anyone who sees the endpoint close also sees the lock free.
     if let Err(e) = r.lock.unlock() {

@@ -20,8 +20,8 @@ pub(crate) struct Config {
     pub env: Vec<(OsString, OsString)>,
     pub program: OsString,
     pub args: Vec<OsString>,
-    /// How long to keep serving after `exited` is durable, unless a controller has already
-    /// received it.
+    /// After `exited` is durable, keep serving until a controller has received it or no record
+    /// was delivered for this long.
     pub linger: Duration,
     /// A frame write to the controller taking longer than this disconnects it.
     pub write_timeout: Duration,

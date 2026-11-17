@@ -11,6 +11,8 @@ pub enum Error {
     Remote(String),
     #[error("this controller was replaced by a newer connection")]
     Replaced,
+    #[error("record stream fell behind; re-attach from the last received seq")]
+    Lagged,
     #[error("disconnected from the shim")]
     Disconnected,
     #[error("protocol error: {0}")]
