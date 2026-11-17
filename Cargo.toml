@@ -1,10 +1,15 @@
 [workspace]
 resolver = "2"
+members = ["crates/*"]
 
-members = [
-    "crates/wasit-core",
-    "crates/wasit-claude",
-    "crates/wasit-codex",
-    "crates/wasit-opencode",
-    "crates/wasit-smoke",
-]
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+tracing = "0.1"
