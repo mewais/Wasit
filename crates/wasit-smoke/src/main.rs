@@ -1,360 +1,115 @@
-//! wasit-smoke — manual live-verification tool for Wasit drivers.
+//! wasit-smoke — a tiny manual harness: run a real agent CLI through its
+//! Wasit `Protocol`, print the events, answer gates from stdin.
 //!
-//! NOT a unit test or CI job. This binary requires a REAL CLI on PATH (or
-//! specified via `--bin`). Run it by hand to confirm that a driver actually
-//! works end-to-end: spawns the process, drives the handshake, streams events,
-//! and answers gates.
+//! ```text
+//! wasit-smoke <claude|codex|opencode|kilo> [options] [prompt...]
+//!   --model M  --mode X  --cwd DIR  --bin PATH  --env K=V (repeatable)
+//!   --resume ID | --continue      --config agent-config.json
+//!   --record FILE    write a replayable transcript (wasit_core::transcript)
+//!   --script FILE    drive the session from a JSON step list (see below)
+//!   --timeout SECS   per-wait deadline in script mode (default 120)
+//! ```
 //!
-//! # Usage
+//! Interactive commands (one per line on stdin): `y`/`n`/`a` approve, deny or
+//! always-allow the latest gate; `q ANSWER` answer the latest question gate;
+//! `i` interrupt; `m MODEL`; `mode ID`; `/name args` slash command; anything
+//! else is a prompt; `.quit` or EOF shuts the session down.
 //!
-//!   wasit-smoke --driver <claude|codex|opencode> \
-//!               --prompt <text> \
-//!               [--cwd <path>] \
-//!               [--model <id>] \
-//!               [--mode <id>] \
-//!               [--bin <path>] \
-//!               [--auto-approve]
-//!
-//! # Example invocations
-//!
-//! ## Claude (needs `claude` on PATH or ANTHROPIC_API_KEY set)
-//!
-//!   cargo run -p wasit-smoke -- \
-//!     --driver claude \
-//!     --prompt "Say hello in one sentence." \
-//!     --model claude-haiku-4
-//!
-//! ## Codex (needs `codex` on PATH)
-//!
-//!   cargo run -p wasit-smoke -- \
-//!     --driver codex \
-//!     --prompt "Echo 'wasit codex smoke ok' and stop." \
-//!     --auto-approve
-//!
-//! ## Opencode (needs `opencode` on PATH)
-//!
-//!   cargo run -p wasit-smoke -- \
-//!     --driver opencode \
-//!     --prompt "Say 'wasit opencode smoke ok' and nothing else." \
-//!     --model claude-haiku-4
-//!
-//! # Gate behaviour
-//!
-//! Without `--auto-approve`, each gate pauses and prints:
-//!   [GATE] <JSON>
-//!   Approve? [y/N]:
-//! Type `y` + Enter to approve (one-time, no permission update), anything else to deny.
-//!
-//! With `--auto-approve`, every gate is approved immediately with no input.
-//!
-//! # Overall timeout
-//!
-//! The run is wrapped in a 300-second wall-clock timeout. If the CLI hangs,
-//! the binary prints a TIMEOUT line and exits non-zero.
+//! Script steps: `{"cmd": <Command JSON>}`, `{"wait": "<event type>",
+//! "contains": "<substring>"?}`, `{"approve": true}` / `{"deny": true}` /
+//! `{"always": true}` (latest gate), `{"answer": "<label>"}` (latest question
+//! gate).
 
-use std::collections::HashMap;
-use std::process;
+use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::time::{timeout, Duration};
-use wasit_core::{AgentDriver, AgentEvent, GateDecision, GateRequest, QuestionAnswer, SpawnSpec};
+use wasit_core::{AgentConfig, ResumeMode, SpawnSpec};
+use wasit_smoke::{run, RunOptions};
 
-// ============================================================================
-// Arg parsing (manual — no clap dependency)
-// ============================================================================
-
-struct Args {
-    driver: String,
-    cwd: Option<String>,
-    model: Option<String>,
-    mode: String,
-    bin: Option<String>,
-    prompt: String,
-    auto_approve: bool,
+fn usage() -> String {
+    "usage: wasit-smoke <claude|codex|opencode|kilo> [--model M] [--mode X] [--cwd D] [--bin B] \
+     [--env K=V] [--resume ID|--continue] [--config FILE] [--record FILE] [--script FILE] \
+     [--timeout SECS] [prompt...]"
+        .into()
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "\
-wasit-smoke — manual live-smoke for Wasit drivers
-
-USAGE:
-  wasit-smoke --driver <claude|codex|opencode> --prompt <text> [OPTIONS]
-
-OPTIONS:
-  --driver <claude|codex|opencode>   (required) which CLI backend to use
-  --prompt <text>                    (required) first prompt to send
-  --cwd <path>                       working directory (default: current dir)
-  --model <id>                       model override (e.g. claude-haiku-4)
-  --mode <id>                        permission/collaboration mode id
-  --bin <path>                       override CLI binary path
-  --auto-approve                     auto-approve every gate (no stdin prompt)
-
-EXAMPLES:
-  # Claude
-  cargo run -p wasit-smoke -- --driver claude --prompt 'Hello in one sentence.' --model claude-haiku-4
-
-  # Codex
-  cargo run -p wasit-smoke -- --driver codex --prompt \"Echo 'smoke ok'\" --auto-approve
-
-  # Opencode
-  cargo run -p wasit-smoke -- --driver opencode --prompt 'Say smoke ok.' --model claude-haiku-4
-"
-    );
-    process::exit(1);
-}
-
-fn parse_args() -> Args {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    let mut driver = String::new();
-    let mut cwd: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut mode = String::new();
-    let mut bin: Option<String> = None;
-    let mut prompt = String::new();
-    let mut auto_approve = false;
-
-    let mut i = 0usize;
-    while i < raw.len() {
-        match raw[i].as_str() {
-            "--driver" => {
-                i += 1;
-                driver = raw.get(i).cloned().unwrap_or_else(|| usage());
-            }
-            "--cwd" => {
-                i += 1;
-                cwd = Some(raw.get(i).cloned().unwrap_or_else(|| usage()));
-            }
-            "--model" => {
-                i += 1;
-                model = Some(raw.get(i).cloned().unwrap_or_else(|| usage()));
-            }
-            "--mode" => {
-                i += 1;
-                mode = raw.get(i).cloned().unwrap_or_else(|| usage());
-            }
-            "--bin" => {
-                i += 1;
-                bin = Some(raw.get(i).cloned().unwrap_or_else(|| usage()));
-            }
-            "--prompt" => {
-                i += 1;
-                prompt = raw.get(i).cloned().unwrap_or_else(|| usage());
-            }
-            "--auto-approve" => {
-                auto_approve = true;
-            }
-            flag => {
-                eprintln!("unknown flag: {flag}");
-                usage();
-            }
-        }
-        i += 1;
-    }
-
-    if driver.is_empty() {
-        eprintln!("error: --driver is required");
-        usage();
-    }
-    if prompt.is_empty() {
-        eprintln!("error: --prompt is required");
-        usage();
-    }
-    if !matches!(driver.as_str(), "claude" | "codex" | "opencode") {
-        eprintln!("error: --driver must be one of: claude, codex, opencode");
-        usage();
-    }
-
-    Args {
+fn parse_args() -> Result<RunOptions, String> {
+    let mut it = std::env::args().skip(1);
+    let driver = it.next().ok_or_else(usage)?;
+    let mut spec = SpawnSpec::default();
+    let mut opts = RunOptions {
         driver,
-        cwd,
-        model,
-        mode,
-        bin,
-        prompt,
-        auto_approve,
-    }
-}
-
-// ============================================================================
-// Gate answering
-// ============================================================================
-
-/// Print the gate and return the decision.
-/// If `auto_approve` is true, always approve with no updates.
-/// Otherwise, read y/N from stdin.
-async fn decide_gate(gate: &GateRequest, auto_approve: bool) -> GateDecision {
-    let gate_json = serde_json::to_string(gate).unwrap_or_else(|_| "<serialize error>".into());
-    println!("[GATE] {gate_json}");
-
-    if auto_approve {
-        println!("[AUTO-APPROVE] approving gate");
-        return GateDecision::Approve {
-            updated_input: None,
-            permission_updates: None,
-            elicitation_content: None,
-        };
-    }
-
-    // Prompt human on stdin.
-    print!("Approve? [y/N]: ");
-    // Flush stdout (no newline above).
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
-    let _ = reader.read_line(&mut line).await;
-    let trimmed = line.trim().to_lowercase();
-
-    if trimmed == "y" || trimmed == "yes" {
-        GateDecision::Approve {
-            updated_input: None,
-            permission_updates: None,
-            elicitation_content: None,
-        }
-    } else {
-        GateDecision::Deny {
-            reason: Some("user denied".to_string()),
-        }
-    }
-}
-
-// ============================================================================
-// Event loop
-// ============================================================================
-
-async fn run_inner(args: Args) -> i32 {
-    // Build SpawnSpec.
-    let spec = SpawnSpec {
-        cwd: args.cwd.or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-        }),
-        model: args.model,
-        mode: args.mode,
-        bin: args.bin,
-        first_prompt: Some(args.prompt),
-        ..SpawnSpec::default()
+        spec: SpawnSpec::default(),
+        config: None,
+        record: None,
+        script: None,
+        wait: Duration::from_secs(120),
+        echo: true,
     };
-
-    // Pick and spawn the driver.
-    let session_result: Result<Box<dyn wasit_core::Session>, wasit_core::DriverError> =
-        match args.driver.as_str() {
-            "claude" => {
-                let driver = wasit_claude::ClaudeDriver::from_path();
-                driver.spawn(spec).await
+    let mut prompt = Vec::new();
+    while let Some(arg) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--model" => spec.model = Some(val()?),
+            "--mode" => spec.mode = val()?,
+            "--cwd" => spec.cwd = Some(val()?),
+            "--bin" => spec.bin = Some(val()?),
+            "--resume" => spec.resume = ResumeMode::Resume(val()?),
+            "--continue" => spec.resume = ResumeMode::Continue,
+            "--env" => {
+                let kv = val()?;
+                let (k, v) = kv.split_once('=').ok_or("--env takes K=V")?;
+                spec.env.push((k.into(), v.into()));
             }
-            "codex" => {
-                let driver = wasit_codex::CodexDriver::from_path();
-                driver.spawn(spec).await
+            "--config" => {
+                let path = val()?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+                let cfg: AgentConfig =
+                    serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+                opts.config = Some(cfg);
             }
-            "opencode" => {
-                let driver = wasit_opencode::OpencodeDriver::from_path();
-                driver.spawn(spec).await
+            "--record" => opts.record = Some(val()?),
+            "--script" => {
+                let path = val()?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+                opts.script =
+                    Some(serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?);
             }
-            other => {
-                eprintln!("internal error: unknown driver {other}");
-                return 2;
+            "--timeout" => {
+                opts.wait =
+                    Duration::from_secs(val()?.parse().map_err(|e| format!("--timeout: {e}"))?)
             }
-        };
-
-    let mut session = match session_result {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("SPAWN FAILED: {e}");
-            return 2;
-        }
-    };
-
-    println!("» [smoke] session spawned with driver={}", args.driver);
-
-    // Event loop.
-    loop {
-        let maybe_event = session.next_event().await;
-
-        match maybe_event {
-            None => {
-                println!("» [smoke] stream ended (None)");
-                return 0;
-            }
-            Some(event) => {
-                // Pretty-print every event as one-line JSON with » prefix.
-                let event_json =
-                    serde_json::to_string(&event).unwrap_or_else(|_| "<serialize error>".into());
-                println!("» {event_json}");
-
-                match &event {
-                    AgentEvent::GateRequested { gate } => {
-                        let request_id = match gate {
-                            GateRequest::Permission { request_id, .. } => request_id.clone(),
-                            GateRequest::Plan { request_id, .. } => request_id.clone(),
-                            GateRequest::Question { request_id, .. } => request_id.clone(),
-                        };
-
-                        match gate {
-                            GateRequest::Question { .. } => {
-                                // Auto-answer questions with empty (skip).
-                                println!("[GATE/Question] auto-skipping with empty QuestionAnswer");
-                                let answer = QuestionAnswer {
-                                    answers: HashMap::new(),
-                                };
-                                if let Err(e) = session.answer_question(&request_id, answer).await {
-                                    eprintln!("answer_question error: {e}");
-                                }
-                            }
-                            _ => {
-                                let decision = decide_gate(gate, args.auto_approve).await;
-                                if let Err(e) = session.answer_gate(&request_id, decision).await {
-                                    eprintln!("answer_gate error: {e}");
-                                }
-                            }
-                        }
-                    }
-
-                    AgentEvent::TurnCompleted { .. } => {
-                        println!("» [smoke] TurnCompleted — exiting 0");
-                        return 0;
-                    }
-
-                    AgentEvent::ProcessExited { code } => {
-                        let c = code.unwrap_or(-1);
-                        println!("» [smoke] ProcessExited code={c}");
-                        return if c == 0 { 0 } else { 1 };
-                    }
-
-                    _ => {
-                        // All other events already printed above; nothing extra to do.
-                    }
-                }
-            }
+            "--help" | "-h" => return Err(usage()),
+            _ => prompt.push(arg),
         }
     }
+    if !prompt.is_empty() {
+        spec.first_prompt = Some(prompt.join(" "));
+    }
+    if spec.cwd.is_none() {
+        spec.cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+    }
+    opts.spec = spec;
+    Ok(opts)
 }
 
-// ============================================================================
-// Entry point
-// ============================================================================
-
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args = parse_args();
-    let driver_name = args.driver.clone();
-
-    let overall = timeout(Duration::from_secs(300), run_inner(args));
-    match overall.await {
-        Ok(exit_code) => {
-            process::exit(exit_code);
+    let result = match parse_args() {
+        Ok(opts) => run(opts).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(outcome) => {
+            println!("exit: {:?}", outcome.exit_code);
+            if outcome.script_error.is_some() {
+                std::process::exit(2);
+            }
         }
-        Err(_elapsed) => {
-            eprintln!(
-                "TIMEOUT: wasit-smoke [{driver_name}] did not complete within 300 seconds. \
-                 The CLI may be hung. Check that the CLI binary is on PATH and that your \
-                 API key is configured."
-            );
-            process::exit(124);
+        Err(e) => {
+            eprintln!("smoke: {e}");
+            std::process::exit(1);
         }
     }
 }
