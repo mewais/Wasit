@@ -2,14 +2,12 @@
 name = "wasit-claude"
 version = "0.1.0"
 edition = "2021"
+description = "Wasit driver for Claude Code (stream-json control protocol): a pure Protocol plus its DriverDescriptor."
 
 [dependencies]
 wasit-core = { path = "../wasit-core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-async-trait = "0.1"
-thiserror = "1"
-tokio = { version = "1", features = ["io-util", "process", "sync", "rt", "rt-multi-thread", "macros", "time"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+wasit-smoke = { path = "../wasit-smoke" }
+tokio = { workspace = true }
