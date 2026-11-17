@@ -1,7 +1,7 @@
 //! Demo daemon for the control protocol, also used by the crate's tests.
 //!
 //! ```text
-//! wasit-control-demo serve-stdio [--host ID] [--build B] [--major N] [--exit-after-events N]
+//! wasit-control-demo serve-stdio [--host ID] [--build B] [--major N] [--pause-after-events N]
 //! wasit-control-demo serve-unix PATH [--host ID] [--build B]   # prints "ready" when listening
 //! wasit-control-demo bridge PATH [--host ID] [--build B]       # stdio <-> PATH, starting serve-unix if absent
 //! ```
@@ -26,7 +26,7 @@ struct Args {
     host: String,
     build: String,
     major: Option<u16>,
-    exit_after_events: Option<u64>,
+    pause_after_events: Option<u64>,
 }
 
 fn parse() -> Result<Args, String> {
@@ -38,7 +38,7 @@ fn parse() -> Result<Args, String> {
         host: "demo".into(),
         build: "demo-build".into(),
         major: None,
-        exit_after_events: None,
+        pause_after_events: None,
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or(format!("{arg} needs a value"));
@@ -46,8 +46,8 @@ fn parse() -> Result<Args, String> {
             "--host" => a.host = val()?,
             "--build" => a.build = val()?,
             "--major" => a.major = Some(val()?.parse().map_err(|e| format!("{e}"))?),
-            "--exit-after-events" => {
-                a.exit_after_events = Some(val()?.parse().map_err(|e| format!("{e}"))?)
+            "--pause-after-events" => {
+                a.pause_after_events = Some(val()?.parse().map_err(|e| format!("{e}"))?)
             }
             _ if a.path.is_none() && !arg.starts_with("--") => a.path = Some(arg),
             other => return Err(format!("unknown argument {other}")),
@@ -56,16 +56,21 @@ fn parse() -> Result<Args, String> {
     Ok(a)
 }
 
-/// Demo service plus `shutdown` and an optional crash after N `count` events.
+/// Demo service plus `shutdown`, `crash` (exits at once, code 3) and an optional pause of
+/// `count` streams after N events.
 struct BinService {
     demo: DemoService,
     shutdown: Arc<Notify>,
-    exit_after_events: Option<u64>,
+    pause_after_events: Option<u64>,
 }
 
 #[async_trait]
 impl Service for BinService {
     async fn call(&self, ctx: CallContext, method: &str, params: Value) -> Result<Value, RpcError> {
+        if method == "crash" {
+            // Simulated crash: no response, no flush.
+            std::process::exit(3);
+        }
         if method == "shutdown" {
             self.shutdown.notify_one();
             return Ok(json!("bye"));
@@ -81,19 +86,13 @@ impl Service for BinService {
         from: Option<Cursor>,
     ) -> Result<EventStream, RpcError> {
         let s = self.demo.subscribe(ctx, topic, params, from).await?;
-        let Some(limit) = self.exit_after_events else {
+        let Some(limit) = self.pause_after_events else {
             return Ok(s);
         };
-        let mut sent = 0u64;
-        Ok(s.map(move |item| {
-            if sent >= limit {
-                // Simulated crash mid-stream.
-                std::process::exit(3);
-            }
-            sent += 1;
-            item
-        })
-        .boxed())
+        // After `limit` events the stream stays open but silent.
+        Ok(s.take(limit as usize)
+            .chain(futures::stream::pending())
+            .boxed())
     }
 }
 
@@ -109,7 +108,7 @@ fn server(a: &Args, shutdown: Arc<Notify>) -> ControlServer {
     let svc = BinService {
         demo: DemoService::new(a.host.clone()),
         shutdown,
-        exit_after_events: a.exit_after_events,
+        pause_after_events: a.pause_after_events,
     };
     ControlServer::new(Arc::new(svc), hello(a), ConnConfig::default())
 }

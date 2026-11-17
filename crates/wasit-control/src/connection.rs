@@ -143,6 +143,20 @@ impl SubscribeOpts {
     }
 }
 
+/// Flow-control window announced for incoming subscriptions: the local buffer size, so a
+/// well-behaved server never overflows it.
+fn window(cfg: &ConnConfig) -> u32 {
+    u32::try_from(cfg.subscription_queue.max(1)).unwrap_or(u32::MAX)
+}
+
+/// A subscription this side serves.
+struct Served {
+    token: CancellationToken,
+    /// Remaining send window (`None` = peer asked for no flow control).
+    credit: Option<Arc<Semaphore>>,
+    window: u32,
+}
+
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -177,7 +191,7 @@ pub(crate) struct Inner {
     next_sub: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     subs: Mutex<HashMap<SubId, SubSlot>>,
-    served: Mutex<HashMap<SubId, CancellationToken>>,
+    served: Mutex<HashMap<SubId, Served>>,
     cancel: CancellationToken,
     close: watch::Sender<Option<ConnClose>>,
     service: Option<Arc<dyn Service>>,
@@ -476,6 +490,7 @@ impl Connection {
                 params: opts.params,
                 from: opts.from.clone(),
                 hops: opts.hops,
+                window: window(&inner.cfg),
             },
             inner.cfg.max_frame,
         )
@@ -513,6 +528,8 @@ impl Connection {
             reason: None,
             last: opts.from,
             conn: Arc::downgrade(&self.inner),
+            window: window(&inner.cfg),
+            consumed: 0,
         })
     }
 
@@ -530,6 +547,7 @@ fn frame_kind(f: &Frame) -> &'static str {
         Frame::Subscribed { .. } => "subscribed",
         Frame::Event { .. } => "event",
         Frame::Unsubscribe { .. } => "unsubscribe",
+        Frame::Credit { .. } => "credit",
         Frame::SubscriptionClosed { .. } => "subscription_closed",
         Frame::Ping { .. } => "ping",
         Frame::Pong { .. } => "pong",
@@ -557,8 +575,8 @@ impl Inner {
             let _ = slot.close.send(CloseReason::HostLost);
         }
         let served = std::mem::take(&mut *lock(&self.served));
-        for token in served.values() {
-            token.cancel();
+        for s in served.values() {
+            s.token.cancel();
         }
     }
 
@@ -674,7 +692,8 @@ impl Inner {
                 params,
                 from,
                 hops,
-            } => self.serve_subscribe(guard, id, host, topic, params, from, hops),
+                window,
+            } => self.serve_subscribe(guard, id, host, topic, params, from, hops, window),
             Frame::Subscribed { id, sub } => {
                 let pending = lock(&self.pending).remove(&id);
                 match pending {
@@ -734,8 +753,18 @@ impl Inner {
                 // Events for unknown subs are late arrivals after an unsubscribe.
             }
             Frame::Unsubscribe { sub } => {
-                if let Some(token) = lock(&self.served).remove(&sub) {
-                    token.cancel();
+                if let Some(s) = lock(&self.served).remove(&sub) {
+                    s.token.cancel();
+                }
+            }
+            Frame::Credit { sub, n } => {
+                if let Some(s) = lock(&self.served).get(&sub) {
+                    if let Some(sem) = &s.credit {
+                        // Never let a confused peer grow the window without bound.
+                        let cap = (s.window as usize).saturating_mul(2);
+                        let add = (n as usize).min(cap.saturating_sub(sem.available_permits()));
+                        sem.add_permits(add);
+                    }
                 }
             }
             Frame::SubscriptionClosed { sub, reason } => {
@@ -824,6 +853,7 @@ impl Inner {
         params: Value,
         from: Option<Cursor>,
         hops: u32,
+        window: u32,
     ) {
         let Some(service) = self.service.clone() else {
             let inner = self.clone();
@@ -851,14 +881,22 @@ impl Inner {
                     return;
                 }
             };
-            inner.pump_subscription(id, stream).await;
+            inner.pump_subscription(id, stream, window).await;
         });
     }
 
-    async fn pump_subscription(self: &Arc<Self>, id: u64, mut stream: EventStream) {
+    async fn pump_subscription(self: &Arc<Self>, id: u64, mut stream: EventStream, window: u32) {
         let sub = SubId(self.next_sub.fetch_add(1, Ordering::Relaxed));
         let token = self.cancel.child_token();
-        lock(&self.served).insert(sub, token.clone());
+        let credit = (window > 0).then(|| Arc::new(Semaphore::new(window as usize)));
+        lock(&self.served).insert(
+            sub,
+            Served {
+                token: token.clone(),
+                credit: credit.clone(),
+                window,
+            },
+        );
         if self.cancel.is_cancelled() {
             lock(&self.served).remove(&sub);
             return;
@@ -884,6 +922,22 @@ impl Inner {
                 None | Some(Err(CloseReason::Ended)) => break CloseReason::Ended,
                 Some(Err(reason)) => break reason,
                 Some(Ok((cursor, payload))) => {
+                    if let Some(sem) = &credit {
+                        // Wait for the subscriber to make room; a consumer that stays full
+                        // for `lag_timeout` is lagging.
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {
+                                lock(&self.served).remove(&sub);
+                                return;
+                            }
+                            r = timeout(self.cfg.lag_timeout, sem.acquire()) => match r {
+                                Ok(Ok(permit)) => permit.forget(),
+                                Ok(Err(_)) => return, // semaphore is never closed
+                                Err(_) => break CloseReason::Lagged,
+                            },
+                        }
+                    }
                     let bytes = match encode(
                         &Frame::Event {
                             sub,
@@ -1063,6 +1117,18 @@ pub struct Subscription {
     reason: Option<CloseReason>,
     last: Option<Cursor>,
     conn: Weak<Inner>,
+    window: u32,
+    consumed: u32,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("sub", &self.sub)
+            .field("last", &self.last)
+            .field("reason", &self.reason)
+            .finish()
+    }
 }
 
 impl Subscription {
@@ -1080,6 +1146,16 @@ impl Subscription {
         match self.items.recv().await {
             Some(item) => {
                 self.last = Some(item.0.clone());
+                self.consumed += 1;
+                if self.consumed >= (self.window / 2).max(1) {
+                    if let Some(inner) = self.conn.upgrade() {
+                        inner.send_soon(Frame::Credit {
+                            sub: self.sub,
+                            n: self.consumed,
+                        });
+                    }
+                    self.consumed = 0;
+                }
                 Some(item)
             }
             None => {

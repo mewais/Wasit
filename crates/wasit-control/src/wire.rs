@@ -272,6 +272,10 @@ pub enum Frame {
         from: Option<Cursor>,
         #[serde(default, skip_serializing_if = "is_zero")]
         hops: u32,
+        /// Flow-control window: the server sends at most this many events beyond those
+        /// acknowledged with `Credit`. `0` = no flow control (queue limits only).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        window: u32,
     },
     Subscribed {
         id: u64,
@@ -284,6 +288,11 @@ pub enum Frame {
     },
     Unsubscribe {
         sub: SubId,
+    },
+    /// The subscriber consumed `n` more events of `sub` (refills the window).
+    Credit {
+        sub: SubId,
+        n: u32,
     },
     SubscriptionClosed {
         sub: SubId,
@@ -310,6 +319,7 @@ const KNOWN_TYPES: &[&str] = &[
     "subscribed",
     "event",
     "unsubscribe",
+    "credit",
     "subscription_closed",
     "ping",
     "pong",
@@ -447,6 +457,7 @@ mod tests {
                 params: Value::Null,
                 from: Some(Cursor::from_u64(9)),
                 hops: 0,
+                window: 16,
             },
             Frame::Subscribed {
                 id: 3,
@@ -458,6 +469,10 @@ mod tests {
                 payload: json!("p"),
             },
             Frame::Unsubscribe { sub: SubId(7) },
+            Frame::Credit {
+                sub: SubId(7),
+                n: 8,
+            },
             Frame::SubscriptionClosed {
                 sub: SubId(7),
                 reason: CloseReason::Error {
