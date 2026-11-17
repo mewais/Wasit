@@ -194,6 +194,8 @@ pub(crate) struct Inner {
     served: Mutex<HashMap<SubId, Served>>,
     cancel: CancellationToken,
     close: watch::Sender<Option<ConnClose>>,
+    /// Set once the writer has written everything queued before the close and shut down.
+    writer_done: watch::Sender<bool>,
     service: Option<Arc<dyn Service>>,
     limiter: Arc<Semaphore>,
 }
@@ -323,6 +325,7 @@ impl Connection {
             served: Mutex::new(HashMap::new()),
             cancel: CancellationToken::new(),
             close: close_tx,
+            writer_done: watch::channel(false).0,
             service,
             limiter: Arc::new(Semaphore::new(cfg.max_concurrent_requests.max(1))),
             cfg,
@@ -377,6 +380,15 @@ impl Connection {
             Err(_) => ConnClose::Local,
         };
         res
+    }
+
+    /// Resolves once the connection has closed and every frame queued before the close (e.g.
+    /// a final response or goodbye) has been written, bounded by the write timeout per frame.
+    pub async fn finished(&self) {
+        self.closed().await;
+        let mut rx = self.inner.writer_done.subscribe();
+        // The sender lives in `Inner`, which we hold.
+        let _ = rx.wait_for(|done| *done).await;
     }
 
     /// Close locally without a goodbye.
@@ -1030,6 +1042,7 @@ async fn writer_task(
         tracing::debug!(conn = inner.id, %message, "connection writer failed");
         inner.close(ConnClose::Io { message });
     }
+    inner.writer_done.send_replace(true);
 }
 
 async fn reader_task(

@@ -154,6 +154,9 @@ async fn run_connection(inner: Arc<ServerInner>, io: BoxDuplex) -> Result<ConnCl
         conn.goodbye(RpcError::new(codes::SHUTTING_DOWN, "server shutting down"));
     }
     let reason = conn.closed().await;
+    // Let the writer flush what was queued before the close (bounded by its own timeouts),
+    // so a shutting-down process does not cut off the final response or goodbye.
+    conn.finished().await;
     inner
         .conns
         .lock()
