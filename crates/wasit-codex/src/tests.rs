@@ -372,6 +372,7 @@ fn render_config_overrides_and_skill_roots() {
                         .into_iter()
                         .collect(),
                 },
+                trusted: true,
             },
             McpServerConfig {
                 name: "bad.name".into(),
@@ -379,6 +380,7 @@ fn render_config_overrides_and_skill_roots() {
                     url: "http://h".into(),
                     headers: Default::default(),
                 },
+                trusted: false,
             },
         ],
         skills: vec![SkillRef {
@@ -400,6 +402,8 @@ fn render_config_overrides_and_skill_roots() {
             r#"mcp_servers.wasl.args=["mcp", "--x"]"#,
             "-c",
             r#"mcp_servers.wasl.env.TOKEN="a\"b""#,
+            "-c",
+            r#"mcp_servers.wasl.default_tools_approval_mode="approve""#,
             "-c",
             r#"developer_instructions="Be \"brief\".""#,
         ]

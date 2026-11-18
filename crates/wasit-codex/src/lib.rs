@@ -425,6 +425,10 @@ pub fn mcp_overrides(server: &McpServerConfig) -> Result<Vec<String>, String> {
             }
         }
     }
+    if server.trusted {
+        // Run the server's tools without an approval prompt.
+        push("default_tools_approval_mode".into(), toml_str("approve"));
+    }
     Ok(out)
 }
 

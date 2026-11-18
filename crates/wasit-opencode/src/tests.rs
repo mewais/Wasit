@@ -317,6 +317,7 @@ fn render_config_env_json_per_flavor() {
                         args: vec!["mcp".into()],
                         env: Default::default(),
                     },
+                    trusted: true,
                 },
                 McpServerConfig {
                     name: "web".into(),
@@ -324,6 +325,7 @@ fn render_config_env_json_per_flavor() {
                         url: "http://h".into(),
                         headers: Default::default(),
                     },
+                    trusted: false,
                 },
             ],
             skills: vec![SkillRef {
@@ -342,6 +344,7 @@ fn render_config_env_json_per_flavor() {
         assert_eq!(k, var);
         let v: Value = serde_json::from_str(v).unwrap();
         assert_eq!(v["permission"]["bash"], "ask");
+        assert_eq!(v["permission"]["wasl_*"], "allow");
         assert_eq!(
             v["mcp"]["wasl"],
             json!({"type":"local","command":["wasl","mcp"],"environment":{}})

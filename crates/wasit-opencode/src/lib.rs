@@ -211,6 +211,16 @@ impl ConfigRenderer for AcpDescriptor {
         if !config.mcp_servers.is_empty() {
             inline.insert("mcp".into(), mcp_json(&config.mcp_servers));
         }
+        // MCP tools are named `<server>_<tool>`; `permission` takes tool-name patterns.
+        let trusted: serde_json::Map<String, Value> = config
+            .mcp_servers
+            .iter()
+            .filter(|s| s.trusted)
+            .map(|s| (format!("{}_*", s.name), Value::String("allow".into())))
+            .collect();
+        if !trusted.is_empty() {
+            inline.insert("permission".into(), Value::Object(trusted));
+        }
         if !config.skills.is_empty() {
             // `skills.paths` takes skill directories (verified: the skill is
             // listed by `<bin> debug skill`).
@@ -272,7 +282,17 @@ impl ConfigRenderer for AcpDescriptor {
                 .and_then(|(_, v)| serde_json::from_str::<Value>(v).ok())
                 .and_then(|v| v.as_object().cloned())
                 .unwrap_or_default();
-            merged.extend(inline);
+            for (k, v) in inline {
+                // `permission` rules merge with the caller's instead of replacing them.
+                match (merged.get_mut(&k), v) {
+                    (Some(Value::Object(old)), Value::Object(new)) if k == "permission" => {
+                        old.extend(new)
+                    }
+                    (_, v) => {
+                        merged.insert(k, v);
+                    }
+                }
+            }
             spec.env.retain(|(k, _)| k != var);
             spec.env
                 .push((var.to_string(), Value::Object(merged).to_string()));

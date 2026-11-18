@@ -40,6 +40,11 @@ pub struct McpServerConfig {
     pub name: String,
     #[serde(flatten)]
     pub transport: McpTransport,
+    /// The agent may call this server's tools without the CLI's own permission prompt
+    /// (the server does its own gating, e.g. the orchestration layer's handoff gates).
+    /// Drivers that cannot pre-allow a server's tools report it as [`Unsupported`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trusted: bool,
 }
 
 /// A skill: the directory `<root>/<name>/` containing `SKILL.md`.

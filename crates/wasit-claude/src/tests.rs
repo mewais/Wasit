@@ -511,6 +511,7 @@ fn render_config_all_items() {
                 args: vec!["mcp".into()],
                 env: Default::default(),
             },
+            trusted: true,
         }],
         skills: vec![
             SkillRef {
@@ -547,6 +548,8 @@ fn render_config_all_items() {
             "/pl",
             "--append-system-prompt",
             "Be brief.",
+            "--allowedTools",
+            "mcp__wasl",
             "--disallowedTools",
             "Bash,Edit"
         ]

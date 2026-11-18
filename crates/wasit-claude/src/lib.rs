@@ -212,6 +212,18 @@ impl ConfigRenderer for ClaudeDescriptor {
             spec.extra_args
                 .extend(["--append-system-prompt".to_string(), text.to_string()]);
         }
+        // `mcp__<server>` allows every tool of that server without asking (claude
+        // permission-rule syntax).
+        let trusted: Vec<String> = config
+            .mcp_servers
+            .iter()
+            .filter(|s| s.trusted)
+            .map(|s| format!("mcp__{}", s.name))
+            .collect();
+        if !trusted.is_empty() {
+            spec.extra_args.push("--allowedTools".into());
+            spec.extra_args.push(trusted.join(","));
+        }
         if !config.tool_policy.disallowed_tools.is_empty() {
             spec.extra_args.push("--disallowedTools".into());
             spec.extra_args
