@@ -1077,3 +1077,40 @@ fn startup_steps_run_before_any_input_and_hang_ignores_the_handshake() {
     fake.close_stdin();
     assert_eq!(fake.wait_exit().and_then(|s| s.code()), Some(0));
 }
+
+#[test]
+fn codex_thread_settings_update_confirms_model_and_mode() {
+    let mut c = Client::start("codex", &Scenario::default());
+    let sid = c.session.clone();
+    let r = c.request(
+        "thread/settings/update",
+        json!({"threadId": sid, "model": "m2"}),
+    );
+    assert!(r["error"].is_null(), "{r}");
+    let n = c
+        .fake
+        .recv_until(|m| m["method"] == "thread/settings/updated")
+        .pop()
+        .unwrap();
+    assert_eq!(n["params"]["threadSettings"]["model"], "m2");
+    assert!(n["params"]["threadSettings"]["collaborationMode"].is_null());
+    let r = c.request(
+        "thread/settings/update",
+        json!({"threadId": sid, "collaborationMode": {"mode": "plan", "settings": {"model": "m2"}}}),
+    );
+    assert!(r["error"].is_null(), "{r}");
+    let n = c
+        .fake
+        .recv_until(|m| m["method"] == "thread/settings/updated")
+        .pop()
+        .unwrap();
+    assert_eq!(
+        n["params"]["threadSettings"]["collaborationMode"]["mode"],
+        "plan"
+    );
+    let r = c.request(
+        "thread/settings/update",
+        json!({"threadId": "nope", "model": "x"}),
+    );
+    assert!(!r["error"].is_null());
+}

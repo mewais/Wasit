@@ -457,6 +457,43 @@ impl Codex {
                 }
                 Incoming::Prompt(text)
             }
+            "thread/settings/update" => {
+                let tid = params["threadId"].as_str().unwrap_or("").to_string();
+                let Some(t) = self.threads.iter_mut().find(|t| t.id == tid) else {
+                    self.error(io, &id, -32600, &format!("thread not found: {tid}"));
+                    return Incoming::Handled;
+                };
+                if let Some(m) = params["model"].as_str() {
+                    t.model = m.to_string();
+                }
+                let model = t.model.clone();
+                self.reply(io, &id, json!({}));
+                let mut n = rec("mode", |m| m["method"] == "thread/settings/updated");
+                set(&mut n, "params.threadId", json!(tid));
+                set(&mut n, "params.threadSettings.model", json!(model));
+                match params["collaborationMode"]["mode"].as_str() {
+                    Some(mode) => {
+                        set(
+                            &mut n,
+                            "params.threadSettings.collaborationMode.mode",
+                            json!(mode),
+                        );
+                        set(
+                            &mut n,
+                            "params.threadSettings.collaborationMode.settings.model",
+                            json!(model),
+                        );
+                    }
+                    None => set(
+                        &mut n,
+                        "params.threadSettings.collaborationMode",
+                        Value::Null,
+                    ),
+                }
+                set(&mut n, "emittedAtMs", json!(now_ms()));
+                io.send(&n);
+                Incoming::Handled
+            }
             "turn/interrupt" => {
                 if in_turn {
                     self.reply(io, &id, json!({}));
