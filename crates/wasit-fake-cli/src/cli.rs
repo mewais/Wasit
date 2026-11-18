@@ -70,10 +70,17 @@ pub fn detect_persona(
     }
 }
 
+/// `WASIT_FAKE_SCENARIO` (a file) or `WASIT_FAKE_SCENARIO_JSON` (the scenario itself, for a
+/// fake on another machine, e.g. inside WSL, that cannot read the test's files).
 fn load_scenario() -> Result<Scenario, String> {
-    match std::env::var_os("WASIT_FAKE_SCENARIO") {
-        Some(p) => Scenario::from_file(p),
-        None => Ok(Scenario::default()),
+    if let Some(p) = std::env::var_os("WASIT_FAKE_SCENARIO") {
+        return Scenario::from_file(p);
+    }
+    match std::env::var("WASIT_FAKE_SCENARIO_JSON") {
+        Ok(j) if !j.is_empty() => {
+            Scenario::from_json(&j).map_err(|e| format!("WASIT_FAKE_SCENARIO_JSON: {e}"))
+        }
+        _ => Ok(Scenario::default()),
     }
 }
 

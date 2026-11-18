@@ -90,7 +90,8 @@ pub fn local_endpoint(path: &Path) -> Endpoint {
     }
     #[cfg(windows)]
     {
-        // FNV-1a of the path: one pipe per daemon path.
+        // FNV-1a of the path: one pipe per daemon path. Pipe names are machine-wide; the data
+        // path lies in the user's profile (`%LOCALAPPDATA%`), so two users never share one.
         let mut h: u64 = 0xcbf29ce484222325;
         for b in path.to_string_lossy().bytes() {
             h ^= b as u64;

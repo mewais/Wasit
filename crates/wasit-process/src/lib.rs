@@ -94,6 +94,26 @@ pub fn spawn_detached(cmd: &mut tokio::process::Command) -> std::io::Result<toki
     cmd.spawn()
 }
 
+/// A path as child processes and people should see it: on Windows without the `\\?\`
+/// verbatim prefix (which many tools reject and which reads as noise in messages) whenever the
+/// path can be written without it. Unchanged elsewhere.
+pub fn plain_path(p: &std::path::Path) -> std::path::PathBuf {
+    let Some(s) = p.to_str() else {
+        return p.to_path_buf();
+    };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let b = rest.as_bytes();
+        // `X:\…` only; other verbatim forms (`\\?\Volume{…}`) have no plain spelling.
+        if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
 /// Decode what a console program wrote. Windows tools such as `wsl.exe` write UTF-16LE (with
 /// or without a BOM) even to a pipe; everything else is taken as UTF-8 (lossy). The result has
 /// no BOM, no NULs and `\n` line ends.
@@ -173,6 +193,26 @@ mod tests {
         // Starting on the high byte of a unit.
         let off = &utf16("Ubuntu\r\n", false)[1..];
         assert!(decode_console_output(off).contains("buntu"));
+    }
+
+    #[test]
+    fn plain_paths() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            plain_path(Path::new(
+                r"\\?\C:\Users\Ünïcode user\AppData\Local\Marsad\agents"
+            )),
+            PathBuf::from(r"C:\Users\Ünïcode user\AppData\Local\Marsad\agents")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\srv\share\x")),
+            PathBuf::from(r"\\srv\share\x")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\Volume{1}\x")),
+            PathBuf::from(r"\\?\Volume{1}\x")
+        );
+        assert_eq!(plain_path(Path::new("/home/u")), PathBuf::from("/home/u"));
     }
 
     #[test]

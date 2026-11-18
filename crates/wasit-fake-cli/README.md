@@ -19,6 +19,9 @@ but honours claude's `--model`, `--permission-mode`, `--resume`, `--session-id` 
 `WASIT_FAKE_SCENARIO=<path.json>` selects the scenario (default: an empty one, which echoes every
 prompt). `WASIT_FAKE_TRANSCRIPT=<path>` appends every line in both directions as
 `{"dir":"in"|"out","msg":…}`, so a test can assert what its driver sent.
+`WASIT_FAKE_SCENARIO_JSON=<json>` passes the scenario inline (a fake on another machine).
+`WASIT_FAKE_CONSOLE_REPORT=<path>` appends `<pid> <none|hidden|visible> <args>`: whether the
+process got a visible console window (Windows; the no-console-window tests).
 
 ## Using it from another crate
 
