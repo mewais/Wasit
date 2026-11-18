@@ -8,9 +8,12 @@ use std::process::Stdio;
 
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+};
 use windows_sys::Win32::System::Console::{
-    GenerateConsoleCtrlEvent, GetStdHandle, SetStdHandle, CTRL_BREAK_EVENT, STD_OUTPUT_HANDLE,
+    GenerateConsoleCtrlEvent, GetStdHandle, SetStdHandle, CTRL_BREAK_EVENT, STD_ERROR_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -104,7 +107,24 @@ fn new_job() -> io::Result<Job> {
     }
 }
 
+/// Mark the shim's own standard handles non-inheritable. `CreateProcess` inherits every
+/// inheritable handle, so without this the CLI child (and its descendants) would keep the
+/// launcher's readiness pipe open and the launcher would never see EOF while the CLI runs.
+fn uninherit_std_handles() {
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain Win32 calls on our own standard handles; failures (no such handle) are
+        // harmless and ignored.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h as isize != -1 {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 pub(crate) async fn spawn(cfg: &Config) -> Result<Spawned, Error> {
+    uninherit_std_handles();
     let job = new_job()?;
     let mut cmd = tokio::process::Command::new(&cfg.program);
     cmd.args(&cfg.args)
