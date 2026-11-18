@@ -393,6 +393,15 @@ async fn run_probe(
         ProbeAction::Handshake { spec, until } => {
             let mut spec = (**spec).clone();
             spec.env.extend(ov.env.iter().cloned());
+            if spec.cwd.is_none() {
+                // A throwaway session may leave traces in its project (e.g. a session record);
+                // keep them out of whatever directory the daemon runs in.
+                let scratch = std::env::temp_dir().join("wasit-discovery");
+                tokio::fs::create_dir_all(&scratch)
+                    .await
+                    .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
+                spec.cwd = Some(scratch.to_string_lossy().into_owned());
+            }
             handshake(desc, &spec, *until, cfg.handshake_timeout).await?
         }
         ProbeAction::ListFiles {
@@ -550,6 +559,8 @@ fn list_files(
     while let Some(d) = stack.pop() {
         let rd = match std::fs::read_dir(&d) {
             Ok(rd) => rd,
+            // A CLI that never ran has no session directory yet: nothing to list.
+            Err(e) if d == dir && e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) if d == dir => return Err(e),
             Err(_) => continue,
         };

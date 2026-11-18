@@ -144,8 +144,18 @@ pub async fn wait_snapshot(
     what: &str,
     pred: impl Fn(&SessionSnapshot) -> bool,
 ) -> SessionSnapshot {
+    wait_snapshot_within(mgr, id, what, T, pred).await
+}
+
+pub async fn wait_snapshot_within(
+    mgr: &SessionManager,
+    id: &SessionId,
+    what: &str,
+    within: Duration,
+    pred: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
     let mut w = mgr.watch(id).unwrap();
-    let r = tokio::time::timeout(T, w.wait_for(|s| pred(s))).await;
+    let r = tokio::time::timeout(within, w.wait_for(|s| pred(s))).await;
     match r {
         Ok(Ok(s)) => (**s).clone(),
         _ => panic!(
