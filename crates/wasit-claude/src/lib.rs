@@ -581,6 +581,14 @@ pub fn parse_permission_modes(out: &ProbeOutput) -> Result<Discovered, String> {
         .split(',')
         .map(|c| c.trim().trim_matches('"').to_string())
         .filter(|c| !c.is_empty())
+        // `--help` says "manual" for the mode the session reports (and accepts) as "default".
+        .map(|c| {
+            if c == "manual" {
+                "default".to_string()
+            } else {
+                c
+            }
+        })
         .map(|id| {
             let (label, description) = mode_words(&id);
             SessionMode {

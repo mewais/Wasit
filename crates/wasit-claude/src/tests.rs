@@ -620,7 +620,7 @@ fn discovery_parsers() {
             // The CLI's default first (clients preselect it), with display words.
             assert_eq!(
                 m.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-                ["manual", "acceptEdits", "auto", "plan"]
+                ["default", "acceptEdits", "auto", "plan"]
             );
             assert_eq!(m[1].label, "Accept edits");
         }
