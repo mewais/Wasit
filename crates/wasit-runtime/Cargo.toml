@@ -12,7 +12,12 @@ path = "src/lib.rs"
 name = "wasit-hostd"
 path = "src/bin/wasit-hostd.rs"
 
+[features]
+# TypeScript definitions of the wire types (ts-rs), for GUI clients.
+ts = ["dep:ts-rs", "wasit-core/ts", "wasit-control/ts"]
+
 [dependencies]
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 wasit-core = { path = "../wasit-core" }
 wasit-claude = { path = "../wasit-claude" }
 wasit-codex = { path = "../wasit-codex" }

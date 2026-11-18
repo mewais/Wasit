@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 /// How to resume or start a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ResumeMode {
     /// Brand-new conversation (the default).
@@ -23,6 +24,7 @@ pub enum ResumeMode {
 /// A file a [`ConfigRenderer`](crate::ConfigRenderer) wants written into the
 /// session directory before the CLI starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct GeneratedFile {
     /// Path relative to [`SpawnSpec::session_dir`]. Never absolute, never `..`.
     pub path: String,
@@ -39,6 +41,7 @@ pub struct GeneratedFile {
 /// [`ConfigRenderer`](crate::ConfigRenderer) may add `extra_args`, `env`,
 /// `files` and `protocol_options` before launch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnSpec {
     /// Working directory for the spawned process (the project).

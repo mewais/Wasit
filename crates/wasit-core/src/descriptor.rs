@@ -11,6 +11,7 @@ use crate::spec::SpawnSpec;
 
 /// A driver id (`"claude"`, `"codex"`, `"opencode"`, `"kilo"`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct DriverId(pub String);
 
@@ -38,6 +39,7 @@ impl From<&str> for DriverId {
 
 /// What happens to a `Command::Prompt` encoded while a turn is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum BusyPrompt {
     /// The prompt is written immediately and the CLI itself queues it for
@@ -52,6 +54,7 @@ pub enum BusyPrompt {
 
 /// Honest capability report. A `false` is honest; a rounded-up `true` is a bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DriverCapabilities {
     /// `Command::Interrupt` stops the running turn.
     pub interrupt: bool,

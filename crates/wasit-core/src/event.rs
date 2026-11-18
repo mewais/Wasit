@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 /// totals when it reports them; in [`AgentEvent::UsageUpdate`] see that
 /// variant's docs for the per-driver meaning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct Usage {
     /// Prompt tokens sent to the model.
@@ -36,6 +37,7 @@ pub struct Usage {
 
 /// Per-model usage row (claude `result.modelUsage`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -51,6 +53,7 @@ pub struct ModelUsage {
 
 /// One selectable agent mode, exactly as the CLI reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct SessionMode {
     /// Wire id used to select the mode (e.g. `"plan"`, `"acceptEdits"`).
@@ -64,6 +67,7 @@ pub struct SessionMode {
 
 /// One selectable model, exactly as the CLI reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct ModelInfo {
     /// The id to pass back (`SpawnSpec::model`, `Command::SetModel`).
@@ -81,6 +85,7 @@ pub struct ModelInfo {
 
 /// One MCP server announced by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct McpServerInfo {
     pub name: String,
@@ -90,6 +95,7 @@ pub struct McpServerInfo {
 
 /// One slash command announced by the CLI. `name` carries no leading `/`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct SlashCommandInfo {
     pub name: String,
@@ -101,6 +107,7 @@ pub struct SlashCommandInfo {
 
 /// One entry of an agent plan / todo list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct PlanEntry {
     pub content: String,
@@ -113,6 +120,7 @@ pub struct PlanEntry {
 
 /// Context-compaction metadata (claude `system/compact_boundary`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct CompactionInfo {
     #[serde(default)]
@@ -129,6 +137,7 @@ pub struct CompactionInfo {
 
 /// Rate-limit status (claude `rate_limit_event`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct RateLimitInfo {
     #[serde(default)]
@@ -147,6 +156,7 @@ pub struct RateLimitInfo {
 
 /// One allowed value of an elicitation / permission-option choice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct ElicitationChoice {
     /// The property key this choice belongs under (`"optionId"` for ACP).
@@ -163,6 +173,7 @@ pub struct ElicitationChoice {
 ///
 /// `request_id` is the protocol's routing id: pass it back verbatim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "gate_type", rename_all = "snake_case")]
 pub enum GateRequest {
     /// The agent wants to run a tool (or an MCP server asks for input).
@@ -236,6 +247,7 @@ impl GateRequest {
 
 /// One question inside a [`GateRequest::Question`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct QuestionPrompt {
     pub question: String,
@@ -249,6 +261,7 @@ pub struct QuestionPrompt {
 
 /// One selectable option of a [`QuestionPrompt`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct QuestionOption {
     pub label: String,
@@ -258,6 +271,7 @@ pub struct QuestionOption {
 
 /// The human's (or an explicit policy's) answer to a permission/plan gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum GateDecision {
     /// Approve the action.
@@ -305,6 +319,7 @@ impl GateDecision {
 /// The human's answer to a [`GateRequest::Question`]: question text →
 /// selected label(s) (comma-joined for multi-select). Empty = skip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct QuestionAnswer {
     pub answers: BTreeMap<String, String>,
@@ -314,6 +329,7 @@ pub struct QuestionAnswer {
 
 /// Why a turn ended, when notable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
     /// The user interrupted the turn (not a failure).
@@ -330,6 +346,7 @@ pub enum EndReason {
 
 /// Everything a driver can report. Internally tagged on `"type"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// The CLI has identified the session. Emitted once per handshake

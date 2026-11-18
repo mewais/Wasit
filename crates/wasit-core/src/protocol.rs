@@ -15,6 +15,7 @@ use crate::spec::SpawnSpec;
 
 /// One line to write to the CLI's stdin, without the trailing newline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct OutLine(pub String);
 
@@ -81,6 +82,7 @@ pub enum Encoded {
 
 /// A user/runtime command for the CLI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
     /// Send a user prompt (starts a turn; see

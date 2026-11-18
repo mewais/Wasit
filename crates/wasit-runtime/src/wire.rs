@@ -35,8 +35,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use wasit_core::{
-    AgentConfig, AgentEvent, Command, DriverCapabilities, DriverId, EndReason, GateRequest,
-    ModelInfo, PlanEntry, ResumableSession, SessionMode, SlashCommandInfo, Unsupported, Usage,
+    AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
+    GateRequest, ModelInfo, PlanEntry, ResumableSession, SessionMode, SlashCommandInfo,
+    Unsupported, Usage,
 };
 
 /// Method names.
@@ -92,6 +93,7 @@ pub mod codes {
 
 /// A session id: 12 characters of lowercase RFC 4648 base32 (`a-z2-7`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct SessionId(pub String);
 
@@ -128,6 +130,7 @@ impl std::fmt::Display for SessionId {
 
 /// What a session is doing, derived only from facts (journal records and the protocol state).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Phase {
     /// The process is spawned but its handshake has not completed.
@@ -180,6 +183,7 @@ impl Phase {
 
 /// A gate waiting for an answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PendingGate {
     pub gate: GateRequest,
     /// Journal time the gate was raised (ms since the Unix epoch).
@@ -190,6 +194,7 @@ pub struct PendingGate {
 
 /// The running turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TurnInfo {
     pub started_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,6 +209,7 @@ pub struct TurnInfo {
 
 /// How the last turn ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TurnOutcome {
     pub ended_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +223,7 @@ pub struct TurnOutcome {
 
 /// A subagent started by a tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SubagentInfo {
     pub call_id: String,
     pub name: String,
@@ -233,6 +240,7 @@ pub struct SubagentInfo {
 
 /// How the process of the latest generation ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ExitSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<i32>,
@@ -245,6 +253,7 @@ pub struct ExitSummary {
 
 /// The continuously reduced state of one session. Rebuilt exactly by replaying its journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionSnapshot {
     pub id: SessionId,
     pub driver: DriverId,
@@ -312,6 +321,7 @@ pub struct SessionSnapshot {
 
 /// What a command did when the session applied it (journal order).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandStatus {
     /// Encoded and written to the CLI.
@@ -351,6 +361,7 @@ impl CommandStatus {
 /// so cursors are monotonic and identical whether an event is produced live or by a replay
 /// after a daemon restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionEvent {
     pub cursor: u64,
     /// Journal time of the record (ms since the Unix epoch).
@@ -361,6 +372,7 @@ pub struct SessionEvent {
 
 /// The payload of a [`SessionEvent`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventKind {
     /// A process generation started.
@@ -414,10 +426,12 @@ pub fn cursor_seq(cursor: u64) -> u64 {
 
 /// Empty success.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Ack {}
 
 /// How a new session starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResumeRequest {
     /// A brand-new conversation.
@@ -429,6 +443,7 @@ pub enum ResumeRequest {
 
 /// `sessions.create`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CreateSession {
     pub driver: DriverId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,6 +479,7 @@ impl CreateSession {
 
 /// Result of `sessions.create`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CreateSessionReply {
     pub id: SessionId,
     /// Config items the driver could not honour (the launch did not fail).
@@ -473,12 +489,14 @@ pub struct CreateSessionReply {
 
 /// Names one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionRef {
     pub id: SessionId,
 }
 
 /// Result of `sessions.list`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionList {
     pub sessions: Vec<SessionSnapshot>,
 }
@@ -486,6 +504,7 @@ pub struct SessionList {
 /// `session.history`: the events with `cursor < before` (all when `None`), the last `limit` of
 /// them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HistoryRequest {
     pub id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -495,6 +514,7 @@ pub struct HistoryRequest {
 
 /// Result of `session.history`, oldest first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HistoryPage {
     pub events: Vec<SessionEvent>,
     /// Older events exist (page again with `before = events[0].cursor`).
@@ -503,6 +523,7 @@ pub struct HistoryPage {
 
 /// `session.command`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CommandRequest {
     pub id: SessionId,
     pub command: Command,
@@ -510,6 +531,7 @@ pub struct CommandRequest {
 
 /// A command the session accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CommandOutcome {
     /// Written to the CLI.
@@ -520,12 +542,14 @@ pub enum CommandOutcome {
 
 /// Result of `session.command`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CommandReply {
     pub outcome: CommandOutcome,
 }
 
 /// Why a command was not accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "error", rename_all = "snake_case")]
 pub enum CommandError {
     #[error("not supported by this driver: {operation}")]
@@ -557,6 +581,7 @@ impl CommandError {
 
 /// A failed runtime operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "error", content = "message", rename_all = "snake_case")]
 pub enum RuntimeError {
     #[error("no such session: {0}")]
@@ -599,6 +624,7 @@ impl RuntimeError {
 
 /// One driver this host knows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DriverSummary {
     pub id: DriverId,
     pub display_name: String,
@@ -607,6 +633,7 @@ pub struct DriverSummary {
 
 /// Result of `host.info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HostInfo {
     pub host_id: String,
     pub build: String,
@@ -620,6 +647,7 @@ pub struct HostInfo {
 
 /// Payload of the `host.sessions` topic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEvent {
     /// The full session list (first event of a fresh subscription, or after an expired cursor).
@@ -635,6 +663,7 @@ pub enum HostEvent {
 
 /// `drivers.inventory`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct InventoryRequest {
     /// Project directory for session discovery (`None` = all projects).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -643,6 +672,7 @@ pub struct InventoryRequest {
 
 /// `drivers.refresh`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RefreshRequest {
     /// Only this driver (`None` = all).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -653,6 +683,7 @@ pub struct RefreshRequest {
 
 /// Outcome of one discovery probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProbeReport {
     pub kind: wasit_core::DiscoveryKind,
     pub ok: bool,
@@ -663,6 +694,7 @@ pub struct ProbeReport {
 
 /// What discovery knows about one driver on this host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DriverInventory {
     pub driver: DriverId,
     pub display_name: String,
@@ -682,6 +714,10 @@ pub struct DriverInventory {
     pub modes: Vec<SessionMode>,
     #[serde(default)]
     pub sessions: Vec<ResumableSession>,
+    /// What the CLI itself has configured on this host for `project` (MCP servers, skills,
+    /// plugins, commands, agents), each with its source.
+    #[serde(default)]
+    pub config: Vec<ConfigItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     /// Probes still running.
@@ -694,6 +730,7 @@ pub struct DriverInventory {
 
 /// Result of `drivers.inventory`; also the payload of the `drivers.inventory` topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct InventoryReply {
     pub drivers: Vec<DriverInventory>,
 }

@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Wasit control protocol: wire types, framing, client, server, link supervisor and router"
 
+[features]
+# TypeScript definitions of the wire types (ts-rs), for GUI clients.
+ts = ["dep:ts-rs"]
+
 [dependencies]
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -531,6 +531,7 @@ fn render_config_all_items() {
         tool_policy: wasit_core::ToolPolicy {
             disallowed_tools: vec!["Bash".into(), "Edit".into()],
         },
+        disabled: vec![],
     };
     let unsupported = d.render_config(&cfg, &mut spec);
     assert_eq!(unsupported.len(), 1);
@@ -598,7 +599,11 @@ fn discovery_parsers() {
         project: Some("/a/b.c".into()),
         ..DiscoveryContext::default()
     };
-    let probes = ClaudeDescriptor.discovery(&ctx);
+    let probes: Vec<_> = ClaudeDescriptor
+        .discovery(&ctx)
+        .into_iter()
+        .filter(|p| p.kind != wasit_core::DiscoveryKind::Config)
+        .collect();
     assert_eq!(probes.len(), 4);
     assert!(
         matches!(&probes[3].action, ProbeAction::ListFiles { dir, recursive: false, .. } if dir == "/h/.claude/projects/-a-b-c")
@@ -644,4 +649,129 @@ fn ready_only_after_the_initialize_response() {
     assert!(p2.is_ready());
     p.on_line(r#"{"type":"control_response","response":{"subtype":"error","request_id":"req_1","error":"no"}}"#);
     assert!(p.is_ready(), "a failed initialize still ends the handshake");
+}
+
+// ── config discovery + disabling (shapes captured from claude 2.1.327) ──────
+
+#[test]
+fn state_file_yields_user_and_local_mcp_servers() {
+    let text = r#"{"numStartups":3,"mcpServers":{"ustdio":{"type":"stdio","command":"echo","args":["hi"],"env":{}}},
+        "projects":{"/w/proj":{"allowedTools":[],"mcpServers":{"lhttp":{"type":"http","url":"https://example.invalid/mcp"}}}}}"#;
+    let out = wasit_core::ProbeOutput::File {
+        path: "/h/.claude.json".into(),
+        contents: Some(text.into()),
+    };
+    let Discovered::Config(items) = crate::parse_state_mcp(&out, Some("/w/proj")).unwrap() else {
+        panic!()
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        (items[0].name.as_str(), items[0].source.scope.as_str()),
+        ("ustdio", "user")
+    );
+    assert_eq!(
+        items[0].mcp,
+        Some(wasit_core::McpTransport::Stdio {
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            env: Default::default()
+        })
+    );
+    assert_eq!(
+        (items[1].name.as_str(), items[1].source.scope.as_str()),
+        ("lhttp", "local")
+    );
+    let missing = wasit_core::ProbeOutput::File {
+        path: "/nope".into(),
+        contents: None,
+    };
+    assert_eq!(
+        crate::parse_state_mcp(&missing, None).unwrap(),
+        Discovered::Config(vec![])
+    );
+}
+
+#[test]
+fn project_mcp_and_plugin_list() {
+    let mcp = wasit_core::ProbeOutput::File {
+        path: "/w/proj/.mcp.json".into(),
+        contents: Some(r#"{"mcpServers":{"pstdio":{"type":"stdio","command":"/bin/cat","args":["x"],"env":{"FOO":"bar"}}}}"#.into()),
+    };
+    let Discovered::Config(items) = crate::parse_project_mcp(&mcp).unwrap() else {
+        panic!()
+    };
+    assert_eq!(items[0].source.scope, "project");
+    let plugins = wasit_core::ProbeOutput::Exec {
+        exit_code: Some(0),
+        stdout: r#"[{"id":"demo@localmkt","version":"1.0.0","scope":"user","enabled":true,"installPath":"/h/.claude/plugins/cache/localmkt/demo/1.0.0","projectEnabled":false}]"#.into(),
+    };
+    let Discovered::Config(items) = crate::parse_plugin_list(&plugins).unwrap() else {
+        panic!()
+    };
+    assert_eq!(items[0].name, "demo@localmkt");
+    assert!(items[0].enabled);
+    assert!(crate::parse_plugin_list(&wasit_core::ProbeOutput::Exec {
+        exit_code: Some(0),
+        stdout: "nope".into()
+    })
+    .is_err());
+}
+
+#[test]
+fn config_probes_cover_files_plugins_and_directories() {
+    let ctx = DiscoveryContext {
+        binary: Some("claude".into()),
+        home: Some("/h".into()),
+        env: vec![],
+        project: Some("/w/proj".into()),
+    };
+    let probes: Vec<_> = descriptor()
+        .discovery(&ctx)
+        .into_iter()
+        .filter(|p| p.kind == wasit_core::DiscoveryKind::Config)
+        .collect();
+    // state file, .mcp.json, plugin list, 2 roots × (skills, agents, commands)
+    assert_eq!(probes.len(), 9);
+    assert!(probes.iter().any(|p| matches!(&p.action,
+        wasit_core::ProbeAction::ReadFile { path, .. } if path == "/h/.claude.json")));
+    assert!(probes.iter().any(|p| matches!(&p.action,
+        wasit_core::ProbeAction::ListFiles { dir, .. } if dir == "/w/proj/.claude/skills")));
+}
+
+#[test]
+fn disabled_items_render_as_one_settings_flag() {
+    use wasit_core::{ConfigItemKind as K, DisabledItem};
+    let d = |kind, name: &str| DisabledItem {
+        kind,
+        name: name.into(),
+        path: None,
+    };
+    let cfg = AgentConfig {
+        disabled: vec![
+            d(K::Skill, "myskill"),
+            d(K::Command, "hello"),
+            d(K::McpServer, "pstdio"),
+            d(K::Plugin, "demo@localmkt"),
+            d(K::Agent, "reviewer"),
+        ],
+        ..AgentConfig::default()
+    };
+    let mut spec = SpawnSpec::default();
+    let unsupported = descriptor().render_config(&cfg, &mut spec);
+    assert_eq!(unsupported.len(), 1);
+    assert_eq!(unsupported[0].item, "agent:reviewer");
+    let at = spec
+        .extra_args
+        .iter()
+        .position(|a| a == "--settings")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&spec.extra_args[at + 1]).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "skillOverrides": {"myskill": "off", "hello": "off"},
+            "deniedMcpServers": [{"serverName": "pstdio"}],
+            "enabledPlugins": {"demo@localmkt": false}
+        })
+    );
 }

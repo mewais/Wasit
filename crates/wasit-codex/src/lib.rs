@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use wasit_core::{
-    listed_files, models_from_handshake, modes_from_handshake, parse_version_line, AgentConfig,
-    BusyPrompt, ConfigRenderer, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
+    config_listing, exec_stdout, listed_files, models_from_handshake, modes_from_handshake,
+    parse_version_line, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem, ConfigItemKind,
+    ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
     DriverCapabilities, DriverDescriptor, DriverId, McpServerConfig, McpTransport, ProbeAction,
     ProbeOutput, Protocol, ResumableSession, SpawnSpec, Unsupported,
 };
@@ -101,8 +102,9 @@ impl DriverDescriptor for CodexDescriptor {
                 action: ProbeAction::Exec {
                     argv: vec![bin, "--version".into()],
                     env: vec![],
+                    cwd: None,
                 },
-                parse: parse_version_line,
+                parse: std::sync::Arc::new(parse_version_line),
             },
             DiscoveryProbe {
                 kind: DiscoveryKind::Models,
@@ -110,7 +112,7 @@ impl DriverDescriptor for CodexDescriptor {
                     spec: handshake.clone(),
                     until: DiscoveryKind::Models,
                 },
-                parse: models_from_handshake,
+                parse: std::sync::Arc::new(models_from_handshake),
             },
             DiscoveryProbe {
                 kind: DiscoveryKind::Modes,
@@ -118,7 +120,7 @@ impl DriverDescriptor for CodexDescriptor {
                     spec: handshake,
                     until: DiscoveryKind::Modes,
                 },
-                parse: modes_from_handshake,
+                parse: std::sync::Arc::new(modes_from_handshake),
             },
         ];
         let home = ctx
@@ -129,6 +131,11 @@ impl DriverDescriptor for CodexDescriptor {
                     .as_deref()
                     .map(|h| format!("{}/.codex", h.trim_end_matches('/')))
             });
+        probes.extend(config_probes(
+            ctx.binary.as_deref().unwrap_or(self.default_binary()),
+            home.as_deref(),
+            ctx.project.clone(),
+        ));
         if let Some(home) = home {
             probes.push(DiscoveryProbe {
                 kind: DiscoveryKind::Sessions,
@@ -139,7 +146,7 @@ impl DriverDescriptor for CodexDescriptor {
                     max_files: 200,
                     head_lines: 40,
                 },
-                parse: parse_sessions,
+                parse: std::sync::Arc::new(parse_sessions),
             });
         }
         probes
@@ -193,9 +200,182 @@ impl ConfigRenderer for CodexDescriptor {
                 "codex has no per-tool deny list; use its sandbox / approval policy",
             ));
         }
+        render_disabled(config, spec, &mut unsupported);
         spec.env.extend(config.env.iter().cloned());
         unsupported
     }
+}
+
+/// Switch off inherited items with config overrides (verified against codex 0.169:
+/// `-c mcp_servers.<name>.enabled=false` drops the server from `codex mcp list --json`, and
+/// `-c skills.config=[{path="…/SKILL.md",enabled=false}]` removes the skill from the
+/// model-visible prompt). Plugins, commands and agents have no verified off switch.
+fn render_disabled(config: &AgentConfig, spec: &mut SpawnSpec, unsupported: &mut Vec<Unsupported>) {
+    let mut skills: Vec<String> = Vec::new();
+    for d in &config.disabled {
+        match d.kind {
+            ConfigItemKind::McpServer if toml_key_ok(&d.name) => spec.extra_args.extend([
+                "-c".to_string(),
+                format!("mcp_servers.{}.enabled=false", d.name),
+            ]),
+            ConfigItemKind::McpServer => unsupported.push(Unsupported::new(
+                d.item_ref().key(),
+                format!(
+                    "server name {:?} must be [A-Za-z0-9_-]+ to be a codex config key",
+                    d.name
+                ),
+            )),
+            ConfigItemKind::Skill => match d.path.as_deref() {
+                Some(p) => {
+                    let file = if p.ends_with("SKILL.md") {
+                        p.to_string()
+                    } else {
+                        format!("{}/SKILL.md", p.trim_end_matches('/'))
+                    };
+                    skills.push(format!("{{path={},enabled=false}}", toml_str(&file)));
+                }
+                None => unsupported.push(Unsupported::new(
+                    d.item_ref().key(),
+                    "codex disables a skill by its SKILL.md path, which is not known",
+                )),
+            },
+            ConfigItemKind::Plugin | ConfigItemKind::Command | ConfigItemKind::Agent => unsupported
+                .push(Unsupported::new(
+                    d.item_ref().key(),
+                    "codex has no verified launch-time switch for this item",
+                )),
+        }
+    }
+    if !skills.is_empty() {
+        spec.extra_args.extend([
+            "-c".to_string(),
+            format!("skills.config=[{}]", skills.join(",")),
+        ]);
+    }
+}
+
+/// Probes for what codex itself has configured: `codex mcp list --json` (run in the project,
+/// so project config applies) and the skill roots (`$CODEX_HOME/skills`, including the
+/// bundled `.system` skills, and `<project>/.agents/skills`).
+fn config_probes(bin: &str, home: Option<&str>, project: Option<String>) -> Vec<DiscoveryProbe> {
+    let mut probes = vec![DiscoveryProbe::new(
+        DiscoveryKind::Config,
+        ProbeAction::Exec {
+            argv: vec![
+                bin.to_string(),
+                "mcp".into(),
+                "list".into(),
+                "--json".into(),
+            ],
+            env: vec![],
+            cwd: project.clone(),
+        },
+        parse_mcp_list,
+    )];
+    let mut roots: Vec<(String, &'static str)> = Vec::new();
+    if let Some(h) = home {
+        roots.push((format!("{h}/skills"), "user"));
+    }
+    if let Some(p) = &project {
+        roots.push((
+            format!("{}/.agents/skills", p.trim_end_matches('/')),
+            "project",
+        ));
+    }
+    for (root, scope) in roots {
+        let r = root.clone();
+        probes.push(DiscoveryProbe::new(
+            DiscoveryKind::Config,
+            config_listing(root, "SKILL.md", true),
+            move |out| {
+                Ok(Discovered::Config(skills_from_listing(
+                    listed_files(out)?,
+                    &r,
+                    |p| {
+                        if p.contains("/.system/") {
+                            "system".to_string()
+                        } else {
+                            scope.to_string()
+                        }
+                    },
+                )))
+            },
+        ));
+    }
+    probes
+}
+
+/// `codex mcp list --json`: `[{name, enabled, transport: {type: "stdio"|"streamable_http", …}}]`.
+pub fn parse_mcp_list(out: &ProbeOutput) -> Result<Discovered, String> {
+    let text = exec_stdout(out)?;
+    let start = text
+        .find('[')
+        .ok_or("`mcp list --json` printed no JSON array")?;
+    let v: Value = serde_json::from_str(&text[start..])
+        .map_err(|e| format!("`mcp list --json` output is not JSON: {e}"))?;
+    let list = v
+        .as_array()
+        .ok_or("`mcp list --json` did not return an array")?;
+    let strs = |v: Option<&Value>| -> Vec<String> {
+        v.and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let map = |v: Option<&Value>| -> std::collections::BTreeMap<String, String> {
+        v.and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let items = list
+        .iter()
+        .filter_map(|s| {
+            let name = s.get("name").and_then(Value::as_str)?;
+            let t = s.get("transport");
+            let mcp = match t.and_then(|t| t.get("type")).and_then(Value::as_str) {
+                Some("stdio") => t
+                    .and_then(|t| t.get("command"))
+                    .and_then(Value::as_str)
+                    .map(|c| McpTransport::Stdio {
+                        command: c.to_string(),
+                        args: strs(t.and_then(|t| t.get("args"))),
+                        env: map(t.and_then(|t| t.get("env"))),
+                    }),
+                Some(_) => t
+                    .and_then(|t| t.get("url"))
+                    .and_then(Value::as_str)
+                    .map(|u| McpTransport::Http {
+                        url: u.to_string(),
+                        headers: map(t.and_then(|t| t.get("http_headers"))),
+                    }),
+                None => None,
+            };
+            Some(ConfigItem {
+                kind: ConfigItemKind::McpServer,
+                name: name.to_string(),
+                source: ConfigSource {
+                    scope: "merged".into(),
+                    path: None,
+                },
+                description: s
+                    .get("disabled_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                enabled: s.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                mcp,
+                path: None,
+            })
+        })
+        .collect();
+    Ok(Discovered::Config(items))
 }
 
 /// A TOML basic string (JSON string syntax is valid TOML for the characters

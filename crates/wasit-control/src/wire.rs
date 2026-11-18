@@ -18,6 +18,7 @@ pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const DEFAULT_MAX_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
@@ -31,6 +32,7 @@ impl fmt::Display for ProtocolVersion {
 
 /// Identifies a machine that hosts sessions (and runs a daemon).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct HostId(pub String);
 
@@ -65,6 +67,7 @@ impl From<String> for HostId {
 /// `c`". The service that owns the topic defines the encoding; [`Cursor::from_u64`] is the
 /// conventional encoding for sequence numbers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct Cursor(pub String);
 
@@ -91,6 +94,7 @@ impl fmt::Display for Cursor {
 
 /// Subscription id, allocated by the side that serves the subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct SubId(pub u64);
 
@@ -102,6 +106,7 @@ impl fmt::Display for SubId {
 
 /// First frame each side sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Hello {
     pub protocol: ProtocolVersion,
     /// Exact build identifier of the sender (used to decide provisioning).
@@ -159,6 +164,7 @@ pub mod codes {
 
 /// Error carried in a `Response`, a `Goodbye` or a `SubscriptionClosed{Error}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RpcError {
     pub code: String,
     pub message: String,
@@ -222,6 +228,7 @@ impl std::error::Error for RpcError {}
 
 /// Why a subscription ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CloseReason {
     /// The topic has no more events (or the service ended it).

@@ -435,3 +435,95 @@ fn ready_only_after_the_session_is_open() {
     assert!(!p.is_ready());
     assert!(ready().is_ready());
 }
+
+// ── config discovery + disabling (shapes captured from opencode 1.19.6 / kilo 7.8.27) ──
+
+#[test]
+fn debug_config_and_skill_parse() {
+    let cfg = r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {"gmcp": {"type": "local", "command": ["echo", "hi"], "enabled": true, "environment": {"A": "1"}},
+          "ghttp": {"type": "remote", "url": "https://example.invalid/mcp"},
+          "off": {"type": "local", "command": ["cat"], "enabled": false}},
+  "plugin": ["some-plugin", ["@kilocode/kilo-indexing", {}]],
+  "plugin_origins": [{"spec": "some-plugin", "source": "/h/.config/opencode", "scope": "global"}],
+  "agent": {"myagent": {"name": "myagent", "description": "my agent", "mode": "subagent", "prompt": "p", "options": {}, "permission": {}}},
+  "mode": {}, "command": {"deploy": {"description": "ship it", "template": "x"}}, "username": "unknown"
+}"#;
+    let out = wasit_core::ProbeOutput::Exec {
+        exit_code: Some(0),
+        stdout: cfg.into(),
+    };
+    let wasit_core::Discovered::Config(items) = crate::parse_debug_config(&out).unwrap() else {
+        panic!()
+    };
+    let find = |n: &str| items.iter().find(|i| i.name == n).unwrap();
+    assert_eq!(
+        find("gmcp").mcp,
+        Some(wasit_core::McpTransport::Stdio {
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            env: [("A".to_string(), "1".to_string())].into()
+        })
+    );
+    assert!(!find("off").enabled);
+    assert_eq!(find("some-plugin").source.scope, "global");
+    assert_eq!(find("@kilocode/kilo-indexing").source.scope, "builtin");
+    assert_eq!(find("myagent").kind, wasit_core::ConfigItemKind::Agent);
+    assert_eq!(find("deploy").description, "ship it");
+
+    let skills = r#"[{"name":"customize-opencode","description":"d","location":"<built-in>","content":"x"},
+        {"name":"gskill","description":"global skill","location":"/h/.config/opencode/skills/gskill/SKILL.md","content":"b"},
+        {"name":"pskill","description":"project skill","location":"/w/p/.opencode/skill/pskill/SKILL.md","content":"b"}]"#;
+    let out = wasit_core::ProbeOutput::Exec {
+        exit_code: Some(0),
+        stdout: skills.into(),
+    };
+    let wasit_core::Discovered::Config(items) =
+        crate::parse_debug_skill(&out, Some("/w/p")).unwrap()
+    else {
+        panic!()
+    };
+    let scopes: Vec<&str> = items.iter().map(|i| i.source.scope.as_str()).collect();
+    assert_eq!(scopes, ["builtin", "global", "project"]);
+}
+
+#[test]
+fn disabled_items_merge_into_the_inline_config() {
+    use wasit_core::{ConfigItemKind as K, DisabledItem};
+    let d = |kind, name: &str| DisabledItem {
+        kind,
+        name: name.into(),
+        path: None,
+    };
+    for desc in [crate::opencode(), crate::kilo()] {
+        let cfg = AgentConfig {
+            disabled: vec![
+                d(K::McpServer, "gmcp"),
+                d(K::Agent, "myagent"),
+                d(K::Skill, "gskill"),
+                d(K::Plugin, "some-plugin"),
+                d(K::Command, "deploy"),
+            ],
+            ..AgentConfig::default()
+        };
+        let mut spec = SpawnSpec::default();
+        let unsupported = desc.render_config(&cfg, &mut spec);
+        let items: Vec<&str> = unsupported.iter().map(|u| u.item.as_str()).collect();
+        assert_eq!(items, ["plugin:some-plugin", "command:deploy"]);
+        let (_, v) = spec
+            .env
+            .iter()
+            .find(|(k, _)| k.ends_with("_CONFIG_CONTENT"))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(v).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "mcp": {"gmcp": {"enabled": false}},
+                "agent": {"myagent": {"disable": true}},
+                "permission": {"skill": {"gskill": "deny"}}
+            })
+        );
+    }
+}

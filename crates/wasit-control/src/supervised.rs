@@ -59,6 +59,7 @@ impl Backoff {
 
 /// Why a host needs provisioning (installing/updating its helper binary).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProvisionReason {
     /// The helper command is not installed on the host.
@@ -81,7 +82,8 @@ pub struct ProvisionError {
 }
 
 /// State of a supervised link (§4.1).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LinkState {
     Connecting,
@@ -93,6 +95,10 @@ pub enum LinkState {
     },
     Reconnecting {
         attempt: u32,
+        #[cfg_attr(
+            feature = "ts",
+            ts(type = "{ secs_since_epoch: number, nanos_since_epoch: number }")
+        )]
         next_at: SystemTime,
         last_error: String,
     },

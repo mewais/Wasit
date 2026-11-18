@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Wasit core: the agent event model, the pure Protocol trait, driver descriptors and registry. No I/O."
 
+[features]
+# TypeScript definitions of the wire types (ts-rs), for GUI clients.
+ts = ["dep:ts-rs"]
+
 [dependencies]
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

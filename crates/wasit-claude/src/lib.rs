@@ -18,10 +18,12 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use wasit_core::{
-    exec_stdout, listed_files, models_from_handshake, parse_version_line, AgentConfig, BusyPrompt,
-    ConfigRenderer, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
-    DriverCapabilities, DriverDescriptor, DriverId, McpServerConfig, McpTransport, ProbeAction,
-    ProbeOutput, Protocol, ResumableSession, ResumeMode, SessionMode, SpawnSpec, Unsupported,
+    config_listing, exec_stdout, listed_files, markdown_items, models_from_handshake,
+    parse_version_line, read_file, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem,
+    ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
+    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, McpServerConfig, McpTransport,
+    ProbeAction, ProbeOutput, Protocol, ResumableSession, ResumeMode, SessionMode, SpawnSpec,
+    Unsupported,
 };
 
 pub use protocol::{
@@ -115,14 +117,16 @@ impl DriverDescriptor for ClaudeDescriptor {
             .binary
             .clone()
             .unwrap_or_else(|| self.default_binary().to_string());
+        let bin_for_config = bin.clone();
         let mut probes = vec![
             DiscoveryProbe {
                 kind: DiscoveryKind::Version,
                 action: ProbeAction::Exec {
                     argv: vec![bin.clone(), "--version".into()],
                     env: vec![],
+                    cwd: None,
                 },
-                parse: parse_version_line,
+                parse: std::sync::Arc::new(parse_version_line),
             },
             // The `initialize` control response carries the model catalog.
             DiscoveryProbe {
@@ -135,7 +139,7 @@ impl DriverDescriptor for ClaudeDescriptor {
                     }),
                     until: DiscoveryKind::Models,
                 },
-                parse: models_from_handshake,
+                parse: std::sync::Arc::new(models_from_handshake),
             },
             // Claude reports no mode list over the protocol; the only live
             // source is the `--permission-mode` choices in `--help`.
@@ -144,10 +148,12 @@ impl DriverDescriptor for ClaudeDescriptor {
                 action: ProbeAction::Exec {
                     argv: vec![bin, "--help".into()],
                     env: vec![],
+                    cwd: None,
                 },
-                parse: parse_permission_modes,
+                parse: std::sync::Arc::new(parse_permission_modes),
             },
         ];
+        probes.extend(config_probes(ctx, &bin_for_config));
         if let Some(dir) = sessions_dir(ctx) {
             probes.push(DiscoveryProbe {
                 kind: DiscoveryKind::Sessions,
@@ -158,7 +164,7 @@ impl DriverDescriptor for ClaudeDescriptor {
                     max_files: 200,
                     head_lines: 30,
                 },
-                parse: parse_sessions,
+                parse: std::sync::Arc::new(parse_sessions),
             });
         }
         probes
@@ -211,9 +217,288 @@ impl ConfigRenderer for ClaudeDescriptor {
             spec.extra_args
                 .push(config.tool_policy.disallowed_tools.join(","));
         }
+        render_disabled(config, spec, &mut unsupported);
         spec.env.extend(config.env.iter().cloned());
         unsupported
     }
+}
+
+/// Switch off inherited items through one `--settings` JSON (verified against claude 2.1:
+/// `skillOverrides: {name: "off"}` removes a skill or command from the session,
+/// `deniedMcpServers: [{serverName}]` drops an MCP server of any scope, `enabledPlugins:
+/// {id: false}` unloads a plugin). Claude has no setting that removes a custom agent.
+fn render_disabled(config: &AgentConfig, spec: &mut SpawnSpec, unsupported: &mut Vec<Unsupported>) {
+    let mut skills = serde_json::Map::new();
+    let mut denied = Vec::new();
+    let mut plugins = serde_json::Map::new();
+    for d in &config.disabled {
+        match d.kind {
+            ConfigItemKind::Skill | ConfigItemKind::Command => {
+                skills.insert(d.name.clone(), json!("off"));
+            }
+            ConfigItemKind::McpServer => denied.push(json!({ "serverName": d.name })),
+            ConfigItemKind::Plugin => {
+                plugins.insert(d.name.clone(), json!(false));
+            }
+            ConfigItemKind::Agent => unsupported.push(Unsupported::new(
+                d.item_ref().key(),
+                "claude has no launch-time setting that removes a custom agent",
+            )),
+        }
+    }
+    let mut settings = serde_json::Map::new();
+    if !skills.is_empty() {
+        settings.insert("skillOverrides".into(), Value::Object(skills));
+    }
+    if !denied.is_empty() {
+        settings.insert("deniedMcpServers".into(), Value::Array(denied));
+    }
+    if !plugins.is_empty() {
+        settings.insert("enabledPlugins".into(), Value::Object(plugins));
+    }
+    if !settings.is_empty() {
+        spec.extra_args.extend([
+            "--settings".to_string(),
+            Value::Object(settings).to_string(),
+        ]);
+    }
+}
+
+fn config_dir(ctx: &DiscoveryContext) -> Option<String> {
+    match ctx.var("CLAUDE_CONFIG_DIR") {
+        Some(d) => Some(d.trim_end_matches('/').to_string()),
+        None => Some(format!(
+            "{}/.claude",
+            ctx.home.as_deref()?.trim_end_matches('/')
+        )),
+    }
+}
+
+/// The global state file holding user- and local-scope MCP servers.
+fn state_file(ctx: &DiscoveryContext) -> Option<String> {
+    match ctx.var("CLAUDE_CONFIG_DIR") {
+        Some(d) => Some(format!("{}/.claude.json", d.trim_end_matches('/'))),
+        None => Some(format!(
+            "{}/.claude.json",
+            ctx.home.as_deref()?.trim_end_matches('/')
+        )),
+    }
+}
+
+/// Probes for what claude itself has configured: MCP servers from its own JSON files
+/// (`~/.claude.json` user + local scope, `<project>/.mcp.json` project scope — claude's
+/// `mcp list` only renders text), plugins from `claude plugin list --json`, skills, commands
+/// and agents from their directories (user and project).
+fn config_probes(ctx: &DiscoveryContext, bin: &str) -> Vec<DiscoveryProbe> {
+    let mut probes = Vec::new();
+    let project = ctx.project.clone();
+    if let Some(state) = state_file(ctx) {
+        let p = project.clone();
+        probes.push(DiscoveryProbe::new(
+            DiscoveryKind::Config,
+            ProbeAction::ReadFile {
+                path: state,
+                max_bytes: 64 * 1024 * 1024,
+            },
+            move |out| parse_state_mcp(out, p.as_deref()),
+        ));
+    }
+    if let Some(proj) = &project {
+        probes.push(DiscoveryProbe::new(
+            DiscoveryKind::Config,
+            ProbeAction::ReadFile {
+                path: format!("{}/.mcp.json", proj.trim_end_matches('/')),
+                max_bytes: 4 * 1024 * 1024,
+            },
+            parse_project_mcp,
+        ));
+    }
+    probes.push(DiscoveryProbe::new(
+        DiscoveryKind::Config,
+        ProbeAction::Exec {
+            argv: vec![
+                bin.to_string(),
+                "plugin".into(),
+                "list".into(),
+                "--json".into(),
+            ],
+            env: vec![],
+            cwd: project.clone(),
+        },
+        parse_plugin_list,
+    ));
+    let mut roots: Vec<(String, &'static str)> = Vec::new();
+    if let Some(dir) = config_dir(ctx) {
+        roots.push((dir, "user"));
+    }
+    if let Some(proj) = &project {
+        roots.push((format!("{}/.claude", proj.trim_end_matches('/')), "project"));
+    }
+    for (base, scope) in roots {
+        let skills = format!("{base}/skills");
+        let root = skills.clone();
+        probes.push(DiscoveryProbe::new(
+            DiscoveryKind::Config,
+            config_listing(skills, "SKILL.md", true),
+            move |out| {
+                Ok(Discovered::Config(skills_from_listing(
+                    listed_files(out)?,
+                    &root,
+                    |_| scope.to_string(),
+                )))
+            },
+        ));
+        for (sub, kind, recursive) in [
+            ("agents", ConfigItemKind::Agent, false),
+            ("commands", ConfigItemKind::Command, true),
+        ] {
+            probes.push(DiscoveryProbe::new(
+                DiscoveryKind::Config,
+                config_listing(format!("{base}/{sub}"), ".md", recursive),
+                move |out| {
+                    Ok(Discovered::Config(markdown_items(
+                        listed_files(out)?,
+                        kind,
+                        scope,
+                    )))
+                },
+            ));
+        }
+    }
+    probes
+}
+
+/// An MCP server definition in claude's JSON (`{"type": "stdio"|"http"|"sse", …}`).
+pub fn mcp_transport_from_json(v: &Value) -> Option<McpTransport> {
+    let str_map = |key: &str| -> std::collections::BTreeMap<String, String> {
+        v.get(key)
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if let Some(url) = v.get("url").and_then(Value::as_str) {
+        return Some(McpTransport::Http {
+            url: url.to_string(),
+            headers: str_map("headers"),
+        });
+    }
+    let command = v.get("command").and_then(Value::as_str)?;
+    Some(McpTransport::Stdio {
+        command: command.to_string(),
+        args: v
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        env: str_map("env"),
+    })
+}
+
+fn mcp_items(servers: Option<&Value>, scope: &str, path: &str) -> Vec<ConfigItem> {
+    let Some(map) = servers.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    map.iter()
+        .map(|(name, def)| ConfigItem {
+            kind: ConfigItemKind::McpServer,
+            name: name.clone(),
+            source: ConfigSource {
+                scope: scope.to_string(),
+                path: Some(path.to_string()),
+            },
+            description: String::new(),
+            enabled: true,
+            mcp: mcp_transport_from_json(def),
+            path: None,
+        })
+        .collect()
+}
+
+fn file_path(out: &ProbeOutput) -> String {
+    match out {
+        ProbeOutput::File { path, .. } => path.clone(),
+        _ => String::new(),
+    }
+}
+
+/// User-scope (`mcpServers`) and local-scope (`projects[<project>].mcpServers`) servers from
+/// `~/.claude.json`.
+pub fn parse_state_mcp(out: &ProbeOutput, project: Option<&str>) -> Result<Discovered, String> {
+    let Some(text) = read_file(out)? else {
+        return Ok(Discovered::Config(Vec::new()));
+    };
+    let path = file_path(out);
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("{path}: {e}"))?;
+    let mut items = mcp_items(v.get("mcpServers"), "user", &path);
+    if let Some(p) = project {
+        let local = v
+            .get("projects")
+            .and_then(|ps| ps.get(p).or_else(|| ps.get(p.trim_end_matches('/'))))
+            .and_then(|e| e.get("mcpServers"));
+        items.extend(mcp_items(local, "local", &path));
+    }
+    Ok(Discovered::Config(items))
+}
+
+/// Project-scope servers from `<project>/.mcp.json`.
+pub fn parse_project_mcp(out: &ProbeOutput) -> Result<Discovered, String> {
+    let Some(text) = read_file(out)? else {
+        return Ok(Discovered::Config(Vec::new()));
+    };
+    let path = file_path(out);
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("{path}: {e}"))?;
+    Ok(Discovered::Config(mcp_items(
+        v.get("mcpServers"),
+        "project",
+        &path,
+    )))
+}
+
+/// `claude plugin list --json`: `[{id, scope, enabled, installPath, …}]`.
+pub fn parse_plugin_list(out: &ProbeOutput) -> Result<Discovered, String> {
+    let text = exec_stdout(out)?;
+    let v: Value = serde_json::from_str(text.trim())
+        .map_err(|e| format!("`plugin list --json` output is not JSON: {e}"))?;
+    let list = v
+        .as_array()
+        .ok_or("`plugin list --json` did not return an array")?;
+    let items = list
+        .iter()
+        .filter_map(|p| {
+            let id = p.get("id").and_then(Value::as_str)?;
+            Some(ConfigItem {
+                kind: ConfigItemKind::Plugin,
+                name: id.to_string(),
+                source: ConfigSource {
+                    scope: p
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user")
+                        .to_string(),
+                    path: p
+                        .get("installPath")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                },
+                description: String::new(),
+                enabled: p.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                mcp: None,
+                path: p
+                    .get("installPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    Ok(Discovered::Config(items))
 }
 
 /// The `--mcp-config` JSON (`{"mcpServers": {...}}`), deterministic.

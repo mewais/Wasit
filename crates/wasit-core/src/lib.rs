@@ -29,16 +29,17 @@ pub mod transcript;
 pub mod wire;
 
 pub use config::{
-    AgentConfig, ConfigRenderer, McpServerConfig, McpTransport, PluginRef, SkillRef, ToolPolicy,
-    Unsupported,
+    AgentConfig, ConfigItem, ConfigItemKind, ConfigItemRef, ConfigRenderer, ConfigSource,
+    DisabledItem, McpServerConfig, McpTransport, PluginRef, SkillRef, ToolPolicy, Unsupported,
 };
 pub use descriptor::{
     BusyPrompt, DriverCapabilities, DriverDescriptor, DriverId, DriverRegistry, RegistryError,
 };
 pub use discovery::{
-    exec_stdout, handshake_events, listed_files, models_from_handshake, modes_from_handshake,
-    parse_version_line, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe, FileHead,
-    ProbeAction, ProbeOutput, ResumableSession,
+    config_listing, exec_stdout, front_matter, handshake_events, listed_files, markdown_items,
+    models_from_handshake, modes_from_handshake, parse_version_line, read_file,
+    skills_from_listing, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe, FileHead,
+    ProbeAction, ProbeOutput, ProbeParse, ResumableSession,
 };
 pub use event::{
     AgentEvent, CompactionInfo, ElicitationChoice, EndReason, GateDecision, GateRequest,

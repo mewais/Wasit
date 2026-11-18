@@ -19,6 +19,7 @@ use crate::transport::{join_duplex, BoxDuplex};
 
 /// What went wrong with a transport command, as far as the UI needs to explain it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CommandFailureKind {
     /// Authentication needs a human (password, missing key, agent).

@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use wasit_core::{
-    exec_stdout, modes_from_handshake, parse_version_line, AgentConfig, BusyPrompt, ConfigRenderer,
-    Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe, DriverCapabilities,
-    DriverDescriptor, DriverId, GeneratedFile, McpServerConfig, McpTransport, ModelInfo,
-    ProbeAction, ProbeOutput, Protocol, ResumableSession, SpawnSpec, Unsupported,
+    exec_stdout, modes_from_handshake, parse_version_line, AgentConfig, BusyPrompt, ConfigItem,
+    ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
+    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, GeneratedFile, McpServerConfig,
+    McpTransport, ModelInfo, ProbeAction, ProbeOutput, Protocol, ResumableSession, SpawnSpec,
+    Unsupported,
 };
 
 pub use protocol::{config_models, config_modes, AcpProtocol};
@@ -147,51 +148,59 @@ impl DriverDescriptor for AcpDescriptor {
             .binary
             .clone()
             .unwrap_or_else(|| self.default_binary().to_string());
-        vec![
-            DiscoveryProbe {
-                kind: DiscoveryKind::Version,
-                action: ProbeAction::Exec {
-                    argv: vec![bin.clone(), "--version".into()],
-                    env: vec![],
+        let mut probes = config_probes(&bin, ctx.project.clone());
+        probes.splice(
+            0..0,
+            [
+                DiscoveryProbe {
+                    kind: DiscoveryKind::Version,
+                    action: ProbeAction::Exec {
+                        argv: vec![bin.clone(), "--version".into()],
+                        env: vec![],
+                        cwd: None,
+                    },
+                    parse: std::sync::Arc::new(parse_version_line),
                 },
-                parse: parse_version_line,
-            },
-            DiscoveryProbe {
-                kind: DiscoveryKind::Models,
-                action: ProbeAction::Exec {
-                    argv: vec![bin.clone(), "models".into()],
-                    env: vec![],
+                DiscoveryProbe {
+                    kind: DiscoveryKind::Models,
+                    action: ProbeAction::Exec {
+                        argv: vec![bin.clone(), "models".into()],
+                        env: vec![],
+                        cwd: None,
+                    },
+                    parse: std::sync::Arc::new(parse_models),
                 },
-                parse: parse_models,
-            },
-            // Modes are user-configurable agents; only an ACP session reports them.
-            DiscoveryProbe {
-                kind: DiscoveryKind::Modes,
-                action: ProbeAction::Handshake {
-                    spec: Box::new(SpawnSpec {
-                        bin: Some(bin.clone()),
-                        cwd: ctx.project.clone(),
-                        ..SpawnSpec::default()
-                    }),
-                    until: DiscoveryKind::Modes,
+                // Modes are user-configurable agents; only an ACP session reports them.
+                DiscoveryProbe {
+                    kind: DiscoveryKind::Modes,
+                    action: ProbeAction::Handshake {
+                        spec: Box::new(SpawnSpec {
+                            bin: Some(bin.clone()),
+                            cwd: ctx.project.clone(),
+                            ..SpawnSpec::default()
+                        }),
+                        until: DiscoveryKind::Modes,
+                    },
+                    parse: std::sync::Arc::new(modes_from_handshake),
                 },
-                parse: modes_from_handshake,
-            },
-            DiscoveryProbe {
-                kind: DiscoveryKind::Sessions,
-                action: ProbeAction::Exec {
-                    argv: vec![
-                        bin,
-                        "session".into(),
-                        "list".into(),
-                        "--format".into(),
-                        "json".into(),
-                    ],
-                    env: vec![],
+                DiscoveryProbe {
+                    kind: DiscoveryKind::Sessions,
+                    action: ProbeAction::Exec {
+                        argv: vec![
+                            bin,
+                            "session".into(),
+                            "list".into(),
+                            "--format".into(),
+                            "json".into(),
+                        ],
+                        env: vec![],
+                        cwd: None,
+                    },
+                    parse: std::sync::Arc::new(parse_sessions),
                 },
-                parse: parse_sessions,
-            },
-        ]
+            ],
+        );
+        probes
     }
 }
 
@@ -245,6 +254,7 @@ impl ConfigRenderer for AcpDescriptor {
                 )),
             }
         }
+        render_disabled(config, &mut inline, &mut unsupported);
         if !config.tool_policy.disallowed_tools.is_empty() {
             unsupported.push(Unsupported::new(
                 "tool_policy",
@@ -270,6 +280,244 @@ impl ConfigRenderer for AcpDescriptor {
         spec.env.extend(config.env.iter().cloned());
         unsupported
     }
+}
+
+/// Switch off inherited items in the inline config the CLI merges last (verified with
+/// `<bin> debug config`): `mcp.<name>.enabled = false`, `agent.<name>.disable = true`, and a
+/// `permission.skill.<name> = "deny"` rule for skills (the CLI's own per-skill switch).
+/// Plugins and commands cannot be removed by a merge (plugin lists concatenate; commands have
+/// no off switch).
+fn render_disabled(
+    config: &AgentConfig,
+    inline: &mut serde_json::Map<String, Value>,
+    unsupported: &mut Vec<Unsupported>,
+) {
+    fn obj<'a>(
+        m: &'a mut serde_json::Map<String, Value>,
+        k: &str,
+    ) -> &'a mut serde_json::Map<String, Value> {
+        let v = m.entry(k.to_string()).or_insert_with(|| json!({}));
+        if !v.is_object() {
+            *v = json!({});
+        }
+        match v {
+            Value::Object(o) => o,
+            _ => unreachable!("replaced by an object above"),
+        }
+    }
+    for d in &config.disabled {
+        match d.kind {
+            ConfigItemKind::McpServer => {
+                obj(obj(inline, "mcp"), &d.name).insert("enabled".into(), json!(false));
+            }
+            ConfigItemKind::Agent => {
+                obj(obj(inline, "agent"), &d.name).insert("disable".into(), json!(true));
+            }
+            ConfigItemKind::Skill => {
+                obj(obj(inline, "permission"), "skill").insert(d.name.clone(), json!("deny"));
+            }
+            ConfigItemKind::Plugin => unsupported.push(Unsupported::new(
+                d.item_ref().key(),
+                "plugin lists from the CLI's config files are concatenated; a launch-time config cannot remove one",
+            )),
+            ConfigItemKind::Command => unsupported.push(Unsupported::new(
+                d.item_ref().key(),
+                "the CLI has no switch that disables a configured command",
+            )),
+        }
+    }
+}
+
+/// Probes for what the CLI itself has configured: `<bin> debug config` (resolved JSON config:
+/// MCP servers, plugins with their origins, agents, commands) and `<bin> debug skill` (every
+/// skill with its location), both run in the project directory.
+fn config_probes(bin: &str, project: Option<String>) -> Vec<DiscoveryProbe> {
+    let exec = |sub: &str| ProbeAction::Exec {
+        argv: vec![bin.to_string(), "debug".into(), sub.into()],
+        env: vec![],
+        cwd: project.clone(),
+    };
+    let p = project.clone();
+    vec![
+        DiscoveryProbe::new(DiscoveryKind::Config, exec("config"), parse_debug_config),
+        DiscoveryProbe::new(DiscoveryKind::Config, exec("skill"), move |out| {
+            parse_debug_skill(out, p.as_deref())
+        }),
+    ]
+}
+
+fn json_stdout(out: &ProbeOutput, what: &str) -> Result<Value, String> {
+    let text = exec_stdout(out)?;
+    let start = text
+        .find(['{', '['])
+        .ok_or(format!("`{what}` printed no JSON"))?;
+    serde_json::from_str(&text[start..]).map_err(|e| format!("`{what}` output is not JSON: {e}"))
+}
+
+fn str_map(v: Option<&Value>) -> std::collections::BTreeMap<String, String> {
+    v.and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn merged(kind: ConfigItemKind, name: &str, description: &str, enabled: bool) -> ConfigItem {
+    ConfigItem {
+        kind,
+        name: name.to_string(),
+        source: ConfigSource {
+            scope: "merged".into(),
+            path: None,
+        },
+        description: description.to_string(),
+        enabled,
+        mcp: None,
+        path: None,
+    }
+}
+
+/// `<bin> debug config`: the resolved configuration.
+pub fn parse_debug_config(out: &ProbeOutput) -> Result<Discovered, String> {
+    let v = json_stdout(out, "debug config")?;
+    let mut items = Vec::new();
+    if let Some(mcp) = v.get("mcp").and_then(Value::as_object) {
+        for (name, def) in mcp {
+            let mut item = merged(
+                ConfigItemKind::McpServer,
+                name,
+                "",
+                def.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            );
+            item.mcp = match def.get("type").and_then(Value::as_str) {
+                Some("local") => {
+                    let cmd: Vec<String> = def
+                        .get("command")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    cmd.split_first().map(|(c, rest)| McpTransport::Stdio {
+                        command: c.clone(),
+                        args: rest.to_vec(),
+                        env: str_map(def.get("environment")),
+                    })
+                }
+                Some("remote") => {
+                    def.get("url")
+                        .and_then(Value::as_str)
+                        .map(|u| McpTransport::Http {
+                            url: u.to_string(),
+                            headers: str_map(def.get("headers")),
+                        })
+                }
+                _ => None,
+            };
+            items.push(item);
+        }
+    }
+    let origins: Vec<&Value> = v
+        .get("plugin_origins")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if let Some(plugins) = v.get("plugin").and_then(Value::as_array) {
+        for p in plugins {
+            let spec = match p {
+                Value::String(s) => s.clone(),
+                Value::Array(a) => match a.first().and_then(Value::as_str) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let mut item = merged(ConfigItemKind::Plugin, &spec, "", true);
+            if let Some(o) = origins
+                .iter()
+                .find(|o| o.get("spec").and_then(Value::as_str) == Some(spec.as_str()))
+            {
+                item.source = ConfigSource {
+                    scope: o
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .unwrap_or("merged")
+                        .to_string(),
+                    path: o.get("source").and_then(Value::as_str).map(str::to_string),
+                };
+            } else {
+                item.source.scope = "builtin".into();
+            }
+            items.push(item);
+        }
+    }
+    for (key, kind) in [
+        ("agent", ConfigItemKind::Agent),
+        ("command", ConfigItemKind::Command),
+    ] {
+        if let Some(map) = v.get(key).and_then(Value::as_object) {
+            for (name, def) in map {
+                items.push(merged(
+                    kind,
+                    name,
+                    def.get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    !def.get("disable").and_then(Value::as_bool).unwrap_or(false),
+                ));
+            }
+        }
+    }
+    Ok(Discovered::Config(items))
+}
+
+/// `<bin> debug skill`: `[{name, description, location, content}]`; `location` is a
+/// `SKILL.md` path, or a marker such as `<built-in>` / `builtin` for skills shipped inside
+/// the CLI.
+pub fn parse_debug_skill(out: &ProbeOutput, project: Option<&str>) -> Result<Discovered, String> {
+    let v = json_stdout(out, "debug skill")?;
+    let list = v
+        .as_array()
+        .ok_or("`debug skill` did not return an array")?;
+    let items = list
+        .iter()
+        .filter_map(|s| {
+            let name = s.get("name").and_then(Value::as_str)?;
+            let location = s
+                .get("location")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let is_file = location.ends_with(".md");
+            let scope = if !is_file {
+                "builtin"
+            } else if project.is_some_and(|p| location.starts_with(p)) {
+                "project"
+            } else {
+                "global"
+            };
+            Some(ConfigItem {
+                kind: ConfigItemKind::Skill,
+                name: name.to_string(),
+                source: ConfigSource {
+                    scope: scope.into(),
+                    path: is_file.then(|| location.to_string()),
+                },
+                description: s
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                enabled: true,
+                mcp: None,
+                path: is_file.then(|| location.to_string()),
+            })
+        })
+        .collect();
+    Ok(Discovered::Config(items))
 }
 
 /// The `mcp` config object.

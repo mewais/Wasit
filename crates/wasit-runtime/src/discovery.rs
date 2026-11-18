@@ -222,6 +222,7 @@ impl Discovery {
                     models: Vec::new(),
                     modes: Vec::new(),
                     sessions: Vec::new(),
+                    config: Vec::new(),
                     project: project.map(str::to_string),
                     refreshing: false,
                     probes: Vec::new(),
@@ -259,6 +260,7 @@ impl Discovery {
                 e.models.clear();
                 e.modes.clear();
                 e.sessions.clear();
+                e.config.clear();
             });
             return;
         };
@@ -272,9 +274,18 @@ impl Discovery {
         env.extend(ov.env.iter().cloned());
         let ctx = DiscoveryContext {
             binary: Some(path_s),
-            home: std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .ok(),
+            // A driver override may point the CLI at another home (tests, sandboxes).
+            home: ov
+                .env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "HOME" || k == "USERPROFILE")
+                .map(|(_, v)| v.clone())
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .ok()
+                }),
             env,
             project: key.0.clone(),
         };
@@ -291,6 +302,7 @@ impl Discovery {
         let results = futures::future::join_all(runs).await;
         self.update(&key, |e| {
             e.probes.clear();
+            let mut config: Option<Vec<wasit_core::ConfigItem>> = None;
             for (kind, r, took) in results {
                 let duration_ms = took.as_millis() as u64;
                 match r {
@@ -300,6 +312,7 @@ impl Discovery {
                             Discovered::Models(m) => e.models = m,
                             Discovered::Modes(m) => e.modes = m,
                             Discovered::Sessions(s) => e.sessions = s,
+                            Discovered::Config(c) => config.get_or_insert_with(Vec::new).extend(c),
                         }
                         e.probes.push(ProbeReport {
                             kind,
@@ -316,6 +329,8 @@ impl Discovery {
                     }),
                 }
             }
+            // Several probes contribute config items; a refresh replaces them as a whole.
+            e.config = config.unwrap_or_default();
             e.refreshing = false;
             e.refreshed_at_ms = now_ms();
         });
@@ -377,18 +392,21 @@ async fn run_probe(
     probe: &DiscoveryProbe,
 ) -> Result<Discovered, String> {
     let output = match &probe.action {
-        ProbeAction::Exec { argv, env } => {
+        ProbeAction::Exec { argv, env, cwd } => {
             let mut env = env.clone();
             env.extend(ov.env.iter().cloned());
-            tokio::time::timeout(cfg.exec_timeout, exec(argv, &env, cfg.max_output))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "`{}` did not finish within {:?}",
-                        argv.join(" "),
-                        cfg.exec_timeout
-                    )
-                })??
+            tokio::time::timeout(
+                cfg.exec_timeout,
+                exec(argv, &env, cwd.as_deref(), cfg.max_output),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "`{}` did not finish within {:?}",
+                    argv.join(" "),
+                    cfg.exec_timeout
+                )
+            })??
         }
         ProbeAction::Handshake { spec, until } => {
             let mut spec = (**spec).clone();
@@ -435,8 +453,47 @@ async fn run_probe(
                 Ok(Ok(Ok(files))) => ProbeOutput::Files { files },
             }
         }
+        ProbeAction::ReadFile { path, max_bytes } => {
+            let read = read_small_file(path, *max_bytes);
+            match tokio::time::timeout(cfg.list_timeout, read).await {
+                Err(_) => {
+                    return Err(format!(
+                        "reading {path} did not finish within {:?}",
+                        cfg.list_timeout
+                    ))
+                }
+                Ok(r) => r?,
+            }
+        }
     };
     (probe.parse)(&output)
+}
+
+/// Read at most `max` bytes of `path`; a missing file yields `contents: None`, a larger one
+/// is an error (a truncated JSON document would be misread).
+async fn read_small_file(path: &str, max: usize) -> Result<ProbeOutput, String> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProbeOutput::File {
+                path: path.to_string(),
+                contents: None,
+            })
+        }
+        Err(e) => return Err(format!("cannot open {path}: {e}")),
+    };
+    let mut buf = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("cannot read {path}: {e}"))?;
+    if buf.len() > max {
+        return Err(format!("{path} is larger than {max} bytes"));
+    }
+    Ok(ProbeOutput::File {
+        path: path.to_string(),
+        contents: Some(String::from_utf8_lossy(&buf).into_owned()),
+    })
 }
 
 fn dir_display(a: &ProbeAction) -> String {
@@ -449,10 +506,15 @@ fn dir_display(a: &ProbeAction) -> String {
 async fn exec(
     argv: &[String],
     env: &[(String, String)],
+    cwd: Option<&str>,
     max: usize,
 ) -> Result<ProbeOutput, String> {
     let (prog, args) = argv.split_first().ok_or("empty probe command")?;
-    let mut child = tokio::process::Command::new(prog)
+    let mut cmd = tokio::process::Command::new(prog);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd
         .args(args)
         .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())

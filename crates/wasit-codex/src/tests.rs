@@ -474,3 +474,70 @@ fn ready_only_after_the_thread_is_open() {
     assert!(!p.is_ready());
     assert!(ready().is_ready());
 }
+
+// ── config discovery + disabling (shapes captured from codex-cli 0.169.1) ──
+
+#[test]
+fn mcp_list_json_parses() {
+    let text = r#"WARNING: proceeding, even though we could not create PATH aliases
+[{"name":"chttp","enabled":true,"disabled_reason":null,"transport":{"type":"streamable_http","url":"https://example.invalid/mcp","bearer_token_env_var":null,"http_headers":null},"auth_status":"unknown"},
+ {"name":"cmcp","enabled":false,"disabled_reason":null,"transport":{"type":"stdio","command":"echo","args":["hi"],"env":null,"env_vars":[],"cwd":null},"auth_status":"unsupported"}]"#;
+    let out = wasit_core::ProbeOutput::Exec {
+        exit_code: Some(0),
+        stdout: text.into(),
+    };
+    let wasit_core::Discovered::Config(items) = crate::parse_mcp_list(&out).unwrap() else {
+        panic!()
+    };
+    assert_eq!(items.len(), 2);
+    assert!(
+        matches!(&items[0].mcp, Some(McpTransport::Http { url, .. }) if url == "https://example.invalid/mcp")
+    );
+    assert!(!items[1].enabled);
+    assert!(
+        matches!(&items[1].mcp, Some(McpTransport::Stdio { command, args, .. }) if command == "echo" && args == &["hi".to_string()])
+    );
+}
+
+#[test]
+fn disabled_items_render_as_config_overrides() {
+    use wasit_core::{ConfigItemKind as K, DisabledItem};
+    let cfg = AgentConfig {
+        disabled: vec![
+            DisabledItem {
+                kind: K::McpServer,
+                name: "cmcp".into(),
+                path: None,
+            },
+            DisabledItem {
+                kind: K::Skill,
+                name: "cs".into(),
+                path: Some("/h/.codex/skills/cs/SKILL.md".into()),
+            },
+            DisabledItem {
+                kind: K::Skill,
+                name: "nopath".into(),
+                path: None,
+            },
+            DisabledItem {
+                kind: K::Plugin,
+                name: "p".into(),
+                path: None,
+            },
+        ],
+        ..AgentConfig::default()
+    };
+    let mut spec = SpawnSpec::default();
+    let unsupported = descriptor().render_config(&cfg, &mut spec);
+    let items: Vec<&str> = unsupported.iter().map(|u| u.item.as_str()).collect();
+    assert_eq!(items, ["skill:nopath", "plugin:p"]);
+    assert_eq!(
+        spec.extra_args,
+        [
+            "-c",
+            "mcp_servers.cmcp.enabled=false",
+            "-c",
+            "skills.config=[{path=\"/h/.codex/skills/cs/SKILL.md\",enabled=false}]"
+        ]
+    );
+}
