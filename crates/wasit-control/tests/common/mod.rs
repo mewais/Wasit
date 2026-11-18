@@ -115,11 +115,17 @@ pub async fn wait_watch<T: Clone>(
 }
 
 pub fn scratch_dir(name: &str) -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "wasit-control-test-{}-{}-{}",
+    // Unix socket paths are limited to ~104 bytes (macOS temp dirs alone use ~50), so keep the
+    // directory name short and, on Unix, under /tmp.
+    #[cfg(unix)]
+    let root = std::path::PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let root = std::env::temp_dir();
+    let base = root.join(format!(
+        "wc-{}-{:x}-{:x}",
         name,
         std::process::id(),
-        fastrand::u64(..)
+        fastrand::u32(..)
     ));
     std::fs::create_dir_all(&base).unwrap();
     base

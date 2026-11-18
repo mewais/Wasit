@@ -252,7 +252,8 @@ async fn slow_controller_is_dropped_and_child_not_blocked() {
             .await
             .unwrap()
             .unwrap();
-        if n == 0 {
+        // The shim drops a stalled controller mid-write, so the last line may be torn.
+        if n == 0 || !line.ends_with('\n') {
             break;
         }
         let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();

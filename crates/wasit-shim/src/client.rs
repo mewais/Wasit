@@ -224,7 +224,17 @@ impl ShimClient {
                 w.flush().await
             })
             .await
-            .map_err(|_| Error::Timeout("sending a request to the shim"))??;
+            .map_err(|_| Error::Timeout("sending a request to the shim"))?
+            .map_err(|e| {
+                use std::io::ErrorKind::*;
+                // A peer that went away is a disconnect, whatever the OS calls it.
+                match e.kind() {
+                    BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected => {
+                        Error::Disconnected
+                    }
+                    _ => Error::Io(e),
+                }
+            })?;
             match timeout(t, rx).await {
                 Err(_) => Err(Error::Timeout("waiting for the shim's ack")),
                 Ok(Err(_)) => Err(Error::Disconnected),
