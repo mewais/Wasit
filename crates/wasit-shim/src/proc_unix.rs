@@ -188,6 +188,9 @@ pub(crate) fn run_guard(cfg: &Config) -> i32 {
     }
     if let Some(cwd) = &cfg.cwd {
         cmd.current_dir(cwd);
+        // Some CLIs (OpenCode, Kilo) take their project from `$PWD`, which would otherwise
+        // still name the directory this process was started in.
+        cmd.env("PWD", cwd);
     }
     // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {

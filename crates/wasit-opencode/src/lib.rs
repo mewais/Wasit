@@ -170,13 +170,18 @@ impl DriverDescriptor for AcpDescriptor {
                     },
                     parse: std::sync::Arc::new(parse_models),
                 },
-                // Modes are user-configurable agents; only an ACP session reports them.
+                // Modes are user-configurable agents; only an ACP session reports them. The
+                // throwaway session is opened in a scratch directory, never in the project:
+                // the CLI keeps every session it opens, and one left in the project would
+                // show in its session list and become what "continue the latest" picks.
+                // (Agents defined only by a project's config appear once a session there
+                // starts: the session reports its own modes.)
                 DiscoveryProbe {
                     kind: DiscoveryKind::Modes,
                     action: ProbeAction::Handshake {
                         spec: Box::new(SpawnSpec {
                             bin: Some(bin.clone()),
-                            cwd: ctx.project.clone(),
+                            cwd: None,
                             ..SpawnSpec::default()
                         }),
                         until: DiscoveryKind::Modes,
@@ -194,7 +199,8 @@ impl DriverDescriptor for AcpDescriptor {
                             "json".into(),
                         ],
                         env: vec![],
-                        cwd: None,
+                        // The CLI lists the sessions of the project it runs in.
+                        cwd: ctx.project.clone(),
                     },
                     parse: std::sync::Arc::new(parse_sessions),
                 },

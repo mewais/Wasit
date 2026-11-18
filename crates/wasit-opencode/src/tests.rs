@@ -558,3 +558,26 @@ fn the_question_tool_is_always_turned_off() {
         );
     }
 }
+
+/// Discovery never opens a session in the project (the CLI would keep it and list it), and
+/// lists the project's own sessions from inside it.
+#[test]
+fn discovery_keeps_throwaway_sessions_out_of_the_project() {
+    for desc in [opencode(), kilo()] {
+        let ctx = DiscoveryContext {
+            binary: Some("cli".into()),
+            home: None,
+            env: vec![],
+            project: Some("/work/app".into()),
+        };
+        for p in desc.discovery(&ctx) {
+            match (&p.kind, &p.action) {
+                (_, ProbeAction::Handshake { spec, .. }) => assert_eq!(spec.cwd, None),
+                (DiscoveryKind::Sessions, ProbeAction::Exec { cwd, .. }) => {
+                    assert_eq!(cwd.as_deref(), Some("/work/app"))
+                }
+                _ => {}
+            }
+        }
+    }
+}

@@ -572,12 +572,14 @@ async fn exec(
 ) -> Result<ProbeOutput, String> {
     let (prog, args) = argv.split_first().ok_or("empty probe command")?;
     let mut cmd = tokio::process::Command::new(prog);
+    cmd.args(args).envs(env.iter().map(|(k, v)| (k, v)));
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+        // OpenCode / Kilo read their project from `$PWD` (e.g. `session list`).
+        #[cfg(unix)]
+        cmd.env("PWD", dir);
     }
     let mut child = cmd
-        .args(args)
-        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -620,6 +622,8 @@ async fn handshake(
         .kill_on_drop(true);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
+        #[cfg(unix)]
+        cmd.env("PWD", cwd);
     }
     let mut child = cmd.spawn().map_err(|e| format!("cannot run {prog}: {e}"))?;
     let mut stdin = child.stdin.take();
@@ -760,4 +764,22 @@ fn list_files(
             }
         })
         .collect())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    /// A probe run in a directory sees it as `$PWD` too (OpenCode / Kilo take their project
+    /// from it), whatever `$PWD` the daemon itself has.
+    #[tokio::test]
+    async fn exec_sets_pwd_to_the_probe_directory() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_string_lossy();
+        let argv = ["sh", "-c", "printf %s \"$PWD\""].map(String::from);
+        let env = [("PWD".to_string(), "/somewhere/else".to_string())];
+        let out = super::exec(&argv, &env, Some(&dir), 4096).await.unwrap();
+        match out {
+            wasit_core::ProbeOutput::Exec { stdout, .. } => assert_eq!(stdout, dir),
+            other => panic!("{other:?}"),
+        }
+    }
 }
