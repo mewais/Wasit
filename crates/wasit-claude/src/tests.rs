@@ -613,14 +613,16 @@ fn render_config_all_items() {
 fn discovery_parsers() {
     let help = ProbeOutput::Exec {
         exit_code: Some(0),
-        stdout: "  --permission-mode <mode>  Permission mode\n   (choices: \"acceptEdits\", \"auto\",\n   \"plan\")\n".into(),
+        stdout: "  --permission-mode <mode>  Permission mode\n   (choices: \"acceptEdits\", \"auto\",\n   \"manual\", \"plan\")\n".into(),
     };
     match parse_permission_modes(&help).unwrap() {
         Discovered::Modes(m) => {
+            // The CLI's default first (clients preselect it), with display words.
             assert_eq!(
                 m.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-                ["acceptEdits", "auto", "plan"]
-            )
+                ["manual", "acceptEdits", "auto", "plan"]
+            );
+            assert_eq!(m[1].label, "Accept edits");
         }
         d => panic!("{d:?}"),
     }

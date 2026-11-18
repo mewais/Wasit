@@ -550,6 +550,19 @@ fn sessions_dir(ctx: &DiscoveryContext) -> Option<String> {
     })
 }
 
+/// Display words for claude's permission modes (`--help` lists bare ids).
+fn mode_words(id: &str) -> (Option<&'static str>, &'static str) {
+    match id {
+        "default" | "manual" => (Some("Ask"), "Asks before edits and commands"),
+        "acceptEdits" => (Some("Accept edits"), "Edits files without asking"),
+        "plan" => (Some("Plan"), "Read-only: plans before changing anything"),
+        "auto" => (Some("Auto"), "Decides on its own what needs asking"),
+        "dontAsk" => (Some("Don't ask"), "Refuses what is not already allowed"),
+        "bypassPermissions" => (Some("Bypass permissions"), "Never asks"),
+        _ => (None, ""),
+    }
+}
+
 /// Parse the `--permission-mode` choices out of `claude --help`.
 pub fn parse_permission_modes(out: &ProbeOutput) -> Result<Discovered, String> {
     let help = exec_stdout(out)?;
@@ -564,16 +577,27 @@ pub fn parse_permission_modes(out: &ProbeOutput) -> Result<Discovered, String> {
     let end = list
         .find(')')
         .ok_or_else(|| "unterminated choices list".to_string())?;
-    let modes: Vec<SessionMode> = list[..end]
+    let mut modes: Vec<SessionMode> = list[..end]
         .split(',')
         .map(|c| c.trim().trim_matches('"').to_string())
         .filter(|c| !c.is_empty())
-        .map(|id| SessionMode {
-            label: id.clone(),
-            id,
-            description: String::new(),
+        .map(|id| {
+            let (label, description) = mode_words(&id);
+            SessionMode {
+                label: label.unwrap_or(&id).to_string(),
+                description: description.to_string(),
+                id,
+            }
         })
         .collect();
+    // The CLI's own default first: clients preselect the first mode.
+    if let Some(i) = modes
+        .iter()
+        .position(|m| m.id == "default" || m.id == "manual")
+    {
+        let m = modes.remove(i);
+        modes.insert(0, m);
+    }
     if modes.is_empty() {
         return Err("empty --permission-mode choices".into());
     }
