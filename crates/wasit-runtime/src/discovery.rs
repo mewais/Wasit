@@ -38,6 +38,9 @@ pub struct DiscoveryConfig {
     pub list_timeout: Duration,
     /// Captured stdout is truncated beyond this.
     pub max_output: usize,
+    /// Probes running at once across all drivers and projects (each may start a CLI process;
+    /// more wait their turn, and their deadline starts when they run).
+    pub max_concurrent_probes: usize,
 }
 
 impl DiscoveryConfig {
@@ -49,6 +52,7 @@ impl DiscoveryConfig {
             handshake_timeout: Duration::from_secs(45),
             list_timeout: Duration::from_secs(15),
             max_output: 4 * 1024 * 1024,
+            max_concurrent_probes: 4,
         }
     }
 
@@ -71,6 +75,8 @@ struct Inner {
     state: Mutex<State>,
     version: watch::Sender<u64>,
     epoch: String,
+    /// Bounds probes running at once ([`DiscoveryConfig::max_concurrent_probes`]).
+    probes: Arc<tokio::sync::Semaphore>,
 }
 
 /// See the module docs. Cheap to clone.
@@ -86,6 +92,7 @@ fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
 
 impl Discovery {
     pub fn new(cfg: DiscoveryConfig) -> Self {
+        let cfg_probes = cfg.max_concurrent_probes.max(1);
         Discovery {
             inner: Arc::new(Inner {
                 cfg,
@@ -94,6 +101,7 @@ impl Discovery {
                 }),
                 version: watch::channel(0).0,
                 epoch: format!("{:x}", fastrand::u64(..) >> 16),
+                probes: Arc::new(tokio::sync::Semaphore::new(cfg_probes)),
             }),
         }
     }
@@ -293,7 +301,10 @@ impl Discovery {
         let runs = probes.iter().map(|p| {
             let desc = desc.clone();
             let ov = ov.clone();
+            let gate = self.inner.probes.clone();
             async move {
+                // The semaphore is never closed, so acquiring only waits for a free slot.
+                let _permit = gate.acquire_owned().await;
                 let started = Instant::now();
                 let r = run_probe(cfg, desc.as_ref(), &ov, p).await;
                 (p.kind, r, started.elapsed())

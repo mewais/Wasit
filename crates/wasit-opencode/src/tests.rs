@@ -526,8 +526,35 @@ fn disabled_items_merge_into_the_inline_config() {
             serde_json::json!({
                 "mcp": {"gmcp": {"enabled": false}},
                 "agent": {"myagent": {"disable": true}},
-                "permission": {"skill": {"gskill": "deny"}}
+                "permission": {"skill": {"gskill": "deny"}},
+                "tools": {"question": false}
             })
+        );
+    }
+}
+
+#[test]
+fn the_question_tool_is_always_turned_off() {
+    // It never reaches ACP (the turn would hang); the model asks in plain text instead.
+    for flavor in [crate::Flavor::OpenCode, crate::Flavor::Kilo] {
+        let desc = crate::AcpDescriptor { flavor };
+        let mut spec = SpawnSpec::default();
+        spec.env.push((
+            flavor.config_env().to_string(),
+            r#"{"tools":{"bash":true}}"#.into(),
+        ));
+        desc.render_config(&AgentConfig::default(), &mut spec);
+        let raw = &spec
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == flavor.config_env())
+            .unwrap()
+            .1;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            v["tools"],
+            serde_json::json!({"bash": true, "question": false})
         );
     }
 }

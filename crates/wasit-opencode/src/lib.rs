@@ -271,7 +271,13 @@ impl ConfigRenderer for AcpDescriptor {
                 "per-tool deny lists are not rendered for this CLI yet (its `permission` config is not verified)",
             ));
         }
-        if !inline.is_empty() {
+        // The CLI's built-in `question` tool never reaches ACP: kilo 7.8.27 offers it to the
+        // model and the turn then blocks with no request on the wire; opencode 1.19.6 hides it
+        // under ACP (`OPENCODE_CLIENT=acp`) unless `OPENCODE_ENABLE_QUESTION_TOOL` is set, with
+        // the same hang. Turning it off makes the model ask in plain text instead (verified
+        // with both CLIs on free models).
+        inline.insert("tools".into(), json!({ "question": false }));
+        {
             let var = self.flavor.config_env();
             // Merge over any inline config the caller already set.
             let mut merged = spec
@@ -285,7 +291,9 @@ impl ConfigRenderer for AcpDescriptor {
             for (k, v) in inline {
                 // `permission` rules merge with the caller's instead of replacing them.
                 match (merged.get_mut(&k), v) {
-                    (Some(Value::Object(old)), Value::Object(new)) if k == "permission" => {
+                    (Some(Value::Object(old)), Value::Object(new))
+                        if k == "permission" || k == "tools" =>
+                    {
                         old.extend(new)
                     }
                     (_, v) => {
