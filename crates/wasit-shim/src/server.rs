@@ -116,6 +116,8 @@ struct Shared {
     next_conn: AtomicU64,
     delivered: watch::Sender<u64>,
     shutdown: watch::Sender<bool>,
+    /// Stops the accept loop (closing the endpoint) ahead of `shutdown`.
+    stop_accepting: watch::Sender<bool>,
     fatal: watch::Sender<Option<String>>,
     shim_pid: u32,
     child_pid: u32,
@@ -670,7 +672,7 @@ async fn connection(shared: Arc<Shared>, rd: BoxRead, wr: BoxWrite) {
 }
 
 async fn accept_loop(shared: Arc<Shared>, mut listener: Listener) {
-    let mut shut = shared.shutdown.subscribe();
+    let mut shut = shared.stop_accepting.subscribe();
     let mut backoff = Duration::from_millis(10);
     loop {
         tokio::select! {
@@ -788,6 +790,7 @@ async fn start(cfg: Config) -> Result<Running, Error> {
         next_conn: AtomicU64::new(1),
         delivered: watch::Sender::new(0),
         shutdown: watch::Sender::new(false),
+        stop_accepting: watch::Sender::new(false),
         fatal: watch::Sender::new(None),
         shim_pid: std::process::id(),
         child_pid: sp.pid,
@@ -957,9 +960,12 @@ async fn supervise(mut r: Running) -> i32 {
         log!("unlock failed: {e}");
     }
     drop(r.lock);
-    shared.shutdown.send_replace(true);
+    // Then the endpoint, then the connections: a controller that sees its stream end also sees
+    // the endpoint gone (a Windows pipe name lives as long as any server-side instance).
+    shared.stop_accepting.send_replace(true);
     if timeout(Duration::from_secs(1), r.accept).await.is_err() {
         log!("accept loop did not stop in time");
     }
+    shared.shutdown.send_replace(true);
     code
 }
