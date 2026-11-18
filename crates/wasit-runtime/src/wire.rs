@@ -446,6 +446,11 @@ pub enum ResumeRequest {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CreateSession {
     pub driver: DriverId,
+    /// Use this id instead of a fresh random one (e.g. so the caller can put the id into the
+    /// session's own configuration, such as an MCP server that needs to know which session it
+    /// serves). Refused when taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,6 +471,7 @@ impl CreateSession {
     pub fn new(driver: impl Into<DriverId>) -> Self {
         CreateSession {
             driver: driver.into(),
+            id: None,
             cwd: None,
             model: None,
             mode: None,

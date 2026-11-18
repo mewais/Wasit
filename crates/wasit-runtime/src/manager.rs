@@ -183,16 +183,30 @@ impl SessionManager {
                 }
             }
         }
-        let id = loop {
-            let id = SessionId::random();
-            let taken = lock(&self.inner.sessions).contains_key(&id);
-            if !taken
-                && !tokio::fs::try_exists(self.session_dir(&id))
-                    .await
-                    .unwrap_or(true)
-            {
-                break id;
+        let id = match &req.id {
+            Some(id) => {
+                let taken = lock(&self.inner.sessions).contains_key(id)
+                    || tokio::fs::try_exists(self.session_dir(id))
+                        .await
+                        .unwrap_or(true);
+                if taken {
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "session id {id} is already taken"
+                    )));
+                }
+                id.clone()
             }
+            None => loop {
+                let id = SessionId::random();
+                let taken = lock(&self.inner.sessions).contains_key(&id);
+                if !taken
+                    && !tokio::fs::try_exists(self.session_dir(&id))
+                        .await
+                        .unwrap_or(true)
+                {
+                    break id;
+                }
+            },
         };
         let dir = self.session_dir(&id);
         let mut spec = SpawnSpec {
