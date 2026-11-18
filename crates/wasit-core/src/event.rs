@@ -326,35 +326,45 @@ pub enum GateRequest {
     /// is in display form (names, not ids); ids are in `details`.
     Spawn {
         request_id: String,
-        /// The agent asking (display name).
-        from: String,
-        /// Name of the new agent.
-        name: String,
-        /// What the new agent is for, in the asking agent's words.
-        role: String,
-        /// Where it would run (host display name).
-        host: String,
-        /// Which agent CLI (display name).
-        driver: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-        /// Working directory on that host.
-        cwd: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mode: Option<String>,
-        /// The first task it would be given, if any.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        instruction: Option<String>,
-        /// The workstream it joins (display name).
-        workstream: String,
-        /// The asking session is in no workstream: approving creates `workstream`.
-        #[serde(default)]
-        new_workstream: bool,
-        /// Extra structured context (ids, limits, …).
-        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-        details: serde_json::Value,
+        /// What would be started (boxed: the variant stays small).
+        #[serde(flatten)]
+        spawn: Box<SpawnGate>,
         choices: Vec<GateChoice>,
     },
+}
+
+/// The request of a [`GateRequest::Spawn`]. Every field is in display form (names, not ids);
+/// ids are in `details`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SpawnGate {
+    /// The agent asking (display name).
+    pub from: String,
+    /// Name of the new agent.
+    pub name: String,
+    /// What the new agent is for, in the asking agent's words.
+    pub role: String,
+    /// Where it would run (host display name).
+    pub host: String,
+    /// Which agent CLI (display name).
+    pub driver: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Working directory on that host.
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The first task it would be given, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// The workstream it joins (display name).
+    pub workstream: String,
+    /// The asking session is in no workstream: approving creates `workstream`.
+    #[serde(default)]
+    pub new_workstream: bool,
+    /// Extra structured context (ids, limits, …).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub details: serde_json::Value,
 }
 
 impl GateRequest {
@@ -709,18 +719,20 @@ mod tests {
     fn spawn_gate_round_trips_and_exposes_its_choices() {
         let g = GateRequest::Spawn {
             request_id: "wasl-spawn-r1".into(),
-            from: "orchestrator".into(),
-            name: "csv-worker".into(),
-            role: "exports CSV files".into(),
-            host: "build-box".into(),
-            driver: "OpenCode".into(),
-            model: Some("deepseek".into()),
-            cwd: "/w".into(),
-            mode: None,
-            instruction: None,
-            workstream: "Invoice export".into(),
-            new_workstream: false,
-            details: serde_json::Value::Null,
+            spawn: Box::new(SpawnGate {
+                from: "orchestrator".into(),
+                name: "csv-worker".into(),
+                role: "exports CSV files".into(),
+                host: "build-box".into(),
+                driver: "OpenCode".into(),
+                model: Some("deepseek".into()),
+                cwd: "/w".into(),
+                mode: None,
+                instruction: None,
+                workstream: "Invoice export".into(),
+                new_workstream: false,
+                details: serde_json::Value::Null,
+            }),
             choices: vec![GateChoice::agent(
                 "allow_once",
                 "Allow once",
@@ -730,6 +742,7 @@ mod tests {
         let v = serde_json::to_value(&g).unwrap();
         assert_eq!(v["gate_type"], "spawn");
         assert!(v.get("mode").is_none());
+        assert_eq!(v["name"], "csv-worker");
         let back: GateRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back, g);
         assert_eq!(back.request_id(), "wasl-spawn-r1");
