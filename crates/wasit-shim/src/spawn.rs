@@ -252,6 +252,9 @@ fn launch(mut cmd: tokio::process::Command) -> std::io::Result<tokio::process::C
 fn launch(mut cmd: tokio::process::Command) -> std::io::Result<tokio::process::Child> {
     use crate::platform::{DETACHED_FLAGS, DETACHED_FLAGS_NO_BREAKAWAY};
     const ERROR_ACCESS_DENIED: i32 = 5;
+    // CreateProcess inherits every inheritable handle: keep our own stdio (possibly a pipe a
+    // caller is waiting on for EOF) out of the detached shim.
+    crate::platform::uninherit_std_handles();
     cmd.creation_flags(DETACHED_FLAGS);
     match cmd.spawn() {
         // The spawner's job does not allow breakaway: stay in it.

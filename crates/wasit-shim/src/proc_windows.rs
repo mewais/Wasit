@@ -110,7 +110,7 @@ fn new_job() -> io::Result<Job> {
 /// Mark the shim's own standard handles non-inheritable. `CreateProcess` inherits every
 /// inheritable handle, so without this the CLI child (and its descendants) would keep the
 /// launcher's readiness pipe open and the launcher would never see EOF while the CLI runs.
-fn uninherit_std_handles() {
+pub(crate) fn uninherit_std_handles() {
     for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // SAFETY: plain Win32 calls on our own standard handles; failures (no such handle) are
         // harmless and ignored.
