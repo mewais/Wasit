@@ -500,7 +500,7 @@ impl Core {
                 }
             }
             NoteKind::Runtime(RuntimeNote::RaiseGate { token, gate }) => {
-                self.raise_external(token, gate, rec.t, em, out)
+                self.raise_external(token, *gate, rec.t, em, out)
             }
             NoteKind::Runtime(RuntimeNote::ResolveGate { token, request_id }) => {
                 self.resolve_external(token, request_id, em, out)
@@ -1147,7 +1147,7 @@ mod tests {
             Kind::Note,
             RuntimeNote::RaiseGate {
                 token: "r0".into(),
-                gate: handoff("x0"),
+                gate: Box::new(handoff("x0")),
             }
             .to_value(),
         );
@@ -1175,7 +1175,7 @@ mod tests {
             Kind::Note,
             RuntimeNote::RaiseGate {
                 token: "r1".into(),
-                gate: handoff("x1"),
+                gate: Box::new(handoff("x1")),
             }
             .to_value(),
         );
@@ -1189,7 +1189,7 @@ mod tests {
             Kind::Note,
             RuntimeNote::RaiseGate {
                 token: "r2".into(),
-                gate: handoff("x1"),
+                gate: Box::new(handoff("x1")),
             }
             .to_value(),
         );
@@ -1234,7 +1234,7 @@ mod tests {
             Kind::Note,
             RuntimeNote::RaiseGate {
                 token: "r3".into(),
-                gate: handoff("x2"),
+                gate: Box::new(handoff("x2")),
             }
             .to_value(),
         );
@@ -1268,7 +1268,7 @@ mod tests {
             Kind::Note,
             RuntimeNote::RaiseGate {
                 token: "r4".into(),
-                gate: handoff("x3"),
+                gate: Box::new(handoff("x3")),
             }
             .to_value(),
         );

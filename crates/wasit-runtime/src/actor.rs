@@ -883,7 +883,7 @@ impl Actor {
         let data = match op {
             GateOp::Raise(gate) => RuntimeNote::RaiseGate {
                 token: tok.clone(),
-                gate,
+                gate: Box::new(gate),
             },
             GateOp::Resolve { request_id } => RuntimeNote::ResolveGate {
                 token: tok.clone(),

@@ -25,7 +25,10 @@ pub(crate) enum RuntimeNote {
     /// orchestration handoff). It is pending like any CLI gate until answered with
     /// `answer_gate` / `answer_question` (journaled as a `command` note, never sent to the CLI)
     /// or withdrawn with `resolve_gate`.
-    RaiseGate { token: String, gate: GateRequest },
+    RaiseGate {
+        token: String,
+        gate: Box<GateRequest>,
+    },
     /// An external gate was withdrawn by its owner without an answer.
     ResolveGate { token: String, request_id: String },
 }
