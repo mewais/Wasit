@@ -166,7 +166,7 @@ pub(crate) struct Actor {
     cfg: Arc<RuntimeConfig>,
     core: Core,
     file: SessionFile,
-    file_tx: watch::Sender<SessionFile>,
+    file_tx: mpsc::UnboundedSender<Persist>,
     snapshot_tx: watch::Sender<Arc<SessionSnapshot>>,
     notify: SnapshotNotify,
     snapshot_dirty: bool,
@@ -286,8 +286,8 @@ impl Actor {
         let meta = init.file.meta();
         let mut core = Core::new(init.desc.clone(), &meta);
         core.hint_modes(init.cfg.mode_hints.get(&meta.driver));
-        let (file_tx, file_rx) = watch::channel(init.file.clone());
-        tokio::spawn(persist(init.dir.clone(), file_rx));
+        let (file_tx, file_rx) = mpsc::unbounded_channel();
+        tokio::spawn(persist(init.dir.clone(), init.file.clone(), file_rx));
         let source = adopt_source(init.dir.clone(), 1);
         Actor {
             id: meta.id,
@@ -551,7 +551,7 @@ impl Actor {
         let native = self.core.snapshot().native_session_id.clone();
         if native.is_some() && native != self.file.native_session_id {
             self.file.native_session_id = native;
-            self.file_tx.send_replace(self.file.clone());
+            self.save_file(None);
         }
     }
 
@@ -823,11 +823,25 @@ impl Actor {
             Msg::Continue { reply } => self.continue_session(reply),
             Msg::Rename { name, reply } => {
                 self.file.display_name = name.clone();
-                self.file_tx.send_replace(self.file.clone());
+                // The reply is sent by the writer once `session.json` holds the new name:
+                // a rename that returned survives a restart.
+                self.save_file(Some(reply));
                 self.core.set_display_name(name);
                 self.snapshot_dirty = true;
                 self.publish_snapshot();
-                let _ = reply.send(Ok(())); // requester may have given up
+            }
+        }
+    }
+
+    /// Queue a write of the actor's copy of `session.json`; `done` is answered once it is on disk.
+    fn save_file(&mut self, done: Option<oneshot::Sender<Result<(), RuntimeError>>>) {
+        if let Err(mpsc::error::SendError(Persist { done, .. })) = self.file_tx.send(Persist {
+            file: self.file.clone(),
+            done,
+        }) {
+            if let Some(done) = done {
+                let _ = done.send(Err(RuntimeError::Io("session.json writer stopped".into())));
+                // requester may have given up
             }
         }
     }
@@ -969,7 +983,7 @@ impl Actor {
         };
         self.pending_spec = spec.clone();
         self.file.spec = spec;
-        self.file_tx.send_replace(self.file.clone());
+        self.save_file(None);
         self.reconnect_attempt = 0;
         self.pending_continue = Some(reply);
         self.source = Some(spawn_source(shim_spec, self.core.last_seq() + 1));
@@ -1063,16 +1077,39 @@ fn reply_msg_busy(m: Msg) {
     }
 }
 
-/// Write `session.json` whenever the actor's copy changes (coalesced).
-async fn persist(dir: PathBuf, mut rx: watch::Receiver<SessionFile>) {
-    let mut last = rx.borrow_and_update().clone();
-    while rx.changed().await.is_ok() {
-        let current = rx.borrow_and_update().clone();
-        if current != last {
-            if let Err(e) = store::write(&dir, &current).await {
-                tracing::warn!(dir = %dir.display(), error = %e, "cannot write session.json");
+/// A request to write `session.json`; `done` is answered after the write.
+pub(crate) struct Persist {
+    file: SessionFile,
+    done: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+}
+
+/// Write `session.json` whenever the actor's copy changes. Queued requests are coalesced to the
+/// newest copy; every waiter is answered only once that copy is on disk (durability first).
+async fn persist(dir: PathBuf, initial: SessionFile, mut rx: mpsc::UnboundedReceiver<Persist>) {
+    let mut last = initial;
+    while let Some(first) = rx.recv().await {
+        let mut current = first.file;
+        let mut waiters: Vec<_> = first.done.into_iter().collect();
+        while let Ok(next) = rx.try_recv() {
+            current = next.file;
+            waiters.extend(next.done);
+        }
+        let result = if current != last {
+            match store::write(&dir, &current).await {
+                Ok(()) => {
+                    last = current;
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), error = %e, "cannot write session.json");
+                    Err(RuntimeError::Io(format!("write session.json: {e}")))
+                }
             }
-            last = current;
+        } else {
+            Ok(())
+        };
+        for w in waiters {
+            let _ = w.send(result.clone()); // requester may have given up
         }
     }
 }
