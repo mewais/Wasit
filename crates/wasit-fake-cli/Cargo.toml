@@ -2,7 +2,7 @@
 name = "wasit-fake-cli"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Scriptable fake agent CLI speaking the real claude / codex / opencode / kilo wire protocols, for tests"
 
 [lib]
