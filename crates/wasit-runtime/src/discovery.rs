@@ -217,6 +217,7 @@ impl Discovery {
                     capabilities: desc.capabilities(),
                     installed: false,
                     binary_path: None,
+                    error: None,
                     version: None,
                     models: Vec::new(),
                     modes: Vec::new(),
@@ -248,6 +249,9 @@ impl Discovery {
             self.update(&key, |e| {
                 e.installed = false;
                 e.binary_path = None;
+                e.error = Some(format!(
+                    "`{wanted}` was not found (PATH or configured path)"
+                ));
                 e.refreshing = false;
                 e.refreshed_at_ms = now_ms();
                 e.probes = vec![];
@@ -261,6 +265,7 @@ impl Discovery {
         let path_s = path.to_string_lossy().into_owned();
         self.update(&key, |e| {
             e.installed = true;
+            e.error = None;
             e.binary_path = Some(path_s.clone());
         });
         let mut env: Vec<(String, String)> = std::env::vars().collect();

@@ -671,6 +671,9 @@ pub struct DriverInventory {
     pub installed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    /// Why the driver is unusable here (e.g. the binary was not found).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default)]

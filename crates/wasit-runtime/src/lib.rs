@@ -27,7 +27,7 @@ mod store;
 mod stream;
 pub mod wire;
 
-pub use client::{ClientError, RuntimeClient};
+pub use client::{ClientError, RuntimeClient, TypedSubscription};
 pub use config::{DriverOverride, RuntimeConfig, ShimLauncher, Timeouts};
 pub use discovery::{Discovery, DiscoveryConfig};
 pub use manager::{
