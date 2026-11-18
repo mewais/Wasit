@@ -41,6 +41,8 @@ impl RuntimeNote {
 }
 
 /// How the core reads a `note` record.
+// Short-lived value classified per journal record; boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum NoteKind {
     Runtime(RuntimeNote),
