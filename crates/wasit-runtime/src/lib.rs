@@ -28,7 +28,7 @@ mod stream;
 pub mod wire;
 
 pub use client::{ClientError, RuntimeClient, TypedSubscription};
-pub use config::{DriverOverride, RuntimeConfig, ShimLauncher, Timeouts};
+pub use config::{DriverOverride, ModeHints, RuntimeConfig, ShimLauncher, Timeouts};
 pub use discovery::{Discovery, DiscoveryConfig};
 pub use manager::{
     AdoptReport, HostEventStream, SessionEventStream, SessionManager, MAX_HISTORY_PAGE,

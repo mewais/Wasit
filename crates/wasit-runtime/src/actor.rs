@@ -284,7 +284,8 @@ fn deadline_from_journal(t_ms: u64, after: Duration) -> Instant {
 impl Actor {
     pub(crate) fn new(init: ActorInit) -> Self {
         let meta = init.file.meta();
-        let core = Core::new(init.desc.clone(), &meta);
+        let mut core = Core::new(init.desc.clone(), &meta);
+        core.hint_modes(init.cfg.mode_hints.get(&meta.driver));
         let (file_tx, file_rx) = watch::channel(init.file.clone());
         tokio::spawn(persist(init.dir.clone(), file_rx));
         let source = adopt_source(init.dir.clone(), 1);

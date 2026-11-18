@@ -190,6 +190,13 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 impl Core {
+    /// Modes to offer until (unless) the CLI reports its own list.
+    pub(crate) fn hint_modes(&mut self, modes: Vec<wasit_core::SessionMode>) {
+        if self.snap.available_modes.is_empty() {
+            self.snap.available_modes = modes;
+        }
+    }
+
     pub(crate) fn new(desc: Arc<dyn DriverDescriptor>, meta: &SessionMeta) -> Self {
         let snap = blank_snapshot(meta, desc.capabilities(), Phase::Starting, true);
         Core {
@@ -1059,6 +1066,42 @@ mod tests {
     }
 
     const INIT_OK: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"commands":[],"models":[{"value":"haiku","displayName":"Haiku","description":"fast"}],"current_permission_mode":"default"}}}"#;
+
+    /// claude reports only its current permission mode; the discovered choices stay offered.
+    #[test]
+    fn hinted_modes_survive_a_current_mode_only_report() {
+        let desc = wasit_claude::descriptor();
+        let mut c = Core::new(desc, &meta());
+        let mode = |id: &str| wasit_core::SessionMode {
+            id: id.into(),
+            label: id.into(),
+            description: String::new(),
+        };
+        c.hint_modes(vec![mode("manual"), mode("plan")]);
+        let mut j = J::new();
+        for (kind, data) in [
+            (Kind::Spawned, json!({"pid": 7, "argv": ["claude"]})),
+            (
+                Kind::Note,
+                RuntimeNote::Start {
+                    spec: Box::new(SpawnSpec::default()),
+                }
+                .to_value(),
+            ),
+            (Kind::Out, json!(INIT_OK)),
+        ] {
+            let rec = j.push(kind, data);
+            c.apply(&rec);
+        }
+        let ids: Vec<_> = c
+            .snapshot()
+            .available_modes
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(ids, ["manual", "plan"]);
+        assert_eq!(c.snapshot().mode.as_deref(), Some("default"));
+    }
 
     /// Drive a claude session through the core like a live actor would, recording the journal;
     /// then replay the journal through a fresh core and compare everything.

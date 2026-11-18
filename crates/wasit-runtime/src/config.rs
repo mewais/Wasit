@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use wasit_core::{DriverId, DriverRegistry};
+use wasit_core::{DriverId, DriverRegistry, SessionMode};
 use wasit_shim::ShimOptions;
 
 /// How to start a shim process.
@@ -90,6 +90,27 @@ pub struct DriverOverride {
     pub env: Vec<(String, String)>,
 }
 
+/// Modes a driver's CLI offers as discovery found them, shared by [`crate::Discovery`] and the
+/// sessions: a CLI whose protocol reports only the current mode (claude's permission modes)
+/// still shows its choices.
+#[derive(Clone, Default)]
+pub struct ModeHints(std::sync::Arc<std::sync::RwLock<BTreeMap<DriverId, Vec<SessionMode>>>>);
+
+impl ModeHints {
+    pub fn get(&self, driver: &DriverId) -> Vec<SessionMode> {
+        let m = self.0.read().unwrap_or_else(|e| e.into_inner());
+        m.get(driver).cloned().unwrap_or_default()
+    }
+
+    pub fn set(&self, driver: &DriverId, modes: Vec<SessionMode>) {
+        if modes.is_empty() {
+            return;
+        }
+        let mut m = self.0.write().unwrap_or_else(|e| e.into_inner());
+        m.insert(driver.clone(), modes);
+    }
+}
+
 /// Everything a [`crate::SessionManager`] needs.
 #[derive(Clone)]
 pub struct RuntimeConfig {
@@ -107,6 +128,8 @@ pub struct RuntimeConfig {
     pub event_tail: usize,
     /// Per-subscriber queue; a subscriber that falls this far behind is dropped (`Lagged`).
     pub subscriber_queue: usize,
+    /// Filled by a [`crate::Discovery`] made with [`crate::DiscoveryConfig::from_runtime`].
+    pub mode_hints: ModeHints,
 }
 
 impl RuntimeConfig {
@@ -120,6 +143,7 @@ impl RuntimeConfig {
             overrides: BTreeMap::new(),
             event_tail: 2048,
             subscriber_queue: 1024,
+            mode_hints: ModeHints::default(),
         }
     }
 

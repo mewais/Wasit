@@ -41,6 +41,8 @@ pub struct DiscoveryConfig {
     /// Probes running at once across all drivers and projects (each may start a CLI process;
     /// more wait their turn, and their deadline starts when they run).
     pub max_concurrent_probes: usize,
+    /// Discovered modes are shared here with the sessions (see [`crate::config::ModeHints`]).
+    pub mode_hints: crate::config::ModeHints,
 }
 
 impl DiscoveryConfig {
@@ -53,6 +55,7 @@ impl DiscoveryConfig {
             list_timeout: Duration::from_secs(15),
             max_output: 4 * 1024 * 1024,
             max_concurrent_probes: 4,
+            mode_hints: Default::default(),
         }
     }
 
@@ -60,6 +63,7 @@ impl DiscoveryConfig {
     pub fn from_runtime(cfg: &RuntimeConfig) -> Self {
         let mut d = DiscoveryConfig::new(cfg.registry.clone());
         d.overrides = cfg.overrides.clone();
+        d.mode_hints = cfg.mode_hints.clone();
         d
     }
 }
@@ -355,7 +359,10 @@ impl Discovery {
                         match d {
                             Discovered::Version(v) => e.version = Some(v),
                             Discovered::Models(m) => e.models = m,
-                            Discovered::Modes(m) => e.modes = m,
+                            Discovered::Modes(m) => {
+                                cfg.mode_hints.set(&key.1, m.clone());
+                                e.modes = m
+                            }
                             Discovered::Sessions(s) => e.sessions = s,
                             Discovered::Config(c) => config.get_or_insert_with(Vec::new).extend(c),
                         }
