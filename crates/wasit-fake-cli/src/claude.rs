@@ -25,6 +25,7 @@ pub struct ClaudeArgs {
     pub resume: Option<String>,
     pub session_id: Option<String>,
     pub partial_messages: bool,
+    pub mcp_config: Option<String>,
 }
 
 impl ClaudeArgs {
@@ -38,6 +39,7 @@ impl ClaudeArgs {
                 "--permission-mode" => a.permission_mode = next,
                 "--resume" | "-r" => a.resume = next,
                 "--session-id" => a.session_id = next,
+                "--mcp-config" => a.mcp_config = next,
                 "--include-partial-messages" => a.partial_messages = true,
                 _ => {
                     i += 1;
@@ -62,6 +64,7 @@ pub struct Claude {
     /// Pending gated tool call: (tool_use_id, request_id).
     tool_use_id: String,
     msg_id: String,
+    mcp: std::collections::BTreeMap<String, crate::mcp::McpLaunch>,
 }
 
 fn resolve_model(m: &str) -> String {
@@ -123,6 +126,11 @@ impl Claude {
             scenario: scenario.clone(),
             tool_use_id: String::new(),
             msg_id: String::new(),
+            mcp: args
+                .mcp_config
+                .as_deref()
+                .map(crate::mcp::servers_from_config)
+                .unwrap_or_default(),
         }
     }
 
@@ -760,6 +768,10 @@ impl Persona for Claude {
             vec![("tool_result_meta", json!([]))],
         );
         io.send(&m);
+    }
+
+    fn mcp_server(&self, name: &str) -> Option<crate::mcp::McpLaunch> {
+        self.mcp.get(name).cloned()
     }
 
     fn turn_end(&mut self, io: &mut Io, outcome: &Outcome, stats: &mut TurnStats) {

@@ -83,6 +83,7 @@ Steps (`{"type": "<name>", …}`):
 | `hang` | | stop answering anything (stdin is drained until EOF) |
 | `garbage` | `line?` | one malformed stdout line |
 | `stderr` | `text` | write to stderr |
+| `mcp_call` | `server`, `tool`, `arguments`, `save_as?` | claude persona: start the stdio MCP server `server` from `--mcp-config`, call `tool`, show it as a tool call `mcp__<server>__<tool>`; `save_as` keeps the result (JSON when it parses) for `{{name.path.0.x}}` placeholders in later `say` texts and `mcp_call` arguments |
 
 Protocol-level requests are answered without scenario help: initialize, session/thread creation,
 load/resume/fork/close/list, set mode / model / config option, interrupt / cancel (turn ends as

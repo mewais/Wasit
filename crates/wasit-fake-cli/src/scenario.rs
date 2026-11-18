@@ -200,6 +200,20 @@ pub enum Step {
     },
     /// Write text to stderr.
     Stderr { text: String },
+    /// Call a tool of one of the MCP servers the CLI was configured with (claude persona:
+    /// `--mcp-config`) and show it as a tool call. `save_as` keeps the result (parsed as JSON
+    /// when it is JSON) for `{{name.path}}` placeholders in later steps' text and arguments.
+    McpCall(McpCallStep),
+}
+
+/// See [`Step::McpCall`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct McpCallStep {
+    pub server: String,
+    pub tool: String,
+    pub arguments: Value,
+    pub save_as: Option<String>,
 }
 
 /// One turn script.
@@ -390,6 +404,22 @@ impl TurnBuilder {
                 ..ToolStep::default()
             },
         }
+    }
+    /// Call `tool` on the configured MCP server `server`; `save_as` keeps the result for
+    /// `{{name.path}}` placeholders in later steps.
+    pub fn mcp_call(
+        self,
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: Value,
+        save_as: Option<&str>,
+    ) -> Self {
+        self.step(Step::McpCall(McpCallStep {
+            server: server.into(),
+            tool: tool.into(),
+            arguments,
+            save_as: save_as.map(str::to_string),
+        }))
     }
     pub fn ask_question(self, question: impl Into<String>, options: &[(&str, &str)]) -> Self {
         self.step(Step::AskQuestion(AskStep {

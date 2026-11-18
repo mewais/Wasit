@@ -21,6 +21,7 @@ pub mod cli;
 pub mod codex;
 pub mod engine;
 pub mod io;
+pub mod mcp;
 pub mod reference;
 pub mod scenario;
 pub mod util;

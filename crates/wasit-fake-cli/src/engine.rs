@@ -75,6 +75,10 @@ pub trait Persona {
     ) -> Option<Value>;
     fn plan_answered(&mut self, _io: &mut Io, _body: &Value, _stats: &mut TurnStats) {}
     fn turn_end(&mut self, io: &mut Io, outcome: &Outcome, stats: &mut TurnStats);
+    /// The MCP server `name` this CLI was configured with (for `mcp_call` steps).
+    fn mcp_server(&self, _name: &str) -> Option<crate::mcp::McpLaunch> {
+        None
+    }
 }
 
 /// Per-process scenario cursor.
@@ -180,12 +184,44 @@ fn run_turn<P: Persona>(
     };
     p.turn_begin(io, prompt, &mut stats);
     let mut outcome = Outcome::Completed;
+    // Results saved by `mcp_call` steps, for `{{name.path}}` placeholders.
+    let mut vars: std::collections::BTreeMap<String, Value> = Default::default();
     for step in &turn.steps {
         let wake = match step {
             Step::Say { text, chunks } => {
+                let text = &crate::mcp::substitute(text, &vars);
                 p.say(io, text, chunks.unwrap_or(1), &mut stats);
                 stats.final_text = text.clone();
                 stats.said.push(text.clone());
+                Wake::Done
+            }
+            Step::McpCall(c) => {
+                stats.tool_calls += 1;
+                let args = crate::mcp::substitute_json(&c.arguments, &vars);
+                let r = match p.mcp_server(&c.server) {
+                    Some(server) => crate::mcp::call(&server, &c.tool, &args),
+                    None => Err(format!("no MCP server named {:?} is configured", c.server)),
+                };
+                let text = match &r {
+                    Ok(t) => t.clone(),
+                    Err(e) => format!("error: {e}"),
+                };
+                if let Some(name) = &c.save_as {
+                    let v = match &r {
+                        Ok(t) => serde_json::from_str(t).unwrap_or(Value::String(t.clone())),
+                        Err(e) => serde_json::json!({ "error": e }),
+                    };
+                    vars.insert(name.clone(), v);
+                }
+                let tool = crate::scenario::ToolStep {
+                    name: format!("mcp__{}__{}", c.server, c.tool),
+                    input: args,
+                    needs_permission: false,
+                    result_if_allowed: Some(text),
+                    result_if_denied: None,
+                    title: None,
+                };
+                p.tool_call(io, &tool, &mut stats);
                 Wake::Done
             }
             Step::Think { text } => {
