@@ -273,6 +273,40 @@ impl Discovery {
             return;
         };
         let path_s = path.to_string_lossy().into_owned();
+        // A folder that is not there (a half-typed path, a deleted project) has nothing to
+        // discover: say so at once instead of starting the CLI's probes for it.
+        if let Some(project) = &key.0 {
+            let is_dir = tokio::fs::metadata(project)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                let error = format!("project folder {project:?} does not exist");
+                // What the folder cannot change (version, models, modes) comes from the
+                // host-wide inventory when it has one.
+                let global = lock(&self.inner.state)
+                    .entries
+                    .get(&(None, key.1.clone()))
+                    .cloned();
+                self.update(&key, |e| {
+                    e.installed = true;
+                    e.binary_path = Some(path_s.clone());
+                    e.error = Some(error);
+                    e.refreshing = false;
+                    e.refreshed_at_ms = now_ms();
+                    e.probes = vec![];
+                    e.version = global.as_ref().and_then(|g| g.version.clone());
+                    e.models = global
+                        .as_ref()
+                        .map(|g| g.models.clone())
+                        .unwrap_or_default();
+                    e.modes = global.as_ref().map(|g| g.modes.clone()).unwrap_or_default();
+                    e.sessions.clear();
+                    e.config.clear();
+                });
+                return;
+            }
+        }
         self.update(&key, |e| {
             e.installed = true;
             e.error = None;

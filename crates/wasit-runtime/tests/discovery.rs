@@ -139,3 +139,42 @@ async fn missing_binary_is_reported_not_installed() {
         assert_eq!(e.project.as_deref(), Some("/tmp"));
     }
 }
+
+#[tokio::test]
+async fn a_folder_that_does_not_exist_runs_no_probes() {
+    let d = TempDir::new();
+    let sc = Scenario::builder()
+        .version("9.9.9")
+        .model("p/alpha", "Alpha")
+        .build();
+    let path = d.path().join("sc.json");
+    sc.write_to(&path).unwrap();
+    let mut cfg = DiscoveryConfig::new(default_registry());
+    for drv in DRIVERS {
+        cfg.overrides.insert(
+            DriverId::new(drv),
+            DriverOverride {
+                binary: Some(fake().to_string_lossy().into_owned()),
+                env: vec![
+                    ("WASIT_FAKE_PERSONA".into(), drv.into()),
+                    ("WASIT_FAKE_SCENARIO".into(), path.to_string_lossy().into()),
+                ],
+            },
+        );
+    }
+    let disc = Discovery::new(cfg);
+    settled(&disc, None).await;
+    // A half-typed path: answered at once, the host-wide models kept, nothing started.
+    let gone = d.path().join("no-such-fold");
+    let gone = gone.to_string_lossy();
+    let inv = settled(&disc, Some(&gone)).await;
+    for e in &inv.drivers {
+        assert!(e.installed, "{e:?}");
+        assert!(e.probes.is_empty(), "{e:?}");
+        assert!(
+            e.error.as_deref().unwrap().contains("does not exist"),
+            "{e:?}"
+        );
+        assert!(e.models.iter().any(|m| m.id == "p/alpha"), "{e:?}");
+    }
+}
