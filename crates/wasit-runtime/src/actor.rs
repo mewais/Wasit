@@ -459,6 +459,7 @@ impl Actor {
     fn lose(&mut self, reason: &str) {
         let events = self.core.mark_lost(reason);
         if !events.is_empty() {
+            self.snapshot_dirty = true;
             self.publish(events);
         }
         self.fail_pending(reason);
@@ -861,6 +862,12 @@ impl Actor {
                 "the session is still running".into(),
             ))); // requester may have given up
             return;
+        }
+        if self.stream_is_live && self.stream.is_some() {
+            // The previous generation's shim is only lingering to deliver records we already
+            // have (its process ended); let it go.
+            self.stream = None;
+            self.drop_connection();
         }
         if self.pending_continue.is_some() || self.source.is_some() || self.stream.is_some() {
             let _ = reply.send(Err(RuntimeError::InvalidState(
