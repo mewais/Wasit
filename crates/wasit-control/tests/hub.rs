@@ -284,9 +284,98 @@ async fn non_retryable_provisioning_error_is_failed_and_retryable_backs_off() {
         ]
     );
     match states.last().unwrap() {
-        LinkState::Failed { reason } => assert!(reason.contains("copy failed #2")),
+        LinkState::Failed { reason, .. } => assert!(reason.contains("copy failed #2")),
         _ => unreachable!(),
     }
+    hub.shutdown().await;
+}
+
+/// Configuration problems (unknown WSL distro, no helper build, foreign bootstrap output,
+/// permission denied, a transport program that cannot start) fail the link without retrying;
+/// only a manual reconnect tries again. Transport drops back off and retry.
+#[tokio::test]
+async fn configuration_problems_fail_without_retrying() {
+    let cases = vec![
+        (
+            ConnectError::Command {
+                kind: CommandFailureKind::UnknownDistro,
+                exit_code: Some(1),
+                stderr: "There is no distribution with the supplied name.".into(),
+            },
+            Some(CommandFailureKind::UnknownDistro),
+        ),
+        (
+            ConnectError::Command {
+                kind: CommandFailureKind::UnsupportedPlatform,
+                exit_code: None,
+                stderr: "no helper for linux/riscv64".into(),
+            },
+            Some(CommandFailureKind::UnsupportedPlatform),
+        ),
+        (
+            ConnectError::Command {
+                kind: CommandFailureKind::UnexpectedOutput,
+                exit_code: None,
+                stderr: "Welcome to my server".into(),
+            },
+            Some(CommandFailureKind::UnexpectedOutput),
+        ),
+        (
+            ConnectError::Command {
+                kind: CommandFailureKind::PermissionDenied,
+                exit_code: Some(126),
+                stderr: "Permission denied".into(),
+            },
+            Some(CommandFailureKind::PermissionDenied),
+        ),
+        (
+            ConnectError::Spawn("wsl.exe: program not found".into()),
+            None,
+        ),
+    ];
+    for (err, problem) in cases {
+        let mc = Arc::new(MemConnector::default());
+        mc.set_target("r1", daemon("r1", "v1"));
+        mc.script("r1", vec![err.clone()]);
+        let hub = Hub::new(hub_cfg("hub", "v1"), mc.clone(), None);
+        let mut ev = hub.events();
+        hub.add_link(spec("r1")).unwrap();
+        let states = collect_until(&mut ev, "r1", |s| matches!(s, LinkState::Failed { .. })).await;
+        assert_eq!(names(&states), ["connecting", "failed"], "{err:?}");
+        match &states[1] {
+            LinkState::Failed { problem: p, .. } => assert_eq!(*p, problem, "{err:?}"),
+            _ => unreachable!(),
+        }
+        let mut attempts = mc.attempts.subscribe();
+        let retried =
+            tokio::time::timeout(Duration::from_millis(300), attempts.wait_for(|n| *n > 1))
+                .await
+                .is_ok();
+        assert!(!retried, "failed link retried on its own: {err:?}");
+        hub.reconnect_now(&HostId::from("r1"));
+        let states = collect_until(&mut ev, "r1", LinkState::is_connected).await;
+        assert_eq!(names(&states), ["connecting", "connected"]);
+        hub.shutdown().await;
+    }
+    // A transport drop is retried with backoff.
+    let mc = Arc::new(MemConnector::default());
+    mc.set_target("r1", daemon("r1", "v1"));
+    mc.script(
+        "r1",
+        vec![ConnectError::Command {
+            kind: CommandFailureKind::Unreachable,
+            exit_code: Some(255),
+            stderr: "Connection reset by peer".into(),
+        }],
+    );
+    let hub = Hub::new(hub_cfg("hub", "v1"), mc.clone(), None);
+    let mut ev = hub.events();
+    hub.add_link(spec("r1")).unwrap();
+    let states = collect_until(&mut ev, "r1", LinkState::is_connected).await;
+    assert_eq!(
+        names(&states),
+        ["connecting", "reconnecting", "connecting", "connected"]
+    );
     hub.shutdown().await;
 }
 

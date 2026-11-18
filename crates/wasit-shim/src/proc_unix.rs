@@ -84,7 +84,7 @@ pub(crate) async fn spawn(_cfg: &Config) -> Result<Spawned, Error> {
     let (shim_end, guard_end) = std::os::unix::net::UnixStream::pair()?;
     let guard_raw = guard_end.as_raw_fd();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let mut cmd = tokio::process::Command::new(self_exe()?);
+    let mut cmd = wasit_process::command(self_exe()?);
     cmd.args(&args)
         .env(ROLE_ENV, "guard")
         .stdin(Stdio::piped())
@@ -181,7 +181,7 @@ pub(crate) fn run_guard(cfg: &Config) -> i32 {
         }
     }
     let guard_pid = std::process::id() as libc::pid_t;
-    let mut cmd = std::process::Command::new(&cfg.program);
+    let mut cmd = wasit_process::std_command(&cfg.program);
     cmd.args(&cfg.args).env_remove(ROLE_ENV);
     for (k, v) in &cfg.env {
         cmd.env(k, v);

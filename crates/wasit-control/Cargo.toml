@@ -10,6 +10,7 @@ description = "Wasit control protocol: wire types, framing, client, server, link
 ts = ["dep:ts-rs"]
 
 [dependencies]
+wasit-process = { path = "../wasit-process" }
 ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -188,6 +188,7 @@ pub fn run_discovery(kind: PersonaKind, args: &[String], scenario: &Scenario) ->
 
 /// Entry point used by `main`.
 pub fn main_with(args: Vec<String>) -> i32 {
+    report_console(&args);
     let exe = std::env::args()
         .next()
         .map(|a| {
@@ -240,6 +241,29 @@ pub fn main_with(args: Vec<String>) -> i32 {
         }
     }
     0
+}
+
+/// `WASIT_FAKE_CONSOLE_REPORT=<file>`: append `<pid> <none|hidden|visible> <args>` — whether
+/// this process got a visible console window (Windows; always `none` elsewhere). The
+/// no-console-window tests read it.
+pub fn report_console(args: &[String]) {
+    let Some(path) = std::env::var_os("WASIT_FAKE_CONSOLE_REPORT") else {
+        return;
+    };
+    #[cfg(windows)]
+    let state = wasit_process::winprobe::own_console_window().as_str();
+    #[cfg(not(windows))]
+    let state = "none";
+    let line = format!("{} {state} {}\n", std::process::id(), args.join(" "));
+    use std::io::Write;
+    // Test instrumentation: a failed write shows up as a missing report line.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 #[cfg(test)]

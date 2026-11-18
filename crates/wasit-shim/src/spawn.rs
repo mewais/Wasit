@@ -178,7 +178,7 @@ pub async fn spawn_detached(spec: &ShimSpec) -> Result<ShimHandle, Error> {
         .create(true)
         .append(true)
         .open(spec.dir.join(LOG_FILE))?;
-    let mut cmd = tokio::process::Command::new(&spec.shim_program);
+    let mut cmd = wasit_process::command(&spec.shim_program);
     cmd.args(&spec.shim_args)
         .args(spec.to_args())
         .stdin(Stdio::null())

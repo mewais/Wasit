@@ -9,7 +9,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
@@ -32,6 +31,19 @@ pub enum CommandFailureKind {
     Unreachable,
     /// The remote helper (e.g. `marsad-agent`) is not installed.
     CommandNotFound,
+    /// WSL has no distribution with the configured name.
+    UnknownDistro,
+    /// WSL itself is missing or has no distribution installed.
+    WslUnavailable,
+    /// A program could not be executed (not executable, access denied) — not a sign-in problem.
+    PermissionDenied,
+    /// There is no helper build for the host's OS/architecture.
+    UnsupportedPlatform,
+    /// The helper build for the host's platform is missing from this installation.
+    HelperMissing,
+    /// The host answered with something that is not the helper's protocol (a shell banner, an
+    /// error page, …).
+    UnexpectedOutput,
     Other,
 }
 
@@ -45,12 +57,52 @@ impl CommandFailureKind {
                 | CommandFailureKind::HostKeyChanged
         )
     }
+
+    /// A configuration problem: retrying on a timer cannot fix it; the link fails until the
+    /// user changes something and asks again.
+    pub fn is_configuration(self) -> bool {
+        matches!(
+            self,
+            CommandFailureKind::UnknownDistro
+                | CommandFailureKind::WslUnavailable
+                | CommandFailureKind::PermissionDenied
+                | CommandFailureKind::UnsupportedPlatform
+                | CommandFailureKind::HelperMissing
+                | CommandFailureKind::UnexpectedOutput
+        )
+    }
+
+    /// Worth retrying with backoff (the network or the peer may come back).
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            CommandFailureKind::Unreachable | CommandFailureKind::Other
+        )
+    }
 }
 
-/// Classify a failed ssh/wsl/command invocation from its exit code and stderr. Pure.
+/// Classify a failed ssh/wsl/command invocation from its exit code and stderr (raw bytes may be
+/// UTF-16LE, as `wsl.exe` writes them: decode with [`wasit_process::decode_console_output`]
+/// first). Pure.
 pub fn classify_command_failure(exit_code: Option<i32>, stderr: &str) -> CommandFailureKind {
     let s = stderr.to_ascii_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|n| s.contains(n));
+
+    if has(&[
+        "there is no distribution with the supplied name",
+        "wsl_e_distro_not_found",
+    ]) {
+        return CommandFailureKind::UnknownDistro;
+    }
+    if has(&[
+        "windows subsystem for linux has no installed distributions",
+        "windows subsystem for linux is not installed",
+        "wsl_e_default_distro_not_found",
+        "the windows subsystem for linux optional component is not enabled",
+        "wsl.exe: not found",
+    ]) {
+        return CommandFailureKind::WslUnavailable;
+    }
 
     if has(&[
         "remote host identification has changed",
@@ -71,7 +123,8 @@ pub fn classify_command_failure(exit_code: Option<i32>, stderr: &str) -> Command
         return CommandFailureKind::HostKeyUnknown;
     }
     if has(&[
-        "permission denied",
+        "permission denied (",
+        "permission denied, please try again",
         "too many authentication failures",
         "authentication failed",
         "no supported authentication methods",
@@ -96,6 +149,9 @@ pub fn classify_command_failure(exit_code: Option<i32>, stderr: &str) -> Command
         "timeout, server",
     ]) {
         return CommandFailureKind::Unreachable;
+    }
+    if exit_code == Some(126) || has(&["permission denied", "cannot execute", "access is denied"]) {
+        return CommandFailureKind::PermissionDenied;
     }
     if exit_code == Some(127)
         || has(&[
@@ -182,14 +238,14 @@ impl ChildHandle {
         self.pid
     }
 
-    /// The last bytes the child wrote to stderr (lossy UTF-8).
+    /// The last bytes the child wrote to stderr (UTF-8, or UTF-16LE as `wsl.exe` writes it).
     pub fn stderr_tail(&self) -> String {
         let t = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
         let (a, b) = t.buf.as_slices();
         let mut v = Vec::with_capacity(a.len() + b.len());
         v.extend_from_slice(a);
         v.extend_from_slice(b);
-        String::from_utf8_lossy(&v).trim().to_owned()
+        wasit_process::decode_console_output(&v).trim().to_owned()
     }
 
     pub fn exit(&self) -> Option<ExitInfo> {
@@ -231,7 +287,7 @@ impl CommandTransport {
             .argv
             .split_first()
             .ok_or_else(|| ConnectError::Spawn("empty argv".into()))?;
-        let mut cmd = Command::new(program);
+        let mut cmd = wasit_process::command(program);
         cmd.args(args)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
@@ -375,6 +431,11 @@ mod tests {
             (Some(1), "'marsad-agent' is not recognized as an internal or external command,\r\noperable program or batch file.", K::CommandNotFound),
             (Some(1), "<3>WSL (123) ERROR: CreateProcessParseCommon:711: execvpe(marsad-agent) failed: No such file or directory", K::CommandNotFound),
             (Some(1), "something else broke", K::Other),
+            (Some(1), "There is no distribution with the supplied name.\r\nError code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND", K::UnknownDistro),
+            (Some(1), "Windows Subsystem for Linux has no installed distributions.", K::WslUnavailable),
+            (Some(126), "sh: 1: /home/u/.marsad/bin/marsad-agent: Permission denied", K::PermissionDenied),
+            (Some(255), "u@h: Permission denied (publickey).", K::AuthNeeded),
+            (Some(255), "Permission denied, please try again.", K::AuthNeeded),
             (None, "", K::Other),
         ];
         for (code, stderr, want) in cases {
@@ -387,5 +448,30 @@ mod tests {
         assert!(K::AuthNeeded.needs_human());
         assert!(K::HostKeyChanged.needs_human());
         assert!(!K::Unreachable.needs_human());
+        for k in [
+            K::UnknownDistro,
+            K::WslUnavailable,
+            K::PermissionDenied,
+            K::UnsupportedPlatform,
+            K::HelperMissing,
+            K::UnexpectedOutput,
+        ] {
+            assert!(
+                k.is_configuration() && !k.is_transient() && !k.needs_human(),
+                "{k:?}"
+            );
+        }
+        assert!(K::Unreachable.is_transient() && !K::Unreachable.is_configuration());
+    }
+
+    #[test]
+    fn classifies_utf16_wsl_output_after_decoding() {
+        // The owner's report: wsl.exe wrote this as UTF-16LE.
+        let raw: Vec<u8> = "There is no distribution with the supplied name.\r\n"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let text = wasit_process::decode_console_output(&raw);
+        assert_eq!(classify_command_failure(Some(1), &text), K::UnknownDistro);
     }
 }

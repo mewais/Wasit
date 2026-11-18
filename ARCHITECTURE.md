@@ -68,6 +68,7 @@ resolved copy of Wasit in any build. Local development uses a `[patch]` section 
 | `wasit-runtime` | Session actor, journal reader, session state reducer, host-level session manager (§3.3). |
 | `wasit-control` | Control protocol: wire types, framing, client, server, link supervisor (§4). |
 | `wasit-fake-cli` | Scriptable fake agent CLI speaking each real wire protocol, for tests. |
+| `wasit-process` | The ONLY place processes are created, in all three repos: `command` / `std_command` (`CREATE_NO_WINDOW` on Windows: no console window ever flashes) and `detached_command` + `spawn_detached` for daemons; `decode_console_output` (UTF-16LE from `wsl.exe`). A source-scan test per repo fails on any other `Command::new`. |
 
 ### 2.2 Wasl crates (after rebuild)
 

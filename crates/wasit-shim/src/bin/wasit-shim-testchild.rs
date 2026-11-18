@@ -67,7 +67,7 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(1000));
         },
         "spawn-sleep" => {
-            let mut c = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut c = wasit_process::std_command(std::env::current_exe().unwrap())
                 .arg("sleep")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())

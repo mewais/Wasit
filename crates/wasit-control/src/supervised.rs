@@ -113,9 +113,14 @@ pub enum LinkState {
         ours: ProtocolVersion,
         theirs: ProtocolVersion,
     },
-    /// Gave up until `reconnect_now`.
+    /// Gave up until `reconnect_now`: a configuration problem (see
+    /// [`CommandFailureKind::is_configuration`]) or provisioning that cannot succeed.
     Failed {
         reason: String,
+        /// What kind of problem, when known (lets a UI word it and say what to do).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        problem: Option<CommandFailureKind>,
     },
     Stopped,
 }
@@ -386,6 +391,7 @@ async fn run(
                     last_error = format!("peer needs provisioning: {reason:?}");
                     let fallback = LinkState::Failed {
                         reason: last_error.clone(),
+                        problem: None,
                     };
                     Next::Provision { reason, fallback }
                 } else {
@@ -442,8 +448,22 @@ async fn run(
                         },
                         fallback: LinkState::Failed {
                             reason: format!("helper not installed: {stderr}"),
+                            problem: Some(CommandFailureKind::CommandNotFound),
                         },
                     },
+                    // Configuration problems: a timer cannot fix them.
+                    ConnectError::Command { kind, stderr, .. } if kind.is_configuration() => {
+                        Next::Park(LinkState::Failed {
+                            reason: stderr,
+                            problem: Some(kind),
+                        })
+                    }
+                    // The local transport program cannot be started (missing, not
+                    // executable): retrying will not help either.
+                    ConnectError::Spawn(m) => Next::Park(LinkState::Failed {
+                        reason: format!("cannot start the connection command: {m}"),
+                        problem: None,
+                    }),
                     ConnectError::Command { kind, stderr, .. } if kind.needs_human() => {
                         Next::Park(LinkState::AuthNeeded {
                             problem: kind,
@@ -463,6 +483,7 @@ async fn run(
                 match &hooks {
                     _ if already => Next::Park(LinkState::Failed {
                         reason: format!("still failing after provisioning: {last_error}"),
+                        problem: None,
                     }),
                     None => Next::Park(fallback),
                     Some(h) => {
@@ -489,6 +510,7 @@ async fn run(
                             }
                             Ok(Some(Err(pe))) => Next::Park(LinkState::Failed {
                                 reason: format!("provisioning failed: {}", pe.message),
+                                problem: None,
                             }),
                         }
                     }

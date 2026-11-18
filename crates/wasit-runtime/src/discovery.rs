@@ -571,7 +571,7 @@ async fn exec(
     max: usize,
 ) -> Result<ProbeOutput, String> {
     let (prog, args) = argv.split_first().ok_or("empty probe command")?;
-    let mut cmd = tokio::process::Command::new(prog);
+    let mut cmd = wasit_process::command(prog);
     cmd.args(args).envs(env.iter().map(|(k, v)| (k, v)));
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -613,7 +613,7 @@ async fn handshake(
 ) -> Result<ProbeOutput, String> {
     let argv = desc.argv(spec);
     let (prog, args) = argv.split_first().ok_or("empty argv")?;
-    let mut cmd = tokio::process::Command::new(prog);
+    let mut cmd = wasit_process::command(prog);
     cmd.args(args)
         .envs(desc.env(spec))
         .stdin(Stdio::piped())

@@ -212,19 +212,13 @@ async fn start_daemon(path: String, host: String, build: String) -> std::io::Res
     use std::process::Stdio;
     use tokio::io::AsyncBufReadExt;
     let exe = std::env::current_exe()?;
-    let mut cmd = tokio::process::Command::new(exe);
+    // Detached: the daemon outlives this bridge.
+    let mut cmd = wasit_process::detached_command(exe);
     cmd.args(["serve-local", &path, "--host", &host, "--build", &build])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    #[cfg(windows)]
-    {
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the daemon outlives this bridge.
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
-    }
-    let mut child = cmd.spawn()?;
+    let mut child = wasit_process::spawn_detached(&mut cmd)?;
     let stdout = child
         .stdout
         .take()

@@ -13,6 +13,7 @@ name = "wasit-shim"
 path = "src/main.rs"
 
 [dependencies]
+wasit-process = { path = "../wasit-process" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

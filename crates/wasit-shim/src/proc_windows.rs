@@ -126,7 +126,7 @@ pub(crate) fn uninherit_std_handles() {
 pub(crate) async fn spawn(cfg: &Config) -> Result<Spawned, Error> {
     uninherit_std_handles();
     let job = new_job()?;
-    let mut cmd = tokio::process::Command::new(&cfg.program);
+    let mut cmd = wasit_process::command(&cfg.program);
     cmd.args(&cfg.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

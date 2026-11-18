@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use serde_json::{json, Value};
 
@@ -66,7 +66,7 @@ pub fn servers_from_config(cfg: &str) -> BTreeMap<String, McpLaunch> {
 /// Call `tool` with `arguments`. `Ok(text)` with the tool's text content, `Err(text)` when the
 /// tool reported an error (or the server could not be used).
 pub fn call(server: &McpLaunch, tool: &str, arguments: &Value) -> Result<String, String> {
-    let mut child = Command::new(&server.command)
+    let mut child = wasit_process::std_command(&server.command)
         .args(&server.args)
         .envs(server.env.iter().cloned())
         .stdin(Stdio::piped())
