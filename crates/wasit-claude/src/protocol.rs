@@ -296,8 +296,10 @@ impl ClaudeProtocol {
                 }
             };
             step.write.push(line);
-            step.events
-                .push(AgentEvent::GateResolved { request_id: id });
+            step.events.push(AgentEvent::GateResolved {
+                request_id: id,
+                reason: None,
+            });
         }
         if self.busy && !self.interrupt_sent {
             self.interrupt_sent = true;
@@ -338,7 +340,10 @@ impl ClaudeProtocol {
                 let id = s(&v, "request_id").to_string();
                 match self.take_gate(&id) {
                     Ok(_) => Step {
-                        events: vec![AgentEvent::GateResolved { request_id: id }],
+                        events: vec![AgentEvent::GateResolved {
+                            request_id: id,
+                            reason: None,
+                        }],
                         ..Step::default()
                     },
                     Err(_) => events(vec![AgentEvent::Unknown { raw: v }]),

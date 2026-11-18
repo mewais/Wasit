@@ -102,25 +102,63 @@ async fn external_gate_survives_restart(driver: &str) {
         .await
         .is_err());
 
-    // Raise + withdraw.
+    // Raise + withdraw: `gate_resolved` with reason "withdrawn", and a late answer is refused
+    // with a typed error.
     mgr.raise_gate(&id, handoff("h-2")).await.unwrap();
-    wait_phase(&mgr, &id, "needs_you").await;
+    let snap = wait_phase(&mgr, &id, "needs_you").await;
+    let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
     mgr.resolve_gate(&id, "h-2").await.unwrap();
+    until(&mut s, |e| is_withdrawn(e, "h-2")).await;
     wait_phase(&mgr, &id, "idle").await;
     assert!(matches!(
         mgr.resolve_gate(&id, "h-2").await,
         Err(CommandError::Rejected { .. })
     ));
+    assert_eq!(
+        late_answer(&mgr, &id, "h-2").await,
+        Err(CommandError::GateWithdrawn {
+            request_id: "h-2".into()
+        })
+    );
 
-    // The gate ends with the process; raising on a stopped session is refused.
+    // The gate ends with the process (withdrawn too); raising on a stopped session is refused.
     mgr.raise_gate(&id, handoff("h-3")).await.unwrap();
+    let snap = wait_phase(&mgr, &id, "needs_you").await;
+    let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
     mgr.stop(&id).await.unwrap();
+    until(&mut s, |e| is_withdrawn(e, "h-3")).await;
     let snap = wait_snapshot(&mgr, &id, "exit", |s| !s.phase.is_live()).await;
     assert!(snap.pending_gates.is_empty());
+    assert!(matches!(
+        late_answer(&mgr, &id, "h-3").await,
+        Err(CommandError::GateWithdrawn { .. })
+    ));
     assert!(matches!(
         mgr.raise_gate(&id, handoff("h-4")).await,
         Err(CommandError::NotRunning { .. })
     ));
+}
+
+fn is_withdrawn(e: &wasit_runtime::wire::SessionEvent, rid: &str) -> bool {
+    is_agent(e, |a| {
+        matches!(a, wasit_core::AgentEvent::GateResolved { request_id, reason }
+            if request_id == rid && reason.as_deref() == Some("withdrawn"))
+    })
+}
+
+async fn late_answer(
+    mgr: &wasit_runtime::SessionManager,
+    id: &wasit_runtime::wire::SessionId,
+    rid: &str,
+) -> Result<wasit_runtime::wire::CommandOutcome, CommandError> {
+    mgr.command(
+        id,
+        Command::AnswerGate {
+            request_id: rid.into(),
+            decision: GateDecision::choose("allow_once"),
+        },
+    )
+    .await
 }
 
 #[tokio::test]

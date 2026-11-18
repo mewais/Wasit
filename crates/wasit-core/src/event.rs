@@ -644,8 +644,14 @@ pub enum AgentEvent {
     GateRequested { gate: GateRequest },
 
     /// A pending gate stopped being pending without the human answering it
-    /// (declined by the protocol on interrupt, or resolved by the CLI).
-    GateResolved { request_id: String },
+    /// (declined by the protocol on interrupt, or resolved by the CLI), or an external gate
+    /// was taken down by its owner or ended with the process (`reason: "withdrawn"`; a late
+    /// answer to it is refused).
+    GateResolved {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 
     /// Usage update. claude: per assistant message; codex: cumulative thread
     /// total; ACP: cost + context window fill.

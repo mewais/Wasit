@@ -239,7 +239,8 @@ fn interrupt_cancels_gates_then_sends_cancel_notification() {
     assert_eq!(
         step.events,
         vec![AgentEvent::GateResolved {
-            request_id: "c2".into()
+            request_id: "c2".into(),
+            reason: None,
         }]
     );
     let ev = p

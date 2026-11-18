@@ -354,6 +354,7 @@ impl CodexProtocol {
             step.write.push(rpc_result(&g.raw_id, interrupt_answer(&g)));
             step.events.push(AgentEvent::GateResolved {
                 request_id: g.routing_id,
+                reason: None,
             });
         }
         match self.active_turn.clone() {
@@ -686,6 +687,7 @@ impl CodexProtocol {
                         let g = self.gates.remove(pos);
                         events(vec![AgentEvent::GateResolved {
                             request_id: g.routing_id,
+                            reason: None,
                         }])
                     }
                     // Our own answer being acknowledged.
@@ -770,6 +772,7 @@ impl CodexProtocol {
         for g in std::mem::take(&mut self.gates) {
             step.events.push(AgentEvent::GateResolved {
                 request_id: g.routing_id,
+                reason: None,
             });
         }
         step.events.push(AgentEvent::TurnCompleted {

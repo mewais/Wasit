@@ -181,7 +181,8 @@ fn interrupt_mid_turn_and_with_pending_gate() {
         })
         .expect("a gate");
     assert!(r.events.contains(&AgentEvent::GateResolved {
-        request_id: gate_id.clone()
+        request_id: gate_id.clone(),
+        reason: None,
     }));
     let deny_pos = r
         .written

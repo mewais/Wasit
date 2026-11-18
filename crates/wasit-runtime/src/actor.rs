@@ -835,14 +835,16 @@ impl Actor {
 
     /// Queue a write of the actor's copy of `session.json`; `done` is answered once it is on disk.
     fn save_file(&mut self, done: Option<oneshot::Sender<Result<(), RuntimeError>>>) {
-        if let Err(mpsc::error::SendError(Persist { done, .. })) = self.file_tx.send(Persist {
+        let sent = self.file_tx.send(Persist {
             file: self.file.clone(),
             done,
-        }) {
-            if let Some(done) = done {
-                let _ = done.send(Err(RuntimeError::Io("session.json writer stopped".into())));
-                // requester may have given up
-            }
+        });
+        if let Err(mpsc::error::SendError(Persist {
+            done: Some(done), ..
+        })) = sent
+        {
+            let _ = done.send(Err(RuntimeError::Io("session.json writer stopped".into())));
+            // requester may have given up
         }
     }
 
@@ -865,6 +867,11 @@ impl Actor {
             let _ = reply.send(Err(CommandError::Rejected {
                 reason: "use sessions.stop to end a session".into(),
             })); // requester may have given up
+            return;
+        }
+        if let Some(request_id) = self.core.answers_withdrawn(&command) {
+            // Also after the process ended: say why the answer did nothing.
+            let _ = reply.send(Err(CommandError::GateWithdrawn { request_id })); // requester may have given up
             return;
         }
         if !self.core.process_running() {

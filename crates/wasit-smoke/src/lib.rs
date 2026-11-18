@@ -85,7 +85,7 @@ impl Live {
             }
             match ev {
                 AgentEvent::GateRequested { gate } => self.last_gate = Some(gate.clone()),
-                AgentEvent::GateResolved { request_id }
+                AgentEvent::GateResolved { request_id, .. }
                     if self.last_gate.as_ref().map(|g| g.request_id()) == Some(request_id) =>
                 {
                     self.last_gate = None

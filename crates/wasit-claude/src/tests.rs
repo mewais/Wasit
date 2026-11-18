@@ -369,7 +369,8 @@ fn interrupt_declines_gates_then_interrupts_and_marks_cancel() {
     assert_eq!(
         step.events,
         vec![AgentEvent::GateResolved {
-            request_id: "g1".into()
+            request_id: "g1".into(),
+            reason: None,
         }]
     );
     // A second interrupt during the same turn writes nothing.

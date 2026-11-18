@@ -190,7 +190,8 @@ fn interrupt_uses_tracked_turn_and_declines_gates() {
     assert_eq!(
         step.events,
         vec![AgentEvent::GateResolved {
-            request_id: "call_1".into()
+            request_id: "call_1".into(),
+            reason: None,
         }]
     );
 }
@@ -286,7 +287,8 @@ fn gates_route_by_item_id_and_encode_per_method() {
     assert_eq!(
         ev,
         vec![AgentEvent::GateResolved {
-            request_id: "f1".into()
+            request_id: "f1".into(),
+            reason: None,
         }]
     );
 }

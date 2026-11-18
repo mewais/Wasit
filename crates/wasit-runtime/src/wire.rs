@@ -91,6 +91,7 @@ pub mod codes {
     pub const SPAWN_FAILED: &str = "spawn_failed";
     pub const IO: &str = "io";
     pub const BUSY: &str = "busy";
+    pub const GATE_WITHDRAWN: &str = "gate_withdrawn";
 }
 
 /// A session id: 12 characters of lowercase RFC 4648 base32 (`a-z2-7`).
@@ -354,6 +355,10 @@ pub enum CommandStatus {
     NotRunning {
         reason: String,
     },
+    /// An answer to an external gate that was withdrawn (its request is gone).
+    Withdrawn {
+        request_id: String,
+    },
 }
 
 impl CommandStatus {
@@ -367,6 +372,9 @@ impl CommandStatus {
             }
             CommandStatus::Rejected { reason } => Err(CommandError::Rejected { reason }),
             CommandStatus::NotRunning { reason } => Err(CommandError::NotRunning { reason }),
+            CommandStatus::Withdrawn { request_id } => {
+                Err(CommandError::GateWithdrawn { request_id })
+            }
         }
     }
 }
@@ -600,6 +608,9 @@ pub enum CommandError {
     Busy,
     #[error("no such session: {id}")]
     SessionNotFound { id: String },
+    /// The gate was withdrawn (the request that raised it is gone); the answer did nothing.
+    #[error("the gate {request_id} is no longer needed (withdrawn)")]
+    GateWithdrawn { request_id: String },
 }
 
 impl CommandError {
@@ -611,6 +622,7 @@ impl CommandError {
             CommandError::Timeout => wasit_control::codes::TIMEOUT,
             CommandError::Busy => codes::BUSY,
             CommandError::SessionNotFound { .. } => codes::SESSION_NOT_FOUND,
+            CommandError::GateWithdrawn { .. } => codes::GATE_WITHDRAWN,
         }
     }
 }

@@ -180,7 +180,16 @@ pub(crate) struct Core {
     /// [`RuntimeNote::RaiseGate`]). They survive turn ends, are answered without the protocol,
     /// and end with the process generation.
     external: BTreeSet<String>,
+    /// Request ids of external gates that were withdrawn or ended with their process (newest
+    /// last, bounded): a late answer to one is refused as [`CommandStatus::Withdrawn`].
+    withdrawn: VecDeque<String>,
 }
+
+/// How many withdrawn external gate ids are remembered for refusing late answers.
+const WITHDRAWN_MEMORY: usize = 256;
+
+/// `GateResolved::reason` of an external gate whose request is gone.
+pub(crate) const WITHDRAWN: &str = "withdrawn";
 
 fn truncate(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
@@ -216,6 +225,7 @@ impl Core {
             prompts: VecDeque::new(),
             stderr_tail: VecDeque::new(),
             external: BTreeSet::new(),
+            withdrawn: VecDeque::new(),
         }
     }
 
@@ -420,6 +430,17 @@ impl Core {
         self.gen = Gen::Exited;
         self.owed.clear();
         self.close_owed = false;
+        // External gates end with the process: their requests are gone.
+        for request_id in std::mem::take(&mut self.external) {
+            self.remember_withdrawn(request_id.clone());
+            let event = AgentEvent::GateResolved {
+                request_id,
+                reason: Some(WITHDRAWN.into()),
+            };
+            let cursor = em.next_cursor();
+            self.reduce(&event, cursor, rec.t);
+            em.push(SessionEventKind::Agent { event });
+        }
         self.clear_live_state();
         self.snap.exit = Some(ExitSummary {
             code: info.code,
@@ -469,6 +490,15 @@ impl Core {
             NoteKind::Runtime(RuntimeNote::Start { spec }) => self.on_start(&spec, rec, em, out),
             NoteKind::Runtime(RuntimeNote::Command { token, command }) => {
                 self.snap.last_activity_ms = rec.t;
+                if let Some(request_id) = self.answers_withdrawn(&command) {
+                    let status = CommandStatus::Withdrawn { request_id };
+                    em.push(SessionEventKind::Input {
+                        command,
+                        status: status.clone(),
+                    });
+                    out.resolved.push((token, status));
+                    return;
+                }
                 if self.answers_external(&command) {
                     self.answer_external(token, command, em, out);
                     return;
@@ -631,6 +661,27 @@ impl Core {
 
     // ── external gates ──────────────────────────────────────────────────────
 
+    /// `command` answers an external gate that was withdrawn (and is not pending again).
+    pub(crate) fn answers_withdrawn(&self, command: &Command) -> Option<String> {
+        match command {
+            Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. }
+                if !self.external.contains(request_id)
+                    && self.withdrawn.iter().any(|w| w == request_id) =>
+            {
+                Some(request_id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn remember_withdrawn(&mut self, request_id: String) {
+        self.withdrawn.retain(|w| *w != request_id);
+        self.withdrawn.push_back(request_id);
+        while self.withdrawn.len() > WITHDRAWN_MEMORY {
+            self.withdrawn.pop_front();
+        }
+    }
+
     /// `command` answers a pending external gate.
     fn answers_external(&self, command: &Command) -> bool {
         match command {
@@ -701,6 +752,10 @@ impl Core {
             CommandStatus::NotRunning {
                 reason: "the process is not running".into(),
             }
+        } else if self.withdrawn.iter().any(|w| *w == rid) {
+            CommandStatus::Rejected {
+                reason: format!("the gate {rid:?} was withdrawn; raise it under a new id"),
+            }
         } else if rid.is_empty()
             || self
                 .snap
@@ -730,7 +785,11 @@ impl Core {
         out: &mut Output,
     ) {
         let status = if self.external.remove(&request_id) {
-            let event = AgentEvent::GateResolved { request_id };
+            self.remember_withdrawn(request_id.clone());
+            let event = AgentEvent::GateResolved {
+                request_id,
+                reason: Some(WITHDRAWN.into()),
+            };
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, em.t);
             em.push(SessionEventKind::Agent { event });
@@ -927,7 +986,7 @@ impl Core {
                     cursor,
                 });
             }
-            AgentEvent::GateResolved { request_id } => {
+            AgentEvent::GateResolved { request_id, .. } => {
                 s.pending_gates
                     .retain(|g| g.gate.request_id() != request_id);
             }
@@ -972,7 +1031,9 @@ impl Core {
     fn clear_live_state(&mut self) {
         self.snap.turn = None;
         self.snap.pending_gates.clear();
-        self.external.clear();
+        for request_id in std::mem::take(&mut self.external) {
+            self.remember_withdrawn(request_id);
+        }
         for a in self.snap.subagents.iter_mut().filter(|a| a.running) {
             a.running = false;
         }
@@ -1346,6 +1407,46 @@ mod tests {
         );
         assert_eq!(out.resolved, vec![("w1".into(), CommandStatus::Sent)]);
         assert!(live.snapshot().pending_gates.is_empty());
+        assert!(out.events.iter().any(|e| matches!(
+            &e.kind,
+            SessionEventKind::Agent { event: AgentEvent::GateResolved { request_id, reason } }
+                if request_id == "x2" && reason.as_deref() == Some("withdrawn")
+        )));
+        // A late answer is refused (typed), and the id cannot be raised again.
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::Command {
+                token: "a2".into(),
+                command: Command::AnswerGate {
+                    request_id: "x2".into(),
+                    decision: GateDecision::choose("allow"),
+                },
+            }
+            .to_value(),
+        );
+        assert_eq!(
+            out.resolved,
+            vec![(
+                "a2".into(),
+                CommandStatus::Withdrawn {
+                    request_id: "x2".into()
+                }
+            )]
+        );
+        assert!(out.writes.is_empty());
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::RaiseGate {
+                token: "r5".into(),
+                gate: Box::new(handoff("x2")),
+            }
+            .to_value(),
+        );
+        assert!(matches!(out.resolved[0].1, CommandStatus::Rejected { .. }));
         let out = feed(
             &mut live,
             &mut j,
@@ -1374,8 +1475,27 @@ mod tests {
             before_exit.apply(r);
         }
         assert_eq!(before_exit.snapshot(), live.snapshot());
-        feed(&mut live, &mut j, Kind::Exited, json!({"code": 0}));
+        let out = feed(&mut live, &mut j, Kind::Exited, json!({"code": 0}));
         assert!(live.snapshot().pending_gates.is_empty());
+        assert!(out.events.iter().any(|e| matches!(
+            &e.kind,
+            SessionEventKind::Agent { event: AgentEvent::GateResolved { request_id, reason } }
+                if request_id == "x3" && reason.as_deref() == Some("withdrawn")
+        )));
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::Command {
+                token: "a3".into(),
+                command: Command::AnswerGate {
+                    request_id: "x3".into(),
+                    decision: GateDecision::choose("allow"),
+                },
+            }
+            .to_value(),
+        );
+        assert!(matches!(out.resolved[0].1, CommandStatus::Withdrawn { .. }));
 
         let mut replay = Core::new(desc, &meta());
         let mut revents = vec![];

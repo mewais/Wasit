@@ -325,6 +325,7 @@ impl AcpProtocol {
             step.write.push(cancelled(&g.raw_id));
             step.events.push(AgentEvent::GateResolved {
                 request_id: g.routing_id,
+                reason: None,
             });
         }
         if self.prompt_active && !self.cancel_sent {
@@ -447,6 +448,7 @@ impl AcpProtocol {
         for g in std::mem::take(&mut self.gates) {
             step.events.push(AgentEvent::GateResolved {
                 request_id: g.routing_id,
+                reason: None,
             });
         }
         step.events.push(AgentEvent::TurnCompleted {
