@@ -310,6 +310,11 @@ pub fn parse_models(out: &ProbeOutput) -> Result<Discovered, String> {
 /// Parse `<bin> session list --format json`.
 pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
     let stdout = exec_stdout(out)?;
+    // With no sessions for the project the CLI prints nothing at all (verified with opencode
+    // 1.19.6 and kilo 7.8.27).
+    if stdout.trim().is_empty() {
+        return Ok(Discovered::Sessions(Vec::new()));
+    }
     let v: Value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("session list is not JSON: {e}"))?;
     let arr = v

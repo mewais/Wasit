@@ -392,6 +392,15 @@ fn discovery_parsers() {
         stdout: String::new()
     })
     .is_err());
+    // No sessions: the CLI prints nothing.
+    assert_eq!(
+        parse_sessions(&ProbeOutput::Exec {
+            exit_code: Some(0),
+            stdout: "\n".into()
+        })
+        .unwrap(),
+        Discovered::Sessions(vec![])
+    );
     assert_eq!(opencode().id().as_str(), "opencode");
     assert_eq!(kilo().default_binary(), "kilo");
 }
