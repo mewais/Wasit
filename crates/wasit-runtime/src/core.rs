@@ -24,7 +24,7 @@
 //! commands journaled in that window, are buffered and applied right after `start` — in live
 //! operation and in replay alike.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use wasit_core::{
@@ -173,6 +173,10 @@ pub(crate) struct Core {
     exit_phase: Option<Phase>,
     prompts: VecDeque<String>,
     stderr_tail: VecDeque<String>,
+    /// Request ids of pending gates raised from outside the CLI protocol (see
+    /// [`RuntimeNote::RaiseGate`]). They survive turn ends, are answered without the protocol,
+    /// and end with the process generation.
+    external: BTreeSet<String>,
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -201,6 +205,7 @@ impl Core {
             exit_phase: None,
             prompts: VecDeque::new(),
             stderr_tail: VecDeque::new(),
+            external: BTreeSet::new(),
         }
     }
 
@@ -449,6 +454,10 @@ impl Core {
             NoteKind::Runtime(RuntimeNote::Start { spec }) => self.on_start(&spec, rec, em, out),
             NoteKind::Runtime(RuntimeNote::Command { token, command }) => {
                 self.snap.last_activity_ms = rec.t;
+                if self.answers_external(&command) {
+                    self.answer_external(token, command, em, out);
+                    return;
+                }
                 match &mut self.gen {
                     Gen::Awaiting(buf) => buf.push(Buffered::Command { token, command }),
                     Gen::Running(_) => self.apply_command(token, command, em, out),
@@ -489,6 +498,12 @@ impl Core {
                         ),
                     });
                 }
+            }
+            NoteKind::Runtime(RuntimeNote::RaiseGate { token, gate }) => {
+                self.raise_external(token, gate, rec.t, em, out)
+            }
+            NoteKind::Runtime(RuntimeNote::ResolveGate { token, request_id }) => {
+                self.resolve_external(token, request_id, em, out)
             }
             NoteKind::StdinClosed => self.close_owed = false,
             NoteKind::Other(message) => em.push(SessionEventKind::Notice { message }),
@@ -599,6 +614,97 @@ impl Core {
         }
     }
 
+    // ── external gates ──────────────────────────────────────────────────────
+
+    /// `command` answers a pending external gate.
+    fn answers_external(&self, command: &Command) -> bool {
+        match command {
+            Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. } => {
+                self.external.contains(request_id)
+            }
+            _ => false,
+        }
+    }
+
+    /// The answer is recorded (as the `input` event its owner watches for) and the gate stops
+    /// being pending; nothing is written to the CLI.
+    fn answer_external(
+        &mut self,
+        token: String,
+        command: Command,
+        em: &mut Emitter,
+        out: &mut Output,
+    ) {
+        if let Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. } =
+            &command
+        {
+            self.external.remove(request_id);
+            self.snap
+                .pending_gates
+                .retain(|g| g.gate.request_id() != request_id);
+        }
+        em.push(SessionEventKind::Input {
+            command,
+            status: CommandStatus::Sent,
+        });
+        out.resolved.push((token, CommandStatus::Sent));
+    }
+
+    fn raise_external(
+        &mut self,
+        token: String,
+        gate: wasit_core::GateRequest,
+        t: u64,
+        em: &mut Emitter,
+        out: &mut Output,
+    ) {
+        let rid = gate.request_id().to_string();
+        let status = if !self.process_running() {
+            CommandStatus::NotRunning {
+                reason: "the process is not running".into(),
+            }
+        } else if rid.is_empty()
+            || self
+                .snap
+                .pending_gates
+                .iter()
+                .any(|g| g.gate.request_id() == rid)
+        {
+            CommandStatus::Rejected {
+                reason: format!("a gate with request id {rid:?} is already pending"),
+            }
+        } else {
+            self.external.insert(rid);
+            let event = AgentEvent::GateRequested { gate };
+            let cursor = em.next_cursor();
+            self.reduce(&event, cursor, t);
+            em.push(SessionEventKind::Agent { event });
+            CommandStatus::Sent
+        };
+        out.resolved.push((token, status));
+    }
+
+    fn resolve_external(
+        &mut self,
+        token: String,
+        request_id: String,
+        em: &mut Emitter,
+        out: &mut Output,
+    ) {
+        let status = if self.external.remove(&request_id) {
+            let event = AgentEvent::GateResolved { request_id };
+            let cursor = em.next_cursor();
+            self.reduce(&event, cursor, em.t);
+            em.push(SessionEventKind::Agent { event });
+            CommandStatus::Sent
+        } else {
+            CommandStatus::Rejected {
+                reason: format!("no external gate {request_id:?} is pending"),
+            }
+        };
+        out.resolved.push((token, status));
+    }
+
     fn note_prompt(&mut self, text: String) {
         if self.snap.title.is_none() {
             self.snap.title = Some(truncate(&text, TITLE_CHARS));
@@ -699,7 +805,10 @@ impl Core {
                 ..
             } => {
                 s.turn = None;
-                s.pending_gates.clear();
+                // CLI gates end with the turn; external gates are owned by someone else.
+                let external = &self.external;
+                s.pending_gates
+                    .retain(|g| external.contains(g.gate.request_id()));
                 s.turns_completed += 1;
                 if *usage != Default::default() {
                     s.usage = usage.clone();
@@ -809,6 +918,7 @@ impl Core {
     fn clear_live_state(&mut self) {
         self.snap.turn = None;
         self.snap.pending_gates.clear();
+        self.external.clear();
         for a in self.snap.subagents.iter_mut().filter(|a| a.running) {
             a.running = false;
         }
@@ -1005,6 +1115,177 @@ mod tests {
             live.owed().collect::<Vec<_>>()
         );
         assert!(events.windows(2).all(|w| w[0].cursor < w[1].cursor));
+    }
+
+    /// External gates: pending like CLI gates, kept across a turn end, answered without the
+    /// protocol (nothing written), withdrawable, cleared by the exit — and replay-exact.
+    #[test]
+    fn external_gates_are_journaled_answered_and_replayed() {
+        let desc = wasit_claude::descriptor();
+        let mut live = Core::new(desc.clone(), &meta());
+        let mut j = J::new();
+        let mut events = vec![];
+        let mut feed = |core: &mut Core, j: &mut J, kind, data: serde_json::Value| {
+            let rec = j.push(kind, data);
+            let out = core.apply(&rec);
+            events.extend(out.events.clone());
+            out
+        };
+        let handoff = |rid: &str| wasit_core::GateRequest::Handoff {
+            request_id: rid.into(),
+            task_id: "t1".into(),
+            from: "h/a".into(),
+            to: "h/b".into(),
+            mode: "consult".into(),
+            instruction: "look".into(),
+            details: serde_json::Value::Null,
+        };
+        // Not running yet: refused.
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::RaiseGate {
+                token: "r0".into(),
+                gate: handoff("x0"),
+            }
+            .to_value(),
+        );
+        assert!(matches!(
+            out.resolved[0].1,
+            CommandStatus::NotRunning { .. }
+        ));
+        feed(&mut live, &mut j, Kind::Spawned, json!({"pid": 7}));
+        feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::Start {
+                spec: Box::new(SpawnSpec {
+                    first_prompt: Some("go".into()),
+                    ..SpawnSpec::default()
+                }),
+            }
+            .to_value(),
+        );
+        feed(&mut live, &mut j, Kind::Out, json!(INIT_OK));
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::RaiseGate {
+                token: "r1".into(),
+                gate: handoff("x1"),
+            }
+            .to_value(),
+        );
+        assert_eq!(out.resolved, vec![("r1".into(), CommandStatus::Sent)]);
+        assert!(out.writes.is_empty());
+        assert_eq!(live.snapshot().phase, Phase::NeedsYou);
+        // Same id twice: rejected.
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::RaiseGate {
+                token: "r2".into(),
+                gate: handoff("x1"),
+            }
+            .to_value(),
+        );
+        assert!(matches!(out.resolved[0].1, CommandStatus::Rejected { .. }));
+        // The turn ends: the external gate stays.
+        feed(
+            &mut live,
+            &mut j,
+            Kind::Out,
+            json!(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#),
+        );
+        assert_eq!(live.snapshot().pending_gates.len(), 1);
+        assert_eq!(live.snapshot().phase, Phase::NeedsYou);
+        // Answered through the normal command path: nothing reaches the CLI.
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::Command {
+                token: "a1".into(),
+                command: Command::AnswerGate {
+                    request_id: "x1".into(),
+                    decision: GateDecision::approve(),
+                },
+            }
+            .to_value(),
+        );
+        assert_eq!(out.resolved, vec![("a1".into(), CommandStatus::Sent)]);
+        assert!(out.writes.is_empty());
+        assert!(live.snapshot().pending_gates.is_empty());
+        assert_eq!(live.snapshot().phase, Phase::Idle);
+        assert!(out.events.iter().any(|e| matches!(
+            &e.kind,
+            SessionEventKind::Input { command: Command::AnswerGate { request_id, .. }, status: CommandStatus::Sent } if request_id == "x1"
+        )));
+        // Raise + withdraw.
+        feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::RaiseGate {
+                token: "r3".into(),
+                gate: handoff("x2"),
+            }
+            .to_value(),
+        );
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::ResolveGate {
+                token: "w1".into(),
+                request_id: "x2".into(),
+            }
+            .to_value(),
+        );
+        assert_eq!(out.resolved, vec![("w1".into(), CommandStatus::Sent)]);
+        assert!(live.snapshot().pending_gates.is_empty());
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::ResolveGate {
+                token: "w2".into(),
+                request_id: "x2".into(),
+            }
+            .to_value(),
+        );
+        assert!(matches!(out.resolved[0].1, CommandStatus::Rejected { .. }));
+        // A pending external gate ends with the process.
+        feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::RaiseGate {
+                token: "r4".into(),
+                gate: handoff("x3"),
+            }
+            .to_value(),
+        );
+        assert_eq!(live.snapshot().pending_gates.len(), 1);
+        let mut before_exit = Core::new(desc.clone(), &meta());
+        for r in &j.recs {
+            before_exit.apply(r);
+        }
+        assert_eq!(before_exit.snapshot(), live.snapshot());
+        feed(&mut live, &mut j, Kind::Exited, json!({"code": 0}));
+        assert!(live.snapshot().pending_gates.is_empty());
+
+        let mut replay = Core::new(desc, &meta());
+        let mut revents = vec![];
+        for r in &j.recs {
+            revents.extend(replay.apply(r).events);
+        }
+        assert_eq!(revents, events);
+        assert_eq!(replay.snapshot(), live.snapshot());
     }
 
     #[test]

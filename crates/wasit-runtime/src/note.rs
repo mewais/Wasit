@@ -5,7 +5,7 @@
 //! trusting the `in` lines that followed it.
 
 use serde::{Deserialize, Serialize};
-use wasit_core::{Command, SpawnSpec};
+use wasit_core::{Command, GateRequest, SpawnSpec};
 
 /// A runtime note. Serialized as `{"wasit": "<kind>", …}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +21,13 @@ pub(crate) enum RuntimeNote {
     Stop { token: String },
     /// The handshake deadline passed; the process is being killed.
     HandshakeTimeout { after_ms: u64 },
+    /// An external gate was raised on the session from outside the CLI protocol (e.g. an
+    /// orchestration handoff). It is pending like any CLI gate until answered with
+    /// `answer_gate` / `answer_question` (journaled as a `command` note, never sent to the CLI)
+    /// or withdrawn with `resolve_gate`.
+    RaiseGate { token: String, gate: GateRequest },
+    /// An external gate was withdrawn by its owner without an answer.
+    ResolveGate { token: String, request_id: String },
 }
 
 impl RuntimeNote {

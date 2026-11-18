@@ -199,6 +199,27 @@ pub enum GateRequest {
         request_id: String,
         questions: Vec<QuestionPrompt>,
     },
+    /// One agent wants to hand work to another (agent-to-agent orchestration). Raised on the
+    /// *sending* session by the orchestration layer as an external gate (not by a CLI);
+    /// answered with [`Command::AnswerGate`](crate::Command::AnswerGate) like any permission.
+    /// By convention a non-`None` `permission_updates` in the approval means "always allow on
+    /// this edge".
+    Handoff {
+        request_id: String,
+        /// Orchestration task id.
+        task_id: String,
+        /// Sending agent (display form, e.g. `host/session`).
+        from: String,
+        /// Receiving agent (display form).
+        to: String,
+        /// Delegation mode (e.g. `consult`, `command`, `message`).
+        mode: String,
+        /// What the receiver is asked to do.
+        instruction: String,
+        /// Extra structured context (peer names, hop count, …).
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        details: serde_json::Value,
+    },
 }
 
 impl GateRequest {
@@ -207,7 +228,8 @@ impl GateRequest {
         match self {
             GateRequest::Permission { request_id, .. }
             | GateRequest::Plan { request_id, .. }
-            | GateRequest::Question { request_id, .. } => request_id,
+            | GateRequest::Question { request_id, .. }
+            | GateRequest::Handoff { request_id, .. } => request_id,
         }
     }
 }

@@ -59,6 +59,11 @@ pub(crate) enum Msg {
         command: Command,
         reply: CommandReply,
     },
+    /// Raise or withdraw an external gate (see [`RuntimeNote::RaiseGate`]).
+    Gate {
+        op: GateOp,
+        reply: CommandReply,
+    },
     Stop {
         reply: UnitReply,
     },
@@ -74,6 +79,12 @@ pub(crate) enum Msg {
         limit: usize,
         reply: oneshot::Sender<HistoryLocal>,
     },
+}
+
+/// An external gate operation.
+pub(crate) enum GateOp {
+    Raise(wasit_core::GateRequest),
+    Resolve { request_id: String },
 }
 
 /// A live subscription handed out by the actor.
@@ -779,6 +790,7 @@ impl Actor {
                 }
             }
             Msg::Command { command, reply } => self.command(command, reply),
+            Msg::Gate { op, reply } => self.gate(op, reply),
             Msg::Stop { reply } => {
                 if !self.core.process_running() {
                     let _ = reply.send(Ok(())); // requester may have given up
@@ -844,6 +856,43 @@ impl Actor {
                 command,
             }
             .to_value(),
+            token: Some(tok.clone()),
+            attach: false,
+        });
+        self.pending.insert(
+            tok,
+            Pending {
+                reply: Reply::Command(reply),
+                deadline: Instant::now() + self.cfg.timeouts.command,
+            },
+        );
+    }
+
+    fn gate(&mut self, op: GateOp, reply: CommandReply) {
+        if !self.core.process_running() {
+            let _ = reply.send(Err(CommandError::NotRunning {
+                reason: format!("the session is {}", self.core.snapshot().phase.name()),
+            })); // requester may have given up
+            return;
+        }
+        if self.pending.len() >= MAX_PENDING {
+            let _ = reply.send(Err(CommandError::Busy)); // requester may have given up
+            return;
+        }
+        let tok = token();
+        let data = match op {
+            GateOp::Raise(gate) => RuntimeNote::RaiseGate {
+                token: tok.clone(),
+                gate,
+            },
+            GateOp::Resolve { request_id } => RuntimeNote::ResolveGate {
+                token: tok.clone(),
+                request_id,
+            },
+        }
+        .to_value();
+        self.push_op(Op::Note {
+            data,
             token: Some(tok.clone()),
             attach: false,
         });
@@ -989,7 +1038,7 @@ fn reply_busy(reply: Reply) {
 
 fn reply_msg_busy(m: Msg) {
     match m {
-        Msg::Command { reply, .. } => {
+        Msg::Command { reply, .. } | Msg::Gate { reply, .. } => {
             let _ = reply.send(Err(CommandError::Busy)); // requester may have given up
         }
         Msg::Stop { reply } | Msg::Continue { reply } => {

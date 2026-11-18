@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use wasit_core::{DriverDescriptor, ResumeMode, SpawnSpec};
 use wasit_shim::ShimState;
 
-use crate::actor::{Actor, ActorInit, HistoryLocal, Msg};
+use crate::actor::{Actor, ActorInit, GateOp, HistoryLocal, Msg};
 use crate::config::RuntimeConfig;
 use crate::core::blank_snapshot;
 use crate::host::HostFeed;
@@ -497,6 +497,48 @@ impl SessionManager {
     ) -> Result<CommandOutcome, CommandError> {
         match self.ask(id, |reply| Msg::Command { command, reply }).await {
             Ok(r) => r,
+            Err(RuntimeError::SessionNotFound(id)) => Err(CommandError::SessionNotFound { id }),
+            Err(RuntimeError::Busy(_)) => Err(CommandError::Busy),
+            Err(RuntimeError::Timeout(_)) => Err(CommandError::Timeout),
+            Err(e) => Err(CommandError::Rejected {
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    /// Raise an *external* gate on a running session: a gate that does not come from the CLI
+    /// (e.g. an orchestration handoff awaiting approval). It is journaled, so it appears in
+    /// the snapshot's `pending_gates` and as a `gate_requested` event exactly like a CLI gate
+    /// and survives a daemon restart (replay). It stays pending across turn ends until it is
+    /// answered through the normal [`Command::AnswerGate`](wasit_core::Command::AnswerGate) /
+    /// `AnswerQuestion` path — which journals the answer as an `input` event (the gate's owner
+    /// watches the session's events for it) and writes nothing to the CLI — or withdrawn with
+    /// [`SessionManager::resolve_gate`]. It ends with the process generation.
+    ///
+    /// Rejected when the request id is empty or already pending; `NotRunning` when no process
+    /// runs (an external gate cannot be journaled without a live shim).
+    pub async fn raise_gate(
+        &self,
+        id: &SessionId,
+        gate: wasit_core::GateRequest,
+    ) -> Result<(), CommandError> {
+        self.gate_op(id, GateOp::Raise(gate)).await
+    }
+
+    /// Withdraw a pending external gate without an answer (emits `gate_resolved`).
+    pub async fn resolve_gate(&self, id: &SessionId, request_id: &str) -> Result<(), CommandError> {
+        self.gate_op(
+            id,
+            GateOp::Resolve {
+                request_id: request_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn gate_op(&self, id: &SessionId, op: GateOp) -> Result<(), CommandError> {
+        match self.ask(id, |reply| Msg::Gate { op, reply }).await {
+            Ok(r) => r.map(|_| ()),
             Err(RuntimeError::SessionNotFound(id)) => Err(CommandError::SessionNotFound { id }),
             Err(RuntimeError::Busy(_)) => Err(CommandError::Busy),
             Err(RuntimeError::Timeout(_)) => Err(CommandError::Timeout),
