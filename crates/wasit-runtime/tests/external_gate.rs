@@ -62,6 +62,18 @@ async fn external_gate_survives_restart(driver: &str) {
     assert_eq!(snap.phase.name(), "needs_you");
     let raised_at = snap.pending_gates[0].cursor;
 
+    // A choice the gate does not offer is refused, typed, and the gate stays pending.
+    let bad = mgr
+        .command(
+            &id,
+            Command::AnswerGate {
+                request_id: "h-1".into(),
+                decision: GateDecision::choose("always_allow"),
+            },
+        )
+        .await;
+    assert!(matches!(bad, Err(CommandError::Rejected { .. })), "{bad:?}");
+    assert_eq!(mgr.snapshot(&id).unwrap().pending_gates.len(), 1);
     let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
     mgr.command(
         &id,

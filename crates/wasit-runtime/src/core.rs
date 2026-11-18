@@ -643,6 +643,29 @@ impl Core {
         em: &mut Emitter,
         out: &mut Output,
     ) {
+        // An answer must pick one of the gate's own choices (the gate's owner reads it back
+        // from the journal and relies on that).
+        if let Command::AnswerGate {
+            request_id,
+            decision,
+        } = &command
+        {
+            let check = self
+                .snap
+                .pending_gates
+                .iter()
+                .find(|g| g.gate.request_id() == request_id)
+                .map(|g| g.gate.check(decision).map(|_| ()));
+            if let Some(Err(reason)) = check {
+                let status = CommandStatus::Rejected { reason };
+                em.push(SessionEventKind::Input {
+                    command,
+                    status: status.clone(),
+                });
+                out.resolved.push((token, status));
+                return;
+            }
+        }
         if let Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. } =
             &command
         {
@@ -1164,7 +1187,11 @@ mod tests {
             mode: "consult".into(),
             instruction: "look".into(),
             details: serde_json::Value::Null,
-            choices: vec![],
+            choices: vec![wasit_core::GateChoice::agent(
+                "allow",
+                "Allow",
+                wasit_core::GateChoiceKind::AllowOnce,
+            )],
         };
         // Not running yet: refused.
         let out = feed(
