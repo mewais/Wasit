@@ -212,17 +212,24 @@ impl Shared {
         let mut buf = Vec::with_capacity(line.len() + 1);
         buf.extend_from_slice(line.as_bytes());
         buf.push(b'\n');
-        stdin
-            .write_all(&buf)
-            .await
-            .map_err(|e| format!("write to child stdin: {e}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("flush child stdin: {e}"))?;
-        // Journaled while still holding the stdin lock: journal order == write order.
+        // Journal first, still holding the stdin lock: the child may answer the moment the
+        // bytes land, and its output must sort after the input that caused it (journal order
+        // == write order). A failed write is recorded as a note right behind the `in` record.
         let data = serde_json::Value::String(line.to_owned()).to_string();
-        Ok(self.append(Kind::In, &data, false))
+        let seq = self.append(Kind::In, &data, false);
+        let written = async {
+            stdin.write_all(&buf).await?;
+            stdin.flush().await
+        }
+        .await;
+        match written {
+            Ok(()) => Ok(seq),
+            Err(e) => {
+                let msg = format!("write to child stdin: {e}");
+                self.note(json!({ "stdin_error": msg }));
+                Err(msg)
+            }
+        }
     }
 
     async fn close_stdin(&self) -> Result<u64, String> {
