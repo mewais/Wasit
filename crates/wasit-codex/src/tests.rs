@@ -202,9 +202,16 @@ fn gates_route_by_item_id_and_encode_per_method() {
     assert!(
         matches!(&ev[0], AgentEvent::GateRequested { gate: GateRequest::Permission { request_id, tool_name, command, explanation, .. } } if request_id == "call_3" && tool_name == "shell" && command.contains("touch a") && explanation == "needs it")
     );
+    match &ev[0] {
+        AgentEvent::GateRequested { gate } => {
+            let ids: Vec<_> = gate.choices().iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(ids, ["accept", "acceptForSession", "decline", "cancel"]);
+        }
+        e => panic!("{e:?}"),
+    }
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "call_3".into(),
-        decision: GateDecision::approve(),
+        decision: GateDecision::choose("accept"),
     }));
     assert_eq!(
         w(&step)[0],
@@ -216,14 +223,38 @@ fn gates_route_by_item_id_and_encode_per_method() {
         .events
         .is_empty());
 
+    // availableDecisions is the list the client may present, in codex's order.
+    let ev = p.on_line(r#"{"method":"item/commandExecution/requestApproval","id":1,"params":{"itemId":"call_4","command":"curl x","availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["curl"]}},{"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"x.org","action":"allow"}}},"cancel"]}}"#).events;
+    let AgentEvent::GateRequested { gate } = &ev[0] else {
+        panic!("{ev:?}")
+    };
+    let ids: Vec<_> = gate.choices().iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "accept",
+            "acceptWithExecpolicyAmendment",
+            "network:2",
+            "cancel"
+        ]
+    );
+    assert_eq!(
+        gate.choices()[1].description,
+        "commands starting with `curl`"
+    );
+    let step = sent(p.encode(Command::AnswerGate {
+        request_id: "call_4".into(),
+        decision: GateDecision::choose("acceptWithExecpolicyAmendment"),
+    }));
+    assert_eq!(
+        w(&step)[0]["result"],
+        json!({"decision":{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["curl"]}}})
+    );
+
     p.on_line(r#"{"method":"execCommandApproval","id":5,"params":{"command":["ls"]}}"#);
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "codex:5".into(),
-        decision: GateDecision::Approve {
-            updated_input: None,
-            permission_updates: Some(json!(true)),
-            elicitation_content: None,
-        },
+        decision: GateDecision::choose("approved_for_session"),
     }));
     assert_eq!(
         w(&step)[0]["result"],
@@ -233,7 +264,7 @@ fn gates_route_by_item_id_and_encode_per_method() {
     p.on_line(r#"{"method":"item/permissions/requestApproval","id":6,"params":{"itemId":"p1","permissions":{"network":{"enabled":true}}}}"#);
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "p1".into(),
-        decision: GateDecision::approve(),
+        decision: GateDecision::choose("accept"),
     }));
     assert_eq!(
         w(&step)[0]["result"],
@@ -243,7 +274,7 @@ fn gates_route_by_item_id_and_encode_per_method() {
     p.on_line(r#"{"method":"mcpServer/elicitation/request","id":7,"params":{"serverName":"hares","message":"ok?","requestedSchema":{"properties":{"grant":{"enum":["once"]}}}}}"#);
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "codex:7".into(),
-        decision: GateDecision::deny(None),
+        decision: GateDecision::choose("decline"),
     }));
     assert_eq!(w(&step)[0]["result"], json!({"action":"decline"}));
 
@@ -270,12 +301,13 @@ fn user_input_question_maps_text_to_ids() {
     assert!(matches!(
         p.encode(Command::AnswerGate {
             request_id: "q1".into(),
-            decision: GateDecision::approve()
+            decision: GateDecision::choose("accept")
         }),
         Err(DriverError::Invalid { .. })
     ));
     let mut a = QuestionAnswer::default();
-    a.answers.insert("Color?".into(), "Red, Blue".into());
+    a.answers
+        .insert("color".into(), vec!["Red".into(), "Blue".into()]);
     let step = sent(p.encode(Command::AnswerQuestion {
         request_id: "q1".into(),
         answer: a,
@@ -432,6 +464,7 @@ fn sessions_parser() {
                 r#"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<environment_context>"}]}}"#.into(),
                 r#"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"hello"}]}}"#.into(),
             ],
+            matching_lines: Some(3),
         }],
     };
     match parse_sessions(&out).unwrap() {
@@ -439,6 +472,7 @@ fn sessions_parser() {
             assert_eq!(s[0].id, "01a1ebcf-0528-7cd2-a32d-e89e91b6a844");
             assert_eq!(s[0].project.as_deref(), Some("/p"));
             assert_eq!(s[0].title, "hello");
+            assert_eq!(s[0].message_count, Some(3));
         }
         d => panic!("{d:?}"),
     }

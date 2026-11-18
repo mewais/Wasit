@@ -162,7 +162,7 @@ fn permission_gate_options_and_answers() {
                     request_id,
                     tool_name,
                     command,
-                    elicitation_choices,
+                    choices,
                     raw_input,
                     ..
                 },
@@ -170,51 +170,52 @@ fn permission_gate_options_and_answers() {
             assert_eq!(request_id, "c1");
             assert_eq!(tool_name, "bash");
             assert_eq!(command, "touch a");
-            assert_eq!(elicitation_choices.len(), 3);
+            assert_eq!(choices.len(), 3);
+            assert_eq!(choices[0].id, "once");
+            assert_eq!(choices[0].label, "Allow once");
+            assert!(!choices[0].neutral_label);
+            assert_eq!(choices[1].kind, wasit_core::GateChoiceKind::AllowAlways);
+            assert_eq!(choices[2].kind, wasit_core::GateChoiceKind::RejectOnce);
             assert_eq!(raw_input["command"], "touch a");
         }
         e => panic!("{e:?}"),
     }
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "c1".into(),
-        decision: GateDecision::approve(),
+        decision: GateDecision::choose("once"),
     }));
     assert_eq!(
         w(&step)[0],
         json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"once"}}})
     );
+    for id in ["reject", "always"] {
+        p.on_line(gate);
+        let step = sent(p.encode(Command::AnswerGate {
+            request_id: "c1".into(),
+            decision: GateDecision::choose(id),
+        }));
+        assert_eq!(w(&step)[0]["result"]["outcome"]["optionId"], id);
+    }
+    // An id the agent did not offer is refused and the gate stays pending.
     p.on_line(gate);
+    assert!(matches!(
+        p.encode(Command::AnswerGate {
+            request_id: "c1".into(),
+            decision: GateDecision::choose("nope"),
+        }),
+        Err(DriverError::Invalid { .. })
+    ));
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "c1".into(),
-        decision: GateDecision::deny(None),
+        decision: GateDecision::choose("once"),
     }));
-    assert_eq!(w(&step)[0]["result"]["outcome"]["optionId"], "reject");
+    assert_eq!(w(&step)[0]["result"]["outcome"]["optionId"], "once");
+    // ACP has no question requests.
     p.on_line(gate);
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "c1".into(),
-        decision: GateDecision::Approve {
-            updated_input: None,
-            permission_updates: Some(json!(true)),
-            elicitation_content: None,
-        },
-    }));
-    assert_eq!(w(&step)[0]["result"]["outcome"]["optionId"], "always");
-    // AnswerQuestion picks an option by name.
-    p.on_line(gate);
-    let mut a = QuestionAnswer::default();
-    a.answers.insert("q".into(), "Always allow".into());
-    let step = sent(p.encode(Command::AnswerQuestion {
-        request_id: "c1".into(),
-        answer: a,
-    }));
-    assert_eq!(w(&step)[0]["result"]["outcome"]["optionId"], "always");
-    p.on_line(gate);
-    let mut a = QuestionAnswer::default();
-    a.answers.insert("q".into(), "nope".into());
     assert!(matches!(
         p.encode(Command::AnswerQuestion {
             request_id: "c1".into(),
-            answer: a
+            answer: QuestionAnswer::default()
         }),
         Err(DriverError::Invalid { .. })
     ));

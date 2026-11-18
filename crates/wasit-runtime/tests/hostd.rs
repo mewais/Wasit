@@ -127,7 +127,7 @@ async fn hostd_end_to_end_with_daemon_kill_and_restart() {
             &id,
             Command::AnswerGate {
                 request_id: "nope".into(),
-                decision: GateDecision::approve(),
+                decision: GateDecision::choose("allow_once"),
             },
         )
         .await
@@ -183,7 +183,7 @@ async fn hostd_end_to_end_with_daemon_kill_and_restart() {
         &id,
         Command::AnswerGate {
             request_id,
-            decision: GateDecision::approve(),
+            decision: GateDecision::choose("allow"),
         },
     )
     .await

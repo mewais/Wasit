@@ -43,6 +43,9 @@ pub(crate) struct SessionFile {
     pub native_session_id: Option<String>,
     #[serde(default)]
     pub unsupported: Vec<Unsupported>,
+    /// User-given name (`sessions.rename`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl SessionFile {
@@ -64,6 +67,7 @@ impl SessionFile {
             spec,
             native_session_id: None,
             unsupported,
+            display_name: None,
         }
     }
 
@@ -74,6 +78,7 @@ impl SessionFile {
             cwd: self.cwd.clone(),
             labels: self.labels.clone(),
             created_at_ms: self.created_at_ms,
+            display_name: self.display_name.clone(),
         }
     }
 }

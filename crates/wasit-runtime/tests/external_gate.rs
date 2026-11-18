@@ -18,6 +18,11 @@ fn handoff(rid: &str) -> GateRequest {
         mode: "consult".into(),
         instruction: "what is 2+2?".into(),
         details: serde_json::Value::Null,
+        choices: vec![wasit_core::GateChoice::agent(
+            "allow_once",
+            "Allow once",
+            wasit_core::GateChoiceKind::AllowOnce,
+        )],
     }
 }
 
@@ -62,7 +67,7 @@ async fn external_gate_survives_restart(driver: &str) {
         &id,
         Command::AnswerGate {
             request_id: "h-1".into(),
-            decision: GateDecision::approve(),
+            decision: GateDecision::choose("allow_once"),
         },
     )
     .await
@@ -79,7 +84,7 @@ async fn external_gate_survives_restart(driver: &str) {
             &id,
             Command::AnswerGate {
                 request_id: "h-1".into(),
-                decision: GateDecision::approve(),
+                decision: GateDecision::choose("allow_once"),
             },
         )
         .await

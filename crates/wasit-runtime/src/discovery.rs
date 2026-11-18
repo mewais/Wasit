@@ -428,16 +428,25 @@ async fn run_probe(
             recursive,
             max_files,
             head_lines,
+            count_containing,
         } => {
-            let (dir, suffix, recursive, max_files, head_lines) = (
+            let (dir, suffix, recursive, max_files, head_lines, count) = (
                 dir.clone(),
                 suffix.clone(),
                 *recursive,
                 *max_files,
                 *head_lines,
+                count_containing.clone(),
             );
             let job = tokio::task::spawn_blocking(move || {
-                list_files(Path::new(&dir), &suffix, recursive, max_files, head_lines)
+                list_files(
+                    Path::new(&dir),
+                    &suffix,
+                    recursive,
+                    max_files,
+                    head_lines,
+                    &count,
+                )
             });
             match tokio::time::timeout(cfg.list_timeout, job).await {
                 Err(_) => {
@@ -608,14 +617,54 @@ async fn handshake(
     }
 }
 
+/// The first `head_lines` lines of `p` and, when `count_containing` is non-empty, how many of
+/// its lines contain one of those substrings (read to the end, line by line).
+fn read_head(
+    p: &Path,
+    head_lines: usize,
+    count_containing: &[String],
+) -> (Vec<String>, Option<u64>) {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(p) else {
+        return (vec![], None);
+    };
+    let mut r = std::io::BufReader::new(f);
+    let mut head = Vec::new();
+    let mut count = 0u64;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            // A file that cannot be read to the end has no trustworthy count.
+            Err(_) => return (head, None),
+        }
+        if head.len() < head_lines {
+            let line = String::from_utf8_lossy(&buf);
+            head.push(line.trim_end_matches(['\n', '\r']).to_string());
+        } else if count_containing.is_empty() {
+            break;
+        }
+        if count_containing.iter().any(|n| memfind(&buf, n.as_bytes())) {
+            count += 1;
+        }
+    }
+    (head, (!count_containing.is_empty()).then_some(count))
+}
+
+fn memfind(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
 fn list_files(
     dir: &Path,
     suffix: &str,
     recursive: bool,
     max_files: usize,
     head_lines: usize,
+    count_containing: &[String],
 ) -> std::io::Result<Vec<FileHead>> {
-    use std::io::BufRead;
     let mut found: Vec<(u64, PathBuf)> = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -650,19 +699,12 @@ fn list_files(
     Ok(found
         .into_iter()
         .map(|(modified_ms, p)| {
-            let head = std::fs::File::open(&p)
-                .map(|f| {
-                    std::io::BufReader::new(f)
-                        .lines()
-                        .take(head_lines)
-                        .map_while(Result::ok)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let (head, matching_lines) = read_head(&p, head_lines, count_containing);
             FileHead {
                 path: p.to_string_lossy().into_owned(),
                 modified_ms,
                 head,
+                matching_lines,
             }
         })
         .collect())

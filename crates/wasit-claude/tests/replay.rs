@@ -60,7 +60,7 @@ fn turns(r: &Replay) -> Vec<(Option<EndReason>, bool, Option<String>)> {
 
 fn start_spec(name: &str) -> wasit_core::SpawnSpec {
     match &load(name)[0] {
-        Record::Start(spec) => spec.clone(),
+        Record::Start(spec) => (**spec).clone(),
         other => panic!("first record is {other:?}"),
     }
 }

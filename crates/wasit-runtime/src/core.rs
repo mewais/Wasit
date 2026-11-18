@@ -56,6 +56,7 @@ pub(crate) struct SessionMeta {
     pub cwd: Option<String>,
     pub labels: std::collections::BTreeMap<String, String>,
     pub created_at_ms: u64,
+    pub display_name: Option<String>,
 }
 
 /// An empty snapshot for `meta` in `phase`.
@@ -77,6 +78,7 @@ pub(crate) fn blank_snapshot(
         pid: None,
         native_session_id: None,
         title: None,
+        display_name: meta.display_name.clone(),
         cli_version: None,
         model: None,
         mode: None,
@@ -88,6 +90,7 @@ pub(crate) fn blank_snapshot(
         last_turn: None,
         turns_completed: 0,
         usage: Default::default(),
+        usage_by_model: Default::default(),
         live_usage: None,
         context_pct: None,
         subagents: Vec::new(),
@@ -207,6 +210,11 @@ impl Core {
             stderr_tail: VecDeque::new(),
             external: BTreeSet::new(),
         }
+    }
+
+    /// Set the user-given display name (not journaled: it lives in `session.json`).
+    pub(crate) fn set_display_name(&mut self, name: Option<String>) {
+        self.snap.display_name = name;
     }
 
     // ── queries ─────────────────────────────────────────────────────────────
@@ -794,6 +802,8 @@ impl Core {
                     prompt: self.prompts.pop_front(),
                     tool_calls: 0,
                     last_tool: None,
+                    current_tool: None,
+                    current_call: None,
                 });
             }
             AgentEvent::TurnCompleted {
@@ -801,8 +811,8 @@ impl Core {
                 was_interrupted,
                 num_turns,
                 usage,
+                per_model,
                 reply,
-                ..
             } => {
                 s.turn = None;
                 // CLI gates end with the turn; external gates are owned by someone else.
@@ -812,6 +822,12 @@ impl Core {
                 s.turns_completed += 1;
                 if *usage != Default::default() {
                     s.usage = usage.clone();
+                }
+                if !per_model.is_empty() {
+                    s.usage_by_model = per_model
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
                 }
                 for a in s.subagents.iter_mut().filter(|a| a.running) {
                     a.running = false;
@@ -834,6 +850,8 @@ impl Core {
                 if let Some(turn) = s.turn.as_mut() {
                     turn.tool_calls += 1;
                     turn.last_tool = Some(name.clone());
+                    turn.current_tool = Some(name.clone());
+                    turn.current_call = Some(call_id.clone());
                 }
                 if *is_subagent {
                     s.subagents.push(SubagentInfo {
@@ -859,6 +877,12 @@ impl Core {
                 }
             }
             AgentEvent::ToolCallFinished { call_id, ok, .. } => {
+                if let Some(turn) = s.turn.as_mut() {
+                    if turn.current_call.as_deref() == Some(call_id.as_str()) {
+                        turn.current_tool = None;
+                        turn.current_call = None;
+                    }
+                }
                 if let Some(a) = s.subagents.iter_mut().find(|a| &a.call_id == call_id) {
                     a.running = false;
                     a.ok = Some(*ok);
@@ -981,6 +1005,7 @@ mod tests {
             cwd: None,
             labels: Default::default(),
             created_at_ms: 0,
+            display_name: None,
         }
     }
 
@@ -1080,7 +1105,7 @@ mod tests {
                 token: "tok".into(),
                 command: Command::AnswerGate {
                     request_id: "g1".into(),
-                    decision: GateDecision::approve(),
+                    decision: GateDecision::choose("allow"),
                 },
             }
             .to_value(),
@@ -1139,6 +1164,7 @@ mod tests {
             mode: "consult".into(),
             instruction: "look".into(),
             details: serde_json::Value::Null,
+            choices: vec![],
         };
         // Not running yet: refused.
         let out = feed(
@@ -1214,7 +1240,7 @@ mod tests {
                 token: "a1".into(),
                 command: Command::AnswerGate {
                     request_id: "x1".into(),
-                    decision: GateDecision::approve(),
+                    decision: GateDecision::choose("allow"),
                 },
             }
             .to_value(),

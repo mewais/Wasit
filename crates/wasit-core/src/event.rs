@@ -154,22 +154,115 @@ pub struct RateLimitInfo {
 
 // ── Gates ─────────────────────────────────────────────────────────────────────
 
-/// One allowed value of an elicitation / permission-option choice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What picking a [`GateChoice`] means, independent of the CLI. Policies ("always allow on this
+/// edge"), summaries and interrupts go by kind; the driver encodes the native answer by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub struct ElicitationChoice {
-    /// The property key this choice belongs under (`"optionId"` for ACP).
-    pub key: String,
-    /// The value sent back on accept.
-    pub value: String,
-    /// Human label.
+pub enum GateChoiceKind {
+    /// Allow this one action (also: approve a plan, accept an elicitation value).
+    AllowOnce,
+    /// Allow and keep allowing: a rule, a session-scoped approval, a mode switch, an edge
+    /// policy — whatever the CLI attaches to the choice (see its `description`).
+    AllowAlways,
+    /// Refuse this action; the agent continues its turn.
+    RejectOnce,
+    /// Refuse and keep refusing (ACP `reject_always`).
+    RejectAlways,
+    /// Refuse and stop the turn (codex `cancel` / `abort`, MCP elicitation `cancel`).
+    Cancel,
+}
+
+impl GateChoiceKind {
+    /// `true` for the allow kinds.
+    pub fn allows(self) -> bool {
+        matches!(
+            self,
+            GateChoiceKind::AllowOnce | GateChoiceKind::AllowAlways
+        )
+    }
+}
+
+/// Whether a [`GateChoice`] takes free text that is sent to the agent with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ChoiceText {
+    #[default]
+    None,
+    /// Optional text (e.g. claude's message to the agent with a denial).
+    Optional,
+    /// The choice cannot be sent without text.
+    Required,
+}
+
+impl ChoiceText {
+    fn is_none(&self) -> bool {
+        matches!(self, ChoiceText::None)
+    }
+}
+
+/// One answer a gate offers, exactly as the agent offers it.
+///
+/// `label` is the agent's own wording when its protocol carries wording (ACP option `name`);
+/// otherwise the driver uses one of the documented neutral labels and sets `neutral_label`
+/// (claude `can_use_tool`, codex approvals: "Allow", "Allow for this session",
+/// "Allow and remember", "Deny", "Deny and stop the turn"; plans: "Approve plan",
+/// "Keep planning"). Answer with [`GateDecision`] carrying `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct GateChoice {
+    /// Pass back verbatim in [`GateDecision::choice`].
+    pub id: String,
     pub label: String,
+    pub kind: GateChoiceKind,
+    /// `label` is a neutral label chosen by the driver because the protocol has no wording.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub neutral_label: bool,
+    /// What the choice does beyond its label, in the agent's terms when it says (e.g. the
+    /// rules claude would remember: `Bash(npm test:*)`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Free text accepted with this choice.
+    #[serde(default, skip_serializing_if = "ChoiceText::is_none")]
+    pub text: ChoiceText,
+}
+
+impl GateChoice {
+    /// A choice whose label is the agent's own wording.
+    pub fn agent(id: impl Into<String>, label: impl Into<String>, kind: GateChoiceKind) -> Self {
+        GateChoice {
+            id: id.into(),
+            label: label.into(),
+            kind,
+            neutral_label: false,
+            description: String::new(),
+            text: ChoiceText::None,
+        }
+    }
+
+    /// A choice with a neutral label (the protocol carries no wording).
+    pub fn neutral(id: impl Into<String>, label: impl Into<String>, kind: GateChoiceKind) -> Self {
+        GateChoice {
+            neutral_label: true,
+            ..GateChoice::agent(id, label, kind)
+        }
+    }
+
+    pub fn with_description(mut self, d: impl Into<String>) -> Self {
+        self.description = d.into();
+        self
+    }
+
+    pub fn with_text(mut self, t: ChoiceText) -> Self {
+        self.text = t;
+        self
+    }
 }
 
 /// A request for a human decision. The agent is blocked until it is answered
-/// with [`Command::AnswerGate`](crate::Command::AnswerGate) or
-/// [`Command::AnswerQuestion`](crate::Command::AnswerQuestion).
+/// with [`Command::AnswerGate`](crate::Command::AnswerGate) (permission, plan, handoff: pick
+/// one of `choices`) or [`Command::AnswerQuestion`](crate::Command::AnswerQuestion).
 ///
 /// `request_id` is the protocol's routing id: pass it back verbatim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,33 +281,28 @@ pub enum GateRequest {
         /// Longer explanation, when known.
         #[serde(default)]
         explanation: String,
-        /// `true` for MCP elicitations (answered accept/decline) and ACP
-        /// permission requests that carry options.
-        #[serde(default)]
-        is_elicitation: bool,
-        /// Choices the human can pick from (elicitation enum / ACP options).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        elicitation_choices: Vec<ElicitationChoice>,
-        /// Claude "always allow" suggestions / raw ACP options, verbatim.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        permission_suggestions: Vec<serde_json::Value>,
+        /// The answers the agent offers, in its order.
+        choices: Vec<GateChoice>,
         /// Raw tool input as the CLI reported it.
         #[serde(default)]
         raw_input: serde_json::Value,
     },
     /// The agent proposes a plan and waits for approval (claude `ExitPlanMode`).
-    Plan { request_id: String, summary: String },
+    Plan {
+        request_id: String,
+        summary: String,
+        choices: Vec<GateChoice>,
+    },
     /// The agent asks the human questions (claude `AskUserQuestion`, codex
-    /// `item/tool/requestUserInput`, ACP permission requests with options).
+    /// `item/tool/requestUserInput`).
     Question {
         request_id: String,
         questions: Vec<QuestionPrompt>,
     },
     /// One agent wants to hand work to another (agent-to-agent orchestration). Raised on the
     /// *sending* session by the orchestration layer as an external gate (not by a CLI);
-    /// answered with [`Command::AnswerGate`](crate::Command::AnswerGate) like any permission.
-    /// By convention a non-`None` `permission_updates` in the approval means "always allow on
-    /// this edge".
+    /// answered with [`Command::AnswerGate`](crate::Command::AnswerGate) like any permission,
+    /// with one of the `choices` the orchestration layer offers.
     Handoff {
         request_id: String,
         /// Orchestration task id.
@@ -230,6 +318,7 @@ pub enum GateRequest {
         /// Extra structured context (peer names, hop count, …).
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         details: serde_json::Value,
+        choices: Vec<GateChoice>,
     },
 }
 
@@ -243,6 +332,50 @@ impl GateRequest {
             | GateRequest::Handoff { request_id, .. } => request_id,
         }
     }
+
+    /// The choices of a permission / plan / handoff gate (empty for questions).
+    pub fn choices(&self) -> &[GateChoice] {
+        match self {
+            GateRequest::Permission { choices, .. }
+            | GateRequest::Plan { choices, .. }
+            | GateRequest::Handoff { choices, .. } => choices,
+            GateRequest::Question { .. } => &[],
+        }
+    }
+
+    /// The choice with this id.
+    pub fn choice(&self, id: &str) -> Option<&GateChoice> {
+        self.choices().iter().find(|c| c.id == id)
+    }
+
+    /// The first choice of one of `kinds` (tried in order).
+    pub fn choice_of_kind(&self, kinds: &[GateChoiceKind]) -> Option<&GateChoice> {
+        kinds
+            .iter()
+            .find_map(|k| self.choices().iter().find(|c| c.kind == *k))
+    }
+
+    /// Check that `decision` names one of this gate's choices and carries text when the choice
+    /// requires it.
+    pub fn check(&self, decision: &GateDecision) -> Result<&GateChoice, String> {
+        let c = self.choice(&decision.choice).ok_or_else(|| {
+            format!(
+                "gate {} offers no choice {:?} (offers: {})",
+                self.request_id(),
+                decision.choice,
+                self.choices()
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        let empty = decision.text.as_deref().is_none_or(|t| t.trim().is_empty());
+        match c.text {
+            ChoiceText::Required if empty => Err(format!("choice {:?} needs text", c.id)),
+            _ => Ok(c),
+        }
+    }
 }
 
 /// One question inside a [`GateRequest::Question`].
@@ -250,6 +383,9 @@ impl GateRequest {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct QuestionPrompt {
+    /// Key of this question in [`QuestionAnswer::answers`] (codex question id; claude: the
+    /// question text, which is how claude keys its answers).
+    pub id: String,
     pub question: String,
     #[serde(default)]
     pub header: String,
@@ -257,6 +393,13 @@ pub struct QuestionPrompt {
     pub multi_select: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<QuestionOption>,
+    /// The agent accepts a free-text answer besides the options (claude always; codex
+    /// `isOther`; a question without options is free text only).
+    #[serde(default)]
+    pub allow_other: bool,
+    /// The answer is a secret (codex `isSecret`): mask it while typing, never echo it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
 }
 
 /// One selectable option of a [`QuestionPrompt`].
@@ -269,60 +412,47 @@ pub struct QuestionOption {
     pub description: String,
 }
 
-/// The human's (or an explicit policy's) answer to a permission/plan gate.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The human's (or an explicit policy's) answer to a permission / plan / handoff gate: one of
+/// the gate's [`GateChoice`]s by id, plus text when the choice takes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum GateDecision {
-    /// Approve the action.
-    Approve {
-        /// Edited tool input (claude `updatedInput`). `None` echoes the
-        /// original input.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        updated_input: Option<serde_json::Value>,
-        /// "Always allow" choice: claude suggestion objects echoed as
-        /// `updatedPermissions`; for codex any value selects the
-        /// session-scoped approval (`acceptForSession`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        permission_updates: Option<serde_json::Value>,
-        /// Elicitation content (e.g. `{"grant":"session"}`); for ACP
-        /// `{"optionId": "<id>"}` picks a specific permission option.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        elicitation_content: Option<serde_json::Value>,
-    },
-    /// Deny the action.
-    Deny {
-        /// Reason surfaced to the agent, when the CLI supports one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
+pub struct GateDecision {
+    pub choice: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl GateDecision {
-    /// A plain one-time approval.
-    pub fn approve() -> Self {
-        GateDecision::Approve {
-            updated_input: None,
-            permission_updates: None,
-            elicitation_content: None,
+    /// Pick the choice `id`.
+    pub fn choose(id: impl Into<String>) -> Self {
+        GateDecision {
+            choice: id.into(),
+            text: None,
         }
     }
 
-    /// A denial with an optional reason.
-    pub fn deny(reason: Option<&str>) -> Self {
-        GateDecision::Deny {
-            reason: reason.map(str::to_string),
+    /// Pick the choice `id` with text.
+    pub fn choose_with(id: impl Into<String>, text: Option<&str>) -> Self {
+        GateDecision {
+            choice: id.into(),
+            text: text.map(str::to_string).filter(|t| !t.trim().is_empty()),
         }
+    }
+
+    /// Pick the first choice of `gate` of one of `kinds`, if it offers one.
+    pub fn by_kind(gate: &GateRequest, kinds: &[GateChoiceKind]) -> Option<Self> {
+        gate.choice_of_kind(kinds)
+            .map(|c| GateDecision::choose(&c.id))
     }
 }
 
-/// The human's answer to a [`GateRequest::Question`]: question text →
-/// selected label(s) (comma-joined for multi-select). Empty = skip.
+/// The human's answer to a [`GateRequest::Question`]: [`QuestionPrompt::id`] → the selected
+/// option labels and/or free text. A missing or empty entry skips that question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct QuestionAnswer {
-    pub answers: BTreeMap<String, String>,
+    pub answers: BTreeMap<String, Vec<String>>,
 }
 
 // ── Turn end reasons ──────────────────────────────────────────────────────────

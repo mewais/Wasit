@@ -42,8 +42,8 @@ pub use discovery::{
     ProbeAction, ProbeOutput, ProbeParse, ResumableSession,
 };
 pub use event::{
-    AgentEvent, CompactionInfo, ElicitationChoice, EndReason, GateDecision, GateRequest,
-    McpServerInfo, ModelInfo, ModelUsage, PlanEntry, QuestionAnswer, QuestionOption,
+    AgentEvent, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind, GateDecision,
+    GateRequest, McpServerInfo, ModelInfo, ModelUsage, PlanEntry, QuestionAnswer, QuestionOption,
     QuestionPrompt, RateLimitInfo, SessionMode, SlashCommandInfo, Usage,
 };
 pub use protocol::{Command, DriverError, Encoded, OutLine, Protocol, Step};

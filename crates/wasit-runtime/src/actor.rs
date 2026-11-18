@@ -70,6 +70,11 @@ pub(crate) enum Msg {
     Continue {
         reply: UnitReply,
     },
+    /// Set the user-given display name.
+    Rename {
+        name: Option<String>,
+        reply: UnitReply,
+    },
     Subscribe {
         from: Option<u64>,
         reply: oneshot::Sender<SubscribeReply>,
@@ -815,6 +820,14 @@ impl Actor {
                 );
             }
             Msg::Continue { reply } => self.continue_session(reply),
+            Msg::Rename { name, reply } => {
+                self.file.display_name = name.clone();
+                self.file_tx.send_replace(self.file.clone());
+                self.core.set_display_name(name);
+                self.snapshot_dirty = true;
+                self.publish_snapshot();
+                let _ = reply.send(Ok(())); // requester may have given up
+            }
         }
     }
 
@@ -1041,7 +1054,7 @@ fn reply_msg_busy(m: Msg) {
         Msg::Command { reply, .. } | Msg::Gate { reply, .. } => {
             let _ = reply.send(Err(CommandError::Busy)); // requester may have given up
         }
-        Msg::Stop { reply } | Msg::Continue { reply } => {
+        Msg::Stop { reply } | Msg::Continue { reply } | Msg::Rename { reply, .. } => {
             let _ = reply.send(Err(RuntimeError::Busy("session is loading".into())));
             // requester may have given up
         }

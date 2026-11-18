@@ -30,9 +30,9 @@ use wasit_core::wire::{
     id_text, opt_s, rpc_error, rpc_notification, rpc_request, rpc_result, s, u, RpcIn,
 };
 use wasit_core::{
-    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateDecision,
-    GateRequest, ModelInfo, OutLine, PlanEntry, Protocol, QuestionAnswer, QuestionOption,
-    QuestionPrompt, ResumeMode, SessionMode, SpawnSpec, Step, Usage,
+    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateChoice,
+    GateChoiceKind, GateRequest, ModelInfo, OutLine, PlanEntry, Protocol, QuestionAnswer,
+    QuestionOption, QuestionPrompt, ResumeMode, SessionMode, SpawnSpec, Step, Usage,
 };
 
 /// `protocol_options` key holding skill roots (a JSON array of absolute
@@ -88,6 +88,8 @@ struct PendingGate {
     raw_id: Value,
     method: String,
     params: Value,
+    /// Per choice id, the JSON-RPC result that answers the request with it.
+    answers: Vec<(String, Value)>,
 }
 
 /// The codex protocol state machine. Create with [`CodexProtocol::new`].
@@ -292,7 +294,15 @@ impl CodexProtocol {
                         detail: format!("gate {request_id} is a question; use answer_question"),
                     });
                 }
-                step.write.push(encode_gate_answer(&gate, &decision));
+                match gate.answers.iter().find(|(id, _)| *id == decision.choice) {
+                    Some((_, result)) => step.write.push(rpc_result(&gate.raw_id, result.clone())),
+                    None => {
+                        let detail =
+                            format!("gate {request_id} offers no choice {:?}", decision.choice);
+                        self.gates.push(gate);
+                        return Err(DriverError::Invalid { detail });
+                    }
+                }
             }
             Command::AnswerQuestion { request_id, answer } => {
                 let gate = self.take_gate(&request_id)?;
@@ -341,8 +351,7 @@ impl CodexProtocol {
         let mut step = Step::default();
         self.queue.retain(|c| !matches!(c, Command::Prompt { .. }));
         for g in std::mem::take(&mut self.gates) {
-            step.write
-                .push(encode_gate_answer(&g, &GateDecision::deny(None)));
+            step.write.push(rpc_result(&g.raw_id, interrupt_answer(&g)));
             step.events.push(AgentEvent::GateResolved {
                 request_id: g.routing_id,
             });
@@ -556,12 +565,13 @@ impl CodexProtocol {
                 let routing_id = opt_s(&params, "approvalId")
                     .or_else(|| opt_s(&params, "itemId"))
                     .unwrap_or_else(|| format!("codex:{}", id_text(&id)));
-                let gate = build_gate(&routing_id, &method, &params);
+                let (gate, answers) = build_gate(&routing_id, &method, &params);
                 self.gates.push(PendingGate {
                     routing_id,
                     raw_id: id,
                     method,
                     params,
+                    answers,
                 });
                 events(vec![AgentEvent::GateRequested { gate }])
             }
@@ -924,53 +934,51 @@ fn token_usage(v: &Value) -> Usage {
     }
 }
 
-fn build_gate(routing_id: &str, method: &str, params: &Value) -> GateRequest {
+/// The gate a server request raises, with the JSON-RPC result each choice answers it with.
+fn build_gate(
+    routing_id: &str,
+    method: &str,
+    params: &Value,
+) -> (GateRequest, Vec<(String, Value)>) {
     match method {
-        "item/tool/requestUserInput" => GateRequest::Question {
-            request_id: routing_id.to_string(),
-            questions: params
-                .get("questions")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .map(|q| QuestionPrompt {
-                            question: s(q, "question").to_string(),
-                            header: s(q, "header").to_string(),
-                            multi_select: false,
-                            options: q
-                                .get("options")
-                                .and_then(Value::as_array)
-                                .map(|o| {
-                                    o.iter()
-                                        .map(|o| QuestionOption {
-                                            label: s(o, "label").to_string(),
-                                            description: s(o, "description").to_string(),
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        },
+        "item/tool/requestUserInput" => (
+            GateRequest::Question {
+                request_id: routing_id.to_string(),
+                questions: params
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().map(user_input_question).collect())
+                    .unwrap_or_default(),
+            },
+            vec![],
+        ),
         "mcpServer/elicitation/request" => {
             let message = s(params, "message").to_string();
-            GateRequest::Permission {
-                request_id: routing_id.to_string(),
-                tool_name: opt_s(params, "serverName")
-                    .or_else(|| opt_s(params, "server"))
-                    .unwrap_or_else(|| "mcp".into()),
-                command: message.clone(),
-                cwd: String::new(),
-                explanation: message,
-                is_elicitation: true,
-                elicitation_choices: wasit_core::wire::elicitation_choices(
-                    params.get("requestedSchema"),
-                ),
-                permission_suggestions: vec![],
-                raw_input: params.clone(),
-            }
+            let pairs = wasit_core::wire::elicitation_choices(params.get("requestedSchema"));
+            let answers = pairs
+                .iter()
+                .map(|(c, content)| {
+                    let r = match content {
+                        Some(c) => json!({"action": "accept", "content": c}),
+                        None => json!({"action": c.id}),
+                    };
+                    (c.id.clone(), r)
+                })
+                .collect();
+            (
+                GateRequest::Permission {
+                    request_id: routing_id.to_string(),
+                    tool_name: opt_s(params, "serverName")
+                        .or_else(|| opt_s(params, "server"))
+                        .unwrap_or_else(|| "mcp".into()),
+                    command: message.clone(),
+                    cwd: String::new(),
+                    explanation: message,
+                    choices: pairs.into_iter().map(|(c, _)| c).collect(),
+                    raw_input: params.clone(),
+                },
+                answers,
+            )
         }
         _ => {
             let (tool, command) = match method {
@@ -1002,66 +1010,218 @@ fn build_gate(routing_id: &str, method: &str, params: &Value) -> GateRequest {
                     },
                 ),
             };
-            GateRequest::Permission {
-                request_id: routing_id.to_string(),
-                tool_name: tool.to_string(),
-                command,
-                cwd: s(params, "cwd").to_string(),
-                explanation: s(params, "reason").to_string(),
-                is_elicitation: false,
-                elicitation_choices: vec![],
-                permission_suggestions: vec![],
-                raw_input: params.clone(),
-            }
+            let pairs = approval_choices(method, params);
+            (
+                GateRequest::Permission {
+                    request_id: routing_id.to_string(),
+                    tool_name: tool.to_string(),
+                    command,
+                    cwd: s(params, "cwd").to_string(),
+                    explanation: s(params, "reason").to_string(),
+                    choices: pairs.iter().map(|(c, _)| c.clone()).collect(),
+                    raw_input: params.clone(),
+                },
+                pairs.into_iter().map(|(c, r)| (c.id, r)).collect(),
+            )
         }
     }
 }
 
-/// The JSON-RPC result answering a gate.
-fn encode_gate_answer(gate: &PendingGate, decision: &GateDecision) -> OutLine {
-    let approve = matches!(decision, GateDecision::Approve { .. });
-    let for_session = matches!(
-        decision,
-        GateDecision::Approve {
-            permission_updates: Some(_),
-            ..
-        }
-    );
-    let result = match gate.method.as_str() {
-        "mcpServer/elicitation/request" => match decision {
-            GateDecision::Approve {
-                elicitation_content,
-                ..
-            } => {
-                json!({"action": "accept", "content": elicitation_content.clone().unwrap_or_else(|| json!({}))})
-            }
-            GateDecision::Deny { .. } => json!({"action": "decline"}),
-        },
-        "execCommandApproval" | "applyPatchApproval" => {
-            json!({"decision": match (approve, for_session) {
-                (true, true) => "approved_for_session",
-                (true, false) => "approved",
-                (false, _) => "denied",
-            }})
-        }
-        "item/permissions/requestApproval" => {
-            if approve {
-                json!({
-                    "permissions": gate.params.get("permissions").cloned().unwrap_or_else(|| json!({})),
-                    "scope": if for_session { "session" } else { "turn" },
+fn user_input_question(q: &Value) -> QuestionPrompt {
+    let options: Vec<QuestionOption> = q
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|o| {
+            o.iter()
+                .map(|o| QuestionOption {
+                    label: s(o, "label").to_string(),
+                    description: s(o, "description").to_string(),
                 })
+                .collect()
+        })
+        .unwrap_or_default();
+    let flag = |k: &str| q.get(k).and_then(Value::as_bool).unwrap_or(false);
+    QuestionPrompt {
+        id: s(q, "id").to_string(),
+        question: s(q, "question").to_string(),
+        header: s(q, "header").to_string(),
+        multi_select: false,
+        allow_other: flag("isOther") || options.is_empty(),
+        secret: flag("isSecret"),
+        options,
+    }
+}
+
+/// The decisions an approval request accepts (codex-cli 0.169.1 app-server schema), each as a
+/// choice with the result it sends. Codex carries no wording, so labels are neutral. A
+/// `commandExecution` request lists its decisions in `availableDecisions`; otherwise the
+/// method's full decision set applies, with the policy amendments codex proposed in the request.
+fn approval_choices(method: &str, params: &Value) -> Vec<(GateChoice, Value)> {
+    use GateChoiceKind::*;
+    let decision = |id: &str, label: &str, kind, d: Value| {
+        (GateChoice::neutral(id, label, kind), json!({"decision": d}))
+    };
+    let amendment = params
+        .get("proposedExecpolicyAmendment")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .cloned();
+    let prefix = |a: &[Value]| {
+        a.iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    match method {
+        "item/permissions/requestApproval" => {
+            let perms = params
+                .get("permissions")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            vec![
+                (
+                    GateChoice::neutral("accept", "Allow", AllowOnce),
+                    json!({"permissions": perms, "scope": "turn"}),
+                ),
+                (
+                    GateChoice::neutral("acceptForSession", "Allow for this session", AllowAlways),
+                    json!({"permissions": perms, "scope": "session"}),
+                ),
+                (
+                    GateChoice::neutral("decline", "Deny", RejectOnce),
+                    json!({"permissions": {}}),
+                ),
+            ]
+        }
+        "execCommandApproval" | "applyPatchApproval" => {
+            let mut v = vec![
+                decision("approved", "Allow", AllowOnce, json!("approved")),
+                decision(
+                    "approved_for_session",
+                    "Allow for this session",
+                    AllowAlways,
+                    json!("approved_for_session"),
+                ),
+            ];
+            if let Some(a) = &amendment {
+                let (c, r) = decision(
+                    "approved_execpolicy_amendment",
+                    "Allow and remember",
+                    AllowAlways,
+                    json!({"approved_execpolicy_amendment": {"proposed_execpolicy_amendment": a}}),
+                );
+                v.push((
+                    c.with_description(format!("commands starting with `{}`", prefix(a))),
+                    r,
+                ));
+            }
+            v.push(decision("denied", "Deny", RejectOnce, json!("denied")));
+            v.push(decision(
+                "abort",
+                "Deny and stop the turn",
+                Cancel,
+                json!("abort"),
+            ));
+            v
+        }
+        _ => {
+            let listed: Vec<Value> = params
+                .get("availableDecisions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut d = vec![json!("accept"), json!("acceptForSession")];
+                    if method == "item/commandExecution/requestApproval" {
+                        if let Some(a) = &amendment {
+                            d.push(json!({"acceptWithExecpolicyAmendment": {"execpolicy_amendment": a}}));
+                        }
+                        for n in params
+                            .get("proposedNetworkPolicyAmendments")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            d.push(json!({"applyNetworkPolicyAmendment": {"network_policy_amendment": n}}));
+                        }
+                    }
+                    d.push(json!("decline"));
+                    d.push(json!("cancel"));
+                    d
+                });
+            listed
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, d)| v2_decision(i, d))
+                .collect()
+        }
+    }
+}
+
+/// One v2 `CommandExecutionApprovalDecision` / `FileChangeApprovalDecision` as a choice.
+fn v2_decision(i: usize, d: Value) -> Option<(GateChoice, Value)> {
+    use GateChoiceKind::*;
+    let choice = match &d {
+        Value::String(k) => match k.as_str() {
+            "accept" => GateChoice::neutral("accept", "Allow", AllowOnce),
+            "acceptForSession" => {
+                GateChoice::neutral("acceptForSession", "Allow for this session", AllowAlways)
+            }
+            "decline" => GateChoice::neutral("decline", "Deny", RejectOnce),
+            "cancel" => GateChoice::neutral("cancel", "Deny and stop the turn", Cancel),
+            _ => return None,
+        },
+        Value::Object(o) => {
+            if let Some(a) = o.get("acceptWithExecpolicyAmendment") {
+                let prefix = a
+                    .get("execpolicy_amendment")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                GateChoice::neutral(
+                    "acceptWithExecpolicyAmendment",
+                    "Allow and remember",
+                    AllowAlways,
+                )
+                .with_description(format!("commands starting with `{prefix}`"))
             } else {
-                json!({"permissions": {}})
+                let n = o
+                    .get("applyNetworkPolicyAmendment")?
+                    .get("network_policy_amendment")
+                    .cloned()
+                    .unwrap_or_default();
+                let allow = s(&n, "action") != "deny";
+                GateChoice::neutral(
+                    format!("network:{i}"),
+                    if allow {
+                        "Allow and remember"
+                    } else {
+                        "Deny and remember"
+                    },
+                    if allow { AllowAlways } else { RejectAlways },
+                )
+                .with_description(format!("network access to {}", s(&n, "host")))
             }
         }
-        // item/commandExecution + item/fileChange.
-        _ => json!({"decision": match (approve, for_session) {
-            (true, true) => "acceptForSession",
-            (true, false) => "accept",
-            (false, _) => "decline",
-        }}),
+        _ => return None,
     };
-    rpc_result(&gate.raw_id, result)
+    Some((choice, json!({"decision": d})))
+}
+
+/// The result that declines a gate when the turn is interrupted (the `turn/interrupt` that
+/// follows stops the turn, so this is the plain refusal of each method).
+fn interrupt_answer(g: &PendingGate) -> Value {
+    match g.method.as_str() {
+        "item/tool/requestUserInput" => json!({"answers": {}}),
+        "mcpServer/elicitation/request" => json!({"action": "decline"}),
+        "item/permissions/requestApproval" => json!({"permissions": {}}),
+        "execCommandApproval" | "applyPatchApproval" => json!({"decision": "denied"}),
+        _ => json!({"decision": "decline"}),
+    }
 }
 
 /// `item/tool/requestUserInput` answer: question text → id mapping.
@@ -1078,13 +1238,14 @@ fn encode_user_input_answer(gate: &PendingGate, answer: &QuestionAnswer) -> OutL
         let text = s(q, "question");
         if let Some(a) = answer
             .answers
-            .get(text)
-            .or_else(|| answer.answers.get(&qid))
+            .get(&qid)
+            .or_else(|| answer.answers.get(text))
         {
             let parts: Vec<Value> = a
-                .split(',')
-                .map(|p| Value::String(p.trim().to_string()))
-                .filter(|p| p.as_str() != Some(""))
+                .iter()
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(|p| Value::String(p.to_string()))
                 .collect();
             answers.insert(qid, json!({"answers": parts}));
         }

@@ -17,8 +17,8 @@ use crate::store::now_ms;
 use crate::stream::StreamEnd;
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandReply, CommandRequest, CreateSession, DriverSummary,
-    HistoryRequest, HostInfo, InventoryRequest, RefreshRequest, RuntimeError, SessionId,
-    SessionList, SessionRef,
+    HistoryRequest, HostInfo, InventoryRequest, RefreshRequest, RenameSession, RuntimeError,
+    SessionId, SessionList, SessionRef,
 };
 
 /// See the module docs.
@@ -146,6 +146,11 @@ impl Service for RuntimeService {
             methods::SESSIONS_DELETE => {
                 let r: SessionRef = params(p)?;
                 m.delete(&r.id).await.map_err(runtime_err)?;
+                ok(Ack {})
+            }
+            methods::SESSIONS_RENAME => {
+                let r: RenameSession = params(p)?;
+                m.rename(&r.id, r.display_name).await.map_err(runtime_err)?;
                 ok(Ack {})
             }
             methods::SESSION_SNAPSHOT => {

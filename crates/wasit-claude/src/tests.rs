@@ -181,7 +181,7 @@ fn tool_use_and_result_correlate() {
 #[test]
 fn permission_gate_approve_echoes_input_and_deny_has_message() {
     let (mut p, _) = ready();
-    let ev = p.on_line(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch a","description":"Create a"},"permission_suggestions":[{"type":"addRules"}]}}"#).events;
+    let ev = p.on_line(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch a","description":"Create a"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch a"}],"behavior":"allow","destination":"localSettings"},{"type":"setMode","mode":"acceptEdits","destination":"session"}]}}"#).events;
     match &ev[0] {
         AgentEvent::GateRequested {
             gate:
@@ -190,7 +190,7 @@ fn permission_gate_approve_echoes_input_and_deny_has_message() {
                     tool_name,
                     command,
                     explanation,
-                    permission_suggestions,
+                    choices,
                     ..
                 },
         } => {
@@ -198,13 +198,20 @@ fn permission_gate_approve_echoes_input_and_deny_has_message() {
             assert_eq!(tool_name, "Bash");
             assert_eq!(command, "touch a");
             assert_eq!(explanation, "Create a");
-            assert_eq!(permission_suggestions.len(), 1);
+            let ids: Vec<_> = choices.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(ids, ["allow", "allow_always", "deny", "deny_stop"]);
+            assert!(choices.iter().all(|c| c.neutral_label));
+            assert_eq!(
+                choices[1].description,
+                "allow rule Bash(touch a) (localSettings); switch to mode acceptEdits (session)"
+            );
+            assert_eq!(choices[2].text, wasit_core::ChoiceText::Optional);
         }
         e => panic!("{e:?}"),
     }
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "g1".into(),
-        decision: GateDecision::approve(),
+        decision: GateDecision::choose("allow"),
     }));
     assert_eq!(
         writes(&step)[0],
@@ -214,18 +221,46 @@ fn permission_gate_approve_echoes_input_and_deny_has_message() {
     assert!(matches!(
         p.encode(Command::AnswerGate {
             request_id: "g1".into(),
-            decision: GateDecision::approve()
+            decision: GateDecision::choose("allow")
         }),
         Err(wasit_core::DriverError::NotFound { .. })
     ));
+    // "Allow and remember" echoes every suggestion as updatedPermissions.
+    p.on_line(r#"{"type":"control_request","request_id":"g3","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls"}],"behavior":"allow","destination":"session"}]}}"#);
+    let step = sent(p.encode(Command::AnswerGate {
+        request_id: "g3".into(),
+        decision: GateDecision::choose("allow_always"),
+    }));
+    assert_eq!(
+        writes(&step)[0]["response"]["response"]["updatedPermissions"][0]["rules"][0]
+            ["ruleContent"],
+        "ls"
+    );
     p.on_line(r#"{"type":"control_request","request_id":"g2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm x"}}}"#);
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "g2".into(),
-        decision: GateDecision::deny(Some("no")),
+        decision: GateDecision::choose_with("deny", Some("no")),
     }));
     assert_eq!(
         writes(&step)[0]["response"]["response"],
         json!({"behavior":"deny","message":"no"})
+    );
+    // Without suggestions there is no "remember" choice; deny_stop interrupts.
+    p.on_line(r#"{"type":"control_request","request_id":"g4","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm y"}}}"#);
+    assert!(matches!(
+        p.encode(Command::AnswerGate {
+            request_id: "g4".into(),
+            decision: GateDecision::choose("allow_always")
+        }),
+        Err(wasit_core::DriverError::Invalid { .. })
+    ));
+    let step = sent(p.encode(Command::AnswerGate {
+        request_id: "g4".into(),
+        decision: GateDecision::choose("deny_stop"),
+    }));
+    assert_eq!(
+        writes(&step)[0]["response"]["response"],
+        json!({"behavior":"deny","message":"denied by user","interrupt":true})
     );
 }
 
@@ -241,12 +276,14 @@ fn question_and_plan_and_elicitation_gates() {
     assert!(matches!(
         p.encode(Command::AnswerGate {
             request_id: "q1".into(),
-            decision: GateDecision::approve()
+            decision: GateDecision::choose("allow")
         }),
         Err(wasit_core::DriverError::Invalid { .. })
     ));
     let mut answer = QuestionAnswer::default();
-    answer.answers.insert("Color?".into(), "Red".into());
+    answer
+        .answers
+        .insert("Color?".into(), vec!["Red".into(), "my own".into()]);
     let step = sent(p.encode(Command::AnswerQuestion {
         request_id: "q1".into(),
         answer,
@@ -254,7 +291,7 @@ fn question_and_plan_and_elicitation_gates() {
     let w = writes(&step);
     assert_eq!(
         w[0]["response"]["response"]["updatedInput"]["answers"],
-        json!({"Color?":"Red"})
+        json!({"Color?":"Red, my own"})
     );
     assert_eq!(
         w[0]["response"]["response"]["updatedInput"]["questions"][0]["question"],
@@ -267,7 +304,26 @@ fn question_and_plan_and_elicitation_gates() {
         AgentEvent::GateRequested {
             gate: GateRequest::Plan {
                 request_id: "p1".into(),
-                summary: "1. do it".into()
+                summary: "1. do it".into(),
+                choices: vec![
+                    wasit_core::GateChoice::neutral(
+                        "allow",
+                        "Approve plan",
+                        wasit_core::GateChoiceKind::AllowOnce
+                    ),
+                    wasit_core::GateChoice::neutral(
+                        "deny",
+                        "Keep planning",
+                        wasit_core::GateChoiceKind::RejectOnce
+                    )
+                    .with_text(wasit_core::ChoiceText::Optional),
+                    wasit_core::GateChoice::neutral(
+                        "deny_stop",
+                        "Deny and stop the turn",
+                        wasit_core::GateChoiceKind::Cancel
+                    )
+                    .with_text(wasit_core::ChoiceText::Optional),
+                ]
             }
         }
     );
@@ -275,15 +331,11 @@ fn question_and_plan_and_elicitation_gates() {
     let ev = p.on_line(r#"{"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mcp_server_name":"hares","message":"Grant?","requested_schema":{"properties":{"grant":{"enum":["once","deny"]}}}}}"#).events;
     assert!(matches!(
         &ev[0],
-        AgentEvent::GateRequested { gate: GateRequest::Permission { is_elicitation: true, tool_name, elicitation_choices, .. } } if tool_name == "hares" && elicitation_choices.len() == 2
+        AgentEvent::GateRequested { gate: GateRequest::Permission { tool_name, choices, .. } } if tool_name == "hares" && choices.len() == 4 && choices[0].id == "accept:once"
     ));
     let step = sent(p.encode(Command::AnswerGate {
         request_id: "e1".into(),
-        decision: GateDecision::Approve {
-            updated_input: None,
-            permission_updates: None,
-            elicitation_content: Some(json!({"grant":"once"})),
-        },
+        decision: GateDecision::choose("accept:once"),
     }));
     assert_eq!(
         writes(&step)[0]["response"]["response"],
@@ -581,11 +633,13 @@ fn discovery_parsers() {
                     r#"{"type":"queue-operation"}"#.into(),
                     r#"{"type":"user","cwd":"/p","message":{"role":"user","content":[{"type":"text","text":"fix it"}]}}"#.into(),
                 ],
+                matching_lines: Some(7),
             },
             wasit_core::FileHead {
                 path: "/h/.claude/projects/-p/agent-x.jsonl".into(),
                 modified_ms: 1,
                 head: vec![],
+                matching_lines: None,
             },
         ],
     };
@@ -594,6 +648,7 @@ fn discovery_parsers() {
             assert_eq!(s.len(), 1);
             assert_eq!(s[0].project.as_deref(), Some("/p"));
             assert_eq!(s[0].title, "fix it");
+            assert_eq!(s[0].message_count, Some(7));
         }
         d => panic!("{d:?}"),
     }

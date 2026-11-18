@@ -31,6 +31,8 @@ use crate::wire::{
     ResumeRequest, RuntimeError, SessionEvent, SessionId, SessionSnapshot,
 };
 
+/// Bound on a user-given display name.
+const DISPLAY_NAME_CHARS: usize = 200;
 /// Mailbox capacity of a session actor.
 const MAILBOX: usize = 64;
 /// Concurrent offline replays (snapshots of finished sessions) during adoption.
@@ -163,7 +165,16 @@ impl SessionManager {
             .map_err(|_| RuntimeError::UnknownDriver(req.driver.to_string()))?;
         let resume = match &req.resume {
             ResumeRequest::New => ResumeMode::Fresh,
-            ResumeRequest::Continue { native_session_id } => {
+            ResumeRequest::Latest => {
+                if !desc.capabilities().continue_latest {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "driver {} cannot continue its most recent session",
+                        req.driver
+                    )));
+                }
+                ResumeMode::Continue
+            }
+            ResumeRequest::Resume { native_session_id } => {
                 if !desc.capabilities().resume {
                     return Err(RuntimeError::Unsupported(format!(
                         "driver {} cannot resume sessions",
@@ -572,6 +583,19 @@ impl SessionManager {
     /// CLI's conversation by its native session id. History and cursors continue.
     pub async fn continue_session(&self, id: &SessionId) -> Result<(), RuntimeError> {
         self.ask(id, |reply| Msg::Continue { reply }).await?
+    }
+
+    /// Set (or clear, with `None` or a blank name) the session's user-given display name.
+    pub async fn rename(&self, id: &SessionId, name: Option<String>) -> Result<(), RuntimeError> {
+        let name = name
+            .map(|n| {
+                n.trim()
+                    .chars()
+                    .take(DISPLAY_NAME_CHARS)
+                    .collect::<String>()
+            })
+            .filter(|n| !n.is_empty());
+        self.ask(id, |reply| Msg::Rename { name, reply }).await?
     }
 
     /// Stop the session (waiting, bounded, for the process to exit) and remove its directory.

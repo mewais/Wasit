@@ -603,6 +603,8 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
                         .unwrap_or_default()
                         .to_string(),
                     modified_ms: e.get("updated").and_then(Value::as_u64).unwrap_or(0),
+                    // `session list` reports no message count (opencode 1.19.6, kilo 7.8.27).
+                    message_count: None,
                 })
             })
             .collect(),

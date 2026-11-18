@@ -16,8 +16,8 @@ use wasit_core::{Command, DriverId};
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandOutcome, CommandReply, CommandRequest,
     CreateSession, CreateSessionReply, HistoryPage, HistoryRequest, HostEvent, HostInfo,
-    InventoryReply, InventoryRequest, RefreshRequest, RuntimeError, SessionEvent, SessionId,
-    SessionList, SessionRef, SessionSnapshot,
+    InventoryReply, InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent,
+    SessionId, SessionList, SessionRef, SessionSnapshot,
 };
 
 /// A failed client call.
@@ -211,6 +211,19 @@ impl RuntimeClient {
     pub async fn delete(&self, id: &SessionId) -> Result<(), ClientError> {
         let _: Ack = self
             .call(methods::SESSIONS_DELETE, SessionRef { id: id.clone() })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn rename(&self, id: &SessionId, name: Option<String>) -> Result<(), ClientError> {
+        let _: Ack = self
+            .call(
+                methods::SESSIONS_RENAME,
+                RenameSession {
+                    id: id.clone(),
+                    display_name: name,
+                },
+            )
             .await?;
         Ok(())
     }

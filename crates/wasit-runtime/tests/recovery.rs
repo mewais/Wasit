@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::json;
-use wasit_core::{AgentEvent, Command, GateDecision};
+use wasit_core::{AgentEvent, Command, GateChoiceKind, GateDecision};
 use wasit_fake_cli::scenario::{Scenario, Turn};
 use wasit_runtime::wire::{Phase, SessionEvent, SessionEventKind, SessionSnapshot};
 use wasit_runtime::{SessionManager, StreamEnd};
@@ -75,23 +75,8 @@ async fn restart_mid_turn(driver: &str) {
 
     let mut s = mgr.subscribe(&id, Some(last)).await.unwrap();
     let gate = after.pending_gates[0].gate.clone();
-    let decision = match &gate {
-        wasit_core::GateRequest::Permission {
-            elicitation_choices,
-            ..
-        } if !elicitation_choices.is_empty() => {
-            let c = elicitation_choices
-                .iter()
-                .find(|c| c.value.contains("allow") || c.label.to_lowercase().contains("allow"))
-                .unwrap_or(&elicitation_choices[0]);
-            GateDecision::Approve {
-                updated_input: None,
-                permission_updates: None,
-                elicitation_content: Some(json!({c.key.clone(): c.value.clone()})),
-            }
-        }
-        _ => GateDecision::approve(),
-    };
+    let decision =
+        GateDecision::by_kind(&gate, &[GateChoiceKind::AllowOnce]).expect("an allow choice");
     mgr.command(
         &id,
         Command::AnswerGate {

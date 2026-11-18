@@ -74,13 +74,16 @@ pub enum ProbeAction {
     },
     /// List files ending in `suffix` under `dir` (recursively when asked),
     /// newest first, at most `max_files`, with the first `head_lines` lines
-    /// of each.
+    /// of each. With a non-empty `count_containing`, also count the lines of each file that
+    /// contain any of those substrings ([`FileHead::matching_lines`]; e.g. a transcript's
+    /// message records).
     ListFiles {
         dir: String,
         suffix: String,
         recursive: bool,
         max_files: usize,
         head_lines: usize,
+        count_containing: Vec<String>,
     },
     /// Read one (small) file. A missing file is not an error: it yields `contents: None`.
     ReadFile { path: String, max_bytes: usize },
@@ -94,6 +97,10 @@ pub struct FileHead {
     /// Modification time, milliseconds since the Unix epoch.
     pub modified_ms: u64,
     pub head: Vec<String>,
+    /// Lines containing one of the probe's `count_containing` substrings (`None` when the
+    /// probe asked for no count or the file could not be read to the end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matching_lines: Option<u64>,
 }
 
 /// What the runtime captured for a probe.
@@ -126,8 +133,11 @@ pub struct ResumableSession {
     pub project: Option<String>,
     /// Title or first user message, when known.
     pub title: String,
-    /// Last modification, milliseconds since the Unix epoch (0 = unknown).
+    /// Last activity (last modification), milliseconds since the Unix epoch (0 = unknown).
     pub modified_ms: u64,
+    /// Messages in the conversation, when the CLI's own records say (`None` = unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<u64>,
 }
 
 /// A parsed probe result.
@@ -394,6 +404,7 @@ pub fn config_listing(dir: String, suffix: &str, recursive: bool) -> ProbeAction
         recursive,
         max_files: 500,
         head_lines: 24,
+        count_containing: vec![],
     }
 }
 
@@ -406,6 +417,7 @@ mod config_discovery_tests {
             path: path.into(),
             modified_ms: 0,
             head: head.iter().map(|s| s.to_string()).collect(),
+            matching_lines: None,
         }
     }
 

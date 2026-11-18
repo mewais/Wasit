@@ -14,7 +14,7 @@ use crate::spec::SpawnSpec;
 #[serde(rename_all = "snake_case")]
 pub enum Record {
     /// `Protocol::start` was called with this spec.
-    Start(SpawnSpec),
+    Start(Box<SpawnSpec>),
     /// The CLI printed this line.
     Out(String),
     /// We wrote this line to the CLI.

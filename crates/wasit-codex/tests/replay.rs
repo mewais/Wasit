@@ -116,9 +116,12 @@ fn gate_approve_and_deny() {
         answers[0]["result"],
         serde_json::json!({"decision": "accept"})
     );
+    // codex 0.169.1 offers `availableDecisions` accept / acceptWithExecpolicyAmendment /
+    // cancel for these commands, so the refusal is `cancel` (the recording answered
+    // `decline`, which codex also accepts; only that answer line was adjusted).
     assert_eq!(
         answers[1]["result"],
-        serde_json::json!({"decision": "decline"})
+        serde_json::json!({"decision": "cancel"})
     );
     let finished: Vec<bool> = r
         .events

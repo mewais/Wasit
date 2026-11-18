@@ -19,9 +19,9 @@
 //!   requests are answered `{"outcome":{"outcome":"cancelled"}}` first.
 //! - Gates: `session/request_permission {toolCall, options}` answered with
 //!   `{"outcome":{"outcome":"selected","optionId":…}}`.
-//! - OpenCode's `question` tool does not surface over ACP (the turn blocks
-//!   with no request), so question gates never arrive; `AnswerQuestion` on a
-//!   permission gate selects the option whose name or id equals the answer.
+//!   Each option becomes a [`GateChoice`] with the option's id, its `name` as the label
+//!   (the agent's own wording) and its `kind` mapped one to one; `AnswerGate` selects the
+//!   chosen option by id. ACP has no question requests, so `AnswerQuestion` is refused.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -30,8 +30,8 @@ use wasit_core::wire::{
     id_text, opt_s, rpc_error, rpc_notification, rpc_request, rpc_result, s, u, RpcIn,
 };
 use wasit_core::{
-    AgentEvent, Command, CompactionInfo, DriverError, ElicitationChoice, Encoded, EndReason,
-    GateDecision, GateRequest, ModelInfo, OutLine, PlanEntry, Protocol, QuestionAnswer, ResumeMode,
+    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateChoice,
+    GateChoiceKind, GateDecision, GateRequest, ModelInfo, OutLine, PlanEntry, Protocol, ResumeMode,
     SessionMode, SlashCommandInfo, SpawnSpec, Step, Usage,
 };
 
@@ -70,7 +70,7 @@ impl Req {
 struct PendingGate {
     routing_id: String,
     raw_id: Value,
-    options: Vec<Value>,
+    choices: Vec<GateChoice>,
 }
 
 /// The ACP protocol state machine.
@@ -258,32 +258,18 @@ impl AcpProtocol {
                 decision,
             } => {
                 let gate = self.take_gate(&request_id)?;
-                match pick_option(&gate.options, &decision) {
-                    Some(option) => step.write.push(selected(&gate.raw_id, &option)),
-                    None if matches!(decision, GateDecision::Deny { .. }) => {
-                        step.write.push(cancelled(&gate.raw_id))
-                    }
-                    None => {
-                        self.gates.push(gate);
-                        return Err(DriverError::Invalid {
-                            detail: format!("gate {request_id} offers no matching option"),
-                        });
-                    }
+                if let Err(detail) = check_choice(&gate.choices, &request_id, &decision) {
+                    self.gates.push(gate);
+                    return Err(DriverError::Invalid { detail });
                 }
+                step.write.push(selected(&gate.raw_id, &decision.choice));
             }
-            Command::AnswerQuestion { request_id, answer } => {
-                let gate = self.take_gate(&request_id)?;
-                match option_for_answer(&gate.options, &answer) {
-                    Some(option) => step.write.push(selected(&gate.raw_id, &option)),
-                    None => {
-                        self.gates.push(gate);
-                        return Err(DriverError::Invalid {
-                            detail: format!(
-                                "answer matches none of the options of gate {request_id}"
-                            ),
-                        });
-                    }
-                }
+            Command::AnswerQuestion { request_id, .. } => {
+                return Err(DriverError::Invalid {
+                    detail: format!(
+                        "gate {request_id} is not a question (ACP has no question requests)"
+                    ),
+                });
             }
             Command::Interrupt => step = self.interrupt(),
             Command::SetModel { model } => {
@@ -522,10 +508,10 @@ impl AcpProtocol {
         let tool = params.get("toolCall").cloned().unwrap_or(Value::Null);
         let routing_id =
             opt_s(&tool, "toolCallId").unwrap_or_else(|| format!("acp:{}", id_text(&id)));
-        let options: Vec<Value> = params
+        let choices: Vec<GateChoice> = params
             .get("options")
             .and_then(Value::as_array)
-            .cloned()
+            .map(|a| a.iter().filter_map(acp_choice).collect())
             .unwrap_or_default();
         let kind = s(&tool, "kind");
         let title = s(&tool, "title");
@@ -546,25 +532,13 @@ impl AcpProtocol {
             } else {
                 format!("{kind}: {title}")
             },
-            is_elicitation: false,
-            elicitation_choices: options
-                .iter()
-                .filter_map(|o| {
-                    let id = opt_s(o, "optionId")?;
-                    Some(ElicitationChoice {
-                        key: "optionId".into(),
-                        label: opt_s(o, "name").unwrap_or_else(|| id.clone()),
-                        value: id,
-                    })
-                })
-                .collect(),
-            permission_suggestions: options.clone(),
+            choices: choices.clone(),
             raw_input: tool.get("rawInput").cloned().unwrap_or(Value::Null),
         };
         self.gates.push(PendingGate {
             routing_id,
             raw_id: id,
-            options,
+            choices,
         });
         events(vec![AgentEvent::GateRequested { gate }])
     }
@@ -909,49 +883,42 @@ pub fn config_models(container: &Value) -> (Vec<ModelInfo>, Option<String>) {
     (models, opt_s(g, "currentValue"))
 }
 
-fn option_kind(o: &Value) -> &str {
-    s(o, "kind")
-}
-
-/// The option id to select for a decision, if any option fits.
-fn pick_option(options: &[Value], decision: &GateDecision) -> Option<String> {
-    let by_kind = |kinds: &[&str]| {
-        kinds.iter().find_map(|k| {
-            options
-                .iter()
-                .find(|o| option_kind(o) == *k)
-                .and_then(|o| opt_s(o, "optionId"))
-        })
+/// One ACP `PermissionOption` (`{optionId, name, kind}`) as a choice: the agent's own id,
+/// wording and kind.
+fn acp_choice(o: &Value) -> Option<GateChoice> {
+    let id = opt_s(o, "optionId")?;
+    let kind = match s(o, "kind") {
+        "allow_always" => GateChoiceKind::AllowAlways,
+        "reject_once" => GateChoiceKind::RejectOnce,
+        "reject_always" => GateChoiceKind::RejectAlways,
+        // `allow_once`; an unknown kind is treated as the narrowest allow.
+        _ => GateChoiceKind::AllowOnce,
     };
-    match decision {
-        GateDecision::Approve {
-            elicitation_content: Some(c),
-            ..
-        } if c.get("optionId").and_then(Value::as_str).is_some() => {
-            let want = s(c, "optionId");
-            options
-                .iter()
-                .find(|o| s(o, "optionId") == want)
-                .map(|_| want.to_string())
-        }
-        GateDecision::Approve {
-            permission_updates: Some(_),
-            ..
-        } => by_kind(&["allow_always", "allow_once"]),
-        GateDecision::Approve { .. } => by_kind(&["allow_once", "allow_always"]),
-        GateDecision::Deny { .. } => by_kind(&["reject_once", "reject_always"]),
-    }
+    Some(match opt_s(o, "name") {
+        Some(name) => GateChoice::agent(id, name, kind),
+        None => GateChoice::neutral(id.clone(), id, kind),
+    })
 }
 
-/// The option whose name or id equals one of the answer values.
-fn option_for_answer(options: &[Value], answer: &QuestionAnswer) -> Option<String> {
-    answer.answers.values().find_map(|a| {
-        let a = a.trim();
-        options
-            .iter()
-            .find(|o| s(o, "optionId") == a || s(o, "name") == a)
-            .and_then(|o| opt_s(o, "optionId"))
-    })
+/// `Ok` when `decision` names one of `choices`.
+fn check_choice(
+    choices: &[GateChoice],
+    request_id: &str,
+    decision: &GateDecision,
+) -> Result<(), String> {
+    if choices.iter().any(|c| c.id == decision.choice) {
+        Ok(())
+    } else {
+        Err(format!(
+            "gate {request_id} offers no option {:?} (offers: {})",
+            decision.choice,
+            choices
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
 }
 
 fn selected(id: &Value, option: &str) -> OutLine {

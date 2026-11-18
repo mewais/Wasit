@@ -15,7 +15,7 @@ use tokio::time::{timeout, Instant};
 use wasit_core::transcript::{to_line, Record};
 use wasit_core::{
     AgentConfig, AgentEvent, Command, DriverDescriptor, DriverId, DriverRegistry, Encoded,
-    GateDecision, GateRequest, Protocol, QuestionAnswer, SpawnSpec, Step,
+    GateChoiceKind, GateDecision, GateRequest, Protocol, QuestionAnswer, SpawnSpec, Step,
 };
 
 /// Every driver this workspace ships, in a stable order.
@@ -136,11 +136,13 @@ impl Live {
         self.apply(step).await
     }
 
-    fn gate_answer(&self, decision: GateDecision) -> Option<Command> {
+    /// Answer the last gate with its first choice of one of `kinds`.
+    fn gate_answer(&self, kinds: &[GateChoiceKind], text: Option<&str>) -> Option<Command> {
         let gate = self.last_gate.as_ref()?;
+        let c = gate.choice_of_kind(kinds)?;
         Some(Command::AnswerGate {
             request_id: gate.request_id().to_string(),
-            decision,
+            decision: GateDecision::choose_with(&c.id, text),
         })
     }
 
@@ -150,11 +152,11 @@ impl Live {
         match gate {
             GateRequest::Question { questions, .. } => {
                 for q in questions {
-                    a.answers.insert(q.question.clone(), answer.to_string());
+                    a.answers.insert(q.id.clone(), vec![answer.to_string()]);
                 }
             }
             _ => {
-                a.answers.insert(String::new(), answer.to_string());
+                a.answers.insert(String::new(), vec![answer.to_string()]);
             }
         }
         Some(Command::AnswerQuestion {
@@ -209,7 +211,7 @@ pub async fn run(mut opts: RunOptions) -> Result<Outcome, String> {
         echo: opts.echo,
         outcome: Outcome::default(),
     };
-    live.rec(&Record::Start(opts.spec.clone()));
+    live.rec(&Record::Start(Box::new(opts.spec.clone())));
     let step = live.protocol.start(&opts.spec);
     live.apply(step).await;
 
@@ -307,9 +309,9 @@ pub(crate) async fn run_interactive(live: &mut Live, rx: &mut mpsc::Receiver<Str
                 let cmd = match text {
                     "" => continue,
                     ".quit" => return,
-                    "y" => live.gate_answer(GateDecision::approve()),
-                    "n" => live.gate_answer(GateDecision::deny(Some("denied in wasit-smoke"))),
-                    "a" => live.gate_answer(GateDecision::Approve { updated_input: None, permission_updates: Some(Value::Bool(true)), elicitation_content: None }),
+                    "y" => live.gate_answer(&[GateChoiceKind::AllowOnce, GateChoiceKind::AllowAlways], None),
+                    "n" => live.gate_answer(&[GateChoiceKind::RejectOnce, GateChoiceKind::Cancel], Some("denied in wasit-smoke")),
+                    "a" => live.gate_answer(&[GateChoiceKind::AllowAlways], None),
                     "i" => Some(Command::Interrupt),
                     t if t.starts_with("q ") => live.question_answer(&t[2..]),
                     t if t.starts_with("m ") => Some(Command::SetModel { model: t[2..].trim().into() }),
@@ -342,15 +344,17 @@ async fn run_script(
                     .map_err(|e| format!("bad cmd {c}: {e}"))?,
             )
         } else if st.get("approve").is_some() {
-            live.gate_answer(GateDecision::approve())
+            live.gate_answer(
+                &[GateChoiceKind::AllowOnce, GateChoiceKind::AllowAlways],
+                None,
+            )
         } else if st.get("deny").is_some() {
-            live.gate_answer(GateDecision::deny(Some("denied in wasit-smoke")))
+            live.gate_answer(
+                &[GateChoiceKind::RejectOnce, GateChoiceKind::Cancel],
+                Some("denied in wasit-smoke"),
+            )
         } else if st.get("always").is_some() {
-            live.gate_answer(GateDecision::Approve {
-                updated_input: None,
-                permission_updates: Some(Value::Bool(true)),
-                elicitation_content: None,
-            })
+            live.gate_answer(&[GateChoiceKind::AllowAlways], None)
         } else if let Some(a) = st.get("answer").and_then(Value::as_str) {
             live.question_answer(a)
         } else if let Some(kind) = st.get("wait").and_then(Value::as_str) {

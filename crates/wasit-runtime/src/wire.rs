@@ -16,6 +16,7 @@
 //! | [`methods::SESSIONS_CONTINUE`] | [`SessionRef`] | [`Ack`] |
 //! | [`methods::SESSIONS_STOP`] | [`SessionRef`] | [`Ack`] |
 //! | [`methods::SESSIONS_DELETE`] | [`SessionRef`] | [`Ack`] |
+//! | [`methods::SESSIONS_RENAME`] | [`RenameSession`] | [`Ack`] |
 //! | [`methods::SESSION_SNAPSHOT`] | [`SessionRef`] | [`SessionSnapshot`] |
 //! | [`methods::SESSION_HISTORY`] | [`HistoryRequest`] | [`HistoryPage`] |
 //! | [`methods::SESSION_COMMAND`] | [`CommandRequest`] | [`CommandReply`] |
@@ -36,7 +37,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
-    GateRequest, ModelInfo, PlanEntry, ResumableSession, SessionMode, SlashCommandInfo,
+    GateRequest, ModelInfo, ModelUsage, PlanEntry, ResumableSession, SessionMode, SlashCommandInfo,
     Unsupported, Usage,
 };
 
@@ -50,6 +51,7 @@ pub mod methods {
     pub const SESSIONS_CONTINUE: &str = "sessions.continue";
     pub const SESSIONS_STOP: &str = "sessions.stop";
     pub const SESSIONS_DELETE: &str = "sessions.delete";
+    pub const SESSIONS_RENAME: &str = "sessions.rename";
     pub const SESSION_SNAPSHOT: &str = "session.snapshot";
     pub const SESSION_HISTORY: &str = "session.history";
     pub const SESSION_COMMAND: &str = "session.command";
@@ -202,9 +204,16 @@ pub struct TurnInfo {
     /// The prompt that started it, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Tool calls started in this turn (the turn's steps as far as the runtime can see).
     pub tool_calls: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool: Option<String>,
+    /// The tool running right now (started, not finished), when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool: Option<String>,
+    /// Call id of `current_tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_call: Option<String>,
 }
 
 /// How the last turn ended.
@@ -273,6 +282,9 @@ pub struct SessionSnapshot {
     /// The first prompt, truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The name the user gave the session (`sessions.rename`), stored with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +306,9 @@ pub struct SessionSnapshot {
     pub turns_completed: u64,
     /// Cumulative usage as of the last completed turn.
     pub usage: Usage,
+    /// Per-model breakdown of `usage`, when the CLI reports one (claude `modelUsage`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usage_by_model: BTreeMap<String, ModelUsage>,
     /// The latest live usage report (meaning per driver: see `AgentEvent::UsageUpdate`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_usage: Option<Usage>,
@@ -437,8 +452,13 @@ pub enum ResumeRequest {
     /// A brand-new conversation.
     #[default]
     New,
-    /// Continue a conversation the CLI already has (from `drivers.inventory` sessions).
-    Continue { native_session_id: String },
+    /// Continue the CLI's most recent conversation in `cwd`, the way the CLI's own "continue"
+    /// does (claude `--continue`, codex latest thread, ACP latest session). Needs
+    /// [`DriverCapabilities::continue_latest`].
+    Latest,
+    /// Resume one conversation the CLI already has, by its native id (from
+    /// `drivers.inventory` sessions). Needs [`DriverCapabilities::resume`].
+    Resume { native_session_id: String },
 }
 
 /// `sessions.create`.
@@ -498,6 +518,16 @@ pub struct CreateSessionReply {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionRef {
     pub id: SessionId,
+}
+
+/// `sessions.rename`: set (or with `None` / blank, clear) the user-given display name, stored
+/// in the session's `session.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RenameSession {
+    pub id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// Result of `sessions.list`.

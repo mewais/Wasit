@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use wasit_core::{AgentEvent, Command, GateDecision, GateRequest, QuestionAnswer};
+use wasit_core::{AgentEvent, Command, GateChoiceKind, GateDecision, GateRequest, QuestionAnswer};
 use wasit_fake_cli::scenario::{Scenario, Step, Turn};
 use wasit_runtime::wire::{CommandError, CommandOutcome, Phase, SessionEventKind};
 
@@ -102,26 +102,12 @@ async fn permission_gate(driver: &str, allow: bool) {
     let gate = &snap.pending_gates[0].gate;
     assert!(matches!(gate, GateRequest::Permission { .. }), "{gate:?}");
     let decision = if allow {
-        match gate {
-            GateRequest::Permission {
-                elicitation_choices,
-                ..
-            } if !elicitation_choices.is_empty() => {
-                // ACP: pick the "allow once" option explicitly.
-                let c = elicitation_choices
-                    .iter()
-                    .find(|c| c.value.contains("allow") || c.label.to_lowercase().contains("allow"))
-                    .unwrap_or(&elicitation_choices[0]);
-                GateDecision::Approve {
-                    updated_input: None,
-                    permission_updates: None,
-                    elicitation_content: Some(json!({c.key.clone(): c.value.clone()})),
-                }
-            }
-            _ => GateDecision::approve(),
-        }
+        GateDecision::by_kind(gate, &[GateChoiceKind::AllowOnce]).expect("an allow choice")
     } else {
-        GateDecision::deny(Some("no"))
+        let c = gate
+            .choice_of_kind(&[GateChoiceKind::RejectOnce, GateChoiceKind::Cancel])
+            .expect("a reject choice");
+        GateDecision::choose_with(&c.id, Some("no"))
     };
     let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
     let out = mgr
@@ -151,7 +137,7 @@ async fn permission_gate(driver: &str, allow: bool) {
             &id,
             Command::AnswerGate {
                 request_id: gate.request_id().to_string(),
-                decision: GateDecision::approve(),
+                decision: GateDecision::by_kind(gate, &[GateChoiceKind::AllowOnce]).unwrap(),
             },
         )
         .await;
@@ -223,7 +209,7 @@ async fn question(driver: &str) {
         } => Command::AnswerQuestion {
             request_id: request_id.clone(),
             answer: QuestionAnswer {
-                answers: [(questions[0].question.clone(), "Blue".to_string())]
+                answers: [(questions[0].id.clone(), vec!["Blue".to_string()])]
                     .into_iter()
                     .collect(),
             },
@@ -231,20 +217,16 @@ async fn question(driver: &str) {
         // ACP models questions as a permission request with options.
         GateRequest::Permission {
             request_id,
-            elicitation_choices,
+            choices,
             ..
         } => {
-            let c = elicitation_choices
+            let c = choices
                 .iter()
                 .find(|c| c.label == "Blue")
                 .expect("Blue option");
             Command::AnswerGate {
                 request_id: request_id.clone(),
-                decision: GateDecision::Approve {
-                    updated_input: None,
-                    permission_updates: None,
-                    elicitation_content: Some(json!({c.key.clone(): c.value.clone()})),
-                },
+                decision: GateDecision::choose(&c.id),
             }
         }
         other => panic!("unexpected gate {other:?}"),

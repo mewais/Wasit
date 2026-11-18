@@ -28,20 +28,37 @@ use std::collections::{HashMap, VecDeque};
 use serde_json::{json, Value};
 use wasit_core::wire::{opt_s, s, u};
 use wasit_core::{
-    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateDecision,
-    GateRequest, McpServerInfo, ModelInfo, ModelUsage, OutLine, Protocol, QuestionAnswer,
-    QuestionOption, QuestionPrompt, RateLimitInfo, SlashCommandInfo, SpawnSpec, Step, Usage,
+    AgentEvent, ChoiceText, Command, CompactionInfo, DriverError, Encoded, EndReason, GateChoice,
+    GateChoiceKind, GateRequest, McpServerInfo, ModelInfo, ModelUsage, OutLine, Protocol,
+    QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, SlashCommandInfo, SpawnSpec,
+    Step, Usage,
 };
 
 /// What a pending gate needs to encode its answer.
 #[derive(Debug, Clone, PartialEq)]
 enum GateKind {
-    /// `can_use_tool` (incl. `ExitPlanMode`); holds the original input.
-    Tool { input: Value },
+    /// `can_use_tool` (incl. `ExitPlanMode`): the original input and, per choice id, the
+    /// native answer.
+    Tool {
+        input: Value,
+        answers: Vec<(String, ToolAnswer)>,
+    },
     /// `AskUserQuestion`; holds the original input (its `questions`).
     Question { input: Value },
-    /// MCP elicitation.
-    Elicitation,
+    /// MCP elicitation: per choice id, the content to accept with (`None` = the choice is
+    /// `decline` / `cancel`, sent as that action).
+    Elicitation {
+        answers: Vec<(String, Option<Value>)>,
+    },
+}
+
+/// The `can_use_tool` response a choice stands for.
+#[derive(Debug, Clone, PartialEq)]
+enum ToolAnswer {
+    /// `{behavior:"allow"}`, with `updatedPermissions` when the choice remembers something.
+    Allow { updated_permissions: Option<Value> },
+    /// `{behavior:"deny", message, interrupt}`.
+    Deny { interrupt: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,40 +169,43 @@ impl ClaudeProtocol {
                 decision,
             } => {
                 let kind = self.take_gate(&request_id)?;
-                let line = match (&kind, decision) {
-                    (GateKind::Question { .. }, _) => {
-                        self.gates.push((request_id.clone(), kind));
-                        return Err(DriverError::Invalid {
-                            detail: format!(
-                                "gate {request_id} is a question; answer it with answer_question"
+                let line = match &kind {
+                    GateKind::Question { .. } => None,
+                    GateKind::Tool { input, answers } => answers
+                        .iter()
+                        .find(|(id, _)| *id == decision.choice)
+                        .map(|(_, a)| match a {
+                            ToolAnswer::Allow {
+                                updated_permissions,
+                            } => encode_allow(
+                                &request_id,
+                                input.clone(),
+                                updated_permissions.clone(),
                             ),
-                        });
-                    }
-                    (
-                        GateKind::Tool { input },
-                        GateDecision::Approve {
-                            updated_input,
-                            permission_updates,
-                            ..
-                        },
-                    ) => encode_allow(
-                        &request_id,
-                        updated_input.unwrap_or_else(|| input.clone()),
-                        permission_updates,
-                    ),
-                    (
-                        GateKind::Elicitation,
-                        GateDecision::Approve {
-                            elicitation_content,
-                            ..
-                        },
-                    ) => encode_elicitation_accept(&request_id, elicitation_content),
-                    (GateKind::Tool { .. }, GateDecision::Deny { reason }) => {
-                        encode_deny(&request_id, reason.as_deref().unwrap_or("denied by user"))
-                    }
-                    (GateKind::Elicitation, GateDecision::Deny { .. }) => {
-                        encode_elicitation_decline(&request_id)
-                    }
+                            ToolAnswer::Deny { interrupt } => encode_deny(
+                                &request_id,
+                                decision.text.as_deref().unwrap_or("denied by user"),
+                                *interrupt,
+                            ),
+                        }),
+                    GateKind::Elicitation { answers } => answers
+                        .iter()
+                        .find(|(id, _)| *id == decision.choice)
+                        .map(|(id, content)| match content {
+                            Some(c) => encode_elicitation_accept(&request_id, Some(c.clone())),
+                            None if id == "cancel" => encode_elicitation_cancel(&request_id),
+                            None => encode_elicitation_decline(&request_id),
+                        }),
+                };
+                let Some(line) = line else {
+                    let detail = match &kind {
+                        GateKind::Question { .. } => format!(
+                            "gate {request_id} is a question; answer it with answer_question"
+                        ),
+                        _ => format!("gate {request_id} offers no choice {:?}", decision.choice),
+                    };
+                    self.gates.push((request_id.clone(), kind));
+                    return Err(DriverError::Invalid { detail });
                 };
                 Ok(Step {
                     write: vec![line],
@@ -270,9 +290,9 @@ impl ClaudeProtocol {
             .retain(|c| !matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
         for (id, kind) in std::mem::take(&mut self.gates) {
             let line = match kind {
-                GateKind::Elicitation => encode_elicitation_decline(&id),
+                GateKind::Elicitation { .. } => encode_elicitation_cancel(&id),
                 GateKind::Tool { .. } | GateKind::Question { .. } => {
-                    encode_deny(&id, "interrupted by user")
+                    encode_deny(&id, "interrupted by user", false)
                 }
             };
             step.write.push(line);
@@ -385,8 +405,8 @@ impl ClaudeProtocol {
                 events(vec![AgentEvent::GateRequested { gate }])
             }
             "elicitation" => {
-                let gate = elicitation_gate(&id, &req);
-                self.gates.push((id, GateKind::Elicitation));
+                let (gate, kind) = elicitation_gate(&id, &req);
+                self.gates.push((id, kind));
                 events(vec![AgentEvent::GateRequested { gate }])
             }
             other => {
@@ -771,16 +791,12 @@ fn session_init(v: &Value) -> AgentEvent {
 fn tool_gate(id: &str, req: &Value) -> (GateRequest, GateKind) {
     let tool_name = s(req, "tool_name").to_string();
     let input = req.get("input").cloned().unwrap_or(Value::Null);
+    let suggestions: Vec<Value> = req
+        .get("permission_suggestions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     match tool_name.as_str() {
-        "ExitPlanMode" => (
-            GateRequest::Plan {
-                request_id: id.to_string(),
-                summary: opt_s(&input, "plan")
-                    .or_else(|| opt_s(&input, "content"))
-                    .unwrap_or_default(),
-            },
-            GateKind::Tool { input },
-        ),
         "AskUserQuestion" => {
             let questions = input
                 .get("questions")
@@ -795,12 +811,26 @@ fn tool_gate(id: &str, req: &Value) -> (GateRequest, GateKind) {
                 GateKind::Question { input },
             )
         }
+        "ExitPlanMode" => {
+            let (choices, answers) = tool_choices(&suggestions, true);
+            (
+                GateRequest::Plan {
+                    request_id: id.to_string(),
+                    summary: opt_s(&input, "plan")
+                        .or_else(|| opt_s(&input, "content"))
+                        .unwrap_or_default(),
+                    choices,
+                },
+                GateKind::Tool { input, answers },
+            )
+        }
         _ => {
             let command = opt_s(&input, "command")
                 .or_else(|| opt_s(&input, "file_path"))
                 .or_else(|| opt_s(&input, "description"))
                 .or_else(|| opt_s(req, "description"))
                 .unwrap_or_default();
+            let (choices, answers) = tool_choices(&suggestions, false);
             let gate = GateRequest::Permission {
                 request_id: id.to_string(),
                 tool_name,
@@ -809,22 +839,128 @@ fn tool_gate(id: &str, req: &Value) -> (GateRequest, GateKind) {
                 explanation: opt_s(&input, "description")
                     .or_else(|| opt_s(req, "description"))
                     .unwrap_or_default(),
-                is_elicitation: false,
-                elicitation_choices: vec![],
-                permission_suggestions: req
-                    .get("permission_suggestions")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
+                choices,
                 raw_input: input.clone(),
             };
-            (gate, GateKind::Tool { input })
+            (gate, GateKind::Tool { input, answers })
         }
+    }
+}
+
+/// The answers a `can_use_tool` request implies. claude's control protocol carries no
+/// wording, so the labels are neutral: allow once; allow and remember (only when claude sent
+/// `permission_suggestions`: they are echoed back as `updatedPermissions`, all of them, the
+/// way the CLI's own "don't ask again" applies them; the description lists them); deny with an
+/// optional message to claude (the agent continues); deny with an optional message and stop
+/// the turn (`interrupt: true`, what the CLI's own "No" does).
+fn tool_choices(suggestions: &[Value], plan: bool) -> (Vec<GateChoice>, Vec<(String, ToolAnswer)>) {
+    let mut choices = vec![GateChoice::neutral(
+        "allow",
+        if plan { "Approve plan" } else { "Allow" },
+        GateChoiceKind::AllowOnce,
+    )];
+    let mut answers = vec![(
+        "allow".to_string(),
+        ToolAnswer::Allow {
+            updated_permissions: None,
+        },
+    )];
+    if !suggestions.is_empty() {
+        choices.push(
+            GateChoice::neutral(
+                "allow_always",
+                if plan {
+                    "Approve and remember"
+                } else {
+                    "Allow and remember"
+                },
+                GateChoiceKind::AllowAlways,
+            )
+            .with_description(
+                suggestions
+                    .iter()
+                    .map(describe_suggestion)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        );
+        answers.push((
+            "allow_always".to_string(),
+            ToolAnswer::Allow {
+                updated_permissions: Some(Value::Array(suggestions.to_vec())),
+            },
+        ));
+    }
+    choices.push(
+        GateChoice::neutral(
+            "deny",
+            if plan { "Keep planning" } else { "Deny" },
+            GateChoiceKind::RejectOnce,
+        )
+        .with_text(ChoiceText::Optional),
+    );
+    answers.push(("deny".to_string(), ToolAnswer::Deny { interrupt: false }));
+    choices.push(
+        GateChoice::neutral(
+            "deny_stop",
+            "Deny and stop the turn",
+            GateChoiceKind::Cancel,
+        )
+        .with_text(ChoiceText::Optional),
+    );
+    answers.push((
+        "deny_stop".to_string(),
+        ToolAnswer::Deny { interrupt: true },
+    ));
+    (choices, answers)
+}
+
+/// One claude `PermissionUpdate` in words, using only what it carries (`addRules`,
+/// `replaceRules`, `removeRules`, `setMode`, `addDirectories`, `removeDirectories`).
+fn describe_suggestion(v: &Value) -> String {
+    let dest = match s(v, "destination") {
+        "" => String::new(),
+        d => format!(" ({d})"),
+    };
+    let rules = || {
+        v.get("rules")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|r| match opt_s(r, "ruleContent") {
+                        Some(c) => format!("{}({c})", s(r, "toolName")),
+                        None => s(r, "toolName").to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    let dirs = || {
+        v.get("directories")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    match s(v, "type") {
+        "addRules" | "replaceRules" => format!("{} rule {}{dest}", s(v, "behavior"), rules()),
+        "removeRules" => format!("remove rule {}{dest}", rules()),
+        "setMode" => format!("switch to mode {}{dest}", s(v, "mode")),
+        "addDirectories" => format!("add directory {}{dest}", dirs()),
+        "removeDirectories" => format!("remove directory {}{dest}", dirs()),
+        other => format!("{other}{dest}"),
     }
 }
 
 fn question_prompt(q: &Value) -> QuestionPrompt {
     QuestionPrompt {
+        // claude keys answers by the question text.
+        id: s(q, "question").to_string(),
         question: s(q, "question").to_string(),
         header: s(q, "header").to_string(),
         multi_select: q
@@ -844,12 +980,16 @@ fn question_prompt(q: &Value) -> QuestionPrompt {
                     .collect()
             })
             .unwrap_or_default(),
+        // AskUserQuestion always accepts a free-text answer (the CLI's "Other").
+        allow_other: true,
+        secret: false,
     }
 }
 
-fn elicitation_gate(id: &str, req: &Value) -> GateRequest {
+fn elicitation_gate(id: &str, req: &Value) -> (GateRequest, GateKind) {
     let message = s(req, "message").to_string();
-    GateRequest::Permission {
+    let pairs = wasit_core::wire::elicitation_choices(req.get("requested_schema"));
+    let gate = GateRequest::Permission {
         request_id: id.to_string(),
         tool_name: opt_s(req, "mcp_server_name")
             .or_else(|| opt_s(req, "server_name"))
@@ -857,11 +997,11 @@ fn elicitation_gate(id: &str, req: &Value) -> GateRequest {
         command: message.clone(),
         cwd: String::new(),
         explanation: message,
-        is_elicitation: true,
-        elicitation_choices: wasit_core::wire::elicitation_choices(req.get("requested_schema")),
-        permission_suggestions: vec![],
+        choices: pairs.iter().map(|(c, _)| c.clone()).collect(),
         raw_input: Value::Null,
-    }
+    };
+    let answers = pairs.into_iter().map(|(c, v)| (c.id, v)).collect();
+    (gate, GateKind::Elicitation { answers })
 }
 
 fn rate_limit(v: &Value) -> AgentEvent {
@@ -908,9 +1048,13 @@ pub fn encode_allow(request_id: &str, input: Value, permission_updates: Option<V
     control_success(request_id, r)
 }
 
-/// `can_use_tool` deny.
-pub fn encode_deny(request_id: &str, message: &str) -> OutLine {
-    control_success(request_id, json!({"behavior": "deny", "message": message}))
+/// `can_use_tool` deny; `interrupt` also stops the turn.
+pub fn encode_deny(request_id: &str, message: &str, interrupt: bool) -> OutLine {
+    let mut r = json!({"behavior": "deny", "message": message});
+    if interrupt {
+        r["interrupt"] = Value::Bool(true);
+    }
+    control_success(request_id, r)
 }
 
 /// Elicitation accept.
@@ -921,6 +1065,11 @@ pub fn encode_elicitation_accept(request_id: &str, content: Option<Value>) -> Ou
     )
 }
 
+/// Elicitation cancel.
+pub fn encode_elicitation_cancel(request_id: &str) -> OutLine {
+    control_success(request_id, json!({"action": "cancel"}))
+}
+
 /// Elicitation decline.
 pub fn encode_elicitation_decline(request_id: &str) -> OutLine {
     control_success(request_id, json!({"action": "decline"}))
@@ -928,10 +1077,12 @@ pub fn encode_elicitation_decline(request_id: &str) -> OutLine {
 
 /// `AskUserQuestion` answer: allow with the original questions plus answers.
 pub fn encode_question_answer(request_id: &str, input: &Value, answer: &QuestionAnswer) -> OutLine {
+    // claude takes one string per question; several picks are comma-joined, as its own UI does.
     let answers: serde_json::Map<String, Value> = answer
         .answers
         .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.clone(), Value::String(v.join(", "))))
         .collect();
     let questions = input.get("questions").cloned().unwrap_or_else(|| json!([]));
     encode_allow(

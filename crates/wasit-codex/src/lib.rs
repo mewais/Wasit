@@ -145,6 +145,7 @@ impl DriverDescriptor for CodexDescriptor {
                     recursive: true,
                     max_files: 200,
                     head_lines: 40,
+                    count_containing: vec![MESSAGE_RECORD.to_string()],
                 },
                 parse: std::sync::Arc::new(parse_sessions),
             });
@@ -152,6 +153,10 @@ impl DriverDescriptor for CodexDescriptor {
         probes
     }
 }
+
+/// Rollout records that are conversation messages (`response_item` payloads of type
+/// `message`, any role). Their count is the session's message count.
+pub const MESSAGE_RECORD: &str = "\"type\":\"message\"";
 
 impl ConfigRenderer for CodexDescriptor {
     fn render_config(&self, config: &AgentConfig, spec: &mut SpawnSpec) -> Vec<Unsupported> {
@@ -486,6 +491,7 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
             project,
             title,
             modified_ms: f.modified_ms,
+            message_count: f.matching_lines,
         });
     }
     Ok(Discovered::Sessions(sessions))

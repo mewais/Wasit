@@ -4,7 +4,7 @@
 
 use serde_json::{json, Value};
 
-use crate::event::ElicitationChoice;
+use crate::event::{GateChoice, GateChoiceKind};
 use crate::protocol::OutLine;
 
 /// A classified JSON-RPC message read from a CLI.
@@ -121,16 +121,20 @@ pub fn u(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// Choices from the first enum property of an elicitation JSON schema
-/// (`{"properties": {"grant": {"enum": [...], "enumNames": [...]}}}`).
-pub fn elicitation_choices(schema: Option<&Value>) -> Vec<ElicitationChoice> {
-    let Some(props) = schema
+/// The choices of an MCP elicitation (claude `elicitation`, codex
+/// `mcpServer/elicitation/request`), each with the `content` to send back on accept (`None`
+/// for decline / cancel).
+///
+/// The first enum property of the requested schema
+/// (`{"properties": {"grant": {"enum": [...], "enumNames": [...]}}}`) gives one accept choice
+/// per value, labelled by the server's `enumNames` (its own wording); without one there is a
+/// single neutral "Accept". MCP's `decline` and `cancel` follow, neutral.
+pub fn elicitation_choices(schema: Option<&Value>) -> Vec<(GateChoice, Option<Value>)> {
+    let mut out = Vec::new();
+    let props = schema
         .and_then(|s| s.get("properties"))
-        .and_then(Value::as_object)
-    else {
-        return vec![];
-    };
-    for (key, prop) in props {
+        .and_then(Value::as_object);
+    for (key, prop) in props.into_iter().flatten() {
         let Some(values) = prop.get("enum").and_then(Value::as_array) else {
             continue;
         };
@@ -138,28 +142,41 @@ pub fn elicitation_choices(schema: Option<&Value>) -> Vec<ElicitationChoice> {
             continue;
         }
         let names = prop.get("enumNames").and_then(Value::as_array);
-        return values
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let value = v
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| v.to_string());
-                let label = names
-                    .and_then(|n| n.get(i))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| value.clone());
-                ElicitationChoice {
-                    key: key.clone(),
-                    value,
-                    label,
+        for (i, v) in values.iter().enumerate() {
+            let value = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            let name = names.and_then(|n| n.get(i)).and_then(Value::as_str);
+            let choice = match name {
+                Some(n) => {
+                    GateChoice::agent(format!("accept:{value}"), n, GateChoiceKind::AllowOnce)
                 }
-            })
-            .collect();
+                None => GateChoice::agent(
+                    format!("accept:{value}"),
+                    value.clone(),
+                    GateChoiceKind::AllowOnce,
+                ),
+            };
+            out.push((choice, Some(json!({ key.clone(): v.clone() }))));
+        }
+        break;
     }
-    vec![]
+    if out.is_empty() {
+        out.push((
+            GateChoice::neutral("accept", "Accept", GateChoiceKind::AllowOnce),
+            Some(json!({})),
+        ));
+    }
+    out.push((
+        GateChoice::neutral("decline", "Decline", GateChoiceKind::RejectOnce),
+        None,
+    ));
+    out.push((
+        GateChoice::neutral("cancel", "Cancel", GateChoiceKind::Cancel),
+        None,
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -215,9 +232,14 @@ mod tests {
     fn elicitation_choices_with_names() {
         let schema = json!({"properties": {"grant": {"enum": ["once", "deny"], "enumNames": ["Once", "Deny"]}}});
         let c = elicitation_choices(Some(&schema));
-        assert_eq!(c.len(), 2);
-        assert_eq!(c[0].key, "grant");
-        assert_eq!(c[1].label, "Deny");
-        assert!(elicitation_choices(None).is_empty());
+        assert_eq!(c.len(), 4);
+        assert_eq!(c[0].0.id, "accept:once");
+        assert_eq!(c[0].1, Some(json!({"grant": "once"})));
+        assert_eq!(c[1].0.label, "Deny");
+        assert!(!c[1].0.neutral_label);
+        assert_eq!(c[2].0.kind, GateChoiceKind::RejectOnce);
+        let plain = elicitation_choices(None);
+        assert_eq!(plain[0].0.id, "accept");
+        assert!(plain[0].0.neutral_label);
     }
 }

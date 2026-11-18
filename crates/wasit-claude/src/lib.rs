@@ -163,6 +163,7 @@ impl DriverDescriptor for ClaudeDescriptor {
                     suffix: ".jsonl".into(),
                     max_files: 200,
                     head_lines: 30,
+                    count_containing: MESSAGE_RECORDS.iter().map(|m| m.to_string()).collect(),
                 },
                 parse: std::sync::Arc::new(parse_sessions),
             });
@@ -579,6 +580,10 @@ pub fn parse_permission_modes(out: &ProbeOutput) -> Result<Discovered, String> {
     Ok(Discovered::Modes(modes))
 }
 
+/// Transcript records that are conversation messages (user or assistant entries; claude writes
+/// compact JSON). Their count is the session's message count.
+pub const MESSAGE_RECORDS: &[&str] = &["\"type\":\"user\"", "\"type\":\"assistant\""];
+
 /// Parse transcript files (`<uuid>.jsonl`) into resumable sessions.
 pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
     let files = listed_files(out)?;
@@ -617,6 +622,7 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
             project,
             title,
             modified_ms: f.modified_ms,
+            message_count: f.matching_lines,
         });
     }
     Ok(Discovered::Sessions(sessions))
