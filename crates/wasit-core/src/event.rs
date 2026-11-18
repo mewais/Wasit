@@ -320,6 +320,41 @@ pub enum GateRequest {
         details: serde_json::Value,
         choices: Vec<GateChoice>,
     },
+    /// An agent wants to start another agent (a worker) on demand. Raised on the *calling*
+    /// session by the orchestration layer as an external gate; answered with
+    /// [`Command::AnswerGate`](crate::Command::AnswerGate) with one of `choices`. Every field
+    /// is in display form (names, not ids); ids are in `details`.
+    Spawn {
+        request_id: String,
+        /// The agent asking (display name).
+        from: String,
+        /// Name of the new agent.
+        name: String,
+        /// What the new agent is for, in the asking agent's words.
+        role: String,
+        /// Where it would run (host display name).
+        host: String,
+        /// Which agent CLI (display name).
+        driver: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Working directory on that host.
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// The first task it would be given, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instruction: Option<String>,
+        /// The workstream it joins (display name).
+        workstream: String,
+        /// The asking session is in no workstream: approving creates `workstream`.
+        #[serde(default)]
+        new_workstream: bool,
+        /// Extra structured context (ids, limits, …).
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        details: serde_json::Value,
+        choices: Vec<GateChoice>,
+    },
 }
 
 impl GateRequest {
@@ -329,16 +364,18 @@ impl GateRequest {
             GateRequest::Permission { request_id, .. }
             | GateRequest::Plan { request_id, .. }
             | GateRequest::Question { request_id, .. }
-            | GateRequest::Handoff { request_id, .. } => request_id,
+            | GateRequest::Handoff { request_id, .. }
+            | GateRequest::Spawn { request_id, .. } => request_id,
         }
     }
 
-    /// The choices of a permission / plan / handoff gate (empty for questions).
+    /// The choices of a permission / plan / handoff / spawn gate (empty for questions).
     pub fn choices(&self) -> &[GateChoice] {
         match self {
             GateRequest::Permission { choices, .. }
             | GateRequest::Plan { choices, .. }
-            | GateRequest::Handoff { choices, .. } => choices,
+            | GateRequest::Handoff { choices, .. }
+            | GateRequest::Spawn { choices, .. } => choices,
             GateRequest::Question { .. } => &[],
         }
     }
@@ -662,4 +699,40 @@ pub enum AgentEvent {
 
     /// A line the protocol did not recognise, kept for observability.
     Unknown { raw: serde_json::Value },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_gate_round_trips_and_exposes_its_choices() {
+        let g = GateRequest::Spawn {
+            request_id: "wasl-spawn-r1".into(),
+            from: "orchestrator".into(),
+            name: "csv-worker".into(),
+            role: "exports CSV files".into(),
+            host: "build-box".into(),
+            driver: "OpenCode".into(),
+            model: Some("deepseek".into()),
+            cwd: "/w".into(),
+            mode: None,
+            instruction: None,
+            workstream: "Invoice export".into(),
+            new_workstream: false,
+            details: serde_json::Value::Null,
+            choices: vec![GateChoice::agent(
+                "allow_once",
+                "Allow once",
+                GateChoiceKind::AllowOnce,
+            )],
+        };
+        let v = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["gate_type"], "spawn");
+        assert!(v.get("mode").is_none());
+        let back: GateRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(back.request_id(), "wasl-spawn-r1");
+        assert!(back.choice("allow_once").is_some());
+    }
 }
