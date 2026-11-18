@@ -581,3 +581,20 @@ fn discovery_keeps_throwaway_sessions_out_of_the_project() {
         }
     }
 }
+
+/// opencode announces a shell call with only its `cwd` and sends the command in an update.
+#[test]
+fn a_tool_update_carries_the_arguments_that_came_late() {
+    let mut p = ready();
+    let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"b","title":"bash","kind":"execute","status":"pending","rawInput":{"cwd":"/w"}}}}"#).events;
+    assert!(matches!(&ev[0], AgentEvent::ToolCallStarted { input, .. } if input["cwd"] == "/w"));
+    let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"b","status":"in_progress","title":"ls","rawInput":{"command":"ls","cwd":"/w"}}}}"#).events;
+    assert!(
+        matches!(&ev[0], AgentEvent::ToolCallUpdated { input: Some(i), name, .. } if i["command"] == "ls" && name == "bash")
+    );
+    let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"b","status":"in_progress","rawInput":{}}}}"#).events;
+    assert!(matches!(
+        &ev[0],
+        AgentEvent::ToolCallUpdated { input: None, .. }
+    ));
+}

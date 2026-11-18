@@ -578,6 +578,10 @@ pub enum AgentEvent {
         content: Vec<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        /// The call's complete input when it arrives after the start (ACP agents announce a
+        /// call first and send its arguments in an update); replaces the started input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
     },
 
     /// A tool call finished.

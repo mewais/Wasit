@@ -704,11 +704,17 @@ impl AcpProtocol {
                 result: (!content.is_empty()).then_some(Value::Array(content)),
             }];
         }
+        // The arguments come in an update (the start carries only `cwd`, say).
+        let input = update
+            .get("rawInput")
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+            .cloned();
         vec![AgentEvent::ToolCallUpdated {
             call_id: id,
             name,
             content,
             status: (!status.is_empty()).then(|| status.to_string()),
+            input,
         }]
     }
 
