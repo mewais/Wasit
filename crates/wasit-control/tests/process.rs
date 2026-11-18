@@ -1,5 +1,4 @@
 //! Real child processes: the demo binary as a stdio server, failing commands, the bridge.
-#![cfg(unix)]
 
 mod common;
 
@@ -21,8 +20,9 @@ fn demo(args: &[&str]) -> CommandSpec {
     CommandSpec::new(argv)
 }
 
-fn sh(script: &str) -> CommandSpec {
-    CommandSpec::new(["sh", "-c", script])
+/// A command that prints `stderr` and exits with `code`, like a failing `ssh`.
+fn failing(stderr: &str, code: u8) -> CommandSpec {
+    demo(&["fail", stderr, "--code", &code.to_string()])
 }
 
 #[tokio::test]
@@ -104,30 +104,35 @@ async fn child_dying_mid_stream_closes_subscription_with_host_lost() {
 async fn failing_transport_commands_are_classified() {
     let cases = [
         (
-            "echo 'user@h: Permission denied (publickey).' >&2; exit 255",
+            "user@h: Permission denied (publickey).",
+            255,
             CommandFailureKind::AuthNeeded,
         ),
         (
-            "echo 'Host key verification failed.' >&2; exit 255",
+            "Host key verification failed.",
+            255,
             CommandFailureKind::HostKeyUnknown,
         ),
         (
-            "echo 'ssh: Could not resolve hostname nope: Name or service not known' >&2; exit 255",
+            "ssh: Could not resolve hostname nope: Name or service not known",
+            255,
             CommandFailureKind::Unreachable,
         ),
         (
-            "echo 'bash: marsad-agent: command not found' >&2; exit 127",
+            "bash: marsad-agent: command not found",
+            127,
             CommandFailureKind::CommandNotFound,
         ),
-        ("cat >/dev/null & exit 1", CommandFailureKind::Other),
+        ("", 1, CommandFailureKind::Other),
     ];
-    for (script, want) in cases {
-        let err = CommandTransport::connect(&sh(script), ClientOptions::new(hello("hub")))
-            .await
-            .unwrap_err();
+    for (stderr, code, want) in cases {
+        let err =
+            CommandTransport::connect(&failing(stderr, code), ClientOptions::new(hello("hub")))
+                .await
+                .unwrap_err();
         match err {
-            ConnectError::Command { kind, .. } => assert_eq!(kind, want, "{script}"),
-            other => panic!("{script}: unexpected {other:?}"),
+            ConnectError::Command { kind, .. } => assert_eq!(kind, want, "{stderr}"),
+            other => panic!("{stderr}: unexpected {other:?}"),
         }
     }
     let err = CommandTransport::connect(
@@ -165,6 +170,7 @@ async fn bridge_starts_the_daemon_and_pumps_bytes() {
     assert_eq!(c1.remote_hello().host_id.as_str(), "bridged");
     let who: String = c1.request("whoami", Value::Null, D).await.unwrap();
     assert_eq!(who, "bridged");
+    #[cfg(unix)]
     assert!(path.exists());
 
     // Second bridge reuses the running daemon (it would fail to start a second one).

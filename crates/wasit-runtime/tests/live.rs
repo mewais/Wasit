@@ -7,7 +7,6 @@
 //! * codex: a throwaway `CODEX_HOME` whose provider is the local fake Responses server
 //!   (`wasit-fake-cli/reference/record/fake-responses.mjs`, started here with `node` on
 //!   127.0.0.1:18080).
-#![cfg(unix)]
 
 mod common;
 
@@ -21,12 +20,12 @@ use wasit_runtime::{default_registry, RuntimeConfig, SessionManager, ShimLaunche
 const LIVE: Duration = Duration::from_secs(240);
 
 fn require(bin: &str) {
-    let ok = std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {bin}")])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let ok = std::env::split_paths(&path).any(|dir| {
+        ["", ".exe", ".cmd", ".bat"]
+            .iter()
+            .any(|ext| dir.join(format!("{bin}{ext}")).is_file())
+    });
     assert!(ok, "live test needs `{bin}` on PATH");
 }
 

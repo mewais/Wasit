@@ -49,8 +49,20 @@ impl Endpoint {
             #[cfg(windows)]
             Endpoint::NamedPipe(name) => {
                 use tokio::net::windows::named_pipe::ClientOptions;
-                let c = ClientOptions::new().open(name)?;
-                Ok(Box::new(c))
+                // ERROR_PIPE_BUSY: every server instance is connected right now (the listener is
+                // between accepting one client and creating the next instance). Retry briefly.
+                const ERROR_PIPE_BUSY: i32 = 231;
+                let mut tries = 0u32;
+                loop {
+                    match ClientOptions::new().open(name) {
+                        Ok(c) => return Ok(Box::new(c)),
+                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && tries < 500 => {
+                            tries += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
             #[allow(unreachable_patterns)]
             other => Err(io::Error::new(
@@ -66,6 +78,49 @@ impl Endpoint {
             e.kind(),
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
         )
+    }
+}
+
+/// The local endpoint for a daemon identified by `path`: the Unix socket at `path`, or on
+/// Windows the named pipe `\\.\pipe\wasit-<hash of path>` (pipes have no filesystem path).
+pub fn local_endpoint(path: &Path) -> Endpoint {
+    #[cfg(unix)]
+    {
+        Endpoint::Unix(path.to_path_buf())
+    }
+    #[cfg(windows)]
+    {
+        // FNV-1a of the path: one pipe per daemon path.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in path.to_string_lossy().bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        Endpoint::NamedPipe(format!(r"\\.\pipe\wasit-{h:016x}"))
+    }
+}
+
+/// Listener type of [`bind_local_exclusive`].
+#[cfg(unix)]
+pub type LocalListener = UnixSocketListener;
+/// Listener type of [`bind_local_exclusive`].
+#[cfg(windows)]
+pub type LocalListener = NamedPipeListener;
+
+/// Bind the endpoint [`local_endpoint`] names for `path`, holding the single-instance lock
+/// `<path>.lock`. A second instance gets `BindError::Lock(LockError::Held)`.
+pub async fn bind_local_exclusive(path: impl Into<PathBuf>) -> Result<LocalListener, BindError> {
+    let path = path.into();
+    #[cfg(unix)]
+    {
+        UnixSocketListener::bind_exclusive(path).await
+    }
+    #[cfg(windows)]
+    {
+        let Endpoint::NamedPipe(name) = local_endpoint(&path) else {
+            unreachable!("local endpoints are named pipes on Windows");
+        };
+        NamedPipeListener::bind_exclusive(name, lock_path_for(&path)).await
     }
 }
 

@@ -15,7 +15,11 @@ impl TempDir {
     pub fn new() -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = PathBuf::from(format!("/tmp/wst-{}-{n}", std::process::id()));
+        #[cfg(unix)]
+        let root = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir();
+        let p = root.join(format!("wst-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         TempDir(p)
@@ -50,8 +54,119 @@ pub async fn start_spec(spec: ShimSpec) -> ShimHandle {
         .expect("spawn failed")
 }
 
-pub fn sh(script: &str) -> Vec<String> {
-    vec!["-c".to_string(), script.to_string()]
+/// The portable stand-in child (see its docs for the modes).
+pub fn child_bin() -> String {
+    env!("CARGO_BIN_EXE_wasit-shim-testchild").to_string()
+}
+
+/// Start the shim around the test child in `mode` with `args`.
+pub async fn start_child(dir: &Path, mode: &str, args: &[&str]) -> ShimHandle {
+    start_spec(child_spec(dir, mode, args)).await
+}
+
+pub fn child_spec(dir: &Path, mode: &str, args: &[&str]) -> ShimSpec {
+    let mut a = vec![mode];
+    a.extend_from_slice(args);
+    spec(dir, &child_bin(), &a)
+}
+
+/// Kill a process outright (SIGKILL / TerminateProcess).
+pub fn kill_hard(pid: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: plain syscall.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        // SAFETY: plain Win32 calls; the handle is closed.
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            assert!(
+                !h.is_null(),
+                "OpenProcess: {}",
+                std::io::Error::last_os_error()
+            );
+            assert!(TerminateProcess(h, 1) != 0);
+            CloseHandle(h);
+        }
+    }
+}
+
+/// A raw (unframed) connection to the shim endpoint: Unix socket or named pipe.
+pub type RawRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+pub type RawWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+
+pub async fn raw_connect(dir: &Path) -> (RawRead, RawWrite) {
+    let name = wasit_shim::endpoint_name(dir);
+    #[cfg(unix)]
+    {
+        let s = tokio::net::UnixStream::connect(name).await.unwrap();
+        let (r, w) = s.into_split();
+        (Box::new(r), Box::new(w))
+    }
+    #[cfg(windows)]
+    {
+        let c = loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(&name) {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(231) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(e) => panic!("open pipe: {e}"),
+            }
+        };
+        let (r, w) = tokio::io::split(c);
+        (Box::new(r), Box::new(w))
+    }
+}
+
+/// A scripted peer endpoint standing in for a shim: accepts one connection.
+pub struct RawListener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+    #[cfg(windows)]
+    inner: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+impl RawListener {
+    pub fn bind(dir: &Path) -> Self {
+        let name = wasit_shim::endpoint_name(dir);
+        #[cfg(unix)]
+        {
+            RawListener {
+                inner: tokio::net::UnixListener::bind(name).unwrap(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            RawListener {
+                inner: tokio::net::windows::named_pipe::ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&name)
+                    .unwrap(),
+            }
+        }
+    }
+
+    pub async fn accept(self) -> (RawRead, RawWrite) {
+        #[cfg(unix)]
+        {
+            let (s, _) = self.inner.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(windows)]
+        {
+            self.inner.connect().await.unwrap();
+            let (r, w) = tokio::io::split(self.inner);
+            (Box::new(r), Box::new(w))
+        }
+    }
 }
 
 pub async fn next(s: &mut RecordStream) -> Record {
@@ -144,4 +259,28 @@ pub async fn await_pid_exit(pid: u32, timeout: Duration) -> bool {
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_millis(100));
     }
+}
+
+/// Windows: wait for the process to be gone (or not exist).
+#[cfg(windows)]
+pub async fn await_pid_exit(pid: u32, timeout: Duration) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: plain Win32 calls; the handle is closed.
+    let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if h.is_null() {
+        return true; // no such process
+    }
+    let h = h as usize;
+    let r = tokio::task::spawn_blocking(move || {
+        // SAFETY: handle is valid until closed below.
+        let w = unsafe { WaitForSingleObject(h as _, timeout.as_millis() as u32) };
+        unsafe { CloseHandle(h as _) };
+        w == WAIT_OBJECT_0
+    })
+    .await
+    .unwrap();
+    r
 }

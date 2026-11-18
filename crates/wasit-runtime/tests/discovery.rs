@@ -1,5 +1,4 @@
 //! Discovery probes executed against the fake CLI (exec, throwaway handshake, file listing).
-#![cfg(unix)]
 
 mod common;
 

@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 mod common;
 
 use std::time::Duration;
@@ -11,7 +9,7 @@ use wasit_shim::{probe, read_journal, Error, ExitInfo, Kind, ShimClient, ShimSta
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn echo_roundtrip_and_clean_exit() {
     let d = TempDir::new();
-    let h = start(d.path(), "cat", &[]).await;
+    let h = start_child(d.path(), "cat", &[]).await;
     assert_eq!(h.spawned_seq, 1);
     assert_eq!(probe(d.path()).await.unwrap(), ShimState::Running);
 
@@ -21,7 +19,7 @@ async fn echo_roundtrip_and_clean_exit() {
     let spawned = next(&mut s).await;
     assert_eq!(spawned.kind, Kind::Spawned);
     assert_eq!(spawned.data["pid"], h.child_pid);
-    assert_eq!(spawned.data["argv"][0], "cat");
+    assert_eq!(spawned.data["argv"][0], child_bin());
 
     let seq = c.write("hello").await.unwrap();
     let r = next(&mut s).await;
@@ -55,7 +53,7 @@ async fn echo_roundtrip_and_clean_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_and_out_are_ordered() {
     let d = TempDir::new();
-    start(d.path(), "cat", &[]).await;
+    start_child(d.path(), "cat", &[]).await;
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(2).await.unwrap();
     let mut acks = Vec::new();
@@ -86,7 +84,17 @@ async fn in_and_out_are_ordered() {
     }
     c.signal(Sig::Kill).await.unwrap();
     recs = until_exited(&mut s).await;
-    assert_eq!(recs.last().unwrap().exit_info().unwrap().signal, Some(9));
+    let info = recs.last().unwrap().exit_info().unwrap();
+    #[cfg(unix)]
+    assert_eq!(info.signal, Some(9));
+    #[cfg(windows)]
+    assert_eq!(
+        info,
+        ExitInfo {
+            code: Some(1),
+            signal: None
+        }
+    );
 }
 
 /// Attach from seq N while the child is writing a fast burst: exactly N.. with no gap and no
@@ -108,7 +116,7 @@ async fn attach_seam_has_no_gap_or_duplicate() {
     let mut concurrent = 0;
     for iter in 0..10u64 {
         let d = TempDir::new();
-        start(d.path(), "sh", &["-c", "while read n; do seq 1 $n; done"]).await;
+        start_child(d.path(), "seqloop", &[]).await;
         let a = ShimClient::connect(d.path()).await.unwrap();
         let mut sa = a.attach(1).await.unwrap();
         a.write(&B1.to_string()).await.unwrap();
@@ -154,7 +162,7 @@ async fn attach_seam_has_no_gap_or_duplicate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_resumes_exactly() {
     let d = TempDir::new();
-    start(d.path(), "cat", &[]).await;
+    start_child(d.path(), "cat", &[]).await;
     let a = ShimClient::connect(d.path()).await.unwrap();
     let mut sa = a.attach(1).await.unwrap();
     for i in 1..=5 {
@@ -188,7 +196,7 @@ async fn reconnect_resumes_exactly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_controller_replaces_old() {
     let d = TempDir::new();
-    start(d.path(), "cat", &[]).await;
+    start_child(d.path(), "cat", &[]).await;
     let a = ShimClient::connect(d.path()).await.unwrap();
     let mut sa = a.attach(1).await.unwrap();
     next(&mut sa).await; // spawned
@@ -210,22 +218,12 @@ async fn new_controller_replaces_old() {
 async fn slow_controller_is_dropped_and_child_not_blocked() {
     const LINES: usize = 400_000;
     let d = TempDir::new();
-    let mut sp = spec(
-        d.path(),
-        "sh",
-        &[
-            "-c",
-            "yes 0123456789012345678901234567890123456789 | head -n 400000",
-        ],
-    );
+    let mut sp = child_spec(d.path(), "yes", &["400000"]);
     sp.options.controller_write_timeout = Duration::from_millis(300);
     sp.options.linger = Duration::from_secs(1);
     let h = start_spec(sp).await;
 
-    let sock = tokio::net::UnixStream::connect(wasit_shim::endpoint_name(d.path()))
-        .await
-        .unwrap();
-    let (rd, mut wr) = sock.into_split();
+    let (rd, mut wr) = raw_connect(d.path()).await;
     wr.write_all(b"{\"type\":\"attach\",\"from_seq\":1}\n")
         .await
         .unwrap();
@@ -287,10 +285,9 @@ async fn slow_controller_is_dropped_and_child_not_blocked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lagging_consumer_gets_lagged_and_requests_still_complete() {
     let d = TempDir::new();
-    let listener = tokio::net::UnixListener::bind(wasit_shim::endpoint_name(d.path())).unwrap();
+    let listener = RawListener::bind(d.path());
     let peer = tokio::spawn(async move {
-        let (sock, _) = listener.accept().await.unwrap();
-        let (rd, mut wr) = sock.into_split();
+        let (rd, mut wr) = listener.accept().await;
         let mut rd = BufReader::new(rd);
         wr.write_all(b"{\"type\":\"hello\",\"proto\":1,\"shim_pid\":1,\"child_pid\":2}\n")
             .await
@@ -352,7 +349,7 @@ async fn shim_survives_death_of_its_spawner() {
             .arg("launch")
             .arg("--dir")
             .arg(d.path())
-            .args(["--", "cat"])
+            .args(["--", &child_bin(), "cat"])
             .output(),
     )
     .await
@@ -377,64 +374,109 @@ async fn shim_survives_death_of_its_spawner() {
     until_exited(&mut s).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exit_code_and_signals_are_recorded() {
-    async fn run(script: &str, sig: Option<Sig>) -> ExitInfo {
-        let d = TempDir::new();
-        start(d.path(), "sh", &["-c", script]).await;
-        let c = ShimClient::connect(d.path()).await.unwrap();
-        let mut s = c.attach(1).await.unwrap();
-        if let Some(sig) = sig {
-            next(&mut s).await; // spawned: child is running
-            c.signal(sig).await.unwrap();
-        }
-        let recs = until_exited(&mut s).await;
-        if let Some(sig) = sig {
-            assert!(recs
-                .iter()
-                .any(|r| r.kind == Kind::Note && r.data["signal"] == sig.as_str()));
-        }
-        let info = recs.last().unwrap().exit_info().unwrap();
-        until_end(&mut s).await;
-        assert_eq!(probe(d.path()).await.unwrap(), ShimState::Exited(info));
-        info
+/// Start the child, optionally deliver `sig` once it runs, return how it ended.
+async fn run_to_exit(mode: &str, args: &[&str], sig: Option<Sig>) -> ExitInfo {
+    let d = TempDir::new();
+    start_child(d.path(), mode, args).await;
+    let c = ShimClient::connect(d.path()).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    if let Some(sig) = sig {
+        next(&mut s).await; // spawned: child is running
+        c.signal(sig).await.unwrap();
     }
+    let recs = until_exited(&mut s).await;
+    if let Some(sig) = sig {
+        assert!(recs
+            .iter()
+            .any(|r| r.kind == Kind::Note && r.data["signal"] == sig.as_str()));
+    }
+    let info = recs.last().unwrap().exit_info().unwrap();
+    until_end(&mut s).await;
+    assert_eq!(probe(d.path()).await.unwrap(), ShimState::Exited(info));
+    info
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_code_is_recorded() {
     assert_eq!(
-        run("exit 7", None).await,
+        run_to_exit("exit", &["7"], None).await,
         ExitInfo {
             code: Some(7),
             signal: None
         }
     );
-    assert_eq!(run("kill -TERM $$", None).await.signal, Some(libc::SIGTERM));
+}
+
+/// POSIX signals: the child dies from the very signal that was sent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn posix_signals_are_recorded() {
+    async fn sh(script: &str, sig: Option<Sig>) -> ExitInfo {
+        let d = TempDir::new();
+        start(d.path(), "sh", &["-c", script]).await;
+        let c = ShimClient::connect(d.path()).await.unwrap();
+        let mut s = c.attach(1).await.unwrap();
+        if let Some(sig) = sig {
+            next(&mut s).await;
+            c.signal(sig).await.unwrap();
+        }
+        let recs = until_exited(&mut s).await;
+        recs.last().unwrap().exit_info().unwrap()
+    }
+    assert_eq!(sh("kill -TERM $$", None).await.signal, Some(libc::SIGTERM));
     assert_eq!(
-        run("exec sleep 1000", Some(Sig::Kill)).await.signal,
+        sh("exec sleep 1000", Some(Sig::Kill)).await.signal,
         Some(libc::SIGKILL)
     );
     assert_eq!(
-        run("exec sleep 1000", Some(Sig::Term)).await.signal,
+        sh("exec sleep 1000", Some(Sig::Term)).await.signal,
         Some(libc::SIGTERM)
     );
     assert_eq!(
-        run("exec sleep 1000", Some(Sig::Int)).await.signal,
+        sh("exec sleep 1000", Some(Sig::Int)).await.signal,
         Some(libc::SIGINT)
     );
+    let info = run_to_exit("sleep", &[], Some(Sig::Kill)).await;
+    assert_eq!(info.signal, Some(libc::SIGKILL));
 }
 
+/// Windows has no POSIX signals: kill and term terminate the job (exit code 1).
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sigterm_to_shim_terminates_child_group() {
-    let d = TempDir::new();
-    let h = start(d.path(), "sh", &["-c", "sleep 1000 & echo $!; wait"]).await;
-    let c = ShimClient::connect(d.path()).await.unwrap();
-    let mut s = c.attach(1).await.unwrap();
-    let bg: u32 = until(&mut s, |r| r.kind == Kind::Out)
+async fn job_termination_is_recorded() {
+    for sig in [Sig::Kill, Sig::Term] {
+        let info = run_to_exit("sleep", &[], Some(sig)).await;
+        assert_eq!(
+            info,
+            ExitInfo {
+                code: Some(1),
+                signal: None
+            }
+        );
+    }
+}
+
+/// Read the pid the `spawn-sleep` child prints for its grandchild.
+async fn grandchild_pid(s: &mut wasit_shim::RecordStream) -> u32 {
+    until(s, |r| r.kind == Kind::Out)
         .await
         .last()
         .unwrap()
         .text()
         .unwrap()
+        .trim()
         .parse()
-        .unwrap();
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_to_shim_terminates_child_group() {
+    let d = TempDir::new();
+    let h = start_child(d.path(), "spawn-sleep", &[]).await;
+    let c = ShimClient::connect(d.path()).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    let bg = grandchild_pid(&mut s).await;
     // SAFETY: plain syscall.
     assert_eq!(unsafe { libc::kill(h.shim_pid as i32, libc::SIGTERM) }, 0);
     let recs = until_exited(&mut s).await;
@@ -454,22 +496,16 @@ async fn sigterm_to_shim_terminates_child_group() {
     assert!(await_pid_exit(h.shim_pid, T).await);
 }
 
+/// Killing the shim outright takes the whole tree with it (process group on Unix, job object
+/// on Windows) and the session probes as dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_9_of_shim_kills_child_group_and_probe_says_dead() {
+async fn killing_the_shim_kills_child_tree_and_probe_says_dead() {
     let d = TempDir::new();
-    let h = start(d.path(), "sh", &["-c", "sleep 1000 & echo $!; wait"]).await;
+    let h = start_child(d.path(), "spawn-sleep", &[]).await;
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(1).await.unwrap();
-    let bg: u32 = until(&mut s, |r| r.kind == Kind::Out)
-        .await
-        .last()
-        .unwrap()
-        .text()
-        .unwrap()
-        .parse()
-        .unwrap();
-    // SAFETY: plain syscall.
-    assert_eq!(unsafe { libc::kill(h.shim_pid as i32, libc::SIGKILL) }, 0);
+    let bg = grandchild_pid(&mut s).await;
+    kill_hard(h.shim_pid);
     assert!(await_pid_exit(h.shim_pid, T).await);
     assert_eq!(probe(d.path()).await.unwrap(), ShimState::Dead);
     assert!(
@@ -499,7 +535,7 @@ async fn torn_final_line_is_truncated_and_seq_continues() {
         "{\"seq\":1,\"t\":1,\"kind\":\"note\",\"data\":\"a\"}\n{\"seq\":2,\"t\":1,\"kind\":\"note\",\"data\":\"b\"}\n{\"seq\":3,\"t\":",
     )
     .unwrap();
-    let h = start(d.path(), "sh", &["-c", "echo x"]).await;
+    let h = start_child(d.path(), "print", &["x"]).await;
     assert_eq!(h.spawned_seq, 3);
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(1).await.unwrap();
@@ -523,7 +559,7 @@ async fn torn_final_line_is_truncated_and_seq_continues() {
 
     // Reusing the directory continues the sequence.
     let last = recs.last().unwrap().seq;
-    let h2 = start(d.path(), "sh", &["-c", "echo y"]).await;
+    let h2 = start_child(d.path(), "print", &["y"]).await;
     assert_eq!(h2.spawned_seq, last + 1);
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(last + 1).await.unwrap();
@@ -535,15 +571,7 @@ async fn torn_final_line_is_truncated_and_seq_continues() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn huge_line_is_split_into_capped_records() {
     let d = TempDir::new();
-    start(
-        d.path(),
-        "sh",
-        &[
-            "-c",
-            "head -c 20000000 /dev/zero | tr '\\0' x; echo; echo after",
-        ],
-    )
-    .await;
+    start_child(d.path(), "huge", &[]).await;
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(2).await.unwrap();
     let recs = until_exited(&mut s).await;
@@ -563,8 +591,8 @@ async fn huge_line_is_split_into_capped_records() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_respects_utf8_boundaries() {
     let d = TempDir::new();
-    let line = "é".repeat(19); // 38 bytes
-    let mut sp = spec(d.path(), "sh", &["-c", &format!("printf '{line}\\n'")]);
+    // 19 x "é" = 38 bytes
+    let mut sp = child_spec(d.path(), "utf8", &[]);
     sp.options.max_record_bytes = 17;
     start_spec(sp).await;
     let c = ShimClient::connect(d.path()).await.unwrap();
@@ -577,15 +605,7 @@ async fn split_respects_utf8_boundaries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_utf8_and_stderr_are_journaled() {
     let d = TempDir::new();
-    start(
-        d.path(),
-        "sh",
-        &[
-            "-c",
-            "printf 'a\\377b\\r\\n'; printf 'e1\\n' >&2; printf 'no-newline'",
-        ],
-    )
-    .await;
+    start_child(d.path(), "bytes", &[]).await;
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(1).await.unwrap();
     let recs = until_exited(&mut s).await;
@@ -612,7 +632,7 @@ async fn spawn_failure_is_reported_and_probe_handles_missing_dirs() {
 #[tokio::test]
 async fn controller_notes_are_ordered_and_refused_after_exit() {
     let d = TempDir::new();
-    start(d.path(), "cat", &[]).await;
+    start_child(d.path(), "cat", &[]).await;
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(1).await.unwrap();
     let n1 = c.note(serde_json::json!({"cmd": 1})).await.unwrap();

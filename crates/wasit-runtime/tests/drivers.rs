@@ -1,6 +1,5 @@
 //! Per-driver session behaviour through the real stack: SessionManager → actor → real shim →
 //! fake CLI speaking each driver's real wire protocol.
-#![cfg(unix)]
 
 mod common;
 

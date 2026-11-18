@@ -24,7 +24,11 @@ impl TempDir {
     pub fn new() -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = PathBuf::from(format!("/tmp/wrt-{}-{n}", std::process::id()));
+        #[cfg(unix)]
+        let root = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let root = std::env::temp_dir();
+        let p = root.join(format!("wrt-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         TempDir(p)
@@ -48,10 +52,7 @@ impl Drop for TempDir {
                     };
                     if v["kind"] == "spawned" {
                         if let Some(pid) = v["data"]["pid"].as_u64() {
-                            let _ = std::process::Command::new("kill")
-                                .args(["-9", &pid.to_string()])
-                                .stderr(std::process::Stdio::null())
-                                .status();
+                            kill_pid(pid);
                         }
                     }
                 }
@@ -59,6 +60,26 @@ impl Drop for TempDir {
         }
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Kill a process outright (`kill -9` / `taskkill /F`); a missing process is fine.
+pub fn kill_pid(pid: u64) {
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("kill");
+        c.args(["-9", &pid.to_string()]);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("taskkill");
+        c.args(["/F", "/PID", &pid.to_string()]);
+        c
+    };
+    let _ = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 pub fn hostd() -> PathBuf {

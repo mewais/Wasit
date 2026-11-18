@@ -1,7 +1,6 @@
 //! End to end through the `wasit-hostd` binary and the typed `RuntimeClient` over a Unix
 //! socket, including `kill -9` of the daemon and a restart with the client's supervised link
 //! resuming its durable subscriptions.
-#![cfg(unix)]
 
 mod common;
 
@@ -11,7 +10,7 @@ use std::process::Stdio;
 use common::*;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use wasit_control::{ClientOptions, ControlClient, Endpoint, Hello};
+use wasit_control::{ClientOptions, ControlClient, Hello};
 use wasit_core::{AgentEvent, Command, GateDecision};
 use wasit_fake_cli::scenario::{Scenario, Turn};
 use wasit_runtime::wire::{HostEvent, SessionEvent, SessionEventKind};
@@ -55,7 +54,7 @@ async fn start_daemon(data: &Path) -> tokio::process::Child {
 
 fn client(data: &Path) -> RuntimeClient {
     RuntimeClient::connect_endpoint(
-        Endpoint::Unix(data.join("hostd.sock")),
+        wasit_control::local_endpoint(&data.join("hostd.sock")),
         Hello::new("test", "gui-test", "gui"),
     )
 }
@@ -257,8 +256,6 @@ async fn bridge_starts_the_daemon_and_pipes_the_protocol() {
     assert_eq!(info.drivers.len(), 4);
     drop(c);
     // The daemon the bridge started is detached; stop it.
-    let _ = std::process::Command::new("kill")
-        .arg(info.pid.to_string())
-        .status();
+    kill_pid(info.pid as u64);
     let _ = bridge.wait().await;
 }

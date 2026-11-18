@@ -1,5 +1,4 @@
 //! Recovery, continuation, history and fan-out behaviour of the runtime (real shims, fake CLI).
-#![cfg(unix)]
 
 mod common;
 
@@ -175,9 +174,23 @@ async fn restart_right_after_create_still_handshakes_and_runs_first_prompt() {
     );
 }
 
+/// Pids of the processes whose command line mentions `dir` (the session's shim).
 fn shim_pids(dir: &std::path::Path) -> Vec<u32> {
+    #[cfg(unix)]
     let out = std::process::Command::new("pgrep")
         .args(["-f", &dir.display().to_string()])
+        .output()
+        .unwrap();
+    #[cfg(windows)]
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{}*' -and $_.Name -like 'wasit-hostd*' }} | ForEach-Object {{ $_.ProcessId }}",
+                dir.display()
+            ),
+        ])
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout)
@@ -201,9 +214,7 @@ async fn killing_the_shim_makes_the_session_lost() {
     assert!(!pids.is_empty(), "no shim process found");
 
     for p in pids {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &p.to_string()])
-            .status();
+        kill_pid(p.into());
     }
     let snap = wait_phase(&mgr, &id, "lost").await;
     assert!(snap.pending_gates.is_empty() && snap.turn.is_none());

@@ -48,8 +48,8 @@ pub use transport::NamedPipeListener;
 #[cfg(unix)]
 pub use transport::UnixSocketListener;
 pub use transport::{
-    join_duplex, lock_path_for, memory_pair, BindError, BoxDuplex, Duplex, Endpoint, InstanceLock,
-    Listener, LockError, StdioListener,
+    bind_local_exclusive, join_duplex, local_endpoint, lock_path_for, memory_pair, BindError,
+    BoxDuplex, Duplex, Endpoint, InstanceLock, Listener, LockError, StdioListener,
 };
 pub use uplink::{Uplink, UplinkChanges};
 pub use wire::{

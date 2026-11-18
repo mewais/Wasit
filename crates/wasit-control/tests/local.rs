@@ -1,5 +1,5 @@
-//! Real Unix sockets: single-instance lock, stale socket cleanup, server restart.
-#![cfg(unix)]
+//! Real local endpoints (Unix sockets / named pipes): single-instance lock, stale socket
+//! cleanup (Unix), server restart.
 
 mod common;
 
@@ -12,17 +12,15 @@ use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 use wasit_control::demo::DemoService;
 use wasit_control::{
-    connector, BindError, ClientOptions, ControlClient, ControlServer, DurableOpts, Endpoint,
-    InstanceLock, LinkState, LockError, RequestOpts, Supervised, SupervisedConfig,
-    SupervisedOptions, UnixSocketListener,
+    bind_local_exclusive, connector, local_endpoint, BindError, ClientOptions, ControlClient,
+    ControlServer, DurableOpts, InstanceLock, LinkState, LockError, RequestOpts, Supervised,
+    SupervisedConfig, SupervisedOptions,
 };
 
 const D: Duration = Duration::from_secs(10);
 
 async fn start(path: &Path, host: &str) -> (ControlServer, JoinHandle<std::io::Result<()>>) {
-    let listener = UnixSocketListener::bind_exclusive(path)
-        .await
-        .expect("bind");
+    let listener = bind_local_exclusive(path).await.expect("bind");
     let server = ControlServer::new(Arc::new(DemoService::new(host)), hello(host), cfg());
     let s2 = server.clone();
     let task = tokio::spawn(async move { s2.serve(listener).await });
@@ -30,37 +28,38 @@ async fn start(path: &Path, host: &str) -> (ControlServer, JoinHandle<std::io::R
 }
 
 #[tokio::test]
-async fn single_instance_lock_and_requests_over_unix_socket() {
+async fn single_instance_lock_and_requests_over_local_endpoint() {
     let dir = scratch_dir("lock");
     let path = dir.join("d.sock");
     let (server, task) = start(&path, "u1").await;
 
     // A second instance cannot bind and must not remove the live socket.
-    match UnixSocketListener::bind_exclusive(&path).await {
+    match bind_local_exclusive(&path).await {
         Err(BindError::Lock(LockError::Held(_))) => {}
         Err(e) => panic!("unexpected error {e}"),
         Ok(_) => panic!("second instance bound"),
     }
+    #[cfg(unix)]
     assert!(path.exists());
 
-    let client = ControlClient::connect_endpoint(
-        &Endpoint::Unix(path.clone()),
-        ClientOptions::new(hello("c")),
-    )
-    .await
-    .unwrap();
+    let client =
+        ControlClient::connect_endpoint(&local_endpoint(&path), ClientOptions::new(hello("c")))
+            .await
+            .unwrap();
     let who: String = client.request("whoami", Value::Null, D).await.unwrap();
     assert_eq!(who, "u1");
 
     server.shutdown(D).await;
     within(task).await.unwrap().unwrap();
     // Listener dropped: socket removed and lock released.
+    #[cfg(unix)]
     assert!(!path.exists());
     let _again = InstanceLock::try_acquire(wasit_control::lock_path_for(&path))
         .await
         .unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn stale_socket_is_removed_only_by_the_lock_holder() {
     let dir = scratch_dir("stale");
@@ -68,12 +67,9 @@ async fn stale_socket_is_removed_only_by_the_lock_holder() {
     // A dead instance left its socket file behind.
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
     assert!(path.exists());
-    let e = ControlClient::connect_endpoint(
-        &Endpoint::Unix(path.clone()),
-        ClientOptions::new(hello("c")),
-    )
-    .await
-    .unwrap_err();
+    let e = ControlClient::connect_endpoint(&local_endpoint(&path), ClientOptions::new(hello("c")))
+        .await
+        .unwrap_err();
     assert!(e.to_string().contains("refused"), "{e}");
 
     // Someone else holds the lock: we must not touch the socket.
@@ -81,7 +77,7 @@ async fn stale_socket_is_removed_only_by_the_lock_holder() {
         .await
         .unwrap();
     assert!(matches!(
-        UnixSocketListener::bind_exclusive(&path).await,
+        bind_local_exclusive(&path).await,
         Err(BindError::Lock(LockError::Held(_)))
     ));
     assert!(path.exists());
@@ -89,12 +85,10 @@ async fn stale_socket_is_removed_only_by_the_lock_holder() {
 
     // With the lock acquired the stale file is replaced.
     let (server, task) = start(&path, "u2").await;
-    let client = ControlClient::connect_endpoint(
-        &Endpoint::Unix(path.clone()),
-        ClientOptions::new(hello("c")),
-    )
-    .await
-    .unwrap();
+    let client =
+        ControlClient::connect_endpoint(&local_endpoint(&path), ClientOptions::new(hello("c")))
+            .await
+            .unwrap();
     let who: String = client.request("whoami", Value::Null, D).await.unwrap();
     assert_eq!(who, "u2");
     server.shutdown(D).await;
@@ -107,7 +101,7 @@ async fn server_restart_supervised_client_reconnects_and_durable_resumes() {
     let path = dir.join("d.sock");
     let (server1, task1) = start(&path, "gen1").await;
 
-    let ep = Endpoint::Unix(path.clone());
+    let ep = local_endpoint(&path);
     let conn = connector(move || {
         let ep = ep.clone();
         async move { ControlClient::connect_endpoint(&ep, ClientOptions::new(hello("gui"))).await }

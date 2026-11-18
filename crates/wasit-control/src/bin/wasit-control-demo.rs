@@ -2,8 +2,9 @@
 //!
 //! ```text
 //! wasit-control-demo serve-stdio [--host ID] [--build B] [--major N] [--pause-after-events N]
-//! wasit-control-demo serve-unix PATH [--host ID] [--build B]   # prints "ready" when listening
-//! wasit-control-demo bridge PATH [--host ID] [--build B]       # stdio <-> PATH, starting serve-unix if absent
+//! wasit-control-demo fail STDERR_TEXT [--code N]                  # print STDERR_TEXT to stderr, exit N
+//! wasit-control-demo serve-local PATH [--host ID] [--build B]   # prints "ready" when listening
+//! wasit-control-demo bridge PATH [--host ID] [--build B]       # stdio <-> PATH, starting serve-local if absent
 //! ```
 
 use std::process::ExitCode;
@@ -27,6 +28,7 @@ struct Args {
     build: String,
     major: Option<u16>,
     pause_after_events: Option<u64>,
+    code: u8,
 }
 
 fn parse() -> Result<Args, String> {
@@ -39,6 +41,7 @@ fn parse() -> Result<Args, String> {
         build: "demo-build".into(),
         major: None,
         pause_after_events: None,
+        code: 1,
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or(format!("{arg} needs a value"));
@@ -46,6 +49,7 @@ fn parse() -> Result<Args, String> {
             "--host" => a.host = val()?,
             "--build" => a.build = val()?,
             "--major" => a.major = Some(val()?.parse().map_err(|e| format!("{e}"))?),
+            "--code" => a.code = val()?.parse().map_err(|e| format!("{e}"))?,
             "--pause-after-events" => {
                 a.pause_after_events = Some(val()?.parse().map_err(|e| format!("{e}"))?)
             }
@@ -123,6 +127,11 @@ async fn main() -> ExitCode {
         }
     };
     match a.mode.as_str() {
+        "fail" => {
+            // `fail TEXT CODE`: TEXT arrives as the path positional, CODE via --code.
+            eprintln!("{}", a.path.clone().unwrap_or_default());
+            ExitCode::from(a.code)
+        }
         "serve-stdio" => {
             let shutdown = Arc::new(Notify::new());
             let srv = server(&a, shutdown.clone());
@@ -137,14 +146,13 @@ async fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        #[cfg(unix)]
-        "serve-unix" => {
+        "serve-local" => {
             use tokio::io::AsyncWriteExt;
             let Some(path) = a.path.clone() else {
-                eprintln!("serve-unix needs a PATH");
+                eprintln!("serve-local needs a PATH");
                 return ExitCode::from(2);
             };
-            let listener = match wasit_control::UnixSocketListener::bind_exclusive(&path).await {
+            let listener = match wasit_control::bind_local_exclusive(&path).await {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("cannot listen: {e}");
@@ -169,13 +177,12 @@ async fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        #[cfg(unix)]
         "bridge" => {
             let Some(path) = a.path.clone() else {
                 eprintln!("bridge needs a PATH");
                 return ExitCode::from(2);
             };
-            let endpoint = wasit_control::Endpoint::Unix(path.clone().into());
+            let endpoint = wasit_control::local_endpoint(std::path::Path::new(&path));
             let start = || start_daemon(path.clone(), a.host.clone(), a.build.clone());
             match wasit_control::bridge(
                 tokio::io::stdin(),
@@ -200,19 +207,24 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Start `serve-unix PATH` detached and wait (bounded by the bridge) for its "ready" line.
-#[cfg(unix)]
+/// Start `serve-local PATH` detached and wait (bounded by the bridge) for its "ready" line.
 async fn start_daemon(path: String, host: String, build: String) -> std::io::Result<()> {
     use std::process::Stdio;
     use tokio::io::AsyncBufReadExt;
     let exe = std::env::current_exe()?;
-    let mut child = tokio::process::Command::new(exe)
-        .args(["serve-unix", &path, "--host", &host, "--build", &build])
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(["serve-local", &path, "--host", &host, "--build", &build])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .process_group(0)
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the daemon outlives this bridge.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let mut child = cmd.spawn()?;
     let stdout = child
         .stdout
         .take()

@@ -101,38 +101,14 @@ fn parse(args: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
-#[cfg(unix)]
 fn socket_path(a: &Args) -> PathBuf {
     a.socket
         .clone()
         .unwrap_or_else(|| a.data.join("hostd.sock"))
 }
 
-#[cfg(windows)]
-fn pipe_name(a: &Args) -> String {
-    match &a.socket {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => {
-            // FNV-1a of the data dir: one pipe per data directory.
-            let mut h: u64 = 0xcbf29ce484222325;
-            for b in a.data.to_string_lossy().bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            format!(r"\\.\pipe\wasit-hostd-{h:016x}")
-        }
-    }
-}
-
 fn endpoint(a: &Args) -> Endpoint {
-    #[cfg(unix)]
-    {
-        Endpoint::Unix(socket_path(a))
-    }
-    #[cfg(windows)]
-    {
-        Endpoint::NamedPipe(pipe_name(a))
-    }
+    wasit_control::local_endpoint(&socket_path(a))
 }
 
 fn runtime_config(a: &Args) -> Result<RuntimeConfig, String> {
@@ -177,29 +153,11 @@ async fn serve(a: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    #[cfg(unix)]
-    let listener = {
-        match wasit_control::UnixSocketListener::bind_exclusive(socket_path(&a)).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("wasit-hostd: cannot listen: {e}");
-                return ExitCode::from(3);
-            }
-        }
-    };
-    #[cfg(windows)]
-    let listener = {
-        match wasit_control::NamedPipeListener::bind_exclusive(
-            pipe_name(&a),
-            a.data.join("hostd.lock"),
-        )
-        .await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("wasit-hostd: cannot listen: {e}");
-                return ExitCode::from(3);
-            }
+    let listener = match wasit_control::bind_local_exclusive(socket_path(&a)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("wasit-hostd: cannot listen: {e}");
+            return ExitCode::from(3);
         }
     };
     let discovery = Discovery::new(DiscoveryConfig::from_runtime(&cfg));
