@@ -507,7 +507,7 @@ mod scenario_impls {
         let mut c = Client::start(persona, &sc);
         c.prompt("x");
         c.run_to_end();
-        assert!(c.fake.stderr().contains("boom on stderr"));
+        assert!(c.fake.stderr_to_end().contains("boom on stderr"));
     }
 
     pub fn fail_step(persona: &'static str) {
@@ -1073,8 +1073,7 @@ fn startup_steps_run_before_any_input_and_hang_ignores_the_handshake() {
     );
     fake.send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
     assert!(fake.recv_timeout(Duration::from_millis(300)).is_none());
-    assert!(fake.stderr().contains("booting"));
-    fake.close_stdin();
+    assert!(fake.stderr_to_end().contains("booting"));
     assert_eq!(fake.wait_exit().and_then(|s| s.code()), Some(0));
 }
 

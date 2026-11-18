@@ -34,6 +34,7 @@ pub struct Fake {
     pub seen: Vec<Value>,
     pub raw: Vec<String>,
     stderr: std::sync::Arc<std::sync::Mutex<String>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
 
 mod tempdir {
@@ -79,7 +80,7 @@ impl Fake {
         let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let err_pipe = child.stderr.take().expect("stderr");
         let sink = stderr.clone();
-        std::thread::spawn(move || {
+        let stderr_reader = std::thread::spawn(move || {
             for line in BufReader::new(err_pipe).lines().map_while(Result::ok) {
                 if let Ok(mut s) = sink.lock() {
                     s.push_str(&line);
@@ -108,12 +109,24 @@ impl Fake {
             seen: vec![],
             raw: vec![],
             stderr,
+            stderr_reader: Some(stderr_reader),
         }
     }
 
     /// Everything the fake has written to stderr so far.
     pub fn stderr(&self) -> String {
         self.stderr.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Everything the fake wrote to stderr: closes its stdin and reads stderr to its end (the
+    /// reader thread lags behind stdout otherwise).
+    pub fn stderr_to_end(&mut self) -> String {
+        self.close_stdin();
+        if let Some(t) = self.stderr_reader.take() {
+            // The reader ends at EOF, when the fake exits; it does not panic.
+            let _ = t.join();
+        }
+        self.stderr()
     }
 
     pub fn send(&mut self, v: &Value) {
