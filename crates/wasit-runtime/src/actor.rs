@@ -509,6 +509,8 @@ impl Actor {
         if !out.events.is_empty() {
             self.publish(out.events);
         }
+        // Requesters answered below see the state their request produced.
+        self.publish_snapshot();
         for (tok, status) in resolved {
             if let Some(p) = self.pending.remove(&tok) {
                 match p.reply {
@@ -605,6 +607,9 @@ impl Actor {
     }
 
     fn publish(&mut self, events: Vec<SessionEvent>) {
+        // The snapshot first: a subscriber that reads the snapshot on an event must see a
+        // state at least as new as that event.
+        self.publish_snapshot();
         for e in &events {
             self.subs.retain(|s| s.offer(e.clone()));
         }
