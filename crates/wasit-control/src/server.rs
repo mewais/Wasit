@@ -5,6 +5,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -20,6 +21,8 @@ struct ServerInner {
     hello: Hello,
     cfg: ConnConfig,
     conns: Mutex<HashMap<u64, Connection>>,
+    /// Bumped whenever a connection is added or removed.
+    conn_changes: watch::Sender<u64>,
     shutdown: CancellationToken,
     tracker: TaskTracker,
 }
@@ -38,6 +41,7 @@ impl ControlServer {
                 hello,
                 cfg,
                 conns: Mutex::new(HashMap::new()),
+                conn_changes: watch::channel(0).0,
                 shutdown: CancellationToken::new(),
                 tracker: TaskTracker::new(),
             }),
@@ -110,6 +114,12 @@ impl ControlServer {
             .collect()
     }
 
+    /// A counter bumped every time a connection is established or closes: await `changed()`
+    /// and re-read [`ControlServer::connections`] (e.g. to notice an uplink coming back).
+    pub fn connection_changes(&self) -> watch::Receiver<u64> {
+        self.inner.conn_changes.subscribe()
+    }
+
     /// Stop accepting, say goodbye to every connection, and wait (at most `grace`) for the
     /// connection tasks to finish.
     pub async fn shutdown(&self, grace: Duration) {
@@ -150,6 +160,7 @@ async fn run_connection(inner: Arc<ServerInner>, io: BoxDuplex) -> Result<ConnCl
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(id, conn.clone());
+    inner.conn_changes.send_modify(|n| *n += 1);
     if inner.shutdown.is_cancelled() {
         conn.goodbye(RpcError::new(codes::SHUTTING_DOWN, "server shutting down"));
     }
@@ -162,5 +173,6 @@ async fn run_connection(inner: Arc<ServerInner>, io: BoxDuplex) -> Result<ConnCl
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+    inner.conn_changes.send_modify(|n| *n += 1);
     Ok(reason)
 }

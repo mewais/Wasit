@@ -18,6 +18,7 @@ pub mod server;
 pub mod service;
 pub mod supervised;
 pub mod transport;
+pub mod uplink;
 pub mod wire;
 
 pub use bridge::{bridge, BridgeError, BridgeOptions};
@@ -50,6 +51,7 @@ pub use transport::{
     join_duplex, lock_path_for, memory_pair, BindError, BoxDuplex, Duplex, Endpoint, InstanceLock,
     Listener, LockError, StdioListener,
 };
+pub use uplink::{Uplink, UplinkChanges};
 pub use wire::{
     codes, CloseReason, Cursor, Frame, Hello, HostId, ProtocolVersion, RpcError, SubId, PROTOCOL,
 };

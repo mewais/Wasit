@@ -1199,7 +1199,9 @@ mod tests {
             &mut live,
             &mut j,
             Kind::Out,
-            json!(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#),
+            json!(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#
+            ),
         );
         assert_eq!(live.snapshot().pending_gates.len(), 1);
         assert_eq!(live.snapshot().phase, Phase::NeedsYou);
