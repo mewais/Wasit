@@ -273,6 +273,10 @@ pub struct FileStat {
     pub size: u64,
     pub mime: String,
     pub is_dir: bool,
+    /// The path lies outside the session's roots (only reported when the request asked for
+    /// `outside`): reading it needs the user's click, i.e. a grant.
+    #[serde(default)]
+    pub outside: bool,
     /// Modification time (ms since the Unix epoch), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ms: Option<u64>,
@@ -694,8 +698,16 @@ pub(crate) async fn stat(
         let Ok(meta) = tokio::fs::metadata(&canon).await else {
             continue;
         };
+        let is_outside = outside && !roots.inside(&canon).await;
         let mime = if meta.is_dir() {
             "inode/directory".to_string()
+        } else if is_outside {
+            // Metadata only: an outside file is not opened until the user clicks it.
+            let name = canon
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            sniff_mime(&[], &name)
         } else {
             let mut head = vec![0u8; 512.min(meta.len() as usize)];
             match tokio::fs::File::open(&canon).await {
@@ -718,6 +730,7 @@ pub(crate) async fn stat(
             size: meta.len(),
             mime,
             is_dir: meta.is_dir(),
+            outside: is_outside,
             modified_ms: meta
                 .modified()
                 .ok()

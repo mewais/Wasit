@@ -481,7 +481,20 @@ async fn reads_stay_inside_the_session_roots_and_honour_ranges() {
         outside,
     };
     assert!(mgr.files_stat(&ask(false)).await.unwrap().files.is_empty());
-    assert_eq!(mgr.files_stat(&ask(true)).await.unwrap().files.len(), 1);
+    let st = mgr.files_stat(&ask(true)).await.unwrap();
+    assert_eq!(st.files.len(), 1);
+    assert!(st.files[0].outside);
+    assert!(
+        !mgr.files_stat(&FilesStatRequest {
+            id: id.clone(),
+            paths: vec!["sub/a.txt".into()],
+            outside: true
+        })
+        .await
+        .unwrap()
+        .files[0]
+            .outside
+    );
     // Bad blob ids never touch the file system.
     let bad_blob = FileReadRequest {
         id: id.clone(),
