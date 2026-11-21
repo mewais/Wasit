@@ -93,25 +93,28 @@ async fn probes_and_sessions_open_no_console_window_from_a_consoleless_daemon() 
     c.create(create(d.path(), "claude", &sc)).await.unwrap();
     let lines = wait_for(&report, "the session", |l| l.len() > before).await;
 
-    // Control: a console program started by a console-less parent WITHOUT wasit-process
-    // (here: cmd.exe started with DETACHED_PROCESS starting the fake) — shows what the check
-    // detects on this machine.
+    // Control: the fake started WITHOUT wasit-process, in a console of its own
+    // (CREATE_NEW_CONSOLE, what a console-less parent's plain spawn amounts to). The check must
+    // see that window, or a clean result above would prove nothing.
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
     let control = d.path().join("control.txt");
-    let st = tokio::process::Command::new("cmd")
-        .args(["/C", &format!("\"{}\" --version", fake().display())])
+    let st = tokio::process::Command::new(fake())
+        .arg("--version")
         .env("WASIT_FAKE_CONSOLE_REPORT", &control)
-        .creation_flags(wasit_process::flags::DETACHED_PROCESS)
+        .creation_flags(CREATE_NEW_CONSOLE)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await
         .unwrap();
-    eprintln!(
-        "control (no wasit-process, exit {st}): {:?}",
-        report_lines(&control)
-    );
+    let control_lines = report_lines(&control);
+    eprintln!("control (no wasit-process, exit {st}): {control_lines:?}");
     eprintln!("reports: {lines:#?}");
+    assert!(
+        control_lines.iter().any(|l| l.contains(" visible")),
+        "the check did not see the control's console window: {control_lines:?}"
+    );
 
     let visible: Vec<_> = lines.iter().filter(|l| l.contains(" visible")).collect();
     assert!(
