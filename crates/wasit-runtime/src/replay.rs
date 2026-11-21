@@ -150,3 +150,33 @@ pub(crate) fn events_between(
     });
     rx
 }
+
+/// The bytes of blob `id`, rebuilt from the journal (the blob store is a cache of what the
+/// journal holds; a missing blob is found again by replaying it).
+pub(crate) async fn find_blob(
+    dir: &Path,
+    desc: Arc<dyn DriverDescriptor>,
+    meta: &SessionMeta,
+    id: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut core = Core::new(desc, meta);
+    let mut stream = match wasit_shim::read_journal(dir, 1).await {
+        Ok(s) => s,
+        Err(wasit_shim::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None)
+        }
+        Err(e) => return Err(format!("read journal: {e}")),
+    };
+    let mut n = 0u32;
+    while let Some(item) = stream.next().await {
+        let rec = item.map_err(|e| format!("read journal: {e}"))?;
+        if let Some((_, bytes)) = core.apply(&rec).blobs.into_iter().find(|(b, _)| b == id) {
+            return Ok(Some(bytes));
+        }
+        n = n.wrapping_add(1);
+        if n.is_multiple_of(256) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(None)
+}

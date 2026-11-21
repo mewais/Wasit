@@ -473,6 +473,34 @@ impl SessionManager {
         r: &crate::media::FileReadRequest,
     ) -> Result<crate::media::FileChunk, RuntimeError> {
         let roots = self.roots(&r.id)?;
+        if let Some(b) = &r.blob {
+            if crate::media::stored_blob(&roots.session_dir, b)
+                .await?
+                .is_none()
+            {
+                // Not stored (yet): the journal has it; replay to find it.
+                let (dir, desc, meta) = {
+                    let map = lock(&self.inner.sessions);
+                    let e = map
+                        .get(&r.id)
+                        .ok_or_else(|| RuntimeError::SessionNotFound(r.id.to_string()))?;
+                    (e.dir.clone(), e.desc.clone(), e.file.meta())
+                };
+                let _permit = self
+                    .inner
+                    .replays
+                    .acquire()
+                    .await
+                    .map_err(|_| RuntimeError::Busy("the runtime is shutting down".into()))?;
+                match replay::find_blob(&dir, desc, &meta, b).await {
+                    Ok(Some(bytes)) => crate::media::restore_blob(&dir, b, &bytes).await?,
+                    Ok(None) => {
+                        return Err(RuntimeError::InvalidRequest(format!("no such blob: {b}")))
+                    }
+                    Err(e) => return Err(RuntimeError::Io(e)),
+                }
+            }
+        }
         crate::media::read(&roots, r).await
     }
 

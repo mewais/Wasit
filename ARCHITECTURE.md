@@ -156,6 +156,22 @@ re-adopt on daemon start (scan session dirs, attach to live shims, replay finish
 stop, delete. It persists `session.json` (spec, driver id, native session id, labels) beside the
 journal.
 
+### 3.4 Images and files
+
+- **One model** (`wasit-core::content`): `ContentPart` = text | image {mime, source, dims} |
+  file {source, name, mime, uri}; `MediaSource` = inline (protocol → runtime only) | blob {sha256,
+  size} | url | path. Carried by `ToolCallUpdated/Finished.parts`, `AssistantContent`,
+  `UserContent`; prompts carry `Attachment`s; descriptors say what they take (`PromptInput`).
+- **Blobs**: the pure core decodes inline media, names it by SHA-256, replaces it by a blob ref and
+  scrubs base64 from raw JSON before an event is published; the actor writes
+  `<session>/blobs/<sha256>` once. The journal stays the truth: replays derive the same ids and a
+  missing blob is rebuilt by replaying the journal.
+- **Methods**: `session.attachment.put` (chunked upload into `<session>/attachments/`, limits),
+  `session.file.read` (blob or path; ranges ≤ 4 MiB; mime sniffed on the host; canonical paths
+  confined to the cwd, attachments and blobs unless `outside`), `session.files.stat`. They travel
+  over the existing control link, so remote hosts need nothing else. A prompt's attachments must
+  be uploads of that session; the runtime loads the bytes a driver embeds before journaling it.
+
 ## 4. Control protocol (`wasit-control`)
 
 One protocol for GUI↔daemon, daemon↔daemon and (later) phone↔daemon.

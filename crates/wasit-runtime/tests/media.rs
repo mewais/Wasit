@@ -185,7 +185,13 @@ async fn tool_result_images_are_blobs_served_once_and_rebuilt_after_a_restart() 
     mgr.adopt_all().await.unwrap();
     wait_snapshot(&mgr, &id, "loaded", |s| s.loaded).await;
     let page = mgr.history(&id, None, 500).await.unwrap();
-    assert_eq!(serde_json::to_value(&page.events).unwrap(), before);
+    // The same records give the same events (adoption may add its own after them).
+    let after = serde_json::to_value(&page.events).unwrap();
+    let n = before.as_array().unwrap().len();
+    assert_eq!(
+        after.as_array().unwrap()[..n],
+        before.as_array().unwrap()[..]
+    );
     assert_eq!(read_all(&mgr, &id, &blob).await, bytes);
     mgr.stop(&id).await.unwrap();
 }

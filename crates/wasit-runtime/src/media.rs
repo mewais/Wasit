@@ -296,12 +296,24 @@ async fn store_blob(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let dir = path.parent().unwrap_or(Path::new("."));
     tokio::fs::create_dir_all(dir).await?;
-    let tmp = path.with_extension("tmp");
+    // Unique temporary name: a restore and the actor may store the same blob at once.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{n}.tmp", std::process::id()));
     let mut f = tokio::fs::File::create(&tmp).await?;
     f.write_all(bytes).await?;
     f.sync_all().await?;
     drop(f);
-    tokio::fs::rename(&tmp, path).await
+    match tokio::fs::rename(&tmp, path).await {
+        Ok(()) => Ok(()),
+        // Content-addressed: whoever stored it first stored the same bytes.
+        Err(_) if tokio::fs::try_exists(path).await.unwrap_or(false) => {
+            // Best effort: a leftover temporary file is harmless.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn wait_blob(path: &Path) {
@@ -391,6 +403,39 @@ impl Roots {
             )))
         }
     }
+}
+
+/// The path of blob `id` if it is stored (waiting for a write in progress); an invalid id is
+/// an error.
+pub(crate) async fn stored_blob(
+    session_dir: &Path,
+    id: &str,
+) -> Result<Option<PathBuf>, RuntimeError> {
+    if !valid_blob_id(id) {
+        return Err(invalid("bad blob id"));
+    }
+    let p = blobs_dir(session_dir).join(id);
+    wait_blob(&p).await;
+    Ok(tokio::fs::try_exists(&p)
+        .await
+        .unwrap_or(false)
+        .then_some(p))
+}
+
+/// Store a blob found again in the journal (awaited, unlike [`write_blob`]).
+pub(crate) async fn restore_blob(
+    session_dir: &Path,
+    id: &str,
+    bytes: &[u8],
+) -> Result<(), RuntimeError> {
+    if blob_id(bytes) != id {
+        return Err(RuntimeError::Io(
+            "the journal's blob does not match its id".into(),
+        ));
+    }
+    store_blob(&blobs_dir(session_dir).join(id), bytes)
+        .await
+        .map_err(|e| io("store blob", e))
 }
 
 /// Read a range of a blob or file.
