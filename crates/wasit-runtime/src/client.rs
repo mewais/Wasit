@@ -267,6 +267,76 @@ impl RuntimeClient {
         Ok(r.outcome)
     }
 
+    /// `session.attachment.put`: one chunk of an upload.
+    pub async fn attachment_put(
+        &self,
+        r: crate::media::AttachmentPut,
+    ) -> Result<crate::media::AttachmentPutReply, ClientError> {
+        self.call(methods::SESSION_ATTACHMENT_PUT, r).await
+    }
+
+    /// Upload `bytes` as `name` in 1 MiB chunks; the attachment to send with a prompt.
+    pub async fn upload(
+        &self,
+        id: &SessionId,
+        upload: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<wasit_core::Attachment, ClientError> {
+        let size = bytes.len() as u64;
+        let chunks: Vec<&[u8]> = if bytes.is_empty() {
+            vec![&[][..]]
+        } else {
+            bytes.chunks(crate::media::MAX_UPLOAD_CHUNK).collect()
+        };
+        let n = chunks.len();
+        let mut offset = 0u64;
+        for (i, c) in chunks.into_iter().enumerate() {
+            let r = self
+                .attachment_put(crate::media::AttachmentPut {
+                    id: id.clone(),
+                    upload: upload.to_string(),
+                    name: name.to_string(),
+                    size,
+                    offset,
+                    data: wasit_core::content::b64_encode(c),
+                    last: i + 1 == n,
+                })
+                .await?;
+            offset = r.received;
+            if let Some(a) = r.attachment {
+                return Ok(a);
+            }
+        }
+        Err(ClientError::Runtime(RuntimeError::Io(
+            "the upload did not finish".into(),
+        )))
+    }
+
+    /// `session.file.read`: a range of a blob or a file.
+    pub async fn file_read(
+        &self,
+        r: crate::media::FileReadRequest,
+    ) -> Result<crate::media::FileChunk, ClientError> {
+        self.call(methods::SESSION_FILE_READ, r).await
+    }
+
+    /// `session.files.stat`.
+    pub async fn files_stat(
+        &self,
+        id: &SessionId,
+        paths: Vec<String>,
+    ) -> Result<crate::media::FilesStatReply, ClientError> {
+        self.call(
+            methods::SESSION_FILES_STAT,
+            crate::media::FilesStatRequest {
+                id: id.clone(),
+                paths,
+            },
+        )
+        .await
+    }
+
     /// A session's events strictly after `from` (from the beginning when `None`).
     pub fn subscribe_session(
         &self,
