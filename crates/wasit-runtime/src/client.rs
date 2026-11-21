@@ -321,14 +321,6 @@ impl RuntimeClient {
         self.call(methods::SESSION_FILE_READ, r).await
     }
 
-    /// `session.file.grant`.
-    pub async fn file_grant(
-        &self,
-        r: crate::media::FileGrantRequest,
-    ) -> Result<crate::media::FileGrant, ClientError> {
-        self.call(methods::SESSION_FILE_GRANT, r).await
-    }
-
     /// `session.files.stat`.
     pub async fn files_stat(
         &self,
@@ -340,7 +332,6 @@ impl RuntimeClient {
             crate::media::FilesStatRequest {
                 id: id.clone(),
                 paths,
-                outside: false,
             },
         )
         .await

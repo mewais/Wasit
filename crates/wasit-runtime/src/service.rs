@@ -181,10 +181,6 @@ impl Service for RuntimeService {
                 let r: crate::media::FilesStatRequest = params(p)?;
                 ok(m.files_stat(&r).await.map_err(runtime_err)?)
             }
-            methods::SESSION_FILE_GRANT => {
-                let r: crate::media::FileGrantRequest = params(p)?;
-                ok(m.file_grant(&r).await.map_err(runtime_err)?)
-            }
             other => Err(RpcError::method_not_found(other)),
         }
     }

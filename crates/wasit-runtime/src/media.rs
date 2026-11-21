@@ -86,150 +86,9 @@ pub struct FileReadRequest {
     /// At most 4 MiB per call (default: 4 MiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<u64>,
-    /// The user explicitly opened a path outside the session's roots; honoured only together
-    /// with a valid `grant` for exactly that file (see [`FileGrantRequest`]).
+    /// The user explicitly opened a path outside the session's roots.
     #[serde(default)]
     pub outside: bool,
-    /// A token from `session.file.grant`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant: Option<String>,
-}
-
-/// `session.file.grant`: the user opened one file outside the session's roots (clicked its
-/// chip). The answer is a short-lived token that lets `session.file.read` (with
-/// `outside: true`) read exactly that canonical file. The automatic read roots do not change.
-/// `parent_grant` lets a previewed HTML file load its relative resources: the new grant is
-/// accepted only if the file lies inside the directory of the parent's file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct FileGrantRequest {
-    pub id: SessionId,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_grant: Option<String>,
-}
-
-/// Result of `session.file.grant`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct FileGrant {
-    pub token: String,
-    /// The canonical file the grant covers.
-    pub path: String,
-    /// When the grant stops working (ms since the Unix epoch).
-    pub expires_ms: u64,
-}
-
-/// How long a grant lives.
-pub const GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-const MAX_GRANTS: usize = 256;
-
-#[derive(Debug, Clone)]
-struct GrantEntry {
-    session: SessionId,
-    path: PathBuf,
-    expires: std::time::Instant,
-}
-
-/// The grants of this process (in memory only: a restart forgets them).
-#[derive(Debug, Default)]
-pub(crate) struct Grants {
-    map: HashMap<String, GrantEntry>,
-}
-
-impl Grants {
-    fn sweep(&mut self, now: std::time::Instant) {
-        self.map.retain(|_, g| g.expires > now);
-    }
-
-    /// Issue a grant for `path` (canonical). With `parent`, the path must lie inside the
-    /// directory of the parent grant's file.
-    pub(crate) fn issue(
-        &mut self,
-        session: &SessionId,
-        path: PathBuf,
-        parent: Option<&str>,
-        now: std::time::Instant,
-    ) -> Result<(String, std::time::Instant), RuntimeError> {
-        self.sweep(now);
-        if let Some(t) = parent {
-            let ok = self.map.get(t).is_some_and(|g| {
-                g.session == *session && g.path.parent().is_some_and(|d| path.starts_with(d))
-            });
-            if !ok {
-                return Err(invalid(
-                    "not inside the folder of the file that was opened (or its grant expired)",
-                ));
-            }
-        }
-        if self.map.len() >= MAX_GRANTS {
-            if let Some(k) = self
-                .map
-                .iter()
-                .min_by_key(|(_, g)| g.expires)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&k);
-            }
-        }
-        let token = format!("{:032x}", fastrand::u128(..));
-        let expires = now + GRANT_TTL;
-        self.map.insert(
-            token.clone(),
-            GrantEntry {
-                session: session.clone(),
-                path,
-                expires,
-            },
-        );
-        Ok((token, expires))
-    }
-
-    /// Does `token` allow `session` to read exactly `path` (canonical) now?
-    pub(crate) fn allows(
-        &self,
-        token: &str,
-        session: &SessionId,
-        path: &Path,
-        now: std::time::Instant,
-    ) -> bool {
-        self.map
-            .get(token)
-            .is_some_and(|g| g.session == *session && g.path == path && g.expires > now)
-    }
-}
-
-fn grants() -> &'static Mutex<Grants> {
-    static G: OnceLock<Mutex<Grants>> = OnceLock::new();
-    G.get_or_init(|| Mutex::new(Grants::default()))
-}
-
-/// `session.file.grant` (the file must exist; symlinks are resolved first).
-pub(crate) async fn grant(roots: &Roots, r: &FileGrantRequest) -> Result<FileGrant, RuntimeError> {
-    let canon = roots.resolve(&r.path, true).await?;
-    let meta = tokio::fs::metadata(&canon)
-        .await
-        .map_err(|e| io("stat", e))?;
-    if !meta.is_file() {
-        return Err(invalid(format!("{} is not a file", canon.display())));
-    }
-    let now = std::time::Instant::now();
-    let (token, expires) = grants().lock().unwrap_or_else(|e| e.into_inner()).issue(
-        &r.id,
-        canon.clone(),
-        r.parent_grant.as_deref(),
-        now,
-    )?;
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-        + expires.saturating_duration_since(now).as_millis() as u64;
-    Ok(FileGrant {
-        token,
-        path: canon.to_string_lossy().into_owned(),
-        expires_ms: ms,
-    })
 }
 
 /// Result of `session.file.read`.
@@ -256,10 +115,6 @@ pub struct FileChunk {
 pub struct FilesStatRequest {
     pub id: SessionId,
     pub paths: Vec<String>,
-    /// Report existence (and kind, size) of paths outside the roots too. Metadata only: reading
-    /// such a file still needs a grant.
-    #[serde(default)]
-    pub outside: bool,
 }
 
 /// One file of [`FilesStatReply`].
@@ -273,10 +128,6 @@ pub struct FileStat {
     pub size: u64,
     pub mime: String,
     pub is_dir: bool,
-    /// The path lies outside the session's roots (only reported when the request asked for
-    /// `outside`): reading it needs the user's click, i.e. a grant.
-    #[serde(default)]
-    pub outside: bool,
     /// Modification time (ms since the Unix epoch), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ms: Option<u64>,
@@ -489,18 +340,6 @@ fn invalid(m: impl Into<String>) -> RuntimeError {
     RuntimeError::InvalidRequest(m.into())
 }
 
-/// `~` and `~/x` against the user's home (the daemon's own), when it is known.
-fn expand_home(p: &str) -> Option<PathBuf> {
-    let rest = if p == "~" {
-        ""
-    } else {
-        p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\"))?
-    };
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    let h = PathBuf::from(home);
-    Some(if rest.is_empty() { h } else { h.join(rest) })
-}
-
 /// The roots a session's reads are confined to: its cwd, its attachments and its blobs.
 pub(crate) struct Roots {
     pub session_dir: PathBuf,
@@ -525,14 +364,6 @@ impl Roots {
         v
     }
 
-    /// Is the canonical path inside one of the roots?
-    pub(crate) async fn inside(&self, canon: &Path) -> bool {
-        self.canonical_roots()
-            .await
-            .iter()
-            .any(|r| canon.starts_with(r))
-    }
-
     /// The canonical path of `p` (relative paths against the cwd) if it exists and lies inside
     /// a root (or `outside` is set). Symlinks are resolved first, so a link pointing out of a
     /// root is outside.
@@ -540,10 +371,7 @@ impl Roots {
         if p.is_empty() || p.contains('\0') {
             return Err(invalid("empty or invalid path"));
         }
-        let raw = match expand_home(p) {
-            Some(h) => h,
-            None => PathBuf::from(p),
-        };
+        let raw = PathBuf::from(p);
         let joined = if raw.is_absolute() {
             raw
         } else {
@@ -624,25 +452,7 @@ pub(crate) async fn read(roots: &Roots, r: &FileReadRequest) -> Result<FileChunk
             }
             p
         }
-        (None, Some(p)) => {
-            let canon = roots.resolve(p, r.outside).await?;
-            if r.outside && !roots.inside(&canon).await {
-                let ok = r.grant.as_deref().is_some_and(|t| {
-                    grants().lock().unwrap_or_else(|e| e.into_inner()).allows(
-                        t,
-                        &r.id,
-                        &canon,
-                        std::time::Instant::now(),
-                    )
-                });
-                if !ok {
-                    return Err(invalid(format!(
-                        "{p} is outside the session's folder and not opened by the user (or the grant expired)"
-                    )));
-                }
-            }
-            canon
-        }
+        (None, Some(p)) => roots.resolve(p, r.outside).await?,
         _ => return Err(invalid("give exactly one of blob, path")),
     };
     let mut f = tokio::fs::File::open(&path)
@@ -682,32 +492,20 @@ pub(crate) async fn read(roots: &Roots, r: &FileReadRequest) -> Result<FileChunk
 }
 
 /// Stat the paths that exist inside the roots.
-pub(crate) async fn stat(
-    roots: &Roots,
-    paths: &[String],
-    outside: bool,
-) -> Result<FilesStatReply, RuntimeError> {
+pub(crate) async fn stat(roots: &Roots, paths: &[String]) -> Result<FilesStatReply, RuntimeError> {
     if paths.len() > MAX_STAT_PATHS {
         return Err(invalid(format!("at most {MAX_STAT_PATHS} paths")));
     }
     let mut files = Vec::new();
     for p in paths {
-        let Ok(canon) = roots.resolve(p, outside).await else {
+        let Ok(canon) = roots.resolve(p, false).await else {
             continue;
         };
         let Ok(meta) = tokio::fs::metadata(&canon).await else {
             continue;
         };
-        let is_outside = outside && !roots.inside(&canon).await;
         let mime = if meta.is_dir() {
             "inode/directory".to_string()
-        } else if is_outside {
-            // Metadata only: an outside file is not opened until the user clicks it.
-            let name = canon
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            sniff_mime(&[], &name)
         } else {
             let mut head = vec![0u8; 512.min(meta.len() as usize)];
             match tokio::fs::File::open(&canon).await {
@@ -730,7 +528,6 @@ pub(crate) async fn stat(
             size: meta.len(),
             mime,
             is_dir: meta.is_dir(),
-            outside: is_outside,
             modified_ms: meta
                 .modified()
                 .ok()
@@ -1011,58 +808,5 @@ mod tests {
         assert_eq!(safe_name("a:b?.png").unwrap(), "a_b_.png");
         assert!(safe_name("..").is_err());
         assert!(safe_name("").is_err());
-    }
-}
-
-#[cfg(test)]
-mod grant_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_grant_is_one_file_one_session_and_expires() {
-        let mut g = Grants::default();
-        let s: SessionId = SessionId("s1".into());
-        let t0 = Instant::now();
-        let (tok, exp) = g.issue(&s, PathBuf::from("/x/a.html"), None, t0).unwrap();
-        assert!(g.allows(&tok, &s, Path::new("/x/a.html"), t0));
-        assert!(!g.allows(&tok, &s, Path::new("/x/b.html"), t0), "sibling");
-        assert!(
-            !g.allows(&tok, &SessionId("s2".into()), Path::new("/x/a.html"), t0),
-            "session"
-        );
-        assert!(!g.allows(&tok, &s, Path::new("/x/a.html"), exp), "expired");
-        assert!(!g.allows("nope", &s, Path::new("/x/a.html"), t0));
-    }
-
-    #[test]
-    fn child_grants_stay_in_the_parents_directory() {
-        let mut g = Grants::default();
-        let s: SessionId = SessionId("s1".into());
-        let t0 = Instant::now();
-        let (p, _) = g
-            .issue(&s, PathBuf::from("/x/site/index.html"), None, t0)
-            .unwrap();
-        assert!(g
-            .issue(&s, PathBuf::from("/x/site/img/a.png"), Some(&p), t0)
-            .is_ok());
-        assert!(g
-            .issue(&s, PathBuf::from("/x/other/a.png"), Some(&p), t0)
-            .is_err());
-        assert!(g
-            .issue(&s, PathBuf::from("/x/site2/a.png"), Some(&p), t0)
-            .is_err());
-        assert!(g
-            .issue(
-                &SessionId("s2".into()),
-                PathBuf::from("/x/site/a.png"),
-                Some(&p),
-                t0
-            )
-            .is_err());
-        let late = t0 + GRANT_TTL + Duration::from_secs(1);
-        assert!(g
-            .issue(&s, PathBuf::from("/x/site/a.png"), Some(&p), late)
-            .is_err());
     }
 }

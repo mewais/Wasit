@@ -510,16 +510,7 @@ impl SessionManager {
         r: &crate::media::FilesStatRequest,
     ) -> Result<crate::media::FilesStatReply, RuntimeError> {
         let roots = self.roots(&r.id)?;
-        crate::media::stat(&roots, &r.paths, r.outside).await
-    }
-
-    /// `session.file.grant`: a short-lived permission to read one file outside the roots.
-    pub async fn file_grant(
-        &self,
-        r: &crate::media::FileGrantRequest,
-    ) -> Result<crate::media::FileGrant, RuntimeError> {
-        let roots = self.roots(&r.id)?;
-        crate::media::grant(&roots, r).await
+        crate::media::stat(&roots, &r.paths).await
     }
 
     /// A `watch` of a session's snapshot (e.g. to await a phase).

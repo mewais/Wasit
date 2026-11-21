@@ -106,7 +106,6 @@ async fn read_all(mgr: &SessionManager, id: &SessionId, blob: &str) -> Vec<u8> {
             offset: 0,
             length: None,
             outside: false,
-            grant: None,
         })
         .await
         .expect("blob read");
@@ -170,7 +169,6 @@ async fn tool_result_images_are_blobs_served_once_and_rebuilt_after_a_restart() 
             offset: 0,
             length: None,
             outside: false,
-            grant: None,
         })
         .await
         .unwrap();
@@ -393,7 +391,6 @@ async fn reads_stay_inside_the_session_roots_and_honour_ranges() {
         offset,
         length,
         outside,
-        grant: None,
     };
     let c = mgr
         .file_read(&rd("sub/a.txt", 3, Some(4), false))
@@ -426,75 +423,12 @@ async fn reads_stay_inside_the_session_roots_and_honour_ranges() {
             .is_err(),
         "symlink escaped"
     );
-    // `outside` alone is not enough: the user's click is a grant of exactly that file.
-    let secret_s = secret.to_str().unwrap();
-    assert!(
-        mgr.file_read(&rd(secret_s, 0, None, true)).await.is_err(),
-        "blanket outside"
-    );
-    let g = mgr
-        .file_grant(&wasit_runtime::media::FileGrantRequest {
-            id: id.clone(),
-            path: secret_s.into(),
-            parent_grant: None,
-        })
+    // The user opened it explicitly.
+    let c = mgr
+        .file_read(&rd(secret.to_str().unwrap(), 0, None, true))
         .await
         .unwrap();
-    let with = |path: &str, token: &str| FileReadRequest {
-        grant: Some(token.into()),
-        ..rd(path, 0, None, true)
-    };
-    let c = mgr.file_read(&with(secret_s, &g.token)).await.unwrap();
     assert_eq!(b64_decode(&c.data).unwrap(), b"top secret");
-    // The grant covers that one file, not its siblings, and not a made-up token.
-    std::fs::write(d.path().join("other.txt"), "x").unwrap();
-    let other = d.path().join("other.txt");
-    assert!(mgr
-        .file_read(&with(other.to_str().unwrap(), &g.token))
-        .await
-        .is_err());
-    assert!(mgr.file_read(&with(secret_s, "00")).await.is_err());
-    // A dotted path to the same file is the same canonical file; a sibling needs a child grant
-    // of a parent grant: allowed inside the parent's directory only.
-    let child = mgr
-        .file_grant(&wasit_runtime::media::FileGrantRequest {
-            id: id.clone(),
-            path: other.to_str().unwrap().into(),
-            parent_grant: Some(g.token.clone()),
-        })
-        .await;
-    assert!(child.is_ok(), "{child:?}");
-    let up = d.path().parent().unwrap().join("outside-of-parent.txt");
-    std::fs::write(&up, "y").unwrap();
-    assert!(mgr
-        .file_grant(&wasit_runtime::media::FileGrantRequest {
-            id: id.clone(),
-            path: up.to_str().unwrap().into(),
-            parent_grant: Some(g.token.clone()),
-        })
-        .await
-        .is_err());
-    // Stat sees outside paths only when asked, and never reads them.
-    let ask = |outside| FilesStatRequest {
-        id: id.clone(),
-        paths: vec![secret_s.into()],
-        outside,
-    };
-    assert!(mgr.files_stat(&ask(false)).await.unwrap().files.is_empty());
-    let st = mgr.files_stat(&ask(true)).await.unwrap();
-    assert_eq!(st.files.len(), 1);
-    assert!(st.files[0].outside);
-    assert!(
-        !mgr.files_stat(&FilesStatRequest {
-            id: id.clone(),
-            paths: vec!["sub/a.txt".into()],
-            outside: true
-        })
-        .await
-        .unwrap()
-        .files[0]
-            .outside
-    );
     // Bad blob ids never touch the file system.
     let bad_blob = FileReadRequest {
         id: id.clone(),
@@ -503,7 +437,6 @@ async fn reads_stay_inside_the_session_roots_and_honour_ranges() {
         offset: 0,
         length: None,
         outside: false,
-        grant: None,
     };
     assert!(mgr.file_read(&bad_blob).await.is_err());
     let st = mgr
@@ -515,7 +448,6 @@ async fn reads_stay_inside_the_session_roots_and_honour_ranges() {
                 "../secret.txt".into(),
                 "link.txt".into(),
             ],
-            outside: false,
         })
         .await
         .unwrap();
