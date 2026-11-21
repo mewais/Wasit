@@ -23,6 +23,7 @@
 //! | [`methods::SESSION_ATTACHMENT_PUT`] | [`crate::media::AttachmentPut`] | [`crate::media::AttachmentPutReply`] |
 //! | [`methods::SESSION_FILE_READ`] | [`crate::media::FileReadRequest`] | [`crate::media::FileChunk`] |
 //! | [`methods::SESSION_FILES_STAT`] | [`crate::media::FilesStatRequest`] | [`crate::media::FilesStatReply`] |
+//! | [`methods::SESSION_FILE_GRANT`] | [`crate::media::FileGrantRequest`] | [`crate::media::FileGrant`] |
 //!
 //! Errors are `RpcError`s whose `code` is one of [`codes`]; command failures carry a
 //! [`CommandError`] and other failures a [`RuntimeError`] as `data`.
@@ -61,6 +62,7 @@ pub mod methods {
     pub const SESSION_ATTACHMENT_PUT: &str = "session.attachment.put";
     pub const SESSION_FILE_READ: &str = "session.file.read";
     pub const SESSION_FILES_STAT: &str = "session.files.stat";
+    pub const SESSION_FILE_GRANT: &str = "session.file.grant";
 }
 
 /// Topic names.
