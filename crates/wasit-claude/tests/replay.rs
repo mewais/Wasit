@@ -246,3 +246,56 @@ fn resume_and_continue() {
     ));
     assert_eq!(turns(&r).len(), 1);
 }
+
+// ── media (claude 2.1.327) ──────────────────────────────────────────────────
+
+const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=";
+
+#[test]
+fn image_attached_to_a_prompt_is_an_image_content_block() {
+    let r = run("claude-image-prompt");
+    let user = r
+        .written
+        .iter()
+        .map(|l| json(l))
+        .find(|v| v["type"] == "user")
+        .expect("user message written");
+    let content = &user["message"]["content"];
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], RED_PNG_B64);
+    // The model saw it.
+    let reply: String = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AssistantDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(reply.to_lowercase().contains("red"), "{reply}");
+}
+
+#[test]
+fn read_of_a_png_reports_the_image_as_a_tool_result_part() {
+    let r = run("claude-read-image");
+    let parts = r
+        .events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallFinished { name, parts, .. } if name == "Read" => {
+                Some(parts.clone())
+            }
+            _ => None,
+        })
+        .expect("Read finished");
+    assert_eq!(
+        parts,
+        vec![wasit_core::ContentPart::inline_image(
+            "image/png",
+            RED_PNG_B64
+        )]
+    );
+}

@@ -42,10 +42,7 @@ fn start_writes_initialize_and_queues_first_prompt() {
     );
     assert_eq!(step.write.len(), 1);
     // A prompt before the initialize response is queued.
-    assert_eq!(
-        p.encode(Command::Prompt { text: "x".into() }).unwrap(),
-        Encoded::Queued
-    );
+    assert_eq!(p.encode(Command::prompt("x")).unwrap(), Encoded::Queued);
     let step = p.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#);
     // Only the first prompt goes out; the second waits for the turn to end.
     assert_eq!(step.write.len(), 1);
@@ -96,10 +93,7 @@ fn unknown_lines_before_init_are_tolerated() {
     let step = p.on_line("not json at all");
     assert!(matches!(step.events[0], AgentEvent::Unknown { .. }));
     // The handshake still completes afterwards.
-    assert_eq!(
-        p.encode(Command::Prompt { text: "x".into() }).unwrap(),
-        Encoded::Queued
-    );
+    assert_eq!(p.encode(Command::prompt("x")).unwrap(), Encoded::Queued);
     let step = p.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#);
     assert_eq!(step.write.len(), 1);
 }
@@ -173,7 +167,8 @@ fn tool_use_and_result_correlate() {
             call_id: "t1".into(),
             name: "Task".into(),
             ok: false,
-            result: Some(json!("done"))
+            result: Some(json!("done")),
+            parts: vec![]
         }
     );
 }
@@ -356,7 +351,7 @@ fn unsupported_control_request_gets_error_reply() {
 #[test]
 fn interrupt_declines_gates_then_interrupts_and_marks_cancel() {
     let (mut p, _) = ready();
-    sent(p.encode(Command::Prompt { text: "go".into() }));
+    sent(p.encode(Command::prompt("go")));
     p.on_line(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"x"}}}"#);
     let step = sent(p.encode(Command::Interrupt));
     let w = writes(&step);
@@ -493,7 +488,7 @@ fn shutdown_closes_stdin_and_rejects_more() {
     let (mut p, _) = ready();
     assert!(sent(p.encode(Command::Shutdown)).close_stdin);
     assert_eq!(
-        p.encode(Command::Prompt { text: "x".into() }),
+        p.encode(Command::prompt("x")),
         Err(wasit_core::DriverError::Shutdown)
     );
 }

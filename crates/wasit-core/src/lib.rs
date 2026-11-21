@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+pub mod content;
 mod descriptor;
 mod discovery;
 mod event;
@@ -32,6 +33,7 @@ pub use config::{
     AgentConfig, ConfigItem, ConfigItemKind, ConfigItemRef, ConfigRenderer, ConfigSource,
     DisabledItem, McpServerConfig, McpTransport, PluginRef, SkillRef, ToolPolicy, Unsupported,
 };
+pub use content::{Attachment, ContentPart, FileInput, MediaSource, PromptInput};
 pub use descriptor::{
     BusyPrompt, DriverCapabilities, DriverDescriptor, DriverId, DriverRegistry, RegistryError,
 };

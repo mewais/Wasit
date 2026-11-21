@@ -118,6 +118,69 @@ pub struct ToolStep {
     pub result_if_denied: Option<String>,
     /// Human title shown with the permission request (default derived from the input).
     pub title: Option<String>,
+    /// The result also carries this image (claude `tool_result` image block, ACP `image`
+    /// content), like a real `Read` of an image file.
+    pub image: Option<ImageStep>,
+    /// When the call runs (allowed), write this file first, like a real `Write`.
+    pub write_file: Option<WriteFileStep>,
+}
+
+/// An image a step shows: `path` (read when the step runs; relative to the cwd) or base64
+/// `data`. `mime` defaults from the bytes (`image/png` otherwise).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ImageStep {
+    pub mime: Option<String>,
+    pub path: Option<String>,
+    pub data: Option<String>,
+}
+
+/// A file a tool step writes (relative paths against the cwd).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WriteFileStep {
+    pub path: String,
+    pub content: String,
+}
+
+impl ImageStep {
+    /// `(mime, base64)` of the image; `None` when its file cannot be read.
+    pub fn load(&self) -> Option<(String, String)> {
+        use base64::Engine;
+        let data = match (&self.data, &self.path) {
+            (Some(d), _) => d.clone(),
+            (None, Some(p)) => {
+                base64::engine::general_purpose::STANDARD.encode(std::fs::read(p).ok()?)
+            }
+            (None, None) => return None,
+        };
+        let mime = self.mime.clone().unwrap_or_else(|| {
+            if data.starts_with("/9j/") {
+                "image/jpeg".into()
+            } else if data.starts_with("R0lG") {
+                "image/gif".into()
+            } else {
+                "image/png".into()
+            }
+        });
+        Some((mime, data))
+    }
+}
+
+impl ToolStep {
+    /// Run the call's effects (write its file) and return the image its result carries.
+    pub fn run(&self) -> Option<(String, String)> {
+        if let Some(w) = &self.write_file {
+            if let Some(dir) = std::path::Path::new(&w.path).parent() {
+                // A missing parent shows up as the write error below.
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&w.path, &w.content) {
+                eprintln!("fake-cli: write {}: {e}", w.path);
+            }
+        }
+        self.image.as_ref().and_then(ImageStep::load)
+    }
 }
 
 /// A question step (claude `AskUserQuestion`, ACP permission-with-options, codex `requestUserInput`).
@@ -200,6 +263,9 @@ pub enum Step {
     },
     /// Write text to stderr.
     Stderr { text: String },
+    /// The agent shows an image in its reply (ACP `agent_message_chunk` image content; the
+    /// claude persona has no such message and ignores it).
+    Image(ImageStep),
     /// Call a tool of one of the MCP servers the CLI was configured with (claude persona:
     /// `--mcp-config`) and show it as a tool call. `save_as` keeps the result (parsed as JSON
     /// when it is JSON) for `{{name.path}}` placeholders in later steps' text and arguments.

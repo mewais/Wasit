@@ -235,3 +235,69 @@ fn opencode_resume_and_continue() {
     assert_eq!(m[list + 1], "session/load");
     assert_eq!(turns(&r).len(), 1);
 }
+
+// ── media (opencode 1.19.6, kilo 7.8.27) ───────────────────────────────────
+
+const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=";
+
+fn reply(r: &Replay) -> String {
+    r.events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AssistantDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn check_image_prompt(name: &str, flavor: Flavor) {
+    let r = run(name, flavor);
+    let prompt = r
+        .written
+        .iter()
+        .map(|l| json(l))
+        .find(|v| v["method"] == "session/prompt")
+        .expect("prompt written");
+    let blocks = &prompt["params"]["prompt"];
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[1]["type"], "image");
+    assert_eq!(blocks[1]["mimeType"], "image/png");
+    assert_eq!(blocks[1]["data"], RED_PNG_B64);
+    assert!(
+        reply(&r).to_lowercase().contains("red"),
+        "{name}: {}",
+        reply(&r)
+    );
+}
+
+#[test]
+fn opencode_image_prompt_is_an_image_block_and_a_vision_model_sees_it() {
+    // opencode/deepseek-v4.1-flash-free
+    check_image_prompt("opencode-image-prompt", Flavor::OpenCode);
+}
+
+#[test]
+fn kilo_image_prompt_is_an_image_block_and_a_vision_model_sees_it() {
+    // kilo/nvidia/nemotron-3.5-super-vl:free (kilo-auto/free answers that it cannot see images)
+    check_image_prompt("kilo-image-prompt", Flavor::Kilo);
+}
+
+#[test]
+fn opencode_read_of_a_png_reports_the_image_as_a_tool_part() {
+    let r = run("opencode-read-image", Flavor::OpenCode);
+    let parts = r
+        .events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallFinished { parts, .. } if !parts.is_empty() => Some(parts.clone()),
+            _ => None,
+        })
+        .expect("a tool result with an image");
+    assert_eq!(
+        parts,
+        vec![wasit_core::ContentPart::inline_image(
+            "image/png",
+            RED_PNG_B64
+        )]
+    );
+}

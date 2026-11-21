@@ -26,13 +26,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{json, Value};
+use wasit_core::content::{
+    b64_decode, b64_encode, base_name, file_uri_path, is_text_mime, path_file_uri,
+};
 use wasit_core::wire::{
     id_text, opt_s, rpc_error, rpc_notification, rpc_request, rpc_result, s, u, RpcIn,
 };
 use wasit_core::{
-    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateChoice,
-    GateChoiceKind, GateDecision, GateRequest, ModelInfo, OutLine, PlanEntry, Protocol, ResumeMode,
-    SessionMode, SlashCommandInfo, SpawnSpec, Step, Usage,
+    AgentEvent, Attachment, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
+    GateChoice, GateChoiceKind, GateDecision, GateRequest, MediaSource, ModelInfo, OutLine,
+    PlanEntry, Protocol, ResumeMode, SessionMode, SlashCommandInfo, SpawnSpec, Step, Usage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +97,9 @@ pub struct AcpProtocol {
     tools: HashMap<String, String>,
     subagents: HashSet<String>,
     subagents_started: HashSet<String>,
+    /// `promptCapabilities` from `initialize`.
+    prompt_image: bool,
+    prompt_embedded: bool,
 }
 
 impl AcpProtocol {
@@ -116,6 +122,8 @@ impl AcpProtocol {
             gates: Vec::new(),
             tools: HashMap::new(),
             subagents: HashSet::new(),
+            prompt_image: false,
+            prompt_embedded: false,
             subagents_started: HashSet::new(),
         }
     }
@@ -138,6 +146,10 @@ impl AcpProtocol {
             .get("agentCapabilities")
             .cloned()
             .unwrap_or(Value::Null);
+        let pc = caps.get("promptCapabilities");
+        let flag = |k: &str| pc.and_then(|p| p.get(k)).and_then(Value::as_bool) == Some(true);
+        self.prompt_image = flag("image");
+        self.prompt_embedded = flag("embeddedContext");
         self.can_list = caps
             .get("sessionCapabilities")
             .and_then(|c| c.get("list"))
@@ -243,7 +255,7 @@ impl AcpProtocol {
     fn encode_now(&mut self, cmd: Command) -> Result<Step, DriverError> {
         let mut step = Step::default();
         match cmd {
-            Command::Prompt { text } => step = self.prompt(&text),
+            Command::Prompt { text, attachments } => step = self.prompt(&text, &attachments),
             Command::RunSlash { name, args } => {
                 let name = name.trim_start_matches('/');
                 let text = if args.trim().is_empty() {
@@ -251,7 +263,7 @@ impl AcpProtocol {
                 } else {
                     format!("/{name} {}", args.trim())
                 };
-                step = self.prompt(&text);
+                step = self.prompt(&text, &[]);
             }
             Command::AnswerGate {
                 request_id,
@@ -289,13 +301,14 @@ impl AcpProtocol {
         Ok(step)
     }
 
-    fn prompt(&mut self, text: &str) -> Step {
+    fn prompt(&mut self, text: &str, attachments: &[Attachment]) -> Step {
         self.prompt_active = true;
         self.cancel_sent = false;
+        let blocks = prompt_blocks(text, attachments, self.prompt_image, self.prompt_embedded);
         let line = self.request(
             Req::Prompt,
             "session/prompt",
-            json!({"sessionId": self.sid(), "prompt": [{"type": "text", "text": text}]}),
+            json!({"sessionId": self.sid(), "prompt": blocks}),
         );
         Step {
             events: vec![AgentEvent::TurnStarted {
@@ -570,10 +583,16 @@ impl AcpProtocol {
         }
         let message_id = opt_s(update, "messageId");
         match kind {
-            "agent_message_chunk" => text_of(update)
-                .map(|text| AgentEvent::AssistantDelta { text, message_id })
-                .into_iter()
-                .collect(),
+            "agent_message_chunk" => match update.get("content").and_then(acp_part) {
+                Some(part) => vec![AgentEvent::AssistantContent {
+                    parts: vec![part],
+                    message_id,
+                }],
+                None => text_of(update)
+                    .map(|text| AgentEvent::AssistantDelta { text, message_id })
+                    .into_iter()
+                    .collect(),
+            },
             "agent_thought_chunk" => text_of(update)
                 .map(|text| AgentEvent::ThinkingDelta { text, message_id })
                 .into_iter()
@@ -697,6 +716,7 @@ impl AcpProtocol {
                 t.to_string()
             }
         });
+        let parts = tool_parts(&content);
         if terminal {
             self.tools.remove(&id);
             return vec![AgentEvent::ToolCallFinished {
@@ -704,6 +724,7 @@ impl AcpProtocol {
                 name,
                 ok: status == "completed",
                 result: (!content.is_empty()).then_some(Value::Array(content)),
+                parts,
             }];
         }
         // The arguments come in an update (the start carries only `cwd`, say).
@@ -717,6 +738,7 @@ impl AcpProtocol {
             content,
             status: (!status.is_empty()).then(|| status.to_string()),
             input,
+            parts,
         }]
     }
 
@@ -748,6 +770,7 @@ impl AcpProtocol {
                 call_id: id.to_string(),
                 name: name.unwrap_or_else(|| "subagent".into()),
                 ok: status == "completed",
+                parts: tool_parts(&content),
                 result: (!content.is_empty()).then_some(Value::Array(content)),
             });
         }
@@ -760,7 +783,7 @@ impl Protocol for AcpProtocol {
         self.spec = spec.clone();
         self.phase = Phase::Handshaking;
         if let Some(p) = &spec.first_prompt {
-            self.queue.push_back(Command::Prompt { text: p.clone() });
+            self.queue.push_back(Command::prompt(p.clone()));
         }
         let line = self.request(
             Req::Initialize,
@@ -824,6 +847,114 @@ fn events(events: Vec<AgentEvent>) -> Step {
         events,
         ..Step::default()
     }
+}
+
+/// The non-text part an ACP content block carries (`image`, `audio`, `resource`,
+/// `resource_link`); `None` for text and unknown blocks.
+pub(crate) fn acp_part(block: &Value) -> Option<ContentPart> {
+    let mime = opt_s(block, "mimeType");
+    match s(block, "type") {
+        "image" => {
+            let source = match (opt_s(block, "data"), opt_s(block, "uri")) {
+                (Some(data), _) => MediaSource::Inline { data },
+                (None, Some(uri)) => uri_source(&uri),
+                (None, None) => return None,
+            };
+            Some(ContentPart::Image {
+                mime: mime.unwrap_or_else(|| "image/png".into()),
+                source,
+                width: None,
+                height: None,
+                alt: None,
+            })
+        }
+        "audio" => Some(ContentPart::File {
+            source: MediaSource::Inline {
+                data: opt_s(block, "data")?,
+            },
+            name: None,
+            mime,
+            uri: None,
+        }),
+        "resource" => {
+            let r = block.get("resource")?;
+            let uri = opt_s(r, "uri");
+            let data = match (opt_s(r, "blob"), r.get("text").and_then(Value::as_str)) {
+                (Some(b), _) => b,
+                (None, Some(t)) => b64_encode(t.as_bytes()),
+                (None, None) => return None,
+            };
+            Some(ContentPart::File {
+                source: MediaSource::Inline { data },
+                name: uri.as_deref().map(base_name),
+                mime: opt_s(r, "mimeType"),
+                uri,
+            })
+        }
+        "resource_link" => {
+            let uri = opt_s(block, "uri")?;
+            Some(ContentPart::File {
+                source: uri_source(&uri),
+                name: opt_s(block, "name").or_else(|| Some(base_name(&uri))),
+                mime,
+                uri: Some(uri),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn uri_source(uri: &str) -> MediaSource {
+    match file_uri_path(uri) {
+        Some(path) => MediaSource::Path { path },
+        None => MediaSource::Url {
+            url: uri.to_string(),
+        },
+    }
+}
+
+/// The non-text parts of ACP tool call content (`{"type":"content","content":{block}}`).
+fn tool_parts(content: &[Value]) -> Vec<ContentPart> {
+    content
+        .iter()
+        .filter(|c| s(c, "type") == "content")
+        .filter_map(|c| c.get("content").and_then(acp_part))
+        .collect()
+}
+
+/// The `session/prompt` blocks for a prompt: the text, then each attachment as an `image`
+/// block (when the agent takes images), an embedded `resource` (text files, when the agent
+/// takes embedded context) or a `resource_link` to the uploaded copy (every ACP agent takes
+/// links).
+pub(crate) fn prompt_blocks(
+    text: &str,
+    attachments: &[Attachment],
+    image: bool,
+    embedded: bool,
+) -> Vec<Value> {
+    let mut blocks = vec![json!({"type": "text", "text": text})];
+    for a in attachments {
+        let uri = path_file_uri(&a.path);
+        let block = match a.data.as_deref() {
+            Some(data) if image && a.mime.starts_with("image/") => {
+                json!({"type": "image", "mimeType": a.mime, "data": data, "uri": uri})
+            }
+            Some(data) if embedded && is_text_mime(&a.mime) => {
+                match b64_decode(data).and_then(|b| String::from_utf8(b).ok()) {
+                    Some(t) => json!({"type": "resource", "resource": {
+                        "uri": uri, "mimeType": a.mime, "text": t}}),
+                    None => resource_link(a, &uri),
+                }
+            }
+            _ => resource_link(a, &uri),
+        };
+        blocks.push(block);
+    }
+    blocks
+}
+
+fn resource_link(a: &Attachment, uri: &str) -> Value {
+    json!({"type": "resource_link", "uri": uri, "name": a.name, "mimeType": a.mime, "size": a.size})
 }
 
 fn text_of(update: &Value) -> Option<String> {

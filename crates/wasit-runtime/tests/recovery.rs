@@ -49,14 +49,7 @@ async fn restart_mid_turn(driver: &str) {
         let id = mgr.create(req).await.unwrap().id;
         wait_phase(&mgr, &id, "idle").await;
         let mut s = mgr.subscribe(&id, None).await.unwrap();
-        mgr.command(
-            &id,
-            Command::Prompt {
-                text: "build it".into(),
-            },
-        )
-        .await
-        .unwrap();
+        mgr.command(&id, Command::prompt("build it")).await.unwrap();
         let snap = wait_phase(&mgr, &id, "needs_you").await;
         let seen = until(&mut s, |e| e.cursor >= snap.cursor).await;
         (id, snap, seen)
@@ -203,7 +196,7 @@ async fn killing_the_shim_makes_the_session_lost() {
     }
     let snap = wait_phase(&mgr, &id, "lost").await;
     assert!(snap.pending_gates.is_empty() && snap.turn.is_none());
-    let r = mgr.command(&id, Command::Prompt { text: "x".into() }).await;
+    let r = mgr.command(&id, Command::prompt("x")).await;
     assert!(r.is_err());
     // A new manager agrees (from the journal alone).
     drop(mgr);
@@ -230,9 +223,7 @@ async fn continue_starts_a_second_generation_with_monotonic_history() {
         .id;
     wait_phase(&mgr, &id, "idle").await;
     let mut s = mgr.subscribe(&id, None).await.unwrap();
-    mgr.command(&id, Command::Prompt { text: "a".into() })
-        .await
-        .unwrap();
+    mgr.command(&id, Command::prompt("a")).await.unwrap();
     until(&mut s, is_turn_completed).await;
     let native = mgr.snapshot(&id).unwrap().native_session_id.unwrap();
     // Continue is refused while running.
@@ -245,9 +236,7 @@ async fn continue_starts_a_second_generation_with_monotonic_history() {
     })
     .await;
     assert_eq!(snap.native_session_id.as_deref(), Some(native.as_str()));
-    mgr.command(&id, Command::Prompt { text: "b".into() })
-        .await
-        .unwrap();
+    mgr.command(&id, Command::prompt("b")).await.unwrap();
     let events = until(&mut s, is_turn_completed).await;
     assert!(assistant_text(&events).contains("one"));
     let full = mgr.history(&id, None, 2000).await.unwrap();
@@ -300,14 +289,9 @@ async fn history_pages_match_the_full_stream_with_a_tiny_tail() {
     wait_phase(&mgr, &id, "idle").await;
     let mut s = mgr.subscribe(&id, None).await.unwrap();
     for i in 0..5 {
-        mgr.command(
-            &id,
-            Command::Prompt {
-                text: format!("p{i}"),
-            },
-        )
-        .await
-        .unwrap();
+        mgr.command(&id, Command::prompt(format!("p{i}")))
+            .await
+            .unwrap();
         until(&mut s, is_turn_completed).await;
     }
     wait_phase(&mgr, &id, "idle").await;
@@ -353,9 +337,7 @@ async fn slow_subscriber_is_dropped_not_buffered() {
     wait_phase(&mgr, &id, "idle").await;
     let cursor = mgr.snapshot(&id).unwrap().cursor;
     let mut slow = mgr.subscribe(&id, Some(cursor)).await.unwrap();
-    mgr.command(&id, Command::Prompt { text: "go".into() })
-        .await
-        .unwrap();
+    mgr.command(&id, Command::prompt("go")).await.unwrap();
     // The session is not slowed down by a subscriber that does not read.
     let done = wait_snapshot(&mgr, &id, "turn done", |s| s.turns_completed == 1).await;
     let got: Vec<SessionEvent> = mgr
@@ -412,14 +394,7 @@ async fn forty_sessions_stay_responsive_with_one_hung() {
         );
     }
     wait_phase(&mgr, &hung, "idle").await;
-    mgr.command(
-        &hung,
-        Command::Prompt {
-            text: "hang".into(),
-        },
-    )
-    .await
-    .unwrap();
+    mgr.command(&hung, Command::prompt("hang")).await.unwrap();
     wait_phase(&mgr, &hung, "working").await;
     for id in &ids {
         wait_phase(&mgr, id, "idle").await;
@@ -433,14 +408,7 @@ async fn forty_sessions_stay_responsive_with_one_hung() {
                 .subscribe(&id, Some(mgr.snapshot(&id).unwrap().cursor))
                 .await
                 .unwrap();
-            mgr.command(
-                &id,
-                Command::Prompt {
-                    text: "ping".into(),
-                },
-            )
-            .await
-            .unwrap();
+            mgr.command(&id, Command::prompt("ping")).await.unwrap();
             let ev = until(&mut s, is_turn_completed).await;
             assert!(assistant_text(&ev).contains("pong"));
         }));
@@ -448,12 +416,7 @@ async fn forty_sessions_stay_responsive_with_one_hung() {
     // The hung session accepts (and journals) commands without holding anyone up.
     let r = tokio::time::timeout(
         Duration::from_secs(10),
-        mgr.command(
-            &hung,
-            Command::Prompt {
-                text: "more".into(),
-            },
-        ),
+        mgr.command(&hung, Command::prompt("more")),
     )
     .await
     .expect("hung session's command was answered");

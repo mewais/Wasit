@@ -123,12 +123,9 @@ fn continue_lists_then_loads_latest() {
 #[test]
 fn prompt_turn_usage_and_queueing() {
     let mut p = ready();
-    let step = sent(p.encode(Command::Prompt { text: "a".into() }));
+    let step = sent(p.encode(Command::prompt("a")));
     assert_eq!(w(&step)[0]["params"]["prompt"][0]["text"], "a");
-    assert_eq!(
-        p.encode(Command::Prompt { text: "b".into() }).unwrap(),
-        Encoded::Queued
-    );
+    assert_eq!(p.encode(Command::prompt("b")).unwrap(), Encoded::Queued);
     let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{"type":"text","text":"Hi"}}}}"#).events;
     assert_eq!(
         ev,
@@ -224,7 +221,7 @@ fn permission_gate_options_and_answers() {
 #[test]
 fn interrupt_cancels_gates_then_sends_cancel_notification() {
     let mut p = ready();
-    sent(p.encode(Command::Prompt { text: "a".into() }));
+    sent(p.encode(Command::prompt("a")));
     p.on_line(r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"c2"},"options":[]}}"#);
     let step = sent(p.encode(Command::Interrupt));
     let lines = w(&step);
@@ -598,4 +595,65 @@ fn a_tool_update_carries_the_arguments_that_came_late() {
         &ev[0],
         AgentEvent::ToolCallUpdated { input: None, .. }
     ));
+}
+
+#[test]
+fn prompt_blocks_follow_the_agents_prompt_capabilities() {
+    use crate::protocol::prompt_blocks;
+    use wasit_core::Attachment;
+    let img = Attachment {
+        name: "a.png".into(),
+        mime: "image/png".into(),
+        size: 3,
+        path: "/w/a b.png".into(),
+        data: Some("AAEC".into()),
+    };
+    let txt = Attachment {
+        name: "n.txt".into(),
+        mime: "text/plain".into(),
+        size: 2,
+        path: "/w/n.txt".into(),
+        data: Some(wasit_core::content::b64_encode(b"hi")),
+    };
+    let bin = Attachment {
+        name: "x.bin".into(),
+        mime: "application/octet-stream".into(),
+        size: 9,
+        path: "/w/x.bin".into(),
+        data: None,
+    };
+    let all = [img.clone(), txt.clone(), bin.clone()];
+    let b = prompt_blocks("look", &all, true, true);
+    assert_eq!(b[0], json!({"type":"text","text":"look"}));
+    assert_eq!(b[1]["type"], "image");
+    assert_eq!(b[1]["data"], "AAEC");
+    assert_eq!(b[1]["uri"], "file:///w/a%20b.png");
+    assert_eq!(b[2]["type"], "resource");
+    assert_eq!(b[2]["resource"]["text"], "hi");
+    assert_eq!(b[3]["type"], "resource_link");
+    assert_eq!(b[3]["name"], "x.bin");
+    // An agent without image / embedded-context support gets links only.
+    let b = prompt_blocks("look", &all, false, false);
+    assert!(b[1..].iter().all(|x| x["type"] == "resource_link"), "{b:?}");
+}
+
+#[test]
+fn agent_and_tool_media_become_parts() {
+    use wasit_core::{ContentPart, MediaSource};
+    let mut p = ready();
+    let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{"type":"resource_link","uri":"file:///w/out.pdf","name":"out.pdf","mimeType":"application/pdf"}}}}"#).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::AssistantContent {
+            parts: vec![ContentPart::File {
+                source: MediaSource::Path {
+                    path: "/w/out.pdf".into()
+                },
+                name: Some("out.pdf".into()),
+                mime: Some("application/pdf".into()),
+                uri: Some("file:///w/out.pdf".into()),
+            }],
+            message_id: Some("m".into()),
+        }]
+    );
 }

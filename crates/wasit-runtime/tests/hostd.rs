@@ -150,14 +150,7 @@ async fn hostd_end_to_end_with_daemon_kill_and_restart() {
             break;
         }
     }
-    c.command(
-        &id,
-        Command::Prompt {
-            text: "list".into(),
-        },
-    )
-    .await
-    .unwrap();
+    c.command(&id, Command::prompt("list")).await.unwrap();
     let request_id = loop {
         let e = next_event(&mut sub).await;
         let rid = match &e.kind {

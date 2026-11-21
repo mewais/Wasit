@@ -602,9 +602,10 @@ impl Persona for Claude {
             .result_if_allowed
             .clone()
             .unwrap_or_else(|| "ok".to_string());
+        let body = result_content(&content, tool.run());
         let m = self.tool_result_message(
             "tool_allow",
-            json!([{"tool_use_id":self.tool_use_id,"type":"tool_result","content":content,"is_error":false}]),
+            json!([{"tool_use_id":self.tool_use_id,"type":"tool_result","content":body,"is_error":false}]),
             vec![
                 (
                     "tool_use_result",
@@ -625,9 +626,10 @@ impl Persona for Claude {
                 .result_if_allowed
                 .clone()
                 .unwrap_or_else(|| "ok".to_string());
+            let body = result_content(&content, tool.run());
             let m = self.tool_result_message(
                 "tool_allow",
-                json!([{"tool_use_id":tuid,"type":"tool_result","content":content,"is_error":false}]),
+                json!([{"tool_use_id":tuid,"type":"tool_result","content":body,"is_error":false}]),
                 vec![
                     (
                         "tool_use_result",
@@ -818,5 +820,16 @@ impl Persona for Claude {
             let t = self.envelope(t);
             io.send(&t);
         }
+    }
+}
+
+/// A `tool_result` content: the text, or (with an image) the image block alone, as claude
+/// sends a `Read` of an image file.
+fn result_content(text: &str, image: Option<(String, String)>) -> Value {
+    match image {
+        Some((mime, data)) => {
+            json!([{"type":"image","source":{"type":"base64","data":data,"media_type":mime}}])
+        }
+        None => json!(text),
     }
 }

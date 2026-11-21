@@ -44,9 +44,7 @@ async fn external_gate_survives_restart(driver: &str) {
         ));
         // A prompt still runs while the external gate is pending, and the gate outlives it.
         let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
-        mgr.command(&id, Command::Prompt { text: "hi".into() })
-            .await
-            .unwrap();
+        mgr.command(&id, Command::prompt("hi")).await.unwrap();
         until(&mut s, is_turn_completed).await;
         let snap = wait_phase(&mgr, &id, "needs_you").await;
         assert_eq!(snap.pending_gates.len(), 1);

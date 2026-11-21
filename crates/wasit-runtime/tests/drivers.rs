@@ -30,10 +30,7 @@ async fn prompt_turn(driver: &str) {
         .build();
     let id = create_idle(&mgr, d.path(), driver, &sc).await;
     let mut s = mgr.subscribe(&id, None).await.unwrap();
-    let out = mgr
-        .command(&id, Command::Prompt { text: "hi".into() })
-        .await
-        .unwrap();
+    let out = mgr.command(&id, Command::prompt("hi")).await.unwrap();
     assert_eq!(out, CommandOutcome::Sent);
     let events = until(&mut s, is_turn_completed).await;
     assert!(
@@ -94,9 +91,7 @@ async fn permission_gate(driver: &str, allow: bool) {
         )
         .build();
     let id = create_idle(&mgr, d.path(), driver, &sc).await;
-    mgr.command(&id, Command::Prompt { text: "go".into() })
-        .await
-        .unwrap();
+    mgr.command(&id, Command::prompt("go")).await.unwrap();
     let snap = wait_phase(&mgr, &id, "needs_you").await;
     assert_eq!(snap.pending_gates.len(), 1);
     let gate = &snap.pending_gates[0].gate;
@@ -191,14 +186,7 @@ async fn question(driver: &str) {
         )
         .build();
     let id = create_idle(&mgr, d.path(), driver, &sc).await;
-    mgr.command(
-        &id,
-        Command::Prompt {
-            text: "ask me".into(),
-        },
-    )
-    .await
-    .unwrap();
+    mgr.command(&id, Command::prompt("ask me")).await.unwrap();
     let snap = wait_phase(&mgr, &id, "needs_you").await;
     let gate = snap.pending_gates[0].gate.clone();
     let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
@@ -262,14 +250,7 @@ async fn interrupt(driver: &str) {
         .build();
     let id = create_idle(&mgr, d.path(), driver, &sc).await;
     let mut s = mgr.subscribe(&id, None).await.unwrap();
-    mgr.command(
-        &id,
-        Command::Prompt {
-            text: "long".into(),
-        },
-    )
-    .await
-    .unwrap();
+    mgr.command(&id, Command::prompt("long")).await.unwrap();
     until(&mut s, |e| {
         is_agent(e, |a| matches!(a, AgentEvent::AssistantDelta { .. }))
     })
@@ -422,16 +403,14 @@ async fn crash_mid_turn(driver: &str) {
         )
         .build();
     let id = create_idle(&mgr, d.path(), driver, &sc).await;
-    mgr.command(&id, Command::Prompt { text: "die".into() })
-        .await
-        .unwrap();
+    mgr.command(&id, Command::prompt("die")).await.unwrap();
     let snap = wait_phase(&mgr, &id, "failed").await;
     let (reason, tail) = failed_reason(&snap.phase).unwrap();
     assert!(reason.contains("code 3"), "{reason}");
     assert!(tail.iter().any(|l| l.contains("out of cheese")), "{tail:?}");
     assert!(snap.turn.is_none() && snap.pending_gates.is_empty());
     assert_eq!(snap.exit.as_ref().unwrap().code, Some(3));
-    let r = mgr.command(&id, Command::Prompt { text: "x".into() }).await;
+    let r = mgr.command(&id, Command::prompt("x")).await;
     assert!(matches!(r, Err(CommandError::NotRunning { .. })), "{r:?}");
 }
 
@@ -535,9 +514,7 @@ async fn garbage_tolerated(driver: &str) {
         .build();
     let id = create_idle(&mgr, d.path(), driver, &sc).await;
     let mut s = mgr.subscribe(&id, None).await.unwrap();
-    mgr.command(&id, Command::Prompt { text: "x".into() })
-        .await
-        .unwrap();
+    mgr.command(&id, Command::prompt("x")).await.unwrap();
     let events = until(&mut s, is_turn_completed).await;
     assert!(events
         .iter()

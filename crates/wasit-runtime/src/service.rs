@@ -75,6 +75,7 @@ impl RuntimeService {
                 id: d.id(),
                 display_name: d.display_name().to_string(),
                 capabilities: d.capabilities(),
+                prompt_input: d.prompt_input(),
             })
             .collect();
         let info = HostInfo {
@@ -167,6 +168,18 @@ impl Service for RuntimeService {
                 let r: CommandRequest = params(p)?;
                 let outcome = m.command(&r.id, r.command).await.map_err(command_err)?;
                 ok(CommandReply { outcome })
+            }
+            methods::SESSION_ATTACHMENT_PUT => {
+                let r: crate::media::AttachmentPut = params(p)?;
+                ok(m.attachment_put(&r).await.map_err(runtime_err)?)
+            }
+            methods::SESSION_FILE_READ => {
+                let r: crate::media::FileReadRequest = params(p)?;
+                ok(m.file_read(&r).await.map_err(runtime_err)?)
+            }
+            methods::SESSION_FILES_STAT => {
+                let r: crate::media::FilesStatRequest = params(p)?;
+                ok(m.files_stat(&r).await.map_err(runtime_err)?)
             }
             other => Err(RpcError::method_not_found(other)),
         }

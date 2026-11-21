@@ -26,13 +26,15 @@
 use std::collections::{HashMap, VecDeque};
 
 use serde_json::{json, Value};
+use wasit_core::content::{base_name, path_reference_text, sniff_mime, COMMON_IMAGE_MIMES};
 use wasit_core::wire::{
     id_text, opt_s, rpc_error, rpc_notification, rpc_request, rpc_result, s, u, RpcIn,
 };
 use wasit_core::{
-    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateChoice,
-    GateChoiceKind, GateRequest, ModelInfo, OutLine, PlanEntry, Protocol, QuestionAnswer,
-    QuestionOption, QuestionPrompt, ResumeMode, SessionMode, SpawnSpec, Step, Usage,
+    AgentEvent, Attachment, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
+    GateChoice, GateChoiceKind, GateRequest, MediaSource, ModelInfo, OutLine, PlanEntry, Protocol,
+    QuestionAnswer, QuestionOption, QuestionPrompt, ResumeMode, SessionMode, SpawnSpec, Step,
+    Usage,
 };
 
 /// `protocol_options` key holding skill roots (a JSON array of absolute
@@ -259,8 +261,8 @@ impl CodexProtocol {
     fn encode_now(&mut self, cmd: Command) -> Result<Step, DriverError> {
         let mut step = Step::default();
         match cmd {
-            Command::Prompt { text } => {
-                let input = json!([{"type": "text", "text": text}]);
+            Command::Prompt { text, attachments } => {
+                let input = Value::Array(user_input(&text, &attachments));
                 let line = match self.active_turn.clone() {
                     Some(turn) => self.request(
                         Req::Steer,
@@ -852,8 +854,74 @@ impl CodexProtocol {
             name,
             ok: status == "completed" && exit_ok,
             result,
+            parts: item_parts(&item),
         }]
     }
+}
+
+/// `turn/start` input: the text (with non-image files named by path), then each image as a
+/// `localImage` (the uploaded copy on this host).
+fn user_input(text: &str, attachments: &[Attachment]) -> Vec<Value> {
+    let (images, files): (Vec<&Attachment>, Vec<&Attachment>) = attachments
+        .iter()
+        .partition(|a| COMMON_IMAGE_MIMES.contains(&a.mime.as_str()));
+    let mut input =
+        vec![json!({"type": "text", "text": format!("{text}{}", path_reference_text(&files))})];
+    for a in images {
+        input.push(json!({"type": "localImage", "path": a.path}));
+    }
+    input
+}
+
+/// Images an item shows: `imageView.path`, `imageGeneration.savedPath`, MCP result image
+/// blocks, dynamic tool `inputImage` items.
+fn item_parts(item: &Value) -> Vec<ContentPart> {
+    let image_at = |path: String| ContentPart::Image {
+        mime: sniff_mime(&[], &path),
+        alt: Some(base_name(&path)),
+        source: MediaSource::Path { path },
+        width: None,
+        height: None,
+    };
+    match s(item, "type") {
+        "imageView" => opt_s(item, "path").map(image_at).into_iter().collect(),
+        "imageGeneration" => opt_s(item, "savedPath").map(image_at).into_iter().collect(),
+        _ => {
+            let mut out = Vec::new();
+            let blocks = item
+                .get("result")
+                .and_then(|r| r.get("content"))
+                .or_else(|| item.get("contentItems"))
+                .and_then(Value::as_array);
+            for b in blocks.into_iter().flatten() {
+                match s(b, "type") {
+                    "image" => {
+                        if let Some(data) = opt_s(b, "data") {
+                            out.push(ContentPart::inline_image(
+                                opt_s(b, "mimeType").unwrap_or_else(|| "image/png".into()),
+                                data,
+                            ));
+                        }
+                    }
+                    "inputImage" => {
+                        if let Some((mime, data)) = data_url(s(b, "imageUrl")) {
+                            out.push(ContentPart::inline_image(mime, data));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+    }
+}
+
+/// `(mime, base64)` of a `data:<mime>;base64,<data>` URL.
+fn data_url(u: &str) -> Option<(String, String)> {
+    let rest = u.strip_prefix("data:")?;
+    let (head, data) = rest.split_once(',')?;
+    let mime = head.strip_suffix(";base64")?;
+    Some((mime.to_string(), data.to_string()))
 }
 
 impl Protocol for CodexProtocol {
@@ -862,7 +930,7 @@ impl Protocol for CodexProtocol {
         self.phase = Phase::Handshaking;
         self.mode = None;
         if let Some(p) = &spec.first_prompt {
-            self.queue.push_back(Command::Prompt { text: p.clone() });
+            self.queue.push_back(Command::prompt(p.clone()));
         }
         let line = self.request(
             Req::Initialize,

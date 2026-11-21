@@ -20,9 +20,9 @@ use serde_json::{json, Value};
 use wasit_core::{
     exec_stdout, modes_from_handshake, parse_version_line, AgentConfig, BusyPrompt, ConfigItem,
     ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
-    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, GeneratedFile, McpServerConfig,
-    McpTransport, ModelInfo, ProbeAction, ProbeOutput, Protocol, ResumableSession, SpawnSpec,
-    Unsupported,
+    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, GeneratedFile,
+    McpServerConfig, McpTransport, ModelInfo, ProbeAction, ProbeOutput, PromptInput, Protocol,
+    ResumableSession, SpawnSpec, Unsupported,
 };
 
 pub use protocol::{config_models, config_modes, AcpProtocol};
@@ -137,6 +137,14 @@ impl DriverDescriptor for AcpDescriptor {
             streaming_output: true,
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
         }
+    }
+
+    /// Verified against opencode 1.19 and kilo 7.8: `initialize` reports
+    /// `promptCapabilities: {image: true, embeddedContext: true}`. Whether the model can see an
+    /// image is the model's business (a text-only model answers that it cannot). The protocol
+    /// falls back to `resource_link`s when an agent reports otherwise.
+    fn prompt_input(&self) -> PromptInput {
+        PromptInput::images_and(FileInput::Embedded, 5 * 1024 * 1024)
     }
 
     fn new_protocol(&self) -> Box<dyn Protocol> {

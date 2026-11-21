@@ -20,6 +20,7 @@ mod core;
 mod discovery;
 mod host;
 mod manager;
+pub mod media;
 mod note;
 mod replay;
 mod service;

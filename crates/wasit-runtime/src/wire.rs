@@ -20,6 +20,9 @@
 //! | [`methods::SESSION_SNAPSHOT`] | [`SessionRef`] | [`SessionSnapshot`] |
 //! | [`methods::SESSION_HISTORY`] | [`HistoryRequest`] | [`HistoryPage`] |
 //! | [`methods::SESSION_COMMAND`] | [`CommandRequest`] | [`CommandReply`] |
+//! | [`methods::SESSION_ATTACHMENT_PUT`] | [`crate::media::AttachmentPut`] | [`crate::media::AttachmentPutReply`] |
+//! | [`methods::SESSION_FILE_READ`] | [`crate::media::FileReadRequest`] | [`crate::media::FileChunk`] |
+//! | [`methods::SESSION_FILES_STAT`] | [`crate::media::FilesStatRequest`] | [`crate::media::FilesStatReply`] |
 //!
 //! Errors are `RpcError`s whose `code` is one of [`codes`]; command failures carry a
 //! [`CommandError`] and other failures a [`RuntimeError`] as `data`.
@@ -37,8 +40,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
-    GateRequest, ModelInfo, ModelUsage, PlanEntry, ResumableSession, SessionMode, SlashCommandInfo,
-    Unsupported, Usage,
+    GateRequest, ModelInfo, ModelUsage, PlanEntry, PromptInput, ResumableSession, SessionMode,
+    SlashCommandInfo, Unsupported, Usage,
 };
 
 /// Method names.
@@ -55,6 +58,9 @@ pub mod methods {
     pub const SESSION_SNAPSHOT: &str = "session.snapshot";
     pub const SESSION_HISTORY: &str = "session.history";
     pub const SESSION_COMMAND: &str = "session.command";
+    pub const SESSION_ATTACHMENT_PUT: &str = "session.attachment.put";
+    pub const SESSION_FILE_READ: &str = "session.file.read";
+    pub const SESSION_FILES_STAT: &str = "session.files.stat";
 }
 
 /// Topic names.
@@ -273,6 +279,9 @@ pub struct SessionSnapshot {
     pub labels: BTreeMap<String, String>,
     pub created_at_ms: u64,
     pub capabilities: DriverCapabilities,
+    /// What a prompt may carry besides text.
+    #[serde(default)]
+    pub prompt_input: PromptInput,
     pub phase: Phase,
     /// Process generations so far (1 after create; +1 per continue).
     pub generation: u32,
@@ -677,6 +686,8 @@ pub struct DriverSummary {
     pub id: DriverId,
     pub display_name: String,
     pub capabilities: DriverCapabilities,
+    #[serde(default)]
+    pub prompt_input: PromptInput,
 }
 
 /// Result of `host.info`.

@@ -503,14 +503,22 @@ impl Acp {
     }
 
     fn finish_call(&self, io: &mut Io, ok: bool, text: &str) {
+        self.finish_call_with(io, ok, text, None)
+    }
+
+    fn finish_call_with(&self, io: &mut Io, ok: bool, text: &str, image: Option<(String, String)>) {
         let sid = self.session.clone();
         if ok {
+            let mut content = vec![json!({"type":"content","content":{"type":"text","text":text}})];
+            if let Some((mime, data)) = image {
+                content.push(json!({"type":"content","content":{"type":"image","mimeType":mime,"data":data}}));
+            }
             self.update(
                 io,
                 &sid,
                 json!({"sessionUpdate":"tool_call_update","toolCallId":self.call_id,
                 "status":"completed","title":self.call_title,
-                "content":[{"type":"content","content":{"type":"text","text":text}}],
+                "content":content,
                 "rawOutput":{"output":text,"metadata":{"output":text,"exit":0,"truncated":false}}}),
             );
         } else {
@@ -616,6 +624,16 @@ impl Persona for Acp {
         );
     }
 
+    fn image(&mut self, io: &mut Io, mime: &str, data: &str, _stats: &mut TurnStats) {
+        let sid = self.session.clone();
+        self.update(
+            io,
+            &sid,
+            json!({"sessionUpdate":"agent_message_chunk","messageId":format!("msg_{}", hex(26)),
+            "content":{"type":"image","mimeType":mime,"data":data}}),
+        );
+    }
+
     fn tool_call(&mut self, io: &mut Io, tool: &ToolStep, _stats: &mut TurnStats) -> Option<Value> {
         let title = tool.title.clone().unwrap_or_else(|| {
             tool.input["command"]
@@ -643,7 +661,7 @@ impl Persona for Acp {
             .result_if_allowed
             .clone()
             .unwrap_or_else(|| "ok".into());
-        self.finish_call(io, true, &text);
+        self.finish_call_with(io, true, &text, tool.run());
         None
     }
 
@@ -660,7 +678,7 @@ impl Persona for Acp {
                 .result_if_allowed
                 .clone()
                 .unwrap_or_else(|| "ok".into());
-            self.finish_call(io, true, &text);
+            self.finish_call_with(io, true, &text, tool.run());
         } else {
             let text = tool
                 .result_if_denied

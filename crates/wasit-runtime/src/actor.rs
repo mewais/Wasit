@@ -503,8 +503,11 @@ impl Actor {
     }
 
     fn on_record(&mut self, rec: Record) {
-        let out = self.core.apply(&rec);
+        let mut out = self.core.apply(&rec);
         self.snapshot_dirty = true;
+        for (id, bytes) in std::mem::take(&mut out.blobs) {
+            crate::media::write_blob(&self.dir, id, bytes);
+        }
         let resolved = out.resolved;
         if !out.events.is_empty() {
             self.publish(out.events);

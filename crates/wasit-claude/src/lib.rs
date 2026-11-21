@@ -21,9 +21,9 @@ use wasit_core::{
     config_listing, exec_stdout, listed_files, markdown_items, models_from_handshake,
     parse_version_line, read_file, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem,
     ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
-    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, McpServerConfig, McpTransport,
-    ProbeAction, ProbeOutput, Protocol, ResumableSession, ResumeMode, SessionMode, SpawnSpec,
-    Unsupported,
+    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, McpServerConfig,
+    McpTransport, ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession, ResumeMode,
+    SessionMode, SpawnSpec, Unsupported,
 };
 
 pub use protocol::{
@@ -106,6 +106,12 @@ impl DriverDescriptor for ClaudeDescriptor {
             streaming_output: false,
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
         }
+    }
+
+    /// Verified with claude 2.1: `image` content blocks (png/jpeg/gif/webp, base64) in a
+    /// stream-json user message are seen by the model; other files are named by path.
+    fn prompt_input(&self) -> PromptInput {
+        PromptInput::images_and(FileInput::PathReference, 5 * 1024 * 1024)
     }
 
     fn new_protocol(&self) -> Box<dyn Protocol> {

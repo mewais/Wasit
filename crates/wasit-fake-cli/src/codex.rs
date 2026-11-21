@@ -849,6 +849,8 @@ impl Codex {
         };
         let mut item = self.items[pos].clone();
         let text = if allow {
+            // The image has no codex shape here; the file write still happens.
+            let _ = tool.run();
             tool.result_if_allowed
                 .clone()
                 .unwrap_or_else(|| "ok".into())

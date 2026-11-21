@@ -74,6 +74,8 @@ pub trait Persona {
         stats: &mut TurnStats,
     ) -> Option<Value>;
     fn plan_answered(&mut self, _io: &mut Io, _body: &Value, _stats: &mut TurnStats) {}
+    /// Show an image in the reply (`Step::Image`); personas without such a message ignore it.
+    fn image(&mut self, _io: &mut Io, _mime: &str, _data: &str, _stats: &mut TurnStats) {}
     fn turn_end(&mut self, io: &mut Io, outcome: &Outcome, stats: &mut TurnStats);
     /// The MCP server `name` this CLI was configured with (for `mcp_call` steps).
     fn mcp_server(&self, _name: &str) -> Option<crate::mcp::McpLaunch> {
@@ -220,12 +222,20 @@ fn run_turn<P: Persona>(
                     result_if_allowed: Some(text),
                     result_if_denied: None,
                     title: None,
+                    image: None,
+                    write_file: None,
                 };
                 p.tool_call(io, &tool, &mut stats);
                 Wake::Done
             }
             Step::Think { text } => {
                 p.think(io, text, &mut stats);
+                Wake::Done
+            }
+            Step::Image(img) => {
+                if let Some((mime, data)) = img.load() {
+                    p.image(io, &mime, &data, &mut stats);
+                }
                 Wake::Done
             }
             Step::Usage(u) => {

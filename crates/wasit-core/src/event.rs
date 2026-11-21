@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+use crate::content::ContentPart;
+
 // ── Usage ───────────────────────────────────────────────────────────────────
 
 /// Token and cost breakdown.
@@ -597,6 +599,18 @@ pub enum AgentEvent {
         message_id: Option<String>,
     },
 
+    /// Non-text assistant content (an image or a file the agent shows: ACP agent message
+    /// `image` / `resource` / `resource_link`, codex image views and generated images).
+    AssistantContent {
+        parts: Vec<ContentPart>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+
+    /// Non-text content of a user message the CLI reports (history replayed on load). The
+    /// user's own prompts are `input` events.
+    UserContent { parts: Vec<ContentPart> },
+
     /// Reasoning / thinking text.
     ThinkingDelta {
         text: String,
@@ -629,6 +643,9 @@ pub enum AgentEvent {
         /// call first and send its arguments in an update); replaces the started input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
+        /// Images / files in the update's content (ACP tool call content blocks).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<ContentPart>,
     },
 
     /// A tool call finished.
@@ -638,6 +655,10 @@ pub enum AgentEvent {
         ok: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<serde_json::Value>,
+        /// Images / files the result carries (claude `tool_result` image blocks, ACP tool
+        /// content), in order. Text stays in `result`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<ContentPart>,
     },
 
     /// The agent is blocked on a human decision.

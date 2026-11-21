@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::config::ConfigRenderer;
+use crate::content::PromptInput;
 use crate::discovery::{DiscoveryContext, DiscoveryProbe};
 use crate::protocol::Protocol;
 use crate::spec::SpawnSpec;
@@ -101,6 +102,10 @@ pub trait DriverDescriptor: ConfigRenderer + Send + Sync {
     fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)>;
     /// Honest capabilities.
     fn capabilities(&self) -> DriverCapabilities;
+    /// What a prompt may carry besides text (default: text only).
+    fn prompt_input(&self) -> PromptInput {
+        PromptInput::default()
+    }
     /// A fresh protocol state machine for one session.
     fn new_protocol(&self) -> Box<dyn Protocol>;
     /// Discovery probes for this host.

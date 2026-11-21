@@ -26,12 +26,13 @@
 use std::collections::{HashMap, VecDeque};
 
 use serde_json::{json, Value};
+use wasit_core::content::{path_reference_text, COMMON_IMAGE_MIMES};
 use wasit_core::wire::{opt_s, s, u};
 use wasit_core::{
-    AgentEvent, ChoiceText, Command, CompactionInfo, DriverError, Encoded, EndReason, GateChoice,
-    GateChoiceKind, GateRequest, McpServerInfo, ModelInfo, ModelUsage, OutLine, Protocol,
-    QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, SlashCommandInfo, SpawnSpec,
-    Step, Usage,
+    AgentEvent, Attachment, ChoiceText, Command, CompactionInfo, ContentPart, DriverError, Encoded,
+    EndReason, GateChoice, GateChoiceKind, GateRequest, McpServerInfo, MediaSource, ModelInfo,
+    ModelUsage, OutLine, Protocol, QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo,
+    SlashCommandInfo, SpawnSpec, Step, Usage,
 };
 
 /// What a pending gate needs to encode its answer.
@@ -154,7 +155,9 @@ impl ClaudeProtocol {
 
     fn encode_now(&mut self, cmd: Command) -> Result<Step, DriverError> {
         match cmd {
-            Command::Prompt { text } => Ok(self.write_prompt(&text)),
+            Command::Prompt { text, attachments } => {
+                Ok(self.write_prompt_with(&text, &attachments))
+            }
             Command::RunSlash { name, args } => {
                 let name = name.trim_start_matches('/');
                 let text = if args.trim().is_empty() {
@@ -260,13 +263,17 @@ impl ClaudeProtocol {
     }
 
     fn write_prompt(&mut self, text: &str) -> Step {
+        self.write_prompt_with(text, &[])
+    }
+
+    fn write_prompt_with(&mut self, text: &str, attachments: &[Attachment]) -> Step {
         self.busy = true;
         self.interrupt_sent = false;
         Step {
             events: vec![AgentEvent::TurnStarted {
                 native_turn_id: None,
             }],
-            write: vec![encode_user_message(text)],
+            write: vec![encode_user_message_with(text, attachments)],
             close_stdin: false,
         }
     }
@@ -551,10 +558,16 @@ impl ClaudeProtocol {
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(Value::as_array);
+        let mut user_parts = Vec::new();
         for block in content.into_iter().flatten() {
             if s(block, "type") == "tool_result" {
                 let call_id = s(block, "tool_use_id").to_string();
                 let name = self.tool_names.remove(&call_id).unwrap_or_default();
+                let parts = block
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(claude_part).collect())
+                    .unwrap_or_default();
                 out.push(AgentEvent::ToolCallFinished {
                     call_id,
                     name,
@@ -563,8 +576,14 @@ impl ClaudeProtocol {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     result: block.get("content").cloned(),
+                    parts,
                 });
+            } else if let Some(p) = claude_part(block) {
+                user_parts.push(p);
             }
+        }
+        if !user_parts.is_empty() {
+            out.push(AgentEvent::UserContent { parts: user_parts });
         }
         out
     }
@@ -645,7 +664,7 @@ impl Protocol for ClaudeProtocol {
             "request": {"subtype": "initialize", "hooks": null},
         }));
         if let Some(p) = &spec.first_prompt {
-            self.queue.push_back(Command::Prompt { text: p.clone() });
+            self.queue.push_back(Command::prompt(p.clone()));
         }
         Step {
             write: vec![init],
@@ -1099,8 +1118,61 @@ pub fn encode_question_answer(request_id: &str, input: &Value, answer: &Question
 
 /// A user message.
 pub fn encode_user_message(text: &str) -> OutLine {
+    encode_user_message_with(text, &[])
+}
+
+/// A user message with attachments: images as `image` content blocks (base64 source); every
+/// other file is named by path in the text (claude reads it with its own tools).
+pub fn encode_user_message_with(text: &str, attachments: &[Attachment]) -> OutLine {
+    let (images, files): (Vec<&Attachment>, Vec<&Attachment>) = attachments
+        .iter()
+        .partition(|a| a.data.is_some() && COMMON_IMAGE_MIMES.contains(&a.mime.as_str()));
+    let text = format!("{text}{}", path_reference_text(&files));
+    let mut content = vec![json!({"type": "text", "text": text})];
+    for a in images {
+        content.push(json!({"type": "image", "source": {
+            "type": "base64", "media_type": a.mime, "data": a.data}}));
+    }
     OutLine::json(&json!({
         "type": "user",
-        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        "message": {"role": "user", "content": content},
     }))
+}
+
+/// The image / document a claude content block carries (`{"type":"image","source":{…}}`).
+fn claude_part(block: &Value) -> Option<ContentPart> {
+    let kind = s(block, "type");
+    if kind != "image" && kind != "document" {
+        return None;
+    }
+    let src = block.get("source")?;
+    let mime = opt_s(src, "media_type");
+    let source = match s(src, "type") {
+        "base64" => MediaSource::Inline {
+            data: opt_s(src, "data")?,
+        },
+        "url" => MediaSource::Url {
+            url: opt_s(src, "url")?,
+        },
+        "text" => MediaSource::Inline {
+            data: wasit_core::content::b64_encode(s(src, "data").as_bytes()),
+        },
+        _ => return None,
+    };
+    Some(if kind == "image" {
+        ContentPart::Image {
+            mime: mime.unwrap_or_else(|| "image/png".into()),
+            source,
+            width: None,
+            height: None,
+            alt: None,
+        }
+    } else {
+        ContentPart::File {
+            source,
+            name: opt_s(block, "title"),
+            mime,
+            uri: None,
+        }
+    })
 }

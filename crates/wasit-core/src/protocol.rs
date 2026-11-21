@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::content::Attachment;
 use crate::event::{AgentEvent, GateDecision, QuestionAnswer};
 use crate::spec::SpawnSpec;
 
@@ -88,7 +89,13 @@ pub enum Command {
     /// Send a user prompt (starts a turn; see
     /// [`DriverCapabilities::prompt_while_busy`](crate::DriverCapabilities::prompt_while_busy)
     /// for what happens during a turn).
-    Prompt { text: String },
+    Prompt {
+        text: String,
+        /// Files sent with the prompt (uploaded first); see
+        /// [`DriverDescriptor::prompt_input`](crate::DriverDescriptor::prompt_input).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
     /// Answer a permission or plan gate.
     AnswerGate {
         request_id: String,
@@ -113,6 +120,14 @@ pub enum Command {
 }
 
 impl Command {
+    /// A text-only prompt.
+    pub fn prompt(text: impl Into<String>) -> Self {
+        Command::Prompt {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
     /// Stable snake_case name, used in errors and `CommandRejected`.
     pub fn name(&self) -> &'static str {
         match self {

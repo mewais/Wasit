@@ -320,7 +320,7 @@ pub(crate) async fn run_interactive(live: &mut Live, rx: &mut mpsc::Receiver<Str
                         let (name, rest) = t[1..].split_once(' ').unwrap_or((&t[1..], ""));
                         Some(Command::RunSlash { name: name.into(), args: rest.into() })
                     }
-                    t => Some(Command::Prompt { text: t.into() }),
+                    t => Some(Command::prompt(t)),
                 };
                 match cmd {
                     Some(c) => { live.command(c).await; }

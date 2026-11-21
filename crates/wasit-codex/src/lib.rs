@@ -19,8 +19,8 @@ use wasit_core::{
     config_listing, exec_stdout, listed_files, models_from_handshake, modes_from_handshake,
     parse_version_line, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem, ConfigItemKind,
     ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
-    DriverCapabilities, DriverDescriptor, DriverId, McpServerConfig, McpTransport, ProbeAction,
-    ProbeOutput, Protocol, ResumableSession, SpawnSpec, Unsupported,
+    DriverCapabilities, DriverDescriptor, DriverId, FileInput, McpServerConfig, McpTransport,
+    ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession, SpawnSpec, Unsupported,
 };
 
 pub use protocol::{CodexProtocol, SKILL_ROOTS_OPTION};
@@ -79,6 +79,15 @@ impl DriverDescriptor for CodexDescriptor {
             continue_latest: true,
             streaming_output: true,
             prompt_while_busy: BusyPrompt::Steered,
+        }
+    }
+
+    /// From the app-server schema (codex 0.169): `UserInput` has `localImage {path}`; other
+    /// files are named by path. Images are uploaded to the session's host first.
+    fn prompt_input(&self) -> PromptInput {
+        PromptInput {
+            embeds_bytes: false,
+            ..PromptInput::images_and(FileInput::PathReference, 20 * 1024 * 1024)
         }
     }
 

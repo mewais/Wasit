@@ -104,7 +104,7 @@ fn continue_lists_latest_thread_then_resumes() {
 #[test]
 fn turn_lifecycle_usage_and_reply() {
     let mut p = ready();
-    let s = sent(p.encode(Command::Prompt { text: "go".into() }));
+    let s = sent(p.encode(Command::prompt("go")));
     let id = w(&s)[0]["id"].as_u64().unwrap();
     p.on_line(&format!(
         r#"{{"id":{id},"result":{{"turn":{{"id":"u1","status":"inProgress","items":[]}}}}}}"#
@@ -143,12 +143,9 @@ fn turn_lifecycle_usage_and_reply() {
 #[test]
 fn prompt_during_turn_is_steered_with_turn_id() {
     let mut p = ready();
-    sent(p.encode(Command::Prompt { text: "a".into() }));
+    sent(p.encode(Command::prompt("a")));
     // Turn id unknown yet: queued.
-    assert_eq!(
-        p.encode(Command::Prompt { text: "b".into() }).unwrap(),
-        Encoded::Queued
-    );
+    assert_eq!(p.encode(Command::prompt("b")).unwrap(), Encoded::Queued);
     let step = p.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"u9"}}}"#);
     let lines = w(&step);
     assert_eq!(lines[0]["method"], "turn/steer");
@@ -159,7 +156,7 @@ fn prompt_during_turn_is_steered_with_turn_id() {
 #[test]
 fn interrupt_uses_tracked_turn_and_declines_gates() {
     let mut p = ready();
-    sent(p.encode(Command::Prompt { text: "a".into() }));
+    sent(p.encode(Command::prompt("a")));
     // Interrupt before the turn id is known waits for it.
     assert!(sent(p.encode(Command::Interrupt)).write.is_empty());
     let step = p.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"u2"}}}"#);
@@ -177,7 +174,7 @@ fn interrupt_uses_tracked_turn_and_declines_gates() {
     ));
 
     // With a pending gate: decline first, then interrupt.
-    sent(p.encode(Command::Prompt { text: "b".into() }));
+    sent(p.encode(Command::prompt("b")));
     p.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"u3"}}}"#);
     p.on_line(r#"{"method":"item/commandExecution/requestApproval","id":0,"params":{"itemId":"call_1","command":"touch x","cwd":"/c"}}"#);
     let step = sent(p.encode(Command::Interrupt));
@@ -376,7 +373,8 @@ fn tool_items_and_unknown_server_requests() {
             call_id: "c1".into(),
             name: "ls".into(),
             ok: false,
-            result: Some(json!("no"))
+            result: Some(json!("no")),
+            parts: vec![]
         }]
     );
     let ev = p.on_line(r#"{"method":"item/started","params":{"item":{"type":"mcpToolCall","id":"m1","server":"fs","tool":"read","arguments":{"p":1}}}}"#).events;
@@ -579,5 +577,43 @@ fn disabled_items_render_as_config_overrides() {
             "-c",
             "skills.config=[{path=\"/h/.codex/skills/cs/SKILL.md\",enabled=false}]"
         ]
+    );
+}
+
+#[test]
+fn images_go_as_local_images_and_files_by_path() {
+    let mut p = ready();
+    let att = |name: &str, mime: &str| wasit_core::Attachment {
+        name: name.into(),
+        mime: mime.into(),
+        size: 5,
+        path: format!("/up/{name}"),
+        data: None,
+    };
+    let s = sent(p.encode(Command::Prompt {
+        text: "see".into(),
+        attachments: vec![att("a.png", "image/png"), att("r.pdf", "application/pdf")],
+    }));
+    let input = &w(&s)[0]["params"]["input"];
+    assert_eq!(input[0]["type"], "text");
+    assert!(input[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("[Attached file: r.pdf"));
+    assert_eq!(input[1], json!({"type":"localImage","path":"/up/a.png"}));
+}
+
+#[test]
+fn image_view_items_carry_the_image_path() {
+    let mut p = ready();
+    p.on_line(r#"{"method":"item/started","params":{"item":{"type":"imageView","id":"v1","path":"/w/p.png"}}}"#);
+    let ev = p
+        .on_line(r#"{"method":"item/completed","params":{"item":{"type":"imageView","id":"v1","path":"/w/p.png"}}}"#)
+        .events;
+    let AgentEvent::ToolCallFinished { parts, .. } = &ev[0] else {
+        panic!("{ev:?}")
+    };
+    assert!(
+        matches!(&parts[0], wasit_core::ContentPart::Image { mime, source: wasit_core::MediaSource::Path { path }, .. } if mime == "image/png" && path == "/w/p.png")
     );
 }

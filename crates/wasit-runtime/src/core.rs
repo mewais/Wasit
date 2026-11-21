@@ -62,10 +62,11 @@ pub(crate) struct SessionMeta {
 /// An empty snapshot for `meta` in `phase`.
 pub(crate) fn blank_snapshot(
     meta: &SessionMeta,
-    caps: wasit_core::DriverCapabilities,
+    desc: &dyn DriverDescriptor,
     phase: Phase,
     loaded: bool,
 ) -> SessionSnapshot {
+    let caps = desc.capabilities();
     SessionSnapshot {
         id: meta.id.clone(),
         driver: meta.driver.clone(),
@@ -73,6 +74,7 @@ pub(crate) fn blank_snapshot(
         labels: meta.labels.clone(),
         created_at_ms: meta.created_at_ms,
         capabilities: caps,
+        prompt_input: desc.prompt_input(),
         phase,
         generation: 0,
         pid: None,
@@ -136,6 +138,8 @@ pub(crate) struct Output {
     pub stop_applied: bool,
     pub spawned: bool,
     pub exited: bool,
+    /// Inline media moved out of events: `(blob id, bytes)` for the blob store.
+    pub blobs: Vec<(String, Vec<u8>)>,
 }
 
 struct Emitter {
@@ -207,7 +211,7 @@ impl Core {
     }
 
     pub(crate) fn new(desc: Arc<dyn DriverDescriptor>, meta: &SessionMeta) -> Self {
-        let snap = blank_snapshot(meta, desc.capabilities(), Phase::Starting, true);
+        let snap = blank_snapshot(meta, desc.as_ref(), Phase::Starting, true);
         Core {
             desc,
             snap,
@@ -511,7 +515,7 @@ impl Core {
                             reason: "the process is not running".into(),
                         };
                         em.push(SessionEventKind::Input {
-                            command,
+                            command: crate::media::without_bytes(command),
                             status: status.clone(),
                         });
                         out.resolved.push((token, status));
@@ -629,7 +633,7 @@ impl Core {
         let accepted = matches!(status, CommandStatus::Sent | CommandStatus::Queued);
         if accepted {
             match &command {
-                Command::Prompt { text } => self.note_prompt(text.clone()),
+                Command::Prompt { text, .. } => self.note_prompt(text.clone()),
                 Command::RunSlash { name, args } => {
                     let text = if args.is_empty() {
                         format!("/{name}")
@@ -650,7 +654,7 @@ impl Core {
             }
         }
         em.push(SessionEventKind::Input {
-            command,
+            command: crate::media::without_bytes(command),
             status: status.clone(),
         });
         out.resolved.push((token, status));
@@ -835,7 +839,8 @@ impl Core {
     // ── protocol output ─────────────────────────────────────────────────────
 
     fn step(&mut self, step: Step, em: &mut Emitter, out: &mut Output) {
-        for event in step.events {
+        for mut event in step.events {
+            crate::media::externalize(&mut event, &mut out.blobs);
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, em.t);
             em.push(SessionEventKind::Agent { event });
@@ -1023,6 +1028,8 @@ impl Core {
             | AgentEvent::RateLimitNotice { .. }
             | AgentEvent::CommandRejected { .. }
             | AgentEvent::Notice { .. }
+            | AgentEvent::AssistantContent { .. }
+            | AgentEvent::UserContent { .. }
             | AgentEvent::ProcessExited { .. }
             | AgentEvent::Unknown { .. } => {}
         }

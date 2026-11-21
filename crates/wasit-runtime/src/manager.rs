@@ -261,7 +261,7 @@ impl SessionManager {
         }
         let snap = Arc::new(blank_snapshot(
             &file.meta(),
-            desc.capabilities(),
+            desc.as_ref(),
             Phase::Starting,
             true,
         ));
@@ -358,12 +358,7 @@ impl SessionManager {
         let state = wasit_shim::probe(dir).await.map_err(|e| e.to_string())?;
         let meta = file.meta();
         if state == ShimState::Running {
-            let snap = Arc::new(blank_snapshot(
-                &meta,
-                desc.capabilities(),
-                Phase::Starting,
-                false,
-            ));
+            let snap = Arc::new(blank_snapshot(&meta, desc.as_ref(), Phase::Starting, false));
             self.insert(id.clone(), dir.to_path_buf(), file, desc, snap, true);
             return Ok(true);
         }
@@ -381,7 +376,7 @@ impl SessionManager {
                 reason: "the shim is gone and the journal has no exit record".into(),
             },
         };
-        let snap = Arc::new(blank_snapshot(&meta, desc.capabilities(), phase, false));
+        let snap = Arc::new(blank_snapshot(&meta, desc.as_ref(), phase, false));
         let (tx, loader) = {
             let watch_tx = {
                 let (snapshot, _) = watch::channel(snap.clone());
@@ -442,6 +437,52 @@ impl SessionManager {
             .get(id)
             .map(|e| (**e.snapshot.borrow()).clone())
             .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))
+    }
+
+    /// The read roots of a session: its directory (blobs, attachments) and its cwd.
+    fn roots(&self, id: &SessionId) -> Result<crate::media::Roots, RuntimeError> {
+        let map = lock(&self.inner.sessions);
+        let e = map
+            .get(id)
+            .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+        let cwd = e
+            .snapshot
+            .borrow()
+            .cwd
+            .clone()
+            .or_else(|| e.file.meta().cwd)
+            .map(PathBuf::from);
+        Ok(crate::media::Roots {
+            session_dir: e.dir.clone(),
+            cwd,
+        })
+    }
+
+    /// `session.attachment.put`: one chunk of an upload into the session's attachments.
+    pub async fn attachment_put(
+        &self,
+        r: &crate::media::AttachmentPut,
+    ) -> Result<crate::media::AttachmentPutReply, RuntimeError> {
+        let dir = self.roots(&r.id)?.session_dir;
+        crate::media::put(&dir, r).await
+    }
+
+    /// `session.file.read`: a range of a blob or of a file inside the session's roots.
+    pub async fn file_read(
+        &self,
+        r: &crate::media::FileReadRequest,
+    ) -> Result<crate::media::FileChunk, RuntimeError> {
+        let roots = self.roots(&r.id)?;
+        crate::media::read(&roots, r).await
+    }
+
+    /// `session.files.stat`: which paths exist inside the session's roots.
+    pub async fn files_stat(
+        &self,
+        r: &crate::media::FilesStatRequest,
+    ) -> Result<crate::media::FilesStatReply, RuntimeError> {
+        let roots = self.roots(&r.id)?;
+        crate::media::stat(&roots, &r.paths).await
     }
 
     /// A `watch` of a session's snapshot (e.g. to await a phase).
@@ -518,8 +559,29 @@ impl SessionManager {
     pub async fn command(
         &self,
         id: &SessionId,
-        command: wasit_core::Command,
+        mut command: wasit_core::Command,
     ) -> Result<CommandOutcome, CommandError> {
+        if let wasit_core::Command::Prompt { attachments, .. } = &mut command {
+            if !attachments.is_empty() {
+                let (dir, input) = {
+                    let map = lock(&self.inner.sessions);
+                    let e = map
+                        .get(id)
+                        .ok_or_else(|| CommandError::SessionNotFound { id: id.to_string() })?;
+                    (e.dir.clone(), e.desc.prompt_input())
+                };
+                crate::media::load_attachments(&dir, &input, attachments)
+                    .await
+                    .map_err(|e| match e {
+                        RuntimeError::Unsupported(operation) => {
+                            CommandError::Unsupported { operation }
+                        }
+                        e => CommandError::Rejected {
+                            reason: e.to_string(),
+                        },
+                    })?;
+            }
+        }
         match self.ask(id, |reply| Msg::Command { command, reply }).await {
             Ok(r) => r,
             Err(RuntimeError::SessionNotFound(id)) => Err(CommandError::SessionNotFound { id }),

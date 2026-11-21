@@ -55,14 +55,7 @@ async fn live_turn(driver: &str, model: Option<&str>, env: Vec<(String, String)>
         .await;
         assert_eq!(snap.phase, Phase::Idle, "{snap:#?}");
         let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
-        mgr.command(
-            &id,
-            Command::Prompt {
-                text: prompt.into(),
-            },
-        )
-        .await
-        .unwrap();
+        mgr.command(&id, Command::prompt(prompt)).await.unwrap();
         let events = tokio::time::timeout(
             LIVE,
             until(&mut s, |e| {
