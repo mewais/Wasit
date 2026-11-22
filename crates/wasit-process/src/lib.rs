@@ -118,6 +118,23 @@ pub fn child_var(name: &str) -> Option<std::ffi::OsString> {
     }
 }
 
+/// Start `cmd` in a new session (Unix `setsid`): no controlling terminal, its own process
+/// group (id = its pid). An interactive shell started this way cannot be stopped by job-control
+/// signals (SIGTTOU/SIGTTIN) from a terminal its parent happens to have (`wsl.exe` gives one).
+#[cfg(all(unix, feature = "tokio"))]
+pub fn new_session(cmd: &mut tokio::process::Command) {
+    // SAFETY: the closure runs between fork and exec and only calls the async-signal-safe
+    // `setsid`.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Kill a whole process group (Unix; `pgid` = the leader's pid). Used to end a capture shell
 /// together with everything its startup files started.
 #[cfg(unix)]

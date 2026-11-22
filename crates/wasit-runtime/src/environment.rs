@@ -12,7 +12,7 @@
 //!    closed and a deadline (output outside the markers, i.e. rc-file chatter, is ignored; the
 //!    whole process group is killed at the deadline), falling back to `-l -c`, then to this
 //!    process's environment. Windows: this process's environment plus the variables only the
-//!    registry has (user, then machine), and PATH = this process's entries, then registry
+//!    registry has (user over machine), and PATH = this process's entries, then registry
 //!    entries it lacks (a GUI's environment is a snapshot from login; installs since then are
 //!    only in the registry).
 //! 2. *(later)* per-host setup commands, evaluated in the captured environment.
@@ -257,8 +257,10 @@ async fn run_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // A new session: no controlling terminal (an interactive shell in a background group of
+    // one would be stopped by SIGTTOU), and a process group to kill at the deadline.
     #[cfg(unix)]
-    cmd.process_group(0);
+    wasit_process::new_session(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", program.display()))?;
@@ -394,9 +396,8 @@ async fn capture_windows(
     let script = format!(
         r#"$x=[Environment]::ExpandEnvironmentVariables
 $r=@{{}}
-foreach($e in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()){{$r[$e.Key]=$e.Value}}
 foreach($t in 'User','Machine'){{foreach($e in [Environment]::GetEnvironmentVariables($t).GetEnumerator()){{if($e.Key -ne 'Path' -and -not $r.ContainsKey($e.Key)){{$r[$e.Key]=$x.Invoke($e.Value)}}}}}}
-$p=@(); foreach($t in 'Process','Machine','User'){{$v=[Environment]::GetEnvironmentVariable('Path',$t); if($v){{foreach($s in $v.Split(';')){{$s=$x.Invoke($s); if($s -and ($p -notcontains $s)){{$p+=$s}}}}}}}}
+$p=@(); foreach($t in 'Machine','User'){{$v=[Environment]::GetEnvironmentVariable('Path',$t); if($v){{foreach($s in $v.Split(';')){{$s=$x.Invoke($s); if($s -and ($p -notcontains $s)){{$p+=$s}}}}}}}}
 $r['Path']=$p -join ';'
 $o=[Console]::Out
 $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $o.Write("`n{end}`n")"#
@@ -410,8 +411,13 @@ $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $
     let ps = PathBuf::from("powershell.exe");
     match run_bounded(&ps, &args, opts.interactive_deadline).await {
         Ok((out, err)) => match between(&out, &begin, &end).map(parse_env) {
-            Some(vars) if vars.iter().any(|(k, _)| k.eq_ignore_ascii_case("PATH")) => {
-                return Some((EnvSource::Registry, None, vars))
+            Some(reg) if reg.iter().any(|(k, _)| k.eq_ignore_ascii_case("PATH")) => {
+                // This process's variables win (PowerShell's own changes are not taken); the
+                // registry adds what it lacks: variables set since login and PATH entries.
+                let own: Vec<(String, String)> = std::env::vars_os()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                    .collect();
+                return Some((EnvSource::Registry, None, merge_own(own, &reg)));
             }
             _ => notes.push(format!("the registry environment could not be read: {err}")),
         },
