@@ -1,7 +1,10 @@
 import http from 'node:http';import fs from 'node:fs';
 let n=0;
+// FAKE_RESPONSES_PORT: the port on 127.0.0.1 (default 18080).
+// FAKE_RESPONSES_LOG: where every request is appended (default /tmp/fake-responses.log).
+const LOG=process.env.FAKE_RESPONSES_LOG||'/tmp/fake-responses.log';
 http.createServer((req,res)=>{let b='';req.on('data',d=>b+=d);req.on('end',async()=>{
- fs.appendFileSync('/tmp/fake-responses.log',req.method+' '+req.url+' '+b+'\n');
+ fs.appendFileSync(LOG,req.method+' '+req.url+' '+b+'\n');
  if(req.url.includes('/models')){res.setHeader('content-type','application/json');return res.end(JSON.stringify({object:'list',data:[{id:'fake',object:'model'}]}))}
  let body={};try{body=JSON.parse(b)}catch{}
  const input=JSON.stringify(body.input||[]);
@@ -34,11 +37,13 @@ http.createServer((req,res)=>{let b='';req.on('data',d=>b+=d);req.on('end',async
    ev('response.function_call_arguments.delta',{item_id:item.id,output_index:0,delta:item.arguments});
    ev('response.output_item.done',{output_index:0,item});finish([item]);return res.end();
  }
- const text=userText.includes('SLOW')?'slow reply '.repeat(20):userText.includes('pong')?'pong':'Hello from fake';
+ // An image in the user's message is described by its MIME type and size (from the data URL).
+ const img=userText.includes('"input_image"')&&/data:([^;"]+);base64,([A-Za-z0-9+\/=]+)/.exec(userText);
+ const text=img?`I see a ${img[1]} image of ${Buffer.from(img[2],'base64').length} bytes`:userText.includes('SLOW')?'slow reply '.repeat(20):userText.includes('pong')?'pong':'Hello from fake';
  const item={id:'msg_'+id,type:'message',role:'assistant',status:'in_progress',content:[]};
  ev('response.output_item.added',{output_index:0,item});
  ev('response.content_part.added',{item_id:item.id,output_index:0,content_index:0,part:{type:'output_text',text:''}});
  if(userText.includes('SLOW')){for(let i=0;i<40;i++){ev('response.output_text.delta',{item_id:item.id,output_index:0,content_index:0,delta:'tick '});await sleep(250)}}
  else ev('response.output_text.delta',{item_id:item.id,output_index:0,content_index:0,delta:text});
  const done={...item,status:'completed',content:[{type:'output_text',text,annotations:[]}]};
- ev('response.output_item.done',{output_index:0,item:done});finish([done]);res.end();});}).listen(18080,'127.0.0.1');
+ ev('response.output_item.done',{output_index:0,item:done});finish([done]);res.end();});}).listen(Number(process.env.FAKE_RESPONSES_PORT||18080),'127.0.0.1');

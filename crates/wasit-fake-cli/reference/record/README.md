@@ -7,7 +7,9 @@ kilo 7.8.27, codex-cli 0.169.1). They are kept for reproducibility, not run by `
 * `codex.mjs <scenario>`: `codex app-server`, with `CODEX_HOME` pointing at a config whose model
   provider is `http://127.0.0.1:18080/v1`, served by `fake-responses.mjs` (a minimal OpenAI
   Responses API stub: text replies, an `exec_command` call for `RUNTOOL`, `request_user_input`
-  for `ASKUSER`, a slow stream for `SLOW`, an HTTP 400 for `FAILME`).
+  for `ASKUSER`, a slow stream for `SLOW`, an HTTP 400 for `FAILME`, and for a message with an
+  `input_image` a reply naming its MIME type and size; requests are appended to
+  `$FAKE_RESPONSES_LOG`, default `/tmp/fake-responses.log`).
 * `trim.py` shortens long lists (models, commands, tools) so the recordings stay small.
 
 Run from this directory with `REF_DIR=..` set.

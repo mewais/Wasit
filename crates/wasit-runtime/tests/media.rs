@@ -13,64 +13,6 @@ use wasit_runtime::media::{AttachmentPut, FileReadRequest, FilesStatRequest};
 use wasit_runtime::wire::{SessionEventKind, SessionId};
 use wasit_runtime::SessionManager;
 
-/// A valid 40x30 PNG (large enough that its base64 is scrubbed from raw values).
-fn png() -> Vec<u8> {
-    fn crc(data: &[u8]) -> u32 {
-        let mut c = 0xffff_ffffu32;
-        for &b in data {
-            c ^= b as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xedb8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-        }
-        !c
-    }
-    fn chunk(out: &mut Vec<u8>, t: &[u8], d: &[u8]) {
-        out.extend((d.len() as u32).to_be_bytes());
-        let mut td = t.to_vec();
-        td.extend(d);
-        out.extend(&td);
-        out.extend(crc(&td).to_be_bytes());
-    }
-    let (w, h) = (40u32, 30u32);
-    let mut raw = Vec::new();
-    for y in 0..h {
-        raw.push(0);
-        for x in 0..w {
-            raw.extend([(x * 6) as u8, (y * 8) as u8, 200]);
-        }
-    }
-    // Stored (uncompressed) deflate blocks inside a zlib stream.
-    let mut z = vec![0x78, 0x01];
-    let mut adler = (1u32, 0u32);
-    for b in &raw {
-        adler.0 = (adler.0 + *b as u32) % 65521;
-        adler.1 = (adler.1 + adler.0) % 65521;
-    }
-    let blocks: Vec<&[u8]> = raw.chunks(65535).collect();
-    for (i, blk) in blocks.iter().enumerate() {
-        z.push(u8::from(i + 1 == blocks.len()));
-        let n = blk.len() as u16;
-        z.extend(n.to_le_bytes());
-        z.extend((!n).to_le_bytes());
-        z.extend(*blk);
-    }
-    z.extend(((adler.1 << 16) | adler.0).to_be_bytes());
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut ihdr = Vec::new();
-    ihdr.extend(w.to_be_bytes());
-    ihdr.extend(h.to_be_bytes());
-    ihdr.extend([8, 2, 0, 0, 0]);
-    chunk(&mut out, b"IHDR", &ihdr);
-    chunk(&mut out, b"IDAT", &z);
-    chunk(&mut out, b"IEND", &[]);
-    out
-}
-
 fn image_turn(data: &str, write: Option<(&str, &str)>) -> Turn {
     Turn {
         when: None,

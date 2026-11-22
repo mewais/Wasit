@@ -6,7 +6,7 @@
 //! * opencode / kilo: free models (`opencode/deepseek-v4.1-flash-free`, `kilo/kilo-auto/free`).
 //! * codex: a throwaway `CODEX_HOME` whose provider is the local fake Responses server
 //!   (`wasit-fake-cli/reference/record/fake-responses.mjs`, started here with `node` on
-//!   127.0.0.1:18080).
+//!   127.0.0.1:18080 / 18081).
 
 mod common;
 
@@ -143,23 +143,27 @@ async fn live_kilo() {
     .await;
 }
 
-#[tokio::test]
-#[ignore = "live: needs the codex CLI and node (local fake Responses server)"]
-async fn live_codex() {
+/// A throwaway `CODEX_HOME` whose provider is the local fake Responses server, started here
+/// (requests appended to `<dir>/responses.log`). The server is killed when the guard drops.
+async fn fake_responses(
+    dir: &std::path::Path,
+    port: u16,
+) -> (std::path::PathBuf, tokio::process::Child) {
     require("codex");
     require("node");
-    let d = TempDir::new();
-    let home = d.path().join("codexhome");
+    let home = dir.join("codexhome");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("config.toml"),
-        "model = \"fake\"\nmodel_provider = \"fake\"\n[model_providers.fake]\nname = \"fake\"\nbase_url = \"http://127.0.0.1:18080/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\n",
+        format!("model = \"fake\"\nmodel_provider = \"fake\"\n[model_providers.fake]\nname = \"fake\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\n"),
     )
     .unwrap();
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../wasit-fake-cli/reference/record/fake-responses.mjs");
-    let mut server = tokio::process::Command::new("node")
+    let server = tokio::process::Command::new("node")
         .arg(&script)
+        .env("FAKE_RESPONSES_LOG", dir.join("responses.log"))
+        .env("FAKE_RESPONSES_PORT", port.to_string())
         .kill_on_drop(true)
         .spawn()
         .expect("start the fake Responses server");
@@ -167,7 +171,7 @@ async fn live_codex() {
     let mut backoff = Duration::from_millis(50);
     let mut up = false;
     for _ in 0..20 {
-        if tokio::net::TcpStream::connect("127.0.0.1:18080")
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok()
         {
@@ -178,6 +182,14 @@ async fn live_codex() {
         backoff = (backoff * 2).min(Duration::from_secs(1));
     }
     assert!(up, "fake Responses server did not start");
+    (home, server)
+}
+
+#[tokio::test]
+#[ignore = "live: needs the codex CLI and node (local fake Responses server)"]
+async fn live_codex() {
+    let d = TempDir::new();
+    let (home, _server) = fake_responses(d.path(), 18080).await;
     live_turn(
         "codex",
         None,
@@ -185,7 +197,94 @@ async fn live_codex() {
         "hello",
     )
     .await;
-    let _ = server.start_kill(); // already exiting or gone is fine
+}
+
+/// Image input through the real codex app-server: a PNG uploaded to the session goes out as
+/// `localImage {path}` (the descriptor's prompt input), codex reads it and sends it to the model
+/// as an `input_image` data URL with the same bytes; the fake model names what it got.
+#[tokio::test]
+#[ignore = "live: needs the codex CLI and node (local fake Responses server)"]
+async fn live_codex_image() {
+    use wasit_core::content::b64_encode;
+    use wasit_runtime::media::AttachmentPut;
+    let d = TempDir::new();
+    let (home, _server) = fake_responses(d.path(), 18081).await;
+    let work = d.path().join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let mgr = live_manager(d.path()).await;
+    let mut req = CreateSession::new("codex");
+    req.cwd = Some(work.to_string_lossy().into_owned());
+    req.config.env = vec![("CODEX_HOME".into(), home.to_string_lossy().into_owned())];
+    let id = mgr.create(req).await.unwrap().id;
+    let snap = wait_snapshot_within(&mgr, &id, "idle", LIVE, |s| {
+        s.phase == Phase::Idle || !s.phase.is_live()
+    })
+    .await;
+    assert_eq!(snap.phase, Phase::Idle, "{snap:#?}");
+    assert!(
+        snap.prompt_input
+            .image_mimes
+            .iter()
+            .any(|m| m == "image/png"),
+        "{:?}",
+        snap.prompt_input
+    );
+    let bytes = png();
+    let att = mgr
+        .attachment_put(&AttachmentPut {
+            id: id.clone(),
+            upload: "cximage1".into(),
+            name: "chart.png".into(),
+            size: bytes.len() as u64,
+            offset: 0,
+            data: b64_encode(&bytes),
+            last: true,
+        })
+        .await
+        .unwrap()
+        .attachment
+        .expect("upload complete");
+    let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
+    mgr.command(
+        &id,
+        Command::Prompt {
+            text: "What is in this picture?".into(),
+            attachments: vec![att],
+        },
+    )
+    .await
+    .unwrap();
+    let events = tokio::time::timeout(
+        LIVE,
+        until(&mut s, |e| {
+            is_turn_completed(e) || matches!(e.kind, SessionEventKind::Exited { .. })
+        }),
+    )
+    .await
+    .expect("turn completed");
+    let text = assistant_text(&events);
+    let want = format!("I see a image/png image of {} bytes", bytes.len());
+    assert!(text.contains(&want), "reply {text:?}, wanted {want:?}");
+    // The model request carried the very bytes, as a data URL.
+    let log = std::fs::read_to_string(d.path().join("responses.log")).unwrap();
+    assert!(log.contains("\"input_image\""), "no input_image in {log}");
+    assert!(
+        log.contains(&format!("data:image/png;base64,{}", b64_encode(&bytes))),
+        "the image bytes did not reach the model"
+    );
+    // What the runtime wrote to codex: a localImage item with the upload's path.
+    let journal = std::fs::read_to_string(
+        d.path()
+            .join("sessions")
+            .join(id.as_str())
+            .join("journal.ndjson"),
+    )
+    .unwrap();
+    assert!(
+        journal.contains("localImage"),
+        "no localImage in the journal"
+    );
+    stop(&mgr, &id).await;
 }
 
 #[tokio::test]
