@@ -263,8 +263,9 @@ async fn setup_variables_and_agent_commands() {
     // Malformed: a failing command whose output is the shell's own message.
     let (r, _) = env.configure(cfg("if then fi ("), "m".into(), false).await;
     let s = r.setup.unwrap();
-    assert!(!s.ok, "{s:?}");
-    assert!(s.exit_code.is_some_and(|c| c != 0), "{s:?}");
+    assert!(!s.ok && s.error.is_some(), "{s:?}");
+    // A status where the shell reports one (bash 5: 2); bash 3.2 abandons the commands.
+    assert_ne!(s.exit_code, Some(0), "{s:?}");
     assert!(s.output.contains("syntax error"), "{s:?}");
 
     // Hanging: bounded by the setup deadline, the whole group killed, the login environment.

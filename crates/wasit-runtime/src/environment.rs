@@ -680,6 +680,8 @@ impl Markers {
         };
         rep.output = tail_lines(&after[..e], SETUP_TAIL_LINES, SETUP_TAIL_BYTES);
         let rest = &after[e + self.end.len()..];
+        // `abandoned` (not a number): the shell gave up the commands before their end without
+        // leaving (an interactive bash 3.2 does so on a syntax error in `eval`).
         let rc: Option<i32> = rest.lines().next().and_then(|l| l.trim().parse().ok());
         rep.exit_code = rc;
         let vars = rest
@@ -693,11 +695,13 @@ impl Markers {
                 ))
             }
             (Some(_), Some(0)) => rep.ok = true,
-            (Some(_), rc) => {
-                rep.error = Some(format!(
-                    "the last command exited with status {}",
-                    code_text(rc)
-                ))
+            (Some(_), Some(rc)) => {
+                rep.error = Some(format!("the last command exited with status {rc}"))
+            }
+            (Some(_), None) => {
+                rep.error = Some(
+                    "the shell abandoned the commands before their end (see the output)".into(),
+                )
             }
         }
         rep.applied = vars.is_some();
@@ -733,8 +737,9 @@ async fn run_setup(
             login.clone(),
             mode,
             format!(
-                "printf '\\n%s\\n' '{b}'\nbegin; eval ${SETUP_VAR}; end </dev/null 2>&1\n\
-                 set __wasit_rc $status\nset -e {SETUP_VAR}\n\
+                "printf '\\n%s\\n' '{b}'\nset -g __wasit_rc abandoned\n\
+                 begin; eval ${SETUP_VAR}; set -g __wasit_rc $status; end </dev/null 2>&1\n\
+                 set -e {SETUP_VAR}\n\
                  printf '\\n%s %s\\n' '{e}' $__wasit_rc\nenv -0 2>/dev/null; or env\nprintf '\\n%s\\n' '{f}'\n",
                 b = m.begin,
                 e = m.end,
@@ -772,7 +777,8 @@ const SETUP_VAR: &str = "__WASIT_SETUP";
 #[cfg(unix)]
 fn posix_script(m: &Markers) -> String {
     format!(
-        "printf '\\n%s\\n' '{b}'\n{{ eval \"${SETUP_VAR}\"; }} </dev/null 2>&1\n__wasit_rc=$?\n\
+        "printf '\\n%s\\n' '{b}'\n__wasit_rc=abandoned\n\
+         {{ eval \"${SETUP_VAR}\"; __wasit_rc=$?; }} </dev/null 2>&1\n\
          unset {SETUP_VAR}\nprintf '\\n%s %s\\n' '{e}' \"$__wasit_rc\"\nenv -0 2>/dev/null || env\n\
          printf '\\n%s\\n' '{f}'\n",
         b = m.begin,
