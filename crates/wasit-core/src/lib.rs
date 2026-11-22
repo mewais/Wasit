@@ -39,9 +39,9 @@ pub use descriptor::{
 };
 pub use discovery::{
     config_listing, exec_stdout, front_matter, handshake_events, listed_files, markdown_items,
-    models_from_handshake, modes_from_handshake, parse_version_line, read_file,
-    skills_from_listing, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe, FileHead,
-    ProbeAction, ProbeOutput, ProbeParse, ResumableSession,
+    models_from_handshake, modes_from_handshake, parse_named_version, parse_version_line,
+    read_file, skills_from_listing, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
+    FileHead, ProbeAction, ProbeOutput, ProbeParse, ResumableSession,
 };
 pub use event::{
     AgentEvent, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind, GateDecision,

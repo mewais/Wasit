@@ -308,20 +308,43 @@ impl DiscoveryKind {
     }
 }
 
-/// Parse a `--version` style stdout: the first whitespace token of the first
-/// non-empty line that starts with a digit or `v`, else the whole first line.
+/// Parse a `--version` stdout whose first non-empty line starts with the version
+/// (`2.1.3 (Claude Code)`, `1.19.6`). Anything else is an error: the command is not the CLI
+/// it stands in for (a per-host agent command such as `genie` is checked this way).
 pub fn parse_version_line(out: &ProbeOutput) -> Result<Discovered, String> {
+    version_after(out, None)
+}
+
+/// [`parse_version_line`] for a CLI that names itself first (`codex-cli 0.169.1`).
+pub fn parse_named_version(
+    name: &'static str,
+) -> impl Fn(&ProbeOutput) -> Result<Discovered, String> {
+    move |out| version_after(out, Some(name))
+}
+
+fn version_after(out: &ProbeOutput, name: Option<&str>) -> Result<Discovered, String> {
     let stdout = exec_stdout(out)?;
     let line = stdout
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .ok_or_else(|| "empty version output".to_string())?;
-    let token = line
-        .split_whitespace()
-        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
-        .unwrap_or(line);
-    Ok(Discovered::Version(token.to_string()))
+    let mut tokens = line.split_whitespace();
+    if let Some(n) = name {
+        if tokens.next() != Some(n) {
+            return Err(format!("printed {line:?}, not a `{n}` version"));
+        }
+    }
+    let is_version = |t: &str| {
+        let t = t.strip_prefix('v').unwrap_or(t);
+        t.starts_with(|c: char| c.is_ascii_digit())
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-+_".contains(c))
+    };
+    match tokens.next() {
+        Some(t) if is_version(t) => Ok(Discovered::Version(t.to_string())),
+        _ => Err(format!("printed {line:?}, not a version")),
+    }
 }
 
 /// Skills from a `ListFiles` of a skills root (suffix `SKILL.md`, recursive): one item per
@@ -481,5 +504,48 @@ mod config_discovery_tests {
             (md[0].name.as_str(), md[0].description.as_str()),
             ("rev", "reviews")
         );
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    fn out(s: &str) -> ProbeOutput {
+        ProbeOutput::Exec {
+            exit_code: Some(0),
+            stdout: s.into(),
+        }
+    }
+
+    fn v(r: Result<Discovered, String>) -> Result<String, String> {
+        r.map(|d| match d {
+            Discovered::Version(v) => v,
+            other => panic!("{other:?}"),
+        })
+    }
+
+    #[test]
+    fn versions_of_the_cli_and_of_something_else() {
+        assert_eq!(
+            v(parse_version_line(&out("2.1.326 (Claude Code)\n"))),
+            Ok("2.1.326".into())
+        );
+        assert_eq!(
+            v(parse_version_line(&out("\n1.19.6\n"))),
+            Ok("1.19.6".into())
+        );
+        assert_eq!(
+            v(parse_version_line(&out("v0.3.0-beta.1"))),
+            Ok("v0.3.0-beta.1".into())
+        );
+        let codex = parse_named_version("codex-cli");
+        assert_eq!(v(codex(&out("codex-cli 0.169.1"))), Ok("0.169.1".into()));
+        // A command standing in for the CLI that is something else.
+        let e = v(parse_version_line(&out("ls (GNU coreutils) 9.4\n"))).unwrap_err();
+        assert!(e.contains("not a version"), "{e}");
+        assert!(v(parse_version_line(&out("Python 3.12.1"))).is_err());
+        assert!(v(codex(&out("2.1.326 (Claude Code)"))).is_err());
+        assert!(v(parse_version_line(&out(""))).is_err());
     }
 }

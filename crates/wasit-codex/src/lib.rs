@@ -17,7 +17,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use wasit_core::{
     config_listing, exec_stdout, listed_files, models_from_handshake, modes_from_handshake,
-    parse_version_line, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem, ConfigItemKind,
+    parse_named_version, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem, ConfigItemKind,
     ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
     DriverCapabilities, DriverDescriptor, DriverId, FileInput, McpServerConfig, McpTransport,
     ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession, SpawnSpec, Unsupported,
@@ -113,7 +113,7 @@ impl DriverDescriptor for CodexDescriptor {
                     env: vec![],
                     cwd: None,
                 },
-                parse: std::sync::Arc::new(parse_version_line),
+                parse: std::sync::Arc::new(parse_named_version("codex-cli")),
             },
             DiscoveryProbe {
                 kind: DiscoveryKind::Models,
