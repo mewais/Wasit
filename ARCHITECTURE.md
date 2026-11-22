@@ -254,10 +254,11 @@ A home directory may be shared by several machines (NFS and similar). Marsad's l
 
 - `<key>`: SHA-256 of the OS machine id (Linux `/etc/machine-id`, macOS `IOPlatformUUID`,
   Windows `MachineGuid`; else the host name), 16 hex. Override `MARSAD_MACHINE_KEY`.
-- Runtime base (override `MARSAD_RUNTIME_DIR`): Linux `$XDG_RUNTIME_DIR/marsad` only when the
-  user has systemd lingering — `/run/user/<uid>` is removed when the last login ends (e.g. the
+- Runtime base (override `MARSAD_RUNTIME_DIR`), from machine facts only (never the calling
+  session's environment, so a desktop-started daemon and an ssh bridge agree): Linux
+  `/run/user/<uid>/marsad` only when the user has systemd lingering — `/run/user/<uid>` is removed when the last login ends (e.g. the
   ssh session that started a detached daemon), which would delete the sockets of daemons and
-  shims that keep running — else `/tmp/marsad-<uid>`; macOS `$TMPDIR/marsad`; Windows
+  shims that keep running — else `/tmp/marsad-<uid>`; macOS `<getconf DARWIN_USER_TEMP_DIR>/marsad`; Windows
   `%LOCALAPPDATA%\Marsad\run` (pipes are machine-wide names derived from these paths). Refused
   unless a real directory owned by the user with no group/other access. Shims hold a shared
   `flock` on their runtime directory (systemd-tmpfiles skips locked directories when aging).

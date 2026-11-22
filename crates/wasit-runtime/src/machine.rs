@@ -10,12 +10,14 @@
 //!   falling back to the host name. The raw id is hashed (it is meant to stay confidential).
 //! * [`runtime_dir`]: a machine-local, owner-only directory for sockets and locks.
 //!
-//! Runtime directory choice (Unix): `$XDG_RUNTIME_DIR/<app>` only when the user has systemd
-//! lingering enabled — otherwise `/run/user/<uid>` is removed when the user's last login
-//! session ends (e.g. the ssh session that started a detached daemon), which would delete the
-//! sockets of shims and daemons that keep running. Without lingering: `/tmp/<app>-<uid>`
-//! (outlives logins; wiped at reboot, when every session is dead anyway). macOS: the per-user
-//! `$TMPDIR/<app>`. The directory is created 0700 and refused when it is not a real directory
+//! Runtime directory choice (Unix), from machine facts only — never from the calling session's
+//! environment, so a desktop-started daemon and an ssh-started bridge agree: `/run/user/<uid>/<app>`
+//! only when the user has systemd lingering enabled — otherwise `/run/user/<uid>` is removed when
+//! the user's last login session ends (e.g. the ssh session that started a detached daemon),
+//! which would delete the sockets of shims and daemons that keep running. Without lingering:
+//! `/tmp/<app>-<uid>` (outlives logins; wiped at reboot, when every session is dead anyway).
+//! macOS: `<DARWIN_USER_TEMP_DIR>/<app>` (`getconf`; the same per-user dir as a GUI's `$TMPDIR`).
+//! The directory is created 0700 and refused when it is not a real directory
 //! owned by us or is accessible by group/others. Processes holding sockets there keep a
 //! shared `flock` on their directory: systemd-tmpfiles skips locked directories when aging.
 //! Windows: `%LOCALAPPDATA%\<App>\run` (local, never roamed); named pipes are machine-local.
@@ -139,22 +141,34 @@ fn default_runtime_dir(app: &str) -> io::Result<PathBuf> {
 
 #[cfg(unix)]
 fn default_runtime_dir(app: &str) -> io::Result<PathBuf> {
+    // Derived from facts of the machine and user only, never from the calling session's
+    // environment: a daemon started from a desktop session and a bridge started over ssh must
+    // agree on one directory (and so on one single-instance lock).
     let uid = wasit_process::effective_uid();
     #[cfg(target_os = "macos")]
-    if let Some(t) = std::env::var_os("TMPDIR").filter(|t| !t.is_empty()) {
-        let t = PathBuf::from(t);
-        if t.is_dir() {
-            return Ok(t.join(app));
-        }
+    if let Some(t) = darwin_user_temp_dir() {
+        return Ok(t.join(app));
     }
     #[cfg(not(target_os = "macos"))]
-    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR").filter(|x| !x.is_empty()) {
-        let x = PathBuf::from(x);
-        if owned_private(&x, uid) && lingering(uid) {
-            return Ok(x.join(app));
+    {
+        let run = PathBuf::from(format!("/run/user/{uid}"));
+        if lingering(uid) && owned_private(&run, uid) {
+            return Ok(run.join(app));
         }
     }
     Ok(PathBuf::from(format!("/tmp/{app}-{uid}")))
+}
+
+/// The per-user temporary directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`), the same for every
+/// session of the user.
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    let out = wasit_process::std_command_inheriting("getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty() && Path::new(&s).is_dir()).then(|| PathBuf::from(s))
 }
 
 /// Whether systemd keeps this user's runtime directory after their last session ends.
@@ -168,11 +182,6 @@ fn lingering(uid: u32) -> bool {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn user_name(uid: u32) -> Option<String> {
-    if let Ok(u) = std::env::var("USER") {
-        if !u.is_empty() {
-            return Some(u);
-        }
-    }
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|l| {
         let f: Vec<&str> = l.split(':').collect();
