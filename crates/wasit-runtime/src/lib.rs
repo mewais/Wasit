@@ -18,6 +18,7 @@ mod client;
 mod config;
 mod core;
 mod discovery;
+pub mod environment;
 mod host;
 pub mod machine;
 mod manager;

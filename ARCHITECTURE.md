@@ -68,7 +68,7 @@ resolved copy of Wasit in any build. Local development uses a `[patch]` section 
 | `wasit-runtime` | Session actor, journal reader, session state reducer, host-level session manager (§3.3). |
 | `wasit-control` | Control protocol: wire types, framing, client, server, link supervisor (§4). |
 | `wasit-fake-cli` | Scriptable fake agent CLI speaking each real wire protocol, for tests. |
-| `wasit-process` | The ONLY place processes are created, in all three repos: `command` / `std_command` (`CREATE_NO_WINDOW` on Windows: no console window ever flashes) and `detached_command` + `spawn_detached` for daemons; `decode_console_output` (UTF-16LE from `wsl.exe`). A source-scan test per repo fails on any other `Command::new`. |
+| `wasit-process` | The ONLY place processes are created, in all three repos: `command` / `std_command` (`CREATE_NO_WINDOW` on Windows: no console window ever flashes) and `detached_command` + `spawn_detached` for daemons; `decode_console_output` (UTF-16LE from `wsl.exe`); the process-wide **base environment** (`set_base_env`) every command starts from (§3.5). A source-scan test per repo fails on any other `Command::new`. |
 
 ### 2.2 Wasl crates (after rebuild)
 
@@ -176,6 +176,23 @@ journal.
   confined to the cwd, attachments and blobs unless `outside`), `session.files.stat`. They travel
   over the existing control link, so remote hosts need nothing else. A prompt's attachments must
   be uploads of that session; the runtime loads the bytes a driver embeds before journaling it.
+
+### 3.5 Host environment
+
+A daemon started by ssh, `wsl.exe` or a GUI has a bare non-login environment, so tools on paths
+that shell startup files add (nvm/fnm, npm-global, `~/.local/bin`, `~/.bun/bin`, cargo,
+Homebrew, `module load`) are invisible. `wasit_runtime::environment::HostEnv` captures the
+user's environment once per daemon start (before discovery and sessions) and on
+`host.environment.refresh`: `$SHELL -l -i -c` printing `env -0` between random markers (stdin
+closed, deadline 6 s, whole process group killed at the deadline, chatter outside the markers
+ignored) → `-l -c` (4 s) → the daemon's own environment, with reasons in `notes`; Windows: the
+registry's user + machine variables over the process's (PATH merged). The result is installed
+with `wasit_process::set_base_env`, so every process created through `wasit-process` (probes,
+shims → agent CLIs, git) starts from it; terminals apply it explicitly; discovery resolves
+binaries on that PATH and names the searched PATH when one is missing. `host.environment`
+reports source, shell, PATH, timing and notes (never other values). Seam for later stages, in
+order: captured → per-host setup commands → per-host variables → per-agent command override
+(the existing `DriverOverride.binary`).
 
 ## 4. Control protocol (`wasit-control`)
 

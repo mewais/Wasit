@@ -27,6 +27,7 @@ pub struct RuntimeService {
     manager: SessionManager,
     discovery: Discovery,
     info: HostInfo,
+    env: Option<crate::environment::HostEnv>,
 }
 
 fn params<T: DeserializeOwned>(v: Value) -> Result<T, RpcError> {
@@ -92,7 +93,14 @@ impl RuntimeService {
             manager,
             discovery,
             info,
+            env: None,
         }
+    }
+
+    /// Serve `host.environment[.refresh]` from this environment stage.
+    pub fn with_environment(mut self, env: crate::environment::HostEnv) -> Self {
+        self.env = Some(env);
+        self
     }
 
     pub fn manager(&self) -> &SessionManager {
@@ -110,6 +118,21 @@ impl Service for RuntimeService {
         let m = &self.manager;
         match method {
             methods::HOST_INFO => ok(&self.info),
+            methods::HOST_ENVIRONMENT => ok(self.env.as_ref().and_then(|e| e.report())),
+            methods::HOST_ENVIRONMENT_REFRESH => {
+                let Some(env) = &self.env else {
+                    return Err(RpcError::new(
+                        wasit_control::codes::METHOD_NOT_FOUND,
+                        "this host has no environment stage",
+                    ));
+                };
+                let report = env.refresh().await;
+                // Agents found (or not) with the old environment are detected again.
+                self.discovery
+                    .refresh(None, None)
+                    .map_err(|e| runtime_err(RuntimeError::UnknownDriver(e)))?;
+                ok(report)
+            }
             methods::DRIVERS_INVENTORY => {
                 let r: InventoryRequest = if p.is_null() {
                     InventoryRequest::default()

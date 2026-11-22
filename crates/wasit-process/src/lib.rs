@@ -44,8 +44,20 @@ pub mod flags {
     pub const DETACHED_NO_BREAKAWAY: u32 = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
 }
 
-/// A `std::process::Command` that never opens a console window on Windows.
+/// A `std::process::Command` that never opens a console window on Windows, with the host's
+/// base environment ([`set_base_env`]) when one is set.
 pub fn std_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
+    let mut cmd = std_command_inheriting(program);
+    if let Some(base) = base_env() {
+        cmd.env_clear();
+        cmd.envs(base.iter().map(|(k, v)| (k, v)));
+    }
+    cmd
+}
+
+/// [`std_command`] that inherits this process's own environment even when a base
+/// environment is set (used to capture the user's environment itself).
+pub fn std_command_inheriting<S: AsRef<OsStr>>(program: S) -> std::process::Command {
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = std::process::Command::new(program);
     #[cfg(windows)]
@@ -60,6 +72,60 @@ pub fn std_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
 #[cfg(feature = "tokio")]
 pub fn command<S: AsRef<OsStr>>(program: S) -> tokio::process::Command {
     tokio::process::Command::from(std_command(program))
+}
+
+/// [`command`] without the base environment (see [`std_command_inheriting`]).
+#[cfg(feature = "tokio")]
+pub fn command_inheriting<S: AsRef<OsStr>>(program: S) -> tokio::process::Command {
+    tokio::process::Command::from(std_command_inheriting(program))
+}
+
+// ── base environment ───────────────────────────────────────────────────────────────────────
+
+type EnvList = std::sync::Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>;
+
+static BASE_ENV: std::sync::RwLock<Option<EnvList>> = std::sync::RwLock::new(None);
+
+/// Set (or clear) the environment every process created through this crate starts from,
+/// instead of inheriting this process's own: the user's real environment as their login
+/// shell sets it up (see `wasit_runtime::environment`). Variables a caller sets on a command
+/// still apply on top. Affects processes created after the call.
+pub fn set_base_env(vars: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>) {
+    let mut g = BASE_ENV.write().unwrap_or_else(|e| e.into_inner());
+    *g = vars.map(std::sync::Arc::new);
+}
+
+/// The current base environment, if one is set.
+pub fn base_env() -> Option<EnvList> {
+    BASE_ENV.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// A variable as children will see it: from the base environment when one is set, else from
+/// this process (case-insensitive names on Windows).
+pub fn child_var(name: &str) -> Option<std::ffi::OsString> {
+    match base_env() {
+        Some(b) => b
+            .iter()
+            .find(|(k, _)| {
+                if cfg!(windows) {
+                    k.to_string_lossy().eq_ignore_ascii_case(name)
+                } else {
+                    k == name
+                }
+            })
+            .map(|(_, v)| v.clone()),
+        None => std::env::var_os(name),
+    }
+}
+
+/// Kill a whole process group (Unix; `pgid` = the leader's pid). Used to end a capture shell
+/// together with everything its startup files started.
+#[cfg(unix)]
+pub fn kill_process_group(pgid: u32) {
+    // SAFETY: kill has no memory-safety preconditions; a stale group id fails with ESRCH.
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+    }
 }
 
 /// A command for a long-lived detached process; start it with [`spawn_detached`].

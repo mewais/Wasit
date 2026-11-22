@@ -169,6 +169,18 @@ impl RuntimeClient {
         self.call(methods::HOST_INFO, ()).await
     }
 
+    /// What the host's environment stage found (`None`: the host has none).
+    pub async fn host_environment(
+        &self,
+    ) -> Result<Option<crate::wire::HostEnvironment>, ClientError> {
+        self.call(methods::HOST_ENVIRONMENT, ()).await
+    }
+
+    /// Capture the host's environment again (agents are detected again with it).
+    pub async fn refresh_environment(&self) -> Result<crate::wire::HostEnvironment, ClientError> {
+        self.call(methods::HOST_ENVIRONMENT_REFRESH, ()).await
+    }
+
     pub async fn inventory(&self, project: Option<String>) -> Result<InventoryReply, ClientError> {
         self.call(methods::DRIVERS_INVENTORY, InventoryRequest { project })
             .await

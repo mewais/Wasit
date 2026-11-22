@@ -262,9 +262,14 @@ impl Discovery {
             self.update(&key, |e| {
                 e.installed = false;
                 e.binary_path = None;
-                e.error = Some(format!(
-                    "`{wanted}` was not found (PATH or configured path)"
-                ));
+                e.error = Some(if Path::new(&wanted).components().count() > 1 {
+                    format!("`{wanted}` does not exist or is not executable")
+                } else {
+                    let path = wasit_process::child_var("PATH")
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    format!("`{wanted}` was not found on PATH (searched: {path})")
+                });
                 e.refreshing = false;
                 e.refreshed_at_ms = now_ms();
                 e.probes = vec![];
@@ -397,10 +402,12 @@ async fn resolve_binary(bin: &str) -> Option<PathBuf> {
         if p.components().count() > 1 {
             return is_executable(p).then(|| p.to_path_buf());
         }
-        let path = std::env::var_os("PATH")?;
+        // The PATH children get (the user's captured environment), not this process's.
+        let path = wasit_process::child_var("PATH")?;
         let exts: Vec<String> = if cfg!(windows) {
-            std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
+            wasit_process::child_var("PATHEXT")
+                .and_then(|v| v.into_string().ok())
+                .unwrap_or_else(|| ".EXE;.CMD;.BAT".into())
                 .split(';')
                 .map(str::to_string)
                 .chain(std::iter::once(String::new()))

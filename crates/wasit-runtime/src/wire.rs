@@ -11,6 +11,8 @@
 //! | [`methods::HOST_INFO`] | — | [`HostInfo`] |
 //! | [`methods::DRIVERS_INVENTORY`] | [`InventoryRequest`] | [`InventoryReply`] |
 //! | [`methods::DRIVERS_REFRESH`] | [`RefreshRequest`] | [`Ack`] |
+//! | [`methods::HOST_ENVIRONMENT`] | — | `Option<`[`HostEnvironment`]`>` |
+//! | [`methods::HOST_ENVIRONMENT_REFRESH`] | — | [`HostEnvironment`] (re-captured; agents re-detected) |
 //! | [`methods::SESSIONS_LIST`] | — | [`SessionList`] |
 //! | [`methods::SESSIONS_CREATE`] | [`CreateSession`] | [`CreateSessionReply`] |
 //! | [`methods::SESSIONS_CONTINUE`] | [`SessionRef`] | [`Ack`] |
@@ -47,6 +49,8 @@ use wasit_core::{
 /// Method names.
 pub mod methods {
     pub const HOST_INFO: &str = "host.info";
+    pub const HOST_ENVIRONMENT: &str = "host.environment";
+    pub const HOST_ENVIRONMENT_REFRESH: &str = "host.environment.refresh";
     pub const DRIVERS_INVENTORY: &str = "drivers.inventory";
     pub const DRIVERS_REFRESH: &str = "drivers.refresh";
     pub const SESSIONS_LIST: &str = "sessions.list";
@@ -80,6 +84,8 @@ pub mod topics {
 /// [`wasit_control::ServiceMux`] next to other services.
 pub const ROUTES: &[&str] = &[
     methods::HOST_INFO,
+    methods::HOST_ENVIRONMENT,
+    methods::HOST_ENVIRONMENT_REFRESH,
     topics::HOST_SESSIONS,
     "drivers.",
     "sessions.",
@@ -702,6 +708,41 @@ pub struct HostInfo {
     pub os: String,
     pub arch: String,
     pub drivers: Vec<DriverSummary>,
+}
+
+/// Where a host's base environment came from (`crate::environment`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum EnvSource {
+    /// The login shell in login + interactive mode (rc files included).
+    LoginInteractiveShell,
+    /// The login shell in login mode only (the interactive attempt failed).
+    LoginShell,
+    /// Windows: the user's and machine's variables from the registry.
+    Registry,
+    /// The daemon's own environment (every capture failed; see the notes).
+    Process,
+}
+
+/// What the host's environment stage found (no values beyond `PATH`: other variables may be
+/// secrets).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HostEnvironment {
+    pub source: EnvSource,
+    /// The shell that was asked (Unix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub captured_at_ms: u64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub duration_ms: u64,
+    /// `PATH` as processes started on this host get it, one entry per element.
+    pub path: Vec<String>,
+    /// Why a capture attempt failed (deadline, no output, stderr tail).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// Payload of the `host.sessions` topic.
