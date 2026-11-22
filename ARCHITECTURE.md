@@ -126,11 +126,16 @@ Unix; `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` + job object on Windows). It
   (`spawned {pid, argv, started_at}`, `exited {code|signal}`) to `journal.ndjson`, each record
   `{seq, t, kind, data}` with a per-session monotonically increasing `seq`, fsync on a short
   coalescing timer;
-- listens on a local endpoint (`ctl.sock`; named pipe `\\.\pipe\wasit-<session_id>` on Windows)
+- listens on a local endpoint (`<run>/ctl.sock`; named pipe `\\.\pipe\wasit-<session_id>` on Windows)
   for ONE controller at a time: `attach {from_seq}` → streams journal records from `from_seq`
   then live, with no gap and no duplicate; `write {line}`, `signal {int|term|kill}`, `close`;
-- holds an exclusive lock on `shim.lock` for its lifetime (liveness = lock held; no pidfile
+- holds an exclusive lock on `<run>/shim.lock` for its lifetime (liveness = lock held; no pidfile
   guessing), and exits once the CLI has exited and the final record is durable.
+- `<run>` (`--run`) is the session's directory in the **machine-local runtime directory**
+  (§4.2); the journal directory may be on a home shared by several machines, where Unix
+  sockets are per-kernel and advisory locks unreliable. The journal there is append + fsync
+  only and never relies on a lock (one writer per session: the shim of the machine that owns
+  the session directory). Without `--run` everything stays in the session directory.
 
 The shim knows nothing about any CLI protocol and should almost never need to change, which is
 what lets the daemon be upgraded/restarted while sessions run.
@@ -187,8 +192,13 @@ One protocol for GUI↔daemon, daemon↔daemon and (later) phone↔daemon.
   Resubscribing with the last cursor is the whole reconnect story.
 - Bounded per-connection queues. A subscriber that falls behind is disconnected with a
   `Lagged` close and simply resubscribes from its cursor. No unbounded buffers.
-- Single-instance: the daemon holds an exclusive lock file next to its socket; a second
-  instance exits.
+- Single-instance: the daemon holds an exclusive lock file next to its socket (both in the
+  machine-local runtime directory, §4.2); a second instance on the same machine exits.
+- `Hello.machine` carries the sender's machine key, so a hub tells hosts apart even when two
+  aliases (or two machines' shared home) would otherwise look alike.
+- A link whose far bridge keeps answering `bridge_unavailable` (it ran, but could not start or
+  reach its daemon) parks as `Failed` after 3 consecutive attempts with a plain message; only
+  genuine drops keep retrying with backoff.
 
 ### 4.1 Topology
 
@@ -209,6 +219,38 @@ One protocol for GUI↔daemon, daemon↔daemon and (later) phone↔daemon.
 - Windows hosts are reached with the same mechanism via OpenSSH for Windows; WSL distros are
   hosts reached via `wsl.exe -d <distro> -- marsad-agent bridge`. The transport is "a command
   whose stdio is the link" — ssh, wsl and (later) anything else are just different commands.
+
+### 4.2 On-disk layout (per machine)
+
+A home directory may be shared by several machines (NFS and similar). Marsad's layout
+(`marsad_proto::layout`, identity and runtime dir from `wasit_runtime::machine`):
+
+```text
+~/.marsad/bin/<os>-<arch>/marsad-agent     helper cache, shared (install: unique temp + rename)
+~/.marsad/machines/<key>/                  durable data of ONE machine
+    sessions/<id>/{session.json, journal.ndjson, blobs/, attachments/, shim.log, generated}
+    wasl/  store/  marsad-agent.log
+<run>/ = <runtime base>/<8 hex of the data root>/   machine-local, 0700, owner-checked
+    marsad.sock, marsad.sock.lock                    daemon endpoint + single-instance lock
+    sessions/<id>/{ctl.sock, shim.lock}              each shim's endpoint + liveness lock
+```
+
+- `<key>`: SHA-256 of the OS machine id (Linux `/etc/machine-id`, macOS `IOPlatformUUID`,
+  Windows `MachineGuid`; else the host name), 16 hex. Override `MARSAD_MACHINE_KEY`.
+- Runtime base (override `MARSAD_RUNTIME_DIR`): Linux `$XDG_RUNTIME_DIR/marsad` only when the
+  user has systemd lingering — `/run/user/<uid>` is removed when the last login ends (e.g. the
+  ssh session that started a detached daemon), which would delete the sockets of daemons and
+  shims that keep running — else `/tmp/marsad-<uid>`; macOS `$TMPDIR/marsad`; Windows
+  `%LOCALAPPDATA%\Marsad\run` (pipes are machine-wide names derived from these paths). Refused
+  unless a real directory owned by the user with no group/other access. Shims hold a shared
+  `flock` on their runtime directory (systemd-tmpfiles skips locked directories when aging).
+- After a daemon restart, sessions are re-found by scanning `machines/<key>/sessions/` and
+  probing each `<run>/sessions/<id>/shim.lock`; after a reboot the runtime directory is gone,
+  every shim is dead, and the journals replay as finished/lost sessions.
+- Migration from the flat layout of earlier builds (`~/.marsad/{sessions,wasl,store,marsad.sock}`):
+  see `marsad-agent/src/migrate.rs` — the machine running the old daemon (its socket answers
+  locally) or, with no daemon, the first new daemon claims finished and locally-live sessions by
+  rename; a foreign live daemon's layout is left alone; stale socket/lock files never block.
 
 ## 5. Orchestration (Wasl on Wasit)
 

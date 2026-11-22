@@ -162,6 +162,13 @@ fn utf16le_offset(b: &[u8]) -> Option<usize> {
     (hi * 10 >= pairs * 6 && lo * 10 <= pairs).then_some(off)
 }
 
+/// The effective user id of this process.
+#[cfg(unix)]
+pub fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

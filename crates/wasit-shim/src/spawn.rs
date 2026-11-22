@@ -44,8 +44,12 @@ pub struct ShimSpec {
     pub shim_program: PathBuf,
     /// Arguments placed before the shim arguments (e.g. `["shim"]` for a host subcommand).
     pub shim_args: Vec<OsString>,
-    /// Session directory (journal, lock, endpoint, log).
+    /// Session directory (journal, log; also lock and endpoint unless `run_dir` is set).
     pub dir: PathBuf,
+    /// Machine-local directory for `shim.lock` and the control endpoint. Set it when `dir` may
+    /// be on a filesystem shared between machines (Unix sockets and advisory locks are
+    /// per-kernel / unreliable there).
+    pub run_dir: Option<PathBuf>,
     pub program: OsString,
     pub args: Vec<OsString>,
     /// Working directory of the child (default: inherited).
@@ -65,12 +69,18 @@ impl ShimSpec {
             shim_program: shim_program.into(),
             shim_args: Vec::new(),
             dir: dir.into(),
+            run_dir: None,
             program: program.into(),
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
             options: ShimOptions::default(),
         }
+    }
+
+    /// Directory of the lock and the control endpoint.
+    pub fn endpoint_dir(&self) -> &std::path::Path {
+        self.run_dir.as_deref().unwrap_or(&self.dir)
     }
 
     pub fn arg(mut self, a: impl Into<OsString>) -> Self {
@@ -94,6 +104,7 @@ impl ShimSpec {
             shim_program: shim_program.into(),
             shim_args: Vec::new(),
             dir: c.dir,
+            run_dir: c.run,
             program: c.program,
             args: c.args,
             cwd: c.cwd,
@@ -111,6 +122,10 @@ impl ShimSpec {
     /// The shim command line (without `shim_program` / `shim_args`).
     pub fn to_args(&self) -> Vec<OsString> {
         let mut v: Vec<OsString> = vec!["--dir".into(), self.dir.clone().into()];
+        if let Some(r) = &self.run_dir {
+            v.push("--run".into());
+            v.push(r.clone().into());
+        }
         if let Some(c) = &self.cwd {
             v.push("--cwd".into());
             v.push(c.clone().into());

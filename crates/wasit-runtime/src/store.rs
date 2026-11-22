@@ -5,11 +5,13 @@
 //! ```text
 //! <root>/sessions/<id>/session.json    this file (spec, driver, native id, labels)
 //! <root>/sessions/<id>/journal.ndjson  the shim's journal = the transcript
-//! <root>/sessions/<id>/shim.lock       held by the live shim
-//! <root>/sessions/<id>/ctl.sock        the shim's control socket (Unix)
+//! <run>/sessions/<id>/shim.lock        held by the live shim
+//! <run>/sessions/<id>/ctl.sock         the shim's control socket (Unix)
 //! <root>/sessions/<id>/shim.log        the shim's own diagnostics
 //! <root>/sessions/<id>/<generated>     files written by the driver's config renderer
 //! ```
+//!
+//! `<run>` is [`RuntimeConfig::run_dir`] (machine-local), or `<root>` when unset.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -147,6 +149,10 @@ pub(crate) fn shim_spec(
         shim_program: cfg.launcher.program.clone(),
         shim_args: cfg.launcher.args.clone(),
         dir: dir.to_path_buf(),
+        run_dir: cfg
+            .run_dir
+            .as_ref()
+            .map(|_| cfg.session_run_dir_for_spawn(dir)),
         program: program.into(),
         args: args.iter().map(OsString::from).collect(),
         cwd: spec.cwd.as_ref().map(PathBuf::from),

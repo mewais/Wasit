@@ -116,6 +116,10 @@ pub struct Hello {
     pub role: String,
     #[serde(default)]
     pub features: Vec<String>,
+    /// Key of the machine the sender runs on (`wasit_runtime::machine::machine_key`), so a hub
+    /// can tell two hosts apart even when they share a home directory or an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 impl Hello {
@@ -130,7 +134,13 @@ impl Hello {
             host_id: host_id.into(),
             role: role.into(),
             features: Vec::new(),
+            machine: None,
         }
+    }
+
+    pub fn with_machine(mut self, machine: impl Into<String>) -> Self {
+        self.machine = Some(machine.into());
+        self
     }
 
     pub fn with_features<I, S>(mut self, features: I) -> Self

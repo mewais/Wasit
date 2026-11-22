@@ -167,6 +167,10 @@ pub struct SupervisedConfig {
     pub connect_timeout: Duration,
     /// Bound on one provisioning run.
     pub provision_timeout: Duration,
+    /// Consecutive attempts where the far side ran but its bridge could not reach (or start)
+    /// its daemon (`bridge_unavailable`) before the link parks as `Failed`: that is a problem
+    /// on the host, not a dropped connection, and retrying forever only hides it.
+    pub bridge_unavailable_attempts: u32,
 }
 
 impl Default for SupervisedConfig {
@@ -175,6 +179,7 @@ impl Default for SupervisedConfig {
             backoff: Backoff::default(),
             connect_timeout: Duration::from_secs(30),
             provision_timeout: Duration::from_secs(300),
+            bridge_unavailable_attempts: 3,
         }
     }
 }
@@ -365,6 +370,7 @@ async fn run(
     let mut attempt: u32 = 0;
     let mut provisioned: Option<ProvisionReason> = None;
     let mut last_error = String::new();
+    let mut bridge_unavailable: u32 = 0;
 
     'outer: loop {
         if stop.is_cancelled() {
@@ -396,6 +402,7 @@ async fn run(
                     Next::Provision { reason, fallback }
                 } else {
                     attempt = 0;
+                    bridge_unavailable = 0;
                     provisioned = None;
                     shared.set(LinkState::Connected {
                         hello: client.remote_hello().clone(),
@@ -433,7 +440,28 @@ async fn run(
             }
             Ok(Err(e)) => {
                 last_error = e.to_string();
+                let unavailable = matches!(
+                    &e,
+                    ConnectError::Refused(r) if r.code == crate::wire::codes::BRIDGE_UNAVAILABLE
+                );
+                bridge_unavailable = if unavailable {
+                    bridge_unavailable + 1
+                } else {
+                    0
+                };
                 match e {
+                    ConnectError::Refused(r)
+                        if unavailable
+                            && bridge_unavailable >= cfg.bridge_unavailable_attempts.max(1) =>
+                    {
+                        Next::Park(LinkState::Failed {
+                            reason: format!(
+                                "the helper on this host could not start or reach its background service                                  ({bridge_unavailable} attempts): {}",
+                                r.message
+                            ),
+                            problem: None,
+                        })
+                    }
                     ConnectError::Incompatible { ours, theirs } => Next::Provision {
                         reason: ProvisionReason::Incompatible { ours, theirs },
                         fallback: LinkState::Incompatible { ours, theirs },
@@ -541,6 +569,7 @@ async fn run(
                     _ = stop.cancelled() => break,
                     _ = reconnect_rx.changed() => {
                         attempt = 0;
+                        bridge_unavailable = 0;
                         provisioned = None;
                     }
                 }

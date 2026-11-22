@@ -223,10 +223,10 @@ async fn sleep_until_opt(t: Option<Instant>) {
 }
 
 /// Connect to a live shim and attach from `from`, or read the journal of a finished one.
-fn adopt_source(dir: PathBuf, from: u64) -> BoxFuture<'static, Source> {
+fn adopt_source(dir: PathBuf, run: PathBuf, from: u64) -> BoxFuture<'static, Source> {
     async move {
-        match wasit_shim::probe(&dir).await {
-            Ok(ShimState::Running) => match ShimClient::connect(&dir).await {
+        match wasit_shim::probe_at(&dir, &run).await {
+            Ok(ShimState::Running) => match ShimClient::connect(&run).await {
                 Ok(c) => {
                     let c = Arc::new(c);
                     match c.attach(from).await {
@@ -261,7 +261,7 @@ fn spawn_source(spec: wasit_shim::ShimSpec, from: u64) -> BoxFuture<'static, Sou
         if let Err(e) = wasit_shim::spawn_detached(&spec).await {
             return Source::SpawnFailed(e.to_string());
         }
-        match ShimClient::connect(&spec.dir).await {
+        match ShimClient::connect(spec.endpoint_dir()).await {
             Ok(c) => {
                 let c = Arc::new(c);
                 match c.attach(from).await {
@@ -288,7 +288,7 @@ impl Actor {
         core.hint_modes(init.cfg.mode_hints.get(&meta.driver));
         let (file_tx, file_rx) = mpsc::unbounded_channel();
         tokio::spawn(persist(init.dir.clone(), init.file.clone(), file_rx));
-        let source = adopt_source(init.dir.clone(), 1);
+        let source = adopt_source(init.dir.clone(), init.cfg.session_run_dir(&init.dir), 1);
         Actor {
             id: meta.id,
             dir: init.dir,
@@ -449,7 +449,11 @@ impl Actor {
                 return;
             }
             // The shim went away without us seeing `exited`: find out what happened.
-            self.source = Some(adopt_source(self.dir.clone(), self.core.last_seq() + 1));
+            self.source = Some(adopt_source(
+                self.dir.clone(),
+                self.cfg.session_run_dir(&self.dir),
+                self.core.last_seq() + 1,
+            ));
         } else {
             let state = self.offline_state.take();
             if !self.core.process_ended() {
@@ -752,7 +756,11 @@ impl Actor {
         }
         if self.reconnect_at.is_some_and(|t| t <= now) {
             self.reconnect_at = None;
-            self.source = Some(adopt_source(self.dir.clone(), self.core.last_seq() + 1));
+            self.source = Some(adopt_source(
+                self.dir.clone(),
+                self.cfg.session_run_dir(&self.dir),
+                self.core.last_seq() + 1,
+            ));
         }
         let expired: Vec<String> = self
             .pending

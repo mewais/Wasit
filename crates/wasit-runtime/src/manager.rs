@@ -121,14 +121,15 @@ impl SessionManager {
             .map_err(|e| io_err(&format!("create {}", sessions_dir.display()), e))?;
         #[cfg(unix)]
         {
-            let probe = sessions_dir
+            let probe = cfg
+                .run_sessions_dir()
                 .join("x".repeat(SessionId::LEN))
                 .join("ctl.sock");
             let len = probe.as_os_str().len();
             if len > MAX_SOCKET_PATH {
                 return Err(RuntimeError::InvalidRequest(format!(
-                    "data directory {} is too long: session sockets would be {len} bytes (max {MAX_SOCKET_PATH})",
-                    cfg.data_dir.display()
+                    "runtime directory {} is too long: session sockets would be {len} bytes (max {MAX_SOCKET_PATH})",
+                    cfg.run_dir.as_deref().unwrap_or(&cfg.data_dir).display()
                 )));
             }
         }
@@ -355,7 +356,10 @@ impl SessionManager {
             .registry
             .get(&file.driver)
             .map_err(|e| e.to_string())?;
-        let state = wasit_shim::probe(dir).await.map_err(|e| e.to_string())?;
+        let run = self.inner.cfg.session_run_dir(dir);
+        let state = wasit_shim::probe_at(dir, &run)
+            .await
+            .map_err(|e| e.to_string())?;
         let meta = file.meta();
         if state == ShimState::Running {
             let snap = Arc::new(blank_snapshot(&meta, desc.as_ref(), Phase::Starting, false));
@@ -383,6 +387,7 @@ impl SessionManager {
                 snapshot
             };
             let dir2 = dir.to_path_buf();
+            let run2 = run.clone();
             let desc2 = desc.clone();
             let feed = self.inner.feed.clone();
             let permits = self.inner.replays.clone();
@@ -392,7 +397,7 @@ impl SessionManager {
                 let Ok(_permit) = permits.acquire_owned().await else {
                     return;
                 };
-                match replay::snapshot(&dir2, desc2, &meta).await {
+                match replay::snapshot(&dir2, &run2, desc2, &meta).await {
                     Ok(s) => {
                         let s = Arc::new(s);
                         w.send_replace(s.clone());
@@ -715,6 +720,14 @@ impl SessionManager {
             l.abort();
         }
         self.inner.feed.remove(id);
+        let run = self.inner.cfg.session_run_dir_for_spawn(&entry.dir);
+        if run != entry.dir {
+            match tokio::fs::remove_dir_all(&run).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&format!("remove {}", run.display()), e)),
+            }
+        }
         tokio::fs::remove_dir_all(&entry.dir)
             .await
             .map_err(|e| io_err(&format!("remove {}", entry.dir.display()), e))

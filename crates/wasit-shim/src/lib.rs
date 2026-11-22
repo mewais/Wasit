@@ -2,8 +2,10 @@
 //!
 //! One shim process owns exactly one CLI child. It journals every stdout/stderr line, every
 //! line written to stdin and the lifecycle of the child to `<dir>/journal.ndjson`, and serves a
-//! single controller over a local endpoint (`<dir>/ctl.sock` on Unix,
-//! `\\.\pipe\wasit-<basename(dir)>` on Windows). The shim knows nothing about any CLI protocol.
+//! single controller over a local endpoint (`<run>/ctl.sock` on Unix,
+//! `\\.\pipe\wasit-<basename(run)>` on Windows) while holding `<run>/shim.lock`. `<run>` is
+//! the machine-local runtime directory (`--run`), defaulting to `<dir>`; `<dir>` may be on a
+//! filesystem shared between machines, `<run>` must not. The shim knows nothing about any CLI protocol.
 //!
 //! * [`run`] is the process entry point (used by the `wasit-shim` binary and by any host
 //!   binary's `shim` subcommand).
@@ -33,7 +35,7 @@ use proc_windows as platform;
 
 pub use client::{read_journal, ClientOptions, RecordStream, ShimClient};
 pub use error::Error;
-pub use probe::{probe, ShimState};
+pub use probe::{probe, probe_at, ShimState};
 pub use record::{ExitInfo, Kind, Record};
 pub use server::run;
 pub use spawn::{spawn_detached, ShimHandle, ShimOptions, ShimSpec};

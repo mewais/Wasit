@@ -19,6 +19,7 @@ mod config;
 mod core;
 mod discovery;
 mod host;
+pub mod machine;
 mod manager;
 pub mod media;
 mod note;

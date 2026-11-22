@@ -630,3 +630,39 @@ async fn flow_control_lets_a_large_replay_through_a_small_window_without_lag() {
     assert_eq!(n, 20000);
     assert_eq!(sub.close_reason(), Some(&CloseReason::Ended));
 }
+
+#[tokio::test]
+async fn supervised_parks_failed_after_repeated_bridge_unavailable() {
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let c = calls.clone();
+    let conn = connector(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        async {
+            Err(ConnectError::Refused(wasit_control::RpcError::new(
+                codes::BRIDGE_UNAVAILABLE,
+                "bridge cannot reach the daemon",
+            )))
+        }
+    });
+    let mut config = SupervisedConfig::default();
+    config.backoff.initial = Duration::from_millis(5);
+    config.backoff.max = Duration::from_millis(20);
+    let sup = Supervised::spawn(
+        conn,
+        SupervisedOptions {
+            config,
+            ..Default::default()
+        },
+    );
+    let mut st = sup.state();
+    let s = wait_watch(&mut st, |s| matches!(s, LinkState::Failed { .. })).await;
+    match s {
+        LinkState::Failed { reason, .. } => {
+            assert!(reason.contains("could not start or reach"), "{reason}");
+            assert!(reason.contains("3 attempts"), "{reason}");
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    sup.stop().await;
+}

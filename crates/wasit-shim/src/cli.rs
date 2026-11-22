@@ -1,5 +1,5 @@
 //! Command line of the shim process:
-//! `--dir <session_dir> [--cwd <dir>] [--env K=V]... [--linger-ms N] [--write-timeout-ms N]
+//! `--dir <session_dir> [--run <runtime_dir>] [--cwd <dir>] [--env K=V]... [--linger-ms N] [--write-timeout-ms N]
 //!  [--max-record-bytes N] [--drain-timeout-ms N] -- <program> <args...>`
 
 use std::ffi::{OsStr, OsString};
@@ -16,6 +16,8 @@ pub(crate) const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_millis(2000);
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub dir: PathBuf,
+    /// Machine-local directory of the lock and the control endpoint (default: `dir`).
+    pub run: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(OsString, OsString)>,
     pub program: OsString,
@@ -59,6 +61,7 @@ pub(crate) fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Config,
     let mut dir = None;
     let mut cfg = Config {
         dir: PathBuf::new(),
+        run: None,
         cwd: None,
         env: Vec::new(),
         program: OsString::new(),
@@ -77,6 +80,7 @@ pub(crate) fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Config,
                 break;
             }
             Some("--dir") => dir = Some(PathBuf::from(value(&mut it, "--dir")?)),
+            Some("--run") => cfg.run = Some(PathBuf::from(value(&mut it, "--run")?)),
             Some("--cwd") => cfg.cwd = Some(PathBuf::from(value(&mut it, "--cwd")?)),
             Some("--env") => cfg.env.push(split_env(&value(&mut it, "--env")?)?),
             Some("--linger-ms") => {
@@ -113,6 +117,13 @@ pub(crate) fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Config,
     Ok(cfg)
 }
 
+impl Config {
+    /// Directory of `shim.lock` and the control endpoint.
+    pub(crate) fn run_dir(&self) -> &std::path::Path {
+        self.run.as_deref().unwrap_or(&self.dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +137,8 @@ mod tests {
         let c = parse(os(&[
             "--dir",
             "/d",
+            "--run",
+            "/r",
             "--cwd",
             "/w",
             "--env",
@@ -139,6 +152,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.dir, PathBuf::from("/d"));
+        assert_eq!(c.run_dir(), std::path::Path::new("/r"));
         assert_eq!(c.cwd, Some(PathBuf::from("/w")));
         assert_eq!(c.env, vec![("A".into(), "b=c".into())]);
         assert_eq!(c.linger, Duration::from_millis(5));

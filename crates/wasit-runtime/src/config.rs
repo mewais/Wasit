@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use wasit_core::{DriverId, DriverRegistry, SessionMode};
@@ -114,11 +114,15 @@ impl ModeHints {
 /// Everything a [`crate::SessionManager`] needs.
 #[derive(Clone)]
 pub struct RuntimeConfig {
-    /// Root of the data layout (`<root>/sessions/<id>/…`). Keep it short: on Unix the shim's
-    /// control socket lives at `<root>/sessions/<id>/ctl.sock`, and socket paths longer than
-    /// ~104 bytes cannot be bound; [`crate::SessionManager::new`] refuses a root that would
-    /// exceed that.
+    /// Root of the durable data layout (`<root>/sessions/<id>/…`: `session.json`, journal,
+    /// blobs, attachments). May be on a filesystem shared between machines when `run_dir` is
+    /// set.
     pub data_dir: PathBuf,
+    /// Machine-local root for each session's `shim.lock` and control socket
+    /// (`<run>/sessions/<id>/`); `None` keeps them in the session's data directory. Keep it
+    /// short: Unix socket paths longer than ~104 bytes cannot be bound, and
+    /// [`crate::SessionManager::new`] refuses a root that would exceed that.
+    pub run_dir: Option<PathBuf>,
     pub launcher: ShimLauncher,
     pub registry: DriverRegistry,
     pub timeouts: Timeouts,
@@ -136,6 +140,7 @@ impl RuntimeConfig {
     pub fn new(data_dir: impl Into<PathBuf>, launcher: ShimLauncher) -> Self {
         RuntimeConfig {
             data_dir: data_dir.into(),
+            run_dir: None,
             launcher,
             registry: crate::default_registry(),
             timeouts: Timeouts::default(),
@@ -149,6 +154,38 @@ impl RuntimeConfig {
 
     pub(crate) fn sessions_dir(&self) -> PathBuf {
         self.data_dir.join("sessions")
+    }
+
+    /// Root of the per-session runtime directories.
+    pub(crate) fn run_sessions_dir(&self) -> PathBuf {
+        self.run_dir
+            .as_deref()
+            .unwrap_or(&self.data_dir)
+            .join("sessions")
+    }
+
+    /// Where new shims of the session whose data directory is `dir` keep their lock and
+    /// endpoint.
+    pub fn session_run_dir_for_spawn(&self, dir: &Path) -> PathBuf {
+        match (&self.run_dir, dir.file_name()) {
+            (Some(r), Some(id)) => r.join("sessions").join(id),
+            _ => dir.to_path_buf(),
+        }
+    }
+
+    /// The runtime directory (lock + endpoint) of the session whose data directory is `dir`:
+    /// [`RuntimeConfig::session_run_dir_for_spawn`], except for a shim started by a build that
+    /// kept its lock in the data directory (adopted from an older layout), until the session's
+    /// next process generation.
+    pub fn session_run_dir(&self, dir: &Path) -> PathBuf {
+        let run = self.session_run_dir_for_spawn(dir);
+        if run != dir
+            && !run.join(wasit_shim::LOCK_FILE).exists()
+            && dir.join(wasit_shim::LOCK_FILE).exists()
+        {
+            return dir.to_path_buf();
+        }
+        run
     }
 
     pub(crate) fn override_for(&self, id: &DriverId) -> DriverOverride {

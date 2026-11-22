@@ -19,15 +19,22 @@ pub enum ShimState {
 /// Probe a session directory without blocking: a non-blocking `try_lock` on `shim.lock`, then
 /// (if free) a bounded read of the journal's last record.
 pub async fn probe(dir: &Path) -> Result<ShimState, Error> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || probe_sync(&dir)).await?
+    probe_at(dir, dir).await
 }
 
-fn probe_sync(dir: &Path) -> Result<ShimState, Error> {
+/// [`probe`] for a session whose lock and endpoint live in a separate runtime directory `run`
+/// (journal in `dir`).
+pub async fn probe_at(dir: &Path, run: &Path) -> Result<ShimState, Error> {
+    let dir = dir.to_path_buf();
+    let run = run.to_path_buf();
+    tokio::task::spawn_blocking(move || probe_sync(&dir, &run)).await?
+}
+
+fn probe_sync(dir: &Path, run: &Path) -> Result<ShimState, Error> {
     match File::options()
         .read(true)
         .write(true)
-        .open(dir.join(LOCK_FILE))
+        .open(run.join(LOCK_FILE))
     {
         Ok(f) => match f.try_lock() {
             Ok(()) => {
@@ -45,6 +52,30 @@ fn probe_sync(dir: &Path) -> Result<ShimState, Error> {
             Ok(ShimState::Exited(r.exit_info().unwrap_or_default()))
         }
         _ => Ok(ShimState::Dead),
+    }
+}
+
+/// Create the runtime directory of a session (owner-only on Unix) and, on Unix, take a shared
+/// lock on it for the shim's lifetime (directory cleaners skip locked directories). The lock is
+/// best effort: a filesystem without `flock` on directories just gets no guard.
+pub(crate) async fn prepare_run_dir(run: &Path) -> Result<Option<File>, Error> {
+    tokio::fs::create_dir_all(run).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(run, std::fs::Permissions::from_mode(0o700)).await?;
+        let run = run.to_path_buf();
+        let guard = tokio::task::spawn_blocking(move || {
+            let f = File::open(&run).ok()?;
+            f.lock_shared().ok()?;
+            Some(f)
+        })
+        .await?;
+        Ok(guard)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
     }
 }
 

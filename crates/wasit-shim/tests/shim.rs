@@ -656,3 +656,40 @@ async fn controller_notes_are_ordered_and_refused_after_exit() {
         wasit_shim::ShimState::Exited(_) | wasit_shim::ShimState::Running
     ));
 }
+
+/// Lock and endpoint in a separate runtime directory (a shared home keeps only the journal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_dir_holds_lock_and_endpoint() {
+    let d = TempDir::new();
+    let r = TempDir::new();
+    let data = d.path().join("s1");
+    let run = r.path().join("s1");
+    let mut sp = child_spec(&data, "cat", &[]);
+    sp.run_dir = Some(run.clone());
+    start_spec(sp).await;
+    assert!(data.join(wasit_shim::JOURNAL_FILE).is_file());
+    assert!(!data.join(wasit_shim::LOCK_FILE).exists());
+    assert!(run.join(wasit_shim::LOCK_FILE).is_file());
+    // Seen from the data directory alone (another machine's view), nobody holds the lock.
+    assert_eq!(
+        wasit_shim::probe_at(&data, &run).await.unwrap(),
+        ShimState::Running
+    );
+    assert_eq!(probe(&data).await.unwrap(), ShimState::Dead);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(wasit_shim::endpoint_name(&run).exists());
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+    let c = ShimClient::connect(&run).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    c.close_stdin().await.unwrap();
+    until_exited(&mut s).await;
+    until_end(&mut s).await;
+    assert!(matches!(
+        wasit_shim::probe_at(&data, &run).await.unwrap(),
+        ShimState::Exited(_)
+    ));
+}

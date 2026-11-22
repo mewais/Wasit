@@ -738,6 +738,9 @@ fn ignore_hangup() {}
 struct Running {
     shared: Arc<Shared>,
     lock: std::fs::File,
+    /// Shared lock on the runtime directory: cleaners such as systemd-tmpfiles skip locked
+    /// directories when aging `/tmp`.
+    _dir_guard: Option<std::fs::File>,
     exit: JoinHandle<io::Result<ExitInfo>>,
     readers: [JoinHandle<io::Result<()>>; 2],
     sync_tx: mpsc::Sender<oneshot::Sender<io::Result<()>>>,
@@ -747,7 +750,9 @@ struct Running {
 
 async fn start(cfg: Config) -> Result<Running, Error> {
     tokio::fs::create_dir_all(&cfg.dir).await?;
-    let lock_file = probe::acquire(&cfg.dir).await?;
+    let run_dir = cfg.run_dir().to_path_buf();
+    let dir_guard = probe::prepare_run_dir(&run_dir).await?;
+    let lock_file = probe::acquire(&run_dir).await?;
     let journal_path = cfg.dir.join(JOURNAL_FILE);
     let (next_seq, len) = {
         let p = journal_path.clone();
@@ -757,7 +762,7 @@ async fn start(cfg: Config) -> Result<Running, Error> {
         .append(true)
         .open(&journal_path)
         .await?;
-    let listener = Listener::bind(&cfg.dir)?;
+    let listener = Listener::bind(&run_dir)?;
     let sp = match platform::spawn(&cfg).await {
         Ok(sp) => sp,
         Err(e) => {
@@ -824,6 +829,7 @@ async fn start(cfg: Config) -> Result<Running, Error> {
     Ok(Running {
         shared,
         lock: lock_file,
+        _dir_guard: dir_guard,
         exit: sp.exit,
         readers,
         sync_tx,

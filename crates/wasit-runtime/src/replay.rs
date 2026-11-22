@@ -54,13 +54,14 @@ async fn run(
 /// The snapshot of a session that has no live shim, rebuilt from its journal.
 pub(crate) async fn snapshot(
     dir: &Path,
+    run_dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
     meta: &SessionMeta,
 ) -> Result<SessionSnapshot, String> {
     let mut core = Core::new(desc, meta);
     run(dir, &mut core, None, |_| true).await?;
     if !core.process_ended() {
-        match wasit_shim::probe(dir).await {
+        match wasit_shim::probe_at(dir, run_dir).await {
             Ok(ShimState::Running) => {}
             Ok(_) => {
                 core.mark_lost("the shim is gone and the journal has no exit record");
