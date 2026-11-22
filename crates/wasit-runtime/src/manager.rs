@@ -62,6 +62,8 @@ pub struct AdoptReport {
 struct ActorHandle {
     tx: mpsc::Sender<Msg>,
     task: JoinHandle<()>,
+    /// The actor's `session.json` writer (ends after the actor).
+    writer: Option<JoinHandle<()>>,
 }
 
 struct Entry {
@@ -297,7 +299,7 @@ impl SessionManager {
 
     fn start_actor(&self, e: &Entry) -> ActorHandle {
         let feed = self.inner.feed.clone();
-        let actor = Actor::new(ActorInit {
+        let mut actor = Actor::new(ActorInit {
             dir: e.dir.clone(),
             desc: e.desc.clone(),
             cfg: self.inner.cfg.clone(),
@@ -305,9 +307,10 @@ impl SessionManager {
             snapshot: e.snapshot.clone(),
             notify: Arc::new(move |s| feed.upsert(s.clone())),
         });
+        let writer = actor.take_writer();
         let (tx, rx) = mpsc::channel(MAILBOX);
         let task = tokio::spawn(actor.run(rx));
-        ActorHandle { tx, task }
+        ActorHandle { tx, task, writer }
     }
 
     /// Scan the data directory and adopt every session not yet known: attach actors to live
@@ -713,11 +716,23 @@ impl SessionManager {
         let Some(mut entry) = entry else {
             return Err(RuntimeError::SessionNotFound(id.to_string()));
         };
+        // Nothing may write into the directory while it is removed: stop the actor and the
+        // loader, then wait for them and for the actor's `session.json` writer to finish (an
+        // update the exit caused is written by then; removing during that write fails with
+        // "directory not empty").
         if let Some(a) = entry.actor.take() {
             a.task.abort();
+            // Cancelled or finished: either way it no longer runs.
+            let _ = a.task.await;
+            if let Some(w) = a.writer {
+                // The writer ends once the actor (its sender) is gone; a panic is logged by tokio.
+                let _ = w.await;
+            }
         }
         if let Some(l) = entry.loader.take() {
             l.abort();
+            // Cancelled or finished: either way it no longer runs.
+            let _ = l.await;
         }
         self.inner.feed.remove(id);
         let run = self.inner.cfg.session_run_dir_for_spawn(&entry.dir);

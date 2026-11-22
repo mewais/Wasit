@@ -167,6 +167,8 @@ pub(crate) struct Actor {
     core: Core,
     file: SessionFile,
     file_tx: mpsc::UnboundedSender<Persist>,
+    /// The `session.json` writer; ends once `file_tx` is dropped and its last write is done.
+    writer: Option<tokio::task::JoinHandle<()>>,
     snapshot_tx: watch::Sender<Arc<SessionSnapshot>>,
     notify: SnapshotNotify,
     snapshot_dirty: bool,
@@ -282,12 +284,18 @@ fn deadline_from_journal(t_ms: u64, after: Duration) -> Instant {
 }
 
 impl Actor {
+    /// The `session.json` writer task, for whoever must wait until nothing writes into the
+    /// session directory any more (delete): it ends after the actor is gone.
+    pub(crate) fn take_writer(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.writer.take()
+    }
+
     pub(crate) fn new(init: ActorInit) -> Self {
         let meta = init.file.meta();
         let mut core = Core::new(init.desc.clone(), &meta);
         core.hint_modes(init.cfg.mode_hints.get(&meta.driver));
         let (file_tx, file_rx) = mpsc::unbounded_channel();
-        tokio::spawn(persist(init.dir.clone(), init.file.clone(), file_rx));
+        let writer = tokio::spawn(persist(init.dir.clone(), init.file.clone(), file_rx));
         let source = adopt_source(init.dir.clone(), init.cfg.session_run_dir(&init.dir), 1);
         Actor {
             id: meta.id,
@@ -298,6 +306,7 @@ impl Actor {
             pending_spec: init.file.spec.clone(),
             file: init.file,
             file_tx,
+            writer: Some(writer),
             snapshot_tx: init.snapshot,
             notify: init.notify,
             snapshot_dirty: true,
