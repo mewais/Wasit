@@ -704,6 +704,49 @@ async fn link_loss_closes_forwarded_subscription_and_durable_client_resumes() {
     hub.shutdown().await;
 }
 
+/// Whoever is told a link is connected can use it at once: the client is in place before the
+/// state is announced. (Marsad applies a host's settings when its link connects; when its
+/// request won the race against the client being installed, routing answered "host is not
+/// connected" and a restarted daemon never got its settings back.)
+#[tokio::test]
+async fn a_link_announced_connected_is_usable_at_once() {
+    let server = daemon("a", "v1");
+    let (gate, gate_rx) = watch::channel(false);
+    let conn = connector(move || {
+        let s = server.clone();
+        let mut gate = gate_rx.clone();
+        async move {
+            // Connect only once the test holds the supervisor (the callback reads it).
+            let _ = gate.wait_for(|open| *open).await;
+            mem_connect(&s, ClientOptions::new(hello("gui"))).await
+        }
+    });
+    let slot: Arc<std::sync::OnceLock<Supervised>> = Arc::default();
+    let (tx, mut usable) = tokio::sync::mpsc::unbounded_channel();
+    let seen = slot.clone();
+    let on_state = Arc::new(move |s: &LinkState| {
+        if s.is_connected() {
+            let _ = tx.send(seen.get().and_then(Supervised::current).is_some());
+        }
+    });
+    let mut config = SupervisedConfig::default();
+    config.backoff.initial = Duration::from_millis(5);
+    let sup = Supervised::spawn(
+        conn,
+        SupervisedOptions {
+            config,
+            on_state: Some(on_state),
+            ..Default::default()
+        },
+    );
+    assert!(slot.set(sup.clone()).is_ok());
+    gate.send_replace(true);
+    assert_eq!(within(usable.recv()).await, Some(true), "first connect");
+    sup.reconnect_now();
+    assert_eq!(within(usable.recv()).await, Some(true), "reconnect");
+    sup.stop().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn hub_links_over_real_child_processes() {

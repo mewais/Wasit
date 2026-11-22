@@ -404,10 +404,12 @@ async fn run(
                     attempt = 0;
                     bridge_unavailable = 0;
                     provisioned = None;
+                    // The client first: whoever is told the link is connected may use it
+                    // at once (a request routed in between would find no client).
+                    shared.client.send_replace(Some(client.clone()));
                     shared.set(LinkState::Connected {
                         hello: client.remote_hello().clone(),
                     });
-                    shared.client.send_replace(Some(client.clone()));
                     enum Ev {
                         Stop,
                         Closed(crate::error::ConnClose),
