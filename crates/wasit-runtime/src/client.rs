@@ -139,7 +139,16 @@ impl RuntimeClient {
         method: &str,
         params: P,
     ) -> Result<R, ClientError> {
-        let mut opts = RequestOpts::new(self.deadline);
+        self.call_within(method, params, self.deadline).await
+    }
+
+    async fn call_within<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: P,
+        deadline: Duration,
+    ) -> Result<R, ClientError> {
+        let mut opts = RequestOpts::new(deadline);
         opts.host = self.host.clone();
         self.link
             .request(method, params, opts, self.wait_connected)
@@ -179,6 +188,25 @@ impl RuntimeClient {
     /// Capture the host's environment again (agents are detected again with it).
     pub async fn refresh_environment(&self) -> Result<crate::wire::HostEnvironment, ClientError> {
         self.call(methods::HOST_ENVIRONMENT_REFRESH, ()).await
+    }
+
+    /// Apply a host environment configuration (setup, variables, agent commands).
+    pub async fn configure_environment(
+        &self,
+        r: &crate::wire::ConfigureEnvironment,
+    ) -> Result<crate::wire::HostEnvironment, ClientError> {
+        self.call(methods::HOST_ENVIRONMENT_CONFIGURE, r).await
+    }
+
+    /// Apply it again (the setup re-runs) and report what discovery then finds.
+    pub async fn test_environment(
+        &self,
+        r: &crate::wire::ConfigureEnvironment,
+    ) -> Result<crate::wire::EnvironmentTest, ClientError> {
+        // The setup's deadline plus discovery's: longer than an ordinary call.
+        let deadline = self.deadline.max(Duration::from_secs(120));
+        self.call_within(methods::HOST_ENVIRONMENT_TEST, r, deadline)
+            .await
     }
 
     pub async fn inventory(&self, project: Option<String>) -> Result<InventoryReply, ClientError> {

@@ -190,9 +190,24 @@ process's variables plus those only the registry has; PATH = the process's entri
 with `wasit_process::set_base_env`, so every process created through `wasit-process` (probes,
 shims → agent CLIs, git) starts from it; terminals apply it explicitly; discovery resolves
 binaries on that PATH and names the searched PATH when one is missing. `host.environment`
-reports source, shell, PATH, timing and notes (never other values). Seam for later stages, in
-order: captured → per-host setup commands → per-host variables → per-agent command override
-(the existing `DriverOverride.binary`).
+reports source, shell, PATH, timing and notes (never other values).
+
+The host's configuration (`HostEnvConfig`, owned by whoever manages the host — Marsad's hub —
+and sent with `host.environment.configure {config, revision}`, kept in memory by the daemon)
+is applied on top, in this order: captured → **setup commands** (Unix: the login shell in the
+mode the capture succeeded with, so functions such as `module` exist, from the captured
+environment, stdin closed, output between markers, deadline 30 s, process group killed; fish
+runs them as fish, csh-family shells via `/bin/sh`; native Windows: PowerShell `-NoProfile`, its
+`$env:` changes taken; the environment the commands leave is taken, keeping the capture's PATH
+entries after theirs; a failure is reported as `SetupReport {ok, exit_code, error, output tail,
+applied}` and a setup that did not finish leaves the captured environment) → **variables** (set
+as given) → **agent commands** (`AgentCommands`: per driver a name or path that stands in for
+the CLI, read by discovery and launches at use time, winning over `DriverOverride.binary`; the
+driver's version probe must answer like that CLI, else `DriverInventory.warning`). Changes apply
+to processes started afterwards (a continued session keeps its stored command); agents are
+detected again when the result changed. `host.environment.test` applies again (setup re-run)
+and returns the report plus the settled inventory. Secret variables are never reported: texts
+are scrubbed of their values and `EnvVar`'s `Debug` hides them.
 
 ## 4. Control protocol (`wasit-control`)
 

@@ -161,11 +161,12 @@ pub(crate) fn shim_spec(
     })
 }
 
-/// Apply the configured per-driver override (binary, extra env) to a spec.
+/// Apply the host's agent command, else the configured per-driver override (binary), and the
+/// override's extra env to a spec.
 pub(crate) fn apply_override(cfg: &RuntimeConfig, driver: &DriverId, spec: &mut SpawnSpec) {
     let o = cfg.override_for(driver);
     if spec.bin.is_none() {
-        spec.bin = o.binary;
+        spec.bin = cfg.commands.get(driver).or(o.binary);
     }
     spec.env.extend(o.env);
 }

@@ -13,6 +13,8 @@
 //! | [`methods::DRIVERS_REFRESH`] | [`RefreshRequest`] | [`Ack`] |
 //! | [`methods::HOST_ENVIRONMENT`] | — | `Option<`[`HostEnvironment`]`>` |
 //! | [`methods::HOST_ENVIRONMENT_REFRESH`] | — | [`HostEnvironment`] (re-captured; agents re-detected) |
+//! | [`methods::HOST_ENVIRONMENT_CONFIGURE`] | [`ConfigureEnvironment`] | [`HostEnvironment`] (setup, variables, agent commands applied; agents re-detected when it changed) |
+//! | [`methods::HOST_ENVIRONMENT_TEST`] | [`ConfigureEnvironment`] | [`EnvironmentTest`] (applied again, setup re-run, agents re-detected) |
 //! | [`methods::SESSIONS_LIST`] | — | [`SessionList`] |
 //! | [`methods::SESSIONS_CREATE`] | [`CreateSession`] | [`CreateSessionReply`] |
 //! | [`methods::SESSIONS_CONTINUE`] | [`SessionRef`] | [`Ack`] |
@@ -51,6 +53,8 @@ pub mod methods {
     pub const HOST_INFO: &str = "host.info";
     pub const HOST_ENVIRONMENT: &str = "host.environment";
     pub const HOST_ENVIRONMENT_REFRESH: &str = "host.environment.refresh";
+    pub const HOST_ENVIRONMENT_CONFIGURE: &str = "host.environment.configure";
+    pub const HOST_ENVIRONMENT_TEST: &str = "host.environment.test";
     pub const DRIVERS_INVENTORY: &str = "drivers.inventory";
     pub const DRIVERS_REFRESH: &str = "drivers.refresh";
     pub const SESSIONS_LIST: &str = "sessions.list";
@@ -86,6 +90,8 @@ pub const ROUTES: &[&str] = &[
     methods::HOST_INFO,
     methods::HOST_ENVIRONMENT,
     methods::HOST_ENVIRONMENT_REFRESH,
+    methods::HOST_ENVIRONMENT_CONFIGURE,
+    methods::HOST_ENVIRONMENT_TEST,
     topics::HOST_SESSIONS,
     "drivers.",
     "sessions.",
@@ -726,10 +732,11 @@ pub enum EnvSource {
 }
 
 /// What the host's environment stage found (no values beyond `PATH`: other variables may be
-/// secrets).
+/// secrets; texts are scrubbed of the configured secret values).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HostEnvironment {
+    /// Where the login environment came from (the first stage).
     pub source: EnvSource,
     /// The shell that was asked (Unix).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -743,6 +750,149 @@ pub struct HostEnvironment {
     /// Why a capture attempt failed (deadline, no output, stderr tail).
     #[serde(default)]
     pub notes: Vec<String>,
+    /// The configuration in effect ([`ConfigureEnvironment::revision`]; `None`: never
+    /// configured since this daemon started).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// How the setup commands went (`None`: there are none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupReport>,
+    /// Names of the variables the configuration sets (values are never reported).
+    #[serde(default)]
+    pub variables: Vec<String>,
+    /// The agent command of each driver that has one.
+    #[serde(default)]
+    pub commands: BTreeMap<DriverId, String>,
+}
+
+/// One run of a host's setup commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SetupReport {
+    /// The commands ran to the end with exit status 0 and their environment was taken.
+    pub ok: bool,
+    /// What ran them (`/bin/bash -l -i`, `powershell -NoProfile`).
+    pub shell: String,
+    /// Exit status of the last command (or of the shell, when the setup ended it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Why it failed, in plain words (deadline, ended the shell, syntax error…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The last lines the commands printed (stdout and stderr together).
+    #[serde(default)]
+    pub output: String,
+    /// The environment after the commands is the one processes get (`false`: the login
+    /// environment without the setup's changes, because the setup did not finish).
+    pub applied: bool,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub duration_ms: u64,
+}
+
+/// A host's environment configuration, applied after the login capture, in this order:
+/// setup commands → variables → agent commands (ARCHITECTURE.md §3.5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HostEnvConfig {
+    /// Shell lines run in the host's login shell (PowerShell on Windows) before agents,
+    /// sessions, terminals and git start; the environment they leave is what those get.
+    #[serde(default)]
+    pub setup: String,
+    #[serde(default)]
+    pub vars: Vec<EnvVar>,
+    /// Per driver: a command (name on `PATH`, or a path) that stands in for the CLI.
+    #[serde(default)]
+    pub commands: BTreeMap<DriverId, String>,
+}
+
+/// One variable. A secret's value is never reported, logged or put in an error.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub secret: bool,
+}
+
+impl std::fmt::Debug for EnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value: &dyn std::fmt::Debug = if self.secret {
+            &"<secret>"
+        } else {
+            &self.value
+        };
+        f.debug_struct("EnvVar")
+            .field("name", &self.name)
+            .field("value", value)
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+impl HostEnvConfig {
+    /// Names are `[A-Za-z_][A-Za-z0-9_]*` and unique (case-insensitively: Windows); agent
+    /// commands are not blank. Messages name variables, never values.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for v in &self.vars {
+            let ok = v
+                .name
+                .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && v.name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !ok {
+                return Err(format!(
+                    "{:?} is not a variable name (letters, digits and '_', not starting with a digit)",
+                    v.name
+                ));
+            }
+            if !seen.insert(v.name.to_ascii_uppercase()) {
+                return Err(format!("variable {} is set twice", v.name));
+            }
+            if v.value.contains('\0') {
+                return Err(format!("the value of {} contains a NUL character", v.name));
+            }
+        }
+        for (d, c) in &self.commands {
+            if c.trim().is_empty() || c.trim() != c {
+                return Err(format!("the {d} command is blank or has spaces around it"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The values of the secret variables (to scrub from texts).
+    pub fn secrets(&self) -> Vec<&str> {
+        self.vars
+            .iter()
+            .filter(|v| v.secret && !v.value.is_empty())
+            .map(|v| v.value.as_str())
+            .collect()
+    }
+}
+
+/// `host.environment.configure` / `.test`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ConfigureEnvironment {
+    pub config: HostEnvConfig,
+    /// Chosen by whoever owns the configuration; reported back in
+    /// [`HostEnvironment::revision`] so it can tell whether a host has it.
+    pub revision: String,
+}
+
+/// Result of `host.environment.test`: the environment after the setup ran again, and every
+/// driver as discovery then found it (command, resolved path, version or error, warning).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvironmentTest {
+    pub environment: HostEnvironment,
+    pub agents: Vec<DriverInventory>,
+    /// Every driver finished probing within the test's deadline (else some are still
+    /// `refreshing` and their results arrive with the inventory topic).
+    pub complete: bool,
 }
 
 /// Payload of the `host.sessions` topic.
@@ -801,6 +951,12 @@ pub struct DriverInventory {
     pub capabilities: DriverCapabilities,
     /// The binary was found (`PATH` lookup or configured path).
     pub installed: bool,
+    /// The host's agent command for this driver, when it has one (what was looked up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The agent command was found but does not answer like this CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
     /// Why the driver is unusable here (e.g. the binary was not found).

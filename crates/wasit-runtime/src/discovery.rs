@@ -20,7 +20,7 @@ use wasit_core::{
     DriverId, DriverRegistry, FileHead, ProbeAction, ProbeOutput, SpawnSpec,
 };
 
-use crate::config::{DriverOverride, RuntimeConfig};
+use crate::config::{AgentCommands, DriverOverride, RuntimeConfig};
 use crate::store::now_ms;
 use crate::stream::{EventStream, StreamEnd};
 use crate::wire::{DriverInventory, InventoryReply, ProbeReport};
@@ -30,6 +30,8 @@ use crate::wire::{DriverInventory, InventoryReply, ProbeReport};
 pub struct DiscoveryConfig {
     pub registry: DriverRegistry,
     pub overrides: BTreeMap<DriverId, DriverOverride>,
+    /// The host's agent commands, read at each refresh (they win over `overrides`' binary).
+    pub commands: AgentCommands,
     /// Deadline of an `Exec` probe.
     pub exec_timeout: Duration,
     /// Deadline of a `Handshake` probe.
@@ -50,6 +52,7 @@ impl DiscoveryConfig {
         DiscoveryConfig {
             registry,
             overrides: BTreeMap::new(),
+            commands: AgentCommands::default(),
             exec_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(45),
             list_timeout: Duration::from_secs(15),
@@ -63,6 +66,7 @@ impl DiscoveryConfig {
     pub fn from_runtime(cfg: &RuntimeConfig) -> Self {
         let mut d = DiscoveryConfig::new(cfg.registry.clone());
         d.overrides = cfg.overrides.clone();
+        d.commands = cfg.commands.clone();
         d.mode_hints = cfg.mode_hints.clone();
         d
     }
@@ -72,6 +76,9 @@ type Key = (Option<String>, DriverId);
 
 struct State {
     entries: BTreeMap<Key, DriverInventory>,
+    /// Entries asked to refresh while a refresh was running: it runs again when that one ends
+    /// (its results came from an environment or command that has changed since).
+    again: std::collections::BTreeSet<Key>,
 }
 
 struct Inner {
@@ -102,6 +109,7 @@ impl Discovery {
                 cfg,
                 state: Mutex::new(State {
                     entries: BTreeMap::new(),
+                    again: Default::default(),
                 }),
                 version: watch::channel(0).0,
                 epoch: format!("{:x}", fastrand::u64(..) >> 16),
@@ -160,6 +168,39 @@ impl Discovery {
             }
         }
         Ok(())
+    }
+
+    /// Re-run every cached inventory (all drivers, every project asked about so far), e.g.
+    /// after the host's environment changed. Returns at once.
+    pub fn refresh_all(&self) {
+        let keys: Vec<Key> = lock(&self.inner.state).entries.keys().cloned().collect();
+        for (project, driver) in keys {
+            self.refresh_driver(&driver, project.as_deref());
+        }
+    }
+
+    /// The inventory of `project` once no driver is refreshing, or as it is when `deadline`
+    /// passes (`complete: false`).
+    pub async fn settled(
+        &self,
+        project: Option<&str>,
+        deadline: Duration,
+    ) -> (InventoryReply, bool) {
+        let mut changes = self.inner.version.subscribe();
+        let wait = async {
+            loop {
+                let inv = self.inventory(project);
+                if inv.drivers.iter().all(|d| !d.refreshing) {
+                    return;
+                }
+                // The sender lives as long as `self`.
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let complete = tokio::time::timeout(deadline, wait).await.is_ok();
+        (self.current(project), complete)
     }
 
     /// Bumps on every inventory change.
@@ -228,6 +269,8 @@ impl Discovery {
                     display_name: desc.display_name().to_string(),
                     capabilities: desc.capabilities(),
                     installed: false,
+                    command: None,
+                    warning: None,
                     binary_path: None,
                     error: None,
                     version: None,
@@ -241,6 +284,7 @@ impl Discovery {
                     refreshed_at_ms: 0,
                 });
             if e.refreshing {
+                st.again.insert(key);
                 return;
             }
             e.refreshing = true;
@@ -253,13 +297,16 @@ impl Discovery {
     async fn run_refresh(&self, desc: Arc<dyn DriverDescriptor>, key: Key) {
         let cfg = &self.inner.cfg;
         let ov = cfg.overrides.get(&key.1).cloned().unwrap_or_default();
-        let wanted = ov
-            .binary
+        let command = cfg.commands.get(&key.1);
+        let wanted = command
             .clone()
+            .or_else(|| ov.binary.clone())
             .unwrap_or_else(|| desc.default_binary().to_string());
         let resolved = resolve_binary(&wanted).await;
         let Some(path) = resolved else {
-            self.update(&key, |e| {
+            self.finish(&key, |e| {
+                e.command = command.clone();
+                e.warning = None;
                 e.installed = false;
                 e.binary_path = None;
                 e.error = Some(if Path::new(&wanted).components().count() > 1 {
@@ -270,7 +317,6 @@ impl Discovery {
                         .unwrap_or_default();
                     format!("`{wanted}` was not found on PATH (searched: {path})")
                 });
-                e.refreshing = false;
                 e.refreshed_at_ms = now_ms();
                 e.probes = vec![];
                 e.version = None;
@@ -297,11 +343,12 @@ impl Discovery {
                     .entries
                     .get(&(None, key.1.clone()))
                     .cloned();
-                self.update(&key, |e| {
+                self.finish(&key, |e| {
+                    e.command = command.clone();
+                    e.warning = None;
                     e.installed = true;
                     e.binary_path = Some(path_s.clone());
                     e.error = Some(error);
-                    e.refreshing = false;
                     e.refreshed_at_ms = now_ms();
                     e.probes = vec![];
                     e.version = global.as_ref().and_then(|g| g.version.clone());
@@ -317,26 +364,31 @@ impl Discovery {
             }
         }
         self.update(&key, |e| {
+            e.command = command.clone();
             e.installed = true;
             e.error = None;
             e.binary_path = Some(path_s.clone());
         });
-        let mut env: Vec<(String, String)> = std::env::vars().collect();
+        // The environment probes get (the host's base environment), not this process's.
+        let mut env: Vec<(String, String)> = match wasit_process::base_env() {
+            Some(b) => b
+                .iter()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
+                .collect(),
+            None => std::env::vars().collect(),
+        };
         env.extend(ov.env.iter().cloned());
+        let var = |names: &[&str]| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| names.contains(&k.as_str()))
+                .map(|(_, v)| v.clone())
+        };
+        let home = var(&["HOME", "USERPROFILE"]);
         let ctx = DiscoveryContext {
             binary: Some(path_s),
-            // A driver override may point the CLI at another home (tests, sandboxes).
-            home: ov
-                .env
-                .iter()
-                .rev()
-                .find(|(k, _)| k == "HOME" || k == "USERPROFILE")
-                .map(|(_, v)| v.clone())
-                .or_else(|| {
-                    std::env::var("HOME")
-                        .or_else(|_| std::env::var("USERPROFILE"))
-                        .ok()
-                }),
+            // A driver override or a host variable may point the CLI at another home.
+            home,
             env,
             project: key.0.clone(),
         };
@@ -354,7 +406,8 @@ impl Discovery {
             }
         });
         let results = futures::future::join_all(runs).await;
-        self.update(&key, |e| {
+        let display = desc.display_name().to_string();
+        self.finish(&key, |e| {
             e.probes.clear();
             let mut config: Option<Vec<wasit_core::ConfigItem>> = None;
             for (kind, r, took) in results {
@@ -388,9 +441,37 @@ impl Discovery {
             }
             // Several probes contribute config items; a refresh replaces them as a whole.
             e.config = config.unwrap_or_default();
-            e.refreshing = false;
             e.refreshed_at_ms = now_ms();
+            // A host agent command must answer like the CLI it stands in for.
+            e.warning = command.as_ref().and_then(|c| {
+                let version = e.probes.iter().find(|p| p.kind == DiscoveryKind::Version)?;
+                let why = version.error.as_deref()?;
+                Some(format!("`{c}` does not answer like {display}: {why}"))
+            });
         });
+    }
+
+    /// The last update of a refresh: clears `refreshing`, unless a refresh was asked for
+    /// meanwhile, which then starts at once (in the same update, so nobody sees the entry as
+    /// settled in between).
+    fn finish(&self, key: &Key, f: impl FnOnce(&mut DriverInventory)) {
+        let again = {
+            let mut st = lock(&self.inner.state);
+            let again = st.again.remove(key);
+            if let Some(e) = st.entries.get_mut(key) {
+                f(e);
+                e.refreshing = again;
+            }
+            again
+        };
+        self.inner.version.send_modify(|v| *v += 1);
+        if again {
+            if let Ok(desc) = self.inner.cfg.registry.get(&key.1) {
+                let this = self.clone();
+                let key = key.clone();
+                tokio::spawn(async move { this.run_refresh(desc, key).await });
+            }
+        }
     }
 }
 

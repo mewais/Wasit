@@ -16,10 +16,14 @@ use crate::manager::SessionManager;
 use crate::store::now_ms;
 use crate::stream::StreamEnd;
 use crate::wire::{
-    methods, topics, Ack, CommandError, CommandReply, CommandRequest, CreateSession, DriverSummary,
-    HistoryRequest, HostInfo, InventoryRequest, RefreshRequest, RenameSession, RuntimeError,
-    SessionId, SessionList, SessionRef,
+    methods, topics, Ack, CommandError, CommandReply, CommandRequest, ConfigureEnvironment,
+    CreateSession, DriverSummary, EnvironmentTest, HistoryRequest, HostInfo, InventoryRequest,
+    RefreshRequest, RenameSession, RuntimeError, SessionId, SessionList, SessionRef,
 };
+
+/// How long `host.environment.test` waits for discovery after the setup ran (a test then
+/// answers within the setup deadline plus this, well inside a client's request deadline).
+const TEST_DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
 
 /// See the module docs.
 #[derive(Clone)]
@@ -103,6 +107,30 @@ impl RuntimeService {
         self
     }
 
+    fn env(&self) -> Result<&crate::environment::HostEnv, RpcError> {
+        self.env.as_ref().ok_or_else(|| {
+            RpcError::new(
+                wasit_control::codes::METHOD_NOT_FOUND,
+                "this host has no environment stage",
+            )
+        })
+    }
+
+    /// A valid configuration whose agent commands name known drivers. Errors name variables
+    /// and drivers, never values.
+    fn configuration(&self, p: Value) -> Result<ConfigureEnvironment, RpcError> {
+        // Not `params`: a decoding error could quote a value.
+        let r: ConfigureEnvironment = serde_json::from_value(p)
+            .map_err(|_| RpcError::invalid_params("not an environment configuration"))?;
+        r.config.validate().map_err(RpcError::invalid_params)?;
+        let reg = &self.manager.config().registry;
+        for d in r.config.commands.keys() {
+            reg.get(d)
+                .map_err(|e| runtime_err(RuntimeError::UnknownDriver(e.to_string())))?;
+        }
+        Ok(r)
+    }
+
     pub fn manager(&self) -> &SessionManager {
         &self.manager
     }
@@ -120,18 +148,29 @@ impl Service for RuntimeService {
             methods::HOST_INFO => ok(&self.info),
             methods::HOST_ENVIRONMENT => ok(self.env.as_ref().and_then(|e| e.report())),
             methods::HOST_ENVIRONMENT_REFRESH => {
-                let Some(env) = &self.env else {
-                    return Err(RpcError::new(
-                        wasit_control::codes::METHOD_NOT_FOUND,
-                        "this host has no environment stage",
-                    ));
-                };
-                let report = env.refresh().await;
+                let report = self.env()?.refresh().await;
                 // Agents found (or not) with the old environment are detected again.
-                self.discovery
-                    .refresh(None, None)
-                    .map_err(|e| runtime_err(RuntimeError::UnknownDriver(e)))?;
+                self.discovery.refresh_all();
                 ok(report)
+            }
+            methods::HOST_ENVIRONMENT_CONFIGURE => {
+                let r = self.configuration(p)?;
+                let (report, changed) = self.env()?.configure(r.config, r.revision, false).await;
+                if changed {
+                    self.discovery.refresh_all();
+                }
+                ok(report)
+            }
+            methods::HOST_ENVIRONMENT_TEST => {
+                let r = self.configuration(p)?;
+                let (environment, _) = self.env()?.configure(r.config, r.revision, true).await;
+                self.discovery.refresh_all();
+                let (inv, complete) = self.discovery.settled(None, TEST_DISCOVERY_DEADLINE).await;
+                ok(EnvironmentTest {
+                    environment,
+                    agents: inv.drivers,
+                    complete,
+                })
             }
             methods::DRIVERS_INVENTORY => {
                 let r: InventoryRequest = if p.is_null() {

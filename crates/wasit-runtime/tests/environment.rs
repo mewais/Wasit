@@ -118,6 +118,7 @@ async fn login_shell_environment_reaches_discovery_and_sessions() {
         shell: Some(fake_shell(d.path(), &home2)),
         interactive_deadline: Duration::from_millis(800),
         login_deadline: Duration::from_secs(4),
+        ..CaptureOptions::default()
     });
     let r2 = env2.refresh().await;
     assert_eq!(r2.source, EnvSource::LoginShell, "{r2:?}");
@@ -136,6 +137,7 @@ async fn login_shell_environment_reaches_discovery_and_sessions() {
         shell: Some(fake_shell(d.path(), &home3)),
         interactive_deadline: Duration::from_millis(500),
         login_deadline: Duration::from_millis(500),
+        ..CaptureOptions::default()
     });
     let r3 = env3.refresh().await;
     assert_eq!(r3.source, EnvSource::Process, "{r3:?}");

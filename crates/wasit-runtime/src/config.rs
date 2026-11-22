@@ -90,6 +90,30 @@ pub struct DriverOverride {
     pub env: Vec<(String, String)>,
 }
 
+/// The per-host agent command of each driver (a name looked up on `PATH`, or a path), set by
+/// the host's environment stage ([`crate::environment::HostEnv::configure`]) and read at use
+/// time by discovery and session launches, so a change applies to the next probe and the next
+/// session. It is the last stage of the host environment (ARCHITECTURE.md §3.5) and wins over
+/// a [`DriverOverride::binary`]. The command stands in for the CLI: same driver, same
+/// arguments.
+#[derive(Clone, Default)]
+pub struct AgentCommands(std::sync::Arc<std::sync::RwLock<BTreeMap<DriverId, String>>>);
+
+impl AgentCommands {
+    pub fn get(&self, driver: &DriverId) -> Option<String> {
+        let m = self.0.read().unwrap_or_else(|e| e.into_inner());
+        m.get(driver).cloned()
+    }
+
+    pub fn all(&self) -> BTreeMap<DriverId, String> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, commands: BTreeMap<DriverId, String>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = commands;
+    }
+}
+
 /// Modes a driver's CLI offers as discovery found them, shared by [`crate::Discovery`] and the
 /// sessions: a CLI whose protocol reports only the current mode (claude's permission modes)
 /// still shows its choices.
@@ -128,6 +152,8 @@ pub struct RuntimeConfig {
     pub timeouts: Timeouts,
     pub shim: ShimOptions,
     pub overrides: BTreeMap<DriverId, DriverOverride>,
+    /// Per-host agent commands (shared with discovery and the host environment stage).
+    pub commands: AgentCommands,
     /// In-memory tail of events kept per session for subscribers and history.
     pub event_tail: usize,
     /// Per-subscriber queue; a subscriber that falls this far behind is dropped (`Lagged`).
@@ -146,6 +172,7 @@ impl RuntimeConfig {
             timeouts: Timeouts::default(),
             shim: ShimOptions::default(),
             overrides: BTreeMap::new(),
+            commands: AgentCommands::default(),
             event_tail: 2048,
             subscriber_queue: 1024,
             mode_hints: ModeHints::default(),
