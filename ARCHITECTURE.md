@@ -186,7 +186,7 @@ user's environment once per daemon start (before discovery and sessions) and on
 `host.environment.refresh`: `$SHELL -l -i -c` printing `env -0` between random markers (stdin
 closed, deadline 6 s, whole process group killed at the deadline, chatter outside the markers
 ignored) → `-l -c` (4 s) → the daemon's own environment, with reasons in `notes`; Windows: the
-registry's user + machine variables over the process's (PATH merged). The result is installed
+process's variables plus those only the registry has; PATH = the process's entries, then registry entries it lacks. The result is installed
 with `wasit_process::set_base_env`, so every process created through `wasit-process` (probes,
 shims → agent CLIs, git) starts from it; terminals apply it explicitly; discovery resolves
 binaries on that PATH and names the searched PATH when one is missing. `host.environment`

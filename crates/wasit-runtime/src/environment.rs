@@ -11,8 +11,10 @@
 //! 1. **captured** — Unix: `$SHELL -l -i -c '<print env between unique markers>'` with stdin
 //!    closed and a deadline (output outside the markers, i.e. rc-file chatter, is ignored; the
 //!    whole process group is killed at the deadline), falling back to `-l -c`, then to this
-//!    process's environment. Windows: this process's environment with the user's and machine's
-//!    variables from the registry (PATH = machine + user + entries only this process had).
+//!    process's environment. Windows: this process's environment plus the variables only the
+//!    registry has (user, then machine), and PATH = this process's entries, then registry
+//!    entries it lacks (a GUI's environment is a snapshot from login; installs since then are
+//!    only in the registry).
 //! 2. *(later)* per-host setup commands, evaluated in the captured environment.
 //! 3. *(later)* per-host variables, overlaid.
 //!
@@ -393,8 +395,8 @@ async fn capture_windows(
         r#"$x=[Environment]::ExpandEnvironmentVariables
 $r=@{{}}
 foreach($e in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()){{$r[$e.Key]=$e.Value}}
-foreach($t in 'Machine','User'){{foreach($e in [Environment]::GetEnvironmentVariables($t).GetEnumerator()){{if($e.Key -ne 'Path'){{$r[$e.Key]=$x.Invoke($e.Value)}}}}}}
-$p=@(); foreach($t in 'Machine','User','Process'){{$v=[Environment]::GetEnvironmentVariable('Path',$t); if($v){{foreach($s in $v.Split(';')){{$s=$x.Invoke($s); if($s -and ($p -notcontains $s)){{$p+=$s}}}}}}}}
+foreach($t in 'User','Machine'){{foreach($e in [Environment]::GetEnvironmentVariables($t).GetEnumerator()){{if($e.Key -ne 'Path' -and -not $r.ContainsKey($e.Key)){{$r[$e.Key]=$x.Invoke($e.Value)}}}}}}
+$p=@(); foreach($t in 'Process','Machine','User'){{$v=[Environment]::GetEnvironmentVariable('Path',$t); if($v){{foreach($s in $v.Split(';')){{$s=$x.Invoke($s); if($s -and ($p -notcontains $s)){{$p+=$s}}}}}}}}
 $r['Path']=$p -join ';'
 $o=[Console]::Out
 $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $o.Write("`n{end}`n")"#
