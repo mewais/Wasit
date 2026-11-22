@@ -625,7 +625,7 @@ $r=@{{}}
 foreach($t in 'User','Machine'){{foreach($e in [Environment]::GetEnvironmentVariables($t).GetEnumerator()){{if($e.Key -ne 'Path' -and -not $r.ContainsKey($e.Key)){{$r[$e.Key]=$x.Invoke($e.Value)}}}}}}
 $p=@(); foreach($t in 'Machine','User'){{$v=[Environment]::GetEnvironmentVariable('Path',$t); if($v){{foreach($s in $v.Split(';')){{$s=$x.Invoke($s); if($s -and ($p -notcontains $s)){{$p+=$s}}}}}}}}
 $r['Path']=$p -join ';'
-$o=[Console]::Out
+$o=New-Object IO.StreamWriter([Console]::OpenStandardOutput(),(New-Object Text.UTF8Encoding $false)); $o.AutoFlush=$true
 $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $o.Write("`n{end}`n")"#
     );
     let args = vec![
@@ -868,7 +868,7 @@ async fn run_setup(
 ) -> (Option<Vec<(String, String)>>, SetupReport) {
     let m = Markers::new();
     let script = format!(
-        r#"$__o=[Console]::Out
+        r#"$__o=New-Object IO.StreamWriter([Console]::OpenStandardOutput(),(New-Object Text.UTF8Encoding $false)); $__o.AutoFlush=$true
 $__o.Write("`n{b}`n")
 $global:LASTEXITCODE=0
 $__rc=0

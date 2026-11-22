@@ -1,6 +1,8 @@
 //! Setup commands on native Windows: PowerShell in the captured environment; `$env:` changes
 //! are taken, then variables; a native command's exit status, a thrown error, an `exit` and a
-//! hang are reported. One test function: the base environment is process-wide.
+//! hang are reported. Non-ASCII text survives both PowerShell runs (a registry variable read by
+//! the capture, setup output and the `$env:` values it leaves). One test function: the base
+//! environment is process-wide.
 #![cfg(windows)]
 
 use std::time::{Duration, Instant};
@@ -21,14 +23,28 @@ fn base(name: &str) -> Option<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn powershell_setup() {
+    // A user variable only the registry has (set after this process started), not ASCII.
+    let set_user = |value: &str| {
+        let st = wasit_process::std_command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "[Environment]::SetEnvironmentVariable('WASIT_E2E_UNI', {value}, 'User')"
+            ))
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    set_user("'ünï 日本 ✓'");
     let env = HostEnv::new(CaptureOptions {
         setup_deadline: Duration::from_secs(20),
         ..CaptureOptions::default()
     });
     let r = env.refresh().await;
+    set_user("$null");
     assert_eq!(r.source, EnvSource::Registry, "{r:?}");
+    assert_eq!(base("WASIT_E2E_UNI").as_deref(), Some("ünï 日本 ✓"));
 
-    let mut c = cfg("$env:FROM_SETUP = 'yes'\n$env:ORDER = 'setup'\n$env:Path = \"C:\\wasit-setup-bin;$env:Path\"\nWrite-Output 'hello from setup'");
+    let mut c = cfg("$env:FROM_SETUP = 'yes'\n$env:ORDER = 'setup'\n$env:Path = \"C:\\wasit-setup-bin;$env:Path\"\nWrite-Output 'hello from setup'\n$env:GREETING = 'grüße 日本'\nWrite-Output 'héllo ✓ 日本語'\ncmd /c echo native-ascii");
     c.vars = vec![EnvVar {
         name: "ORDER".into(),
         value: "variable".into(),
@@ -39,7 +55,10 @@ async fn powershell_setup() {
     assert!(s.ok && s.applied, "{s:?}");
     assert_eq!(s.shell, "powershell -NoProfile");
     assert!(s.output.contains("hello from setup"), "{s:?}");
+    assert!(s.output.contains("héllo ✓ 日本語"), "{s:?}");
+    assert!(s.output.contains("native-ascii"), "{s:?}");
     assert_eq!(base("FROM_SETUP").as_deref(), Some("yes"));
+    assert_eq!(base("GREETING").as_deref(), Some("grüße 日本"));
     assert_eq!(base("ORDER").as_deref(), Some("variable"));
     assert_eq!(
         r.path.first().map(String::as_str),
