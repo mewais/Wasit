@@ -209,6 +209,11 @@ async fn setup_variables_and_agent_commands() {
     let id = mgr.create(req).await.unwrap().id;
     let snap = wait_snapshot(&mgr, &id, "one turn", |s| s.turns_completed >= 1).await;
     assert_eq!(snap.turns_completed, 1);
+    assert_eq!(
+        snap.command.as_deref(),
+        Some("genie"),
+        "the snapshot names the command"
+    );
     let genie_env = std::fs::read_to_string(d.path().join("genie-env")).unwrap();
     assert!(genie_env.contains("ORDER=variable"), "{genie_env}");
     assert!(genie_env.contains(&format!("API_TOKEN={SECRET}")));

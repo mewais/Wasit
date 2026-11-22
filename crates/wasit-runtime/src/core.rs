@@ -57,6 +57,8 @@ pub(crate) struct SessionMeta {
     pub labels: std::collections::BTreeMap<String, String>,
     pub created_at_ms: u64,
     pub display_name: Option<String>,
+    /// The command the CLI is started as instead of the driver's default binary.
+    pub command: Option<String>,
 }
 
 /// An empty snapshot for `meta` in `phase`.
@@ -73,6 +75,7 @@ pub(crate) fn blank_snapshot(
         cwd: meta.cwd.clone(),
         labels: meta.labels.clone(),
         created_at_ms: meta.created_at_ms,
+        command: meta.command.clone(),
         capabilities: caps,
         prompt_input: desc.prompt_input(),
         phase,
@@ -1104,6 +1107,7 @@ mod tests {
             labels: Default::default(),
             created_at_ms: 0,
             display_name: None,
+            command: None,
         }
     }
 

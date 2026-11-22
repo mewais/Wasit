@@ -290,6 +290,11 @@ pub struct SessionSnapshot {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     pub created_at_ms: u64,
+    /// The command this session's CLI is started as instead of the driver's default binary
+    /// (the host's agent command, or a configured binary), stored with the session: a
+    /// continued session keeps it. `None`: the default binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     pub capabilities: DriverCapabilities,
     /// What a prompt may carry besides text.
     #[serde(default)]

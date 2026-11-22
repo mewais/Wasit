@@ -81,6 +81,7 @@ impl SessionFile {
             labels: self.labels.clone(),
             created_at_ms: self.created_at_ms,
             display_name: self.display_name.clone(),
+            command: self.spec.bin.clone(),
         }
     }
 }
