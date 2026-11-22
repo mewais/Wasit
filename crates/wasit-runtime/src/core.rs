@@ -1062,10 +1062,12 @@ impl Core {
                 .clone()
                 .unwrap_or(Phase::Exited { code: None }),
             Gen::Awaiting(_) | Gen::Running(_) => {
-                if !self.handshake_done {
-                    Phase::Starting
-                } else if !self.snap.pending_gates.is_empty() {
+                // A pending gate needs the human whatever else is going on: one raised from
+                // outside (a handoff) can come before the CLI's handshake.
+                if !self.snap.pending_gates.is_empty() {
                     Phase::NeedsYou
+                } else if !self.handshake_done {
+                    Phase::Starting
                 } else if self.snap.turn.is_some() {
                     Phase::Working
                 } else {
@@ -1278,6 +1280,57 @@ mod tests {
             live.owed().collect::<Vec<_>>()
         );
         assert!(events.windows(2).all(|w| w[0].cursor < w[1].cursor));
+    }
+
+    /// A gate raised from outside (a handoff) while the CLI is still starting needs the human
+    /// at once: the session reads `needs_you`, not `starting`.
+    #[test]
+    fn a_gate_raised_while_starting_needs_you() {
+        let mut live = Core::new(wasit_claude::descriptor(), &meta());
+        let mut j = J::new();
+        let mut feed = |core: &mut Core, j: &mut J, kind, data: serde_json::Value| {
+            let rec = j.push(kind, data);
+            core.apply(&rec)
+        };
+        feed(&mut live, &mut j, Kind::Spawned, json!({"pid": 7}));
+        feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::Start {
+                spec: Box::new(SpawnSpec::default()),
+            }
+            .to_value(),
+        );
+        assert_eq!(live.snapshot().phase, Phase::Starting);
+        let gate = wasit_core::GateRequest::Handoff {
+            request_id: "x1".into(),
+            task_id: "t1".into(),
+            from: "h/a".into(),
+            to: "h/b".into(),
+            mode: "consult".into(),
+            instruction: "look".into(),
+            details: serde_json::Value::Null,
+            choices: vec![wasit_core::GateChoice::agent(
+                "allow",
+                "Allow",
+                wasit_core::GateChoiceKind::AllowOnce,
+            )],
+        };
+        let out = feed(
+            &mut live,
+            &mut j,
+            Kind::Note,
+            RuntimeNote::RaiseGate {
+                token: "r1".into(),
+                gate: Box::new(gate),
+            }
+            .to_value(),
+        );
+        assert_eq!(out.resolved, vec![("r1".into(), CommandStatus::Sent)]);
+        assert_eq!(live.snapshot().phase, Phase::NeedsYou);
+        feed(&mut live, &mut j, Kind::Out, json!(INIT_OK));
+        assert_eq!(live.snapshot().phase, Phase::NeedsYou);
     }
 
     /// External gates: pending like CLI gates, kept across a turn end, answered without the
