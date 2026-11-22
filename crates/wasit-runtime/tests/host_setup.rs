@@ -260,10 +260,11 @@ async fn setup_variables_and_agent_commands() {
     );
     assert_eq!(base("HALF"), None);
 
-    // Malformed: the shell's own message is the output.
+    // Malformed: a failing command whose output is the shell's own message.
     let (r, _) = env.configure(cfg("if then fi ("), "m".into(), false).await;
     let s = r.setup.unwrap();
-    assert!(!s.ok && !s.applied, "{s:?}");
+    assert!(!s.ok, "{s:?}");
+    assert!(s.exit_code.is_some_and(|c| c != 0), "{s:?}");
     assert!(s.output.contains("syntax error"), "{s:?}");
 
     // Hanging: bounded by the setup deadline, the whole group killed, the login environment.

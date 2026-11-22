@@ -20,8 +20,9 @@
 //!    mode the capture succeeded with (so functions such as `module` that startup files define
 //!    exist), starting from the captured environment, stdin closed, between markers, with
 //!    their own deadline; the environment they leave is taken (PATH entries and variables of
-//!    the capture they dropped are kept, after theirs). POSIX shells and fish run the lines as
-//!    written; another login shell (csh, …) runs them with `/bin/sh`. Windows: PowerShell
+//!    the capture they dropped are kept, after theirs). The lines reach the shell in a variable
+//!    and run with `eval` (POSIX shells and fish; another login shell, csh, …, runs them with
+//!    `/bin/sh`), so a syntax error is reported as their failure with the shell's message. Windows: PowerShell
 //!    (`-NoProfile`) in the captured environment; its `$env:` changes are taken. A setup that
 //!    fails is reported ([`SetupReport`]); one that did not finish (deadline, ended the
 //!    shell) leaves the captured environment.
@@ -732,7 +733,8 @@ async fn run_setup(
             login.clone(),
             mode,
             format!(
-                "printf '\\n%s\\n' '{b}'\nbegin\n{setup}\nend </dev/null 2>&1\nset __wasit_rc $status\n\
+                "printf '\\n%s\\n' '{b}'\nbegin; eval ${SETUP_VAR}; end </dev/null 2>&1\n\
+                 set __wasit_rc $status\nset -e {SETUP_VAR}\n\
                  printf '\\n%s %s\\n' '{e}' $__wasit_rc\nenv -0 2>/dev/null; or env\nprintf '\\n%s\\n' '{f}'\n",
                 b = m.begin,
                 e = m.end,
@@ -741,9 +743,9 @@ async fn run_setup(
         ),
         // Not POSIX shells: the lines run with `/bin/sh` (in the captured environment).
         "csh" | "tcsh" | "nu" | "elvish" | "xonsh" | "pwsh" => {
-            (PathBuf::from("/bin/sh"), &[][..], posix_script(&m, setup))
+            (PathBuf::from("/bin/sh"), &[][..], posix_script(&m))
         }
-        _ => (login.clone(), mode, posix_script(&m, setup)),
+        _ => (login.clone(), mode, posix_script(&m)),
     };
     let mut args: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
     let what = std::iter::once(shell.display().to_string())
@@ -752,17 +754,27 @@ async fn run_setup(
         .join(" ");
     args.push("-c".into());
     args.push(script);
-    match run_bounded(&shell, &args, Some(&captured.vars), opts.setup_deadline).await {
+    // The lines travel in a variable and run with `eval`: never re-quoted into the script, and
+    // a syntax error in them is their own output and exit status, not the wrapper's.
+    let mut env = captured.vars.clone();
+    env.push((SETUP_VAR.into(), setup.into()));
+    match run_bounded(&shell, &args, Some(&env), opts.setup_deadline).await {
         Ok(r) => m.read(&r, what, opts.setup_deadline),
         Err(e) => (None, start_failed(what, e)),
     }
 }
 
+/// The variable that carries the setup lines into the shell (removed before its environment is
+/// read).
 #[cfg(unix)]
-fn posix_script(m: &Markers, setup: &str) -> String {
+const SETUP_VAR: &str = "__WASIT_SETUP";
+
+#[cfg(unix)]
+fn posix_script(m: &Markers) -> String {
     format!(
-        "printf '\\n%s\\n' '{b}'\n{{\n{setup}\n}} </dev/null 2>&1\n__wasit_rc=$?\n\
-         printf '\\n%s %s\\n' '{e}' \"$__wasit_rc\"\nenv -0 2>/dev/null || env\nprintf '\\n%s\\n' '{f}'\n",
+        "printf '\\n%s\\n' '{b}'\n{{ eval \"${SETUP_VAR}\"; }} </dev/null 2>&1\n__wasit_rc=$?\n\
+         unset {SETUP_VAR}\nprintf '\\n%s %s\\n' '{e}' \"$__wasit_rc\"\nenv -0 2>/dev/null || env\n\
+         printf '\\n%s\\n' '{f}'\n",
         b = m.begin,
         e = m.end,
         f = m.env_end
