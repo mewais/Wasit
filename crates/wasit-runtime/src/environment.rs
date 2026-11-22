@@ -12,7 +12,8 @@
 //! 1. **captured** — Unix: `$SHELL -l -i -c '<print env between unique markers>'` with stdin
 //!    closed and a deadline (output outside the markers, i.e. rc-file chatter, is ignored; the
 //!    whole process group is killed at the deadline), falling back to `-l -c`, then to this
-//!    process's environment. Windows: this process's environment plus the variables only the
+//!    process's environment. csh/tcsh (where `-l` must be the only argument) run `-c`, which
+//!    reads `.cshrc`/`.tcshrc`, and source `/etc/csh.login` and `~/.login` themselves. Windows: this process's environment plus the variables only the
 //!    registry has (user over machine), and PATH = this process's entries, then registry
 //!    entries it lacks (a GUI's environment is a snapshot from login; installs since then are
 //!    only in the registry).
@@ -22,7 +23,8 @@
 //!    their own deadline; the environment they leave is taken (PATH entries and variables of
 //!    the capture they dropped are kept, after theirs). The lines reach the shell in a variable
 //!    and run with `eval` (POSIX shells and fish; another login shell, csh, …, runs them with
-//!    `/bin/sh`), so a syntax error is reported as their failure with the shell's message. Windows: PowerShell
+//!    `/bin/sh`); the shell parses them first (`-n`), so a syntax error is reported with the
+//!    shell's message and nothing runs. Windows: PowerShell
 //!    (`-NoProfile`) in the captured environment; its `$env:` changes are taken. A setup that
 //!    fails is reported ([`SetupReport`]); one that did not finish (deadline, ended the
 //!    shell) leaves the captured environment.
@@ -506,6 +508,38 @@ fn login_shell() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
+/// How a login shell is driven, by its file name.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    /// sh, bash, zsh, dash, ksh, …: `-l [-i] -c`, setup lines run by the shell itself.
+    Posix,
+    /// fish: like a POSIX shell on the command line; setup lines are fish.
+    Fish,
+    /// csh / tcsh: `-l` must be the only argument (tcsh refuses `-l -c`), so a `-c` shell
+    /// (which reads `.cshrc`/`.tcshrc`) sources the login files itself; setup lines run with
+    /// `/bin/sh`.
+    Csh,
+    /// nu, elvish, xonsh, pwsh: captured like a POSIX shell; setup lines run with `/bin/sh`.
+    Foreign,
+}
+
+#[cfg(unix)]
+impl Family {
+    fn of(shell: &std::path::Path) -> Family {
+        match shell
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+        {
+            "fish" => Family::Fish,
+            "csh" | "tcsh" => Family::Csh,
+            "nu" | "elvish" | "xonsh" | "pwsh" => Family::Foreign,
+            _ => Family::Posix,
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn capture_unix(
     opts: &CaptureOptions,
@@ -517,22 +551,34 @@ async fn capture_unix(
         format!("__WASIT_ENV_BEGIN_{n}__"),
         format!("__WASIT_ENV_END_{n}__"),
     );
-    // POSIX shells and fish alike; `env -0` keeps multi-line values (exported functions).
-    let script = format!(
-        "printf '\\n%s\\n' '{begin}'; env -0 2>/dev/null || env; printf '\\n%s\\n' '{end}'"
-    );
-    let attempts = [
-        (
-            EnvSource::LoginInteractiveShell,
-            vec!["-l".to_string(), "-i".into(), "-c".into(), script.clone()],
-            opts.interactive_deadline,
-        ),
-        (
+    // POSIX shells, fish and csh alike (no redirection: csh has no `2>`); `env -0` keeps
+    // multi-line values (exported functions), plain `env` where it has no `-0`.
+    let script = format!("printf '\\n%s\\n' '{begin}'; env -0 || env; printf '\\n%s\\n' '{end}'");
+    let attempts = match Family::of(&shell) {
+        Family::Csh => vec![(
             EnvSource::LoginShell,
-            vec!["-l".to_string(), "-c".into(), script.clone()],
+            vec![
+                "-c".to_string(),
+                format!(
+                    "if ( -r /etc/csh.login ) source /etc/csh.login; \
+                     if ( -r ~/.login ) source ~/.login; {script}"
+                ),
+            ],
             opts.login_deadline,
-        ),
-    ];
+        )],
+        _ => vec![
+            (
+                EnvSource::LoginInteractiveShell,
+                vec!["-l".to_string(), "-i".into(), "-c".into(), script.clone()],
+                opts.interactive_deadline,
+            ),
+            (
+                EnvSource::LoginShell,
+                vec!["-l".to_string(), "-c".into(), script.clone()],
+                opts.login_deadline,
+            ),
+        ],
+    };
     for (source, args, deadline) in attempts {
         let what = format!("{} {}", shell.display(), args[..args.len() - 2].join(" "));
         match run_bounded(&shell, &args, None, deadline).await {
@@ -722,18 +768,15 @@ async fn run_setup(
     setup: &str,
 ) -> (Option<Vec<(String, String)>>, SetupReport) {
     let login = opts.shell.clone().unwrap_or_else(login_shell);
-    let name = login
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let family = Family::of(&login);
     let mode: &[&str] = match captured.report.source {
         EnvSource::LoginInteractiveShell => &["-l", "-i"],
         EnvSource::LoginShell => &["-l"],
         _ => &[],
     };
     let m = Markers::new();
-    let (shell, flags, script) = match name.as_str() {
-        "fish" => (
+    let (shell, flags, script) = match family {
+        Family::Fish => (
             login.clone(),
             mode,
             format!(
@@ -747,15 +790,14 @@ async fn run_setup(
             ),
         ),
         // Not POSIX shells: the lines run with `/bin/sh` (in the captured environment).
-        "csh" | "tcsh" | "nu" | "elvish" | "xonsh" | "pwsh" => {
-            (PathBuf::from("/bin/sh"), &[][..], posix_script(&m))
-        }
-        _ => (login.clone(), mode, posix_script(&m)),
+        Family::Csh | Family::Foreign => (PathBuf::from("/bin/sh"), &[][..], posix_script(&m)),
+        Family::Posix => (login.clone(), mode, posix_script(&m)),
     };
-    // A POSIX shell first parses the lines without running them (`-n`): what a shell does with a
-    // syntax error inside `eval` differs between shells and versions (an interactive bash 3.2
-    // prints it and reports success), so it is never left to the run itself.
-    if name != "fish" {
+    // The shell first parses the lines without running them (`-n`; fish too): what a shell does
+    // with a syntax error inside `eval` differs between shells and versions (an interactive
+    // bash 3.2 prints it and reports success, fish runs nothing and says 123), so it is never
+    // left to the run itself.
+    {
         let check = ["-n".to_string(), "-c".to_string(), setup.to_string()];
         match run_bounded(&shell, &check, Some(&captured.vars), opts.setup_deadline).await {
             Ok(r) if r.code == Some(0) => {}

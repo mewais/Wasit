@@ -185,7 +185,7 @@ Homebrew, `module load`) are invisible. `wasit_runtime::environment::HostEnv` ca
 user's environment once per daemon start (before discovery and sessions) and on
 `host.environment.refresh`: `$SHELL -l -i -c` printing `env -0` between random markers (stdin
 closed, deadline 6 s, whole process group killed at the deadline, chatter outside the markers
-ignored) → `-l -c` (4 s) → the daemon's own environment, with reasons in `notes`; Windows: the
+ignored) → `-l -c` (4 s) → the daemon's own environment (csh/tcsh, where `-l` must stand alone: `-c`, which reads `.cshrc`/`.tcshrc`, sourcing `/etc/csh.login` and `~/.login`), with reasons in `notes`; Windows: the
 process's variables plus those only the registry has; PATH = the process's entries, then registry entries it lacks. The result is installed
 with `wasit_process::set_base_env`, so every process created through `wasit-process` (probes,
 shims → agent CLIs, git) starts from it; terminals apply it explicitly; discovery resolves
@@ -197,7 +197,7 @@ and sent with `host.environment.configure {config, revision}`, kept in memory by
 is applied on top, in this order: captured → **setup commands** (Unix: the login shell in the
 mode the capture succeeded with, so functions such as `module` exist, from the captured
 environment, stdin closed, output between markers, deadline 30 s, process group killed; fish
-runs them as fish, csh-family shells via `/bin/sh`; native Windows: PowerShell `-NoProfile`, its
+runs them as fish, csh-family shells via `/bin/sh` (lines are POSIX); the shell parses them with `-n` first, so a syntax error runs nothing; native Windows: PowerShell `-NoProfile`, its
 `$env:` changes taken; the environment the commands leave is taken, keeping the capture's PATH
 entries after theirs; a failure is reported as `SetupReport {ok, exit_code, error, output tail,
 applied}` and a setup that did not finish leaves the captured environment) → **variables** (set
