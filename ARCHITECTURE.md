@@ -307,7 +307,7 @@ A home directory may be shared by several machines (NFS and similar). Marsad's l
   `deny`; "always allow" chosen in a gate writes the edge policy. Standalone Wasl (no
   supervisor) falls back to MCP elicitation, else deny.
 - **Safety:** hop count and causation chain are propagated and enforced (cycle ⇒ rejected with a
-  clear error to the agent); per-task deadline; optional per-workstream budget.
+  clear error to the agent); per-task deadline (a delegated task inherits what is left of the deadline of the task its sender works on); optional per-workstream budget.
 - Workstream graph (Marsad) ⇒ peer table + edge policies pushed to the nodes. Agents spawned on
   demand appear as new nodes attached to their spawner.
 
