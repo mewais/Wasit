@@ -1288,7 +1288,7 @@ mod tests {
     fn a_gate_raised_while_starting_needs_you() {
         let mut live = Core::new(wasit_claude::descriptor(), &meta());
         let mut j = J::new();
-        let mut feed = |core: &mut Core, j: &mut J, kind, data: serde_json::Value| {
+        let feed = |core: &mut Core, j: &mut J, kind, data: serde_json::Value| {
             let rec = j.push(kind, data);
             core.apply(&rec)
         };
