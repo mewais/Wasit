@@ -63,6 +63,52 @@ pub fn servers_from_config(cfg: &str) -> BTreeMap<String, McpLaunch> {
     out
 }
 
+/// The local servers of an OpenCode/Kilo inline config (`{"mcp": {name: {"type": "local",
+/// "command": [cmd, args…], "environment": {…}}}}`).
+pub fn servers_from_opencode_config(cfg: &str) -> BTreeMap<String, McpLaunch> {
+    let v: Value = serde_json::from_str(cfg).unwrap_or(Value::Null);
+    let mut out = BTreeMap::new();
+    if let Some(m) = v.get("mcp").and_then(Value::as_object) {
+        for (name, s) in m {
+            if s.get("type").and_then(Value::as_str) != Some("local")
+                || s.get("enabled").and_then(Value::as_bool) == Some(false)
+            {
+                continue;
+            }
+            let cmd: Vec<String> = s
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some((command, args)) = cmd.split_first() else {
+                continue;
+            };
+            let env = s
+                .get("environment")
+                .and_then(Value::as_object)
+                .map(|e| {
+                    e.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.insert(
+                name.clone(),
+                McpLaunch {
+                    command: command.clone(),
+                    args: args.to_vec(),
+                    env,
+                },
+            );
+        }
+    }
+    out
+}
+
 /// Call `tool` with `arguments`. `Ok(text)` with the tool's text content, `Err(text)` when the
 /// tool reported an error (or the server could not be used).
 pub fn call(server: &McpLaunch, tool: &str, arguments: &Value) -> Result<String, String> {
@@ -197,5 +243,13 @@ mod tests {
         let m = servers_from_config(cfg);
         assert_eq!(m["wasl"].args, ["mcp", "--session", "s1"]);
         assert_eq!(m["wasl"].env, [("A".to_string(), "1".to_string())]);
+        // OpenCode / Kilo inline config: local servers only, disabled ones left out.
+        let oc = r#"{"mcp":{"marsad":{"type":"local","command":["/bin/m","ask-mcp","--session","s2"],"environment":{"B":"2"}},
+            "off":{"type":"local","command":["/bin/o"],"enabled":false},"web":{"type":"remote","url":"http://x"}}}"#;
+        let m = servers_from_opencode_config(oc);
+        assert_eq!(m.keys().collect::<Vec<_>>(), ["marsad"]);
+        assert_eq!(m["marsad"].command, "/bin/m");
+        assert_eq!(m["marsad"].args, ["ask-mcp", "--session", "s2"]);
+        assert_eq!(m["marsad"].env, [("B".to_string(), "2".to_string())]);
     }
 }

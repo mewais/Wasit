@@ -22,6 +22,15 @@ impl Flavor {
             Flavor::Kilo => "kilo",
         }
     }
+
+    /// The variable holding the inline JSON config the real CLI merges over its own (where
+    /// Wasit puts MCP servers).
+    fn config_env(self) -> &'static str {
+        match self {
+            Flavor::Opencode => "OPENCODE_CONFIG_CONTENT",
+            Flavor::Kilo => "KILO_CONFIG_CONTENT",
+        }
+    }
 }
 
 struct Sess {
@@ -569,6 +578,11 @@ fn selected_allows(body: &Value) -> bool {
 }
 
 impl Persona for Acp {
+    fn mcp_server(&self, name: &str) -> Option<crate::mcp::McpLaunch> {
+        let cfg = std::env::var(self.flavor.config_env()).ok()?;
+        crate::mcp::servers_from_opencode_config(&cfg).remove(name)
+    }
+
     fn handle_line(&mut self, io: &mut Io, line: &str, in_turn: bool) -> Incoming {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             return Incoming::Handled;
