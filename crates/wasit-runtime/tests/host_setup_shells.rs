@@ -31,8 +31,9 @@ fn real(name: &str) -> PathBuf {
         })
 }
 
-/// `<dir>/<name>/bin/<name>`: runs the real shell with HOME = `<dir>/<name>/home` (the file
-/// name is what the environment stage recognises the shell by). Returns (shell, home).
+/// `<dir>/<name>/bin/<name>`: runs the real shell with HOME = `<dir>/<name>/home` and no
+/// `XDG_CONFIG_HOME`/`ZDOTDIR` (CI runners set XDG_CONFIG_HOME, where fish would look instead);
+/// the file name is what the environment stage recognises the shell by. Returns (shell, home).
 fn shell(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     let home = dir.join(name).join("home");
     let bin = dir.join(name).join("bin");
@@ -42,7 +43,7 @@ fn shell(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     exe(
         &s,
         &format!(
-            "#!/bin/sh\nHOME='{}'; export HOME\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nHOME='{}'; export HOME\nunset XDG_CONFIG_HOME ZDOTDIR\nexec '{}' \"$@\"\n",
             home.display(),
             real(name).display()
         ),
