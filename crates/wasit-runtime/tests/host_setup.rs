@@ -264,7 +264,7 @@ async fn setup_variables_and_agent_commands() {
     let (r, _) = env.configure(cfg("if then fi ("), "m".into(), false).await;
     let s = r.setup.unwrap();
     assert!(!s.ok && s.error.is_some(), "{s:?}");
-    // A status where the shell reports one (bash 5: 2); bash 3.2 abandons the commands.
+    // Found by the syntax check before anything runs, whatever the shell version.
     assert_ne!(s.exit_code, Some(0), "{s:?}");
     assert!(s.output.contains("syntax error"), "{s:?}");
 

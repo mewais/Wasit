@@ -752,6 +752,36 @@ async fn run_setup(
         }
         _ => (login.clone(), mode, posix_script(&m)),
     };
+    // A POSIX shell first parses the lines without running them (`-n`): what a shell does with a
+    // syntax error inside `eval` differs between shells and versions (an interactive bash 3.2
+    // prints it and reports success), so it is never left to the run itself.
+    if name != "fish" {
+        let check = ["-n".to_string(), "-c".to_string(), setup.to_string()];
+        match run_bounded(&shell, &check, Some(&captured.vars), opts.setup_deadline).await {
+            Ok(r) if r.code == Some(0) => {}
+            Ok(r) => {
+                let mut rep = start_failed(
+                    format!("{} -n", shell.display()),
+                    if r.timed_out {
+                        format!(
+                            "did not finish within {} s",
+                            opts.setup_deadline.as_secs_f32()
+                        )
+                    } else {
+                        "the commands have a syntax error (see the output); nothing was run".into()
+                    },
+                );
+                rep.exit_code = r.code;
+                rep.output = tail_lines(
+                    &format!("{}\n{}", r.out, r.err),
+                    SETUP_TAIL_LINES,
+                    SETUP_TAIL_BYTES,
+                );
+                return (None, rep);
+            }
+            Err(e) => return (None, start_failed(shell.display().to_string(), e)),
+        }
+    }
     let mut args: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
     let what = std::iter::once(shell.display().to_string())
         .chain(args.iter().cloned())
