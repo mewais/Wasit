@@ -121,15 +121,12 @@ pub async fn capture(opts: &CaptureOptions) -> Captured {
     let attempt = capture_unix(opts, &mut notes).await;
     #[cfg(windows)]
     let attempt = capture_windows(opts, &mut notes).await;
+    let own: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
     let (source, shell, vars) = match attempt {
-        Some(x) => x,
-        None => (
-            EnvSource::Process,
-            None,
-            std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                .collect(),
-        ),
+        Some((src, sh, captured)) => (src, sh, merge_own(captured, &own)),
+        None => (EnvSource::Process, None, own),
     };
     let path = vars
         .iter()
@@ -157,6 +154,43 @@ pub async fn capture(opts: &CaptureOptions) -> Captured {
         },
         vars,
     }
+}
+
+/// Keep what the daemon could already reach: variables only this process has are added, and
+/// `PATH` entries only this process has are appended (a login profile that resets `PATH` must
+/// not hide a tool the session's own environment pointed at).
+pub fn merge_own(
+    mut captured: Vec<(String, String)>,
+    own: &[(String, String)],
+) -> Vec<(String, String)> {
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    for (k, v) in own {
+        if DROP.contains(&k.as_str()) {
+            continue;
+        }
+        match captured.iter_mut().find(|(ck, _)| same(ck, k)) {
+            None => captured.push((k.clone(), v.clone())),
+            Some((_, cv)) if same(k, "PATH") => {
+                let have: Vec<PathBuf> = std::env::split_paths(cv.as_str()).collect();
+                let extra: Vec<PathBuf> = std::env::split_paths(v)
+                    .filter(|p| !p.as_os_str().is_empty() && !have.contains(p))
+                    .collect();
+                if !extra.is_empty() {
+                    if let Ok(joined) = std::env::join_paths(have.into_iter().chain(extra)) {
+                        *cv = joined.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    captured
 }
 
 /// Parse `env -0` (NUL-separated) or plain `env` output (one per line; a line without `=`
@@ -388,6 +422,30 @@ $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_variables_and_path_entries_are_kept() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let captured = vec![
+            ("PATH".into(), format!("/a{sep}/b")),
+            ("X".into(), "1".into()),
+        ];
+        let own = vec![
+            ("PATH".into(), format!("/b{sep}/fake")),
+            ("X".into(), "0".into()),
+            ("ONLY".into(), "o".into()),
+            ("SHLVL".into(), "3".into()),
+        ];
+        let m = merge_own(captured, &own);
+        assert_eq!(
+            m,
+            vec![
+                ("PATH".into(), format!("/a{sep}/b{sep}/fake")),
+                ("X".into(), "1".into()),
+                ("ONLY".into(), "o".into()),
+            ]
+        );
+    }
 
     #[test]
     fn parses_nul_and_line_output() {
