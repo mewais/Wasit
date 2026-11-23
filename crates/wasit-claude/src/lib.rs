@@ -7,8 +7,15 @@
 //!
 //! Launch: `claude --print --input-format stream-json --output-format
 //! stream-json --verbose [--model M] [--permission-mode MODE]
-//! --permission-prompt-tool stdio [--continue | --resume ID] <rendered args>`.
-//! The prompt is never on the command line; it goes through stdin.
+//! --permission-prompt-tool stdio [--continue | --resume ID | --session-id ID] [--name N]
+//! <rendered args>`. The prompt is never on the command line; it goes through stdin.
+//!
+//! Conversation ids (verified with claude 2.1.293): `--session-id U` starts a fresh conversation
+//! under a caller-chosen UUID; it is refused ("Session ID U is already in use.", exit 1) once a
+//! transcript for U exists in the working directory's project, and a transcript exists only from
+//! the first prompt on. `--resume U` fails ("No conversation found with session ID: U", exit 1)
+//! before then. So the id is chosen at create, and a continue before the first prompt starts the
+//! conversation again under the same id instead of resuming it.
 
 #![forbid(unsafe_code)]
 
@@ -78,9 +85,18 @@ impl DriverDescriptor for ClaudeDescriptor {
         // Route permission prompts to us over the control protocol.
         argv.extend(["--permission-prompt-tool".to_string(), "stdio".to_string()]);
         match &spec.resume {
-            ResumeMode::Fresh => {}
+            ResumeMode::Fresh => {
+                if let Some(id) = &spec.native_session_id {
+                    argv.extend(["--session-id".to_string(), id.clone()]);
+                }
+            }
             ResumeMode::Continue => argv.push("--continue".to_string()),
             ResumeMode::Resume(id) => argv.extend(["--resume".to_string(), id.clone()]),
+        }
+        // Writes the title into claude's own transcript (`custom-title`, `agent-name`; verified
+        // with 2.1.293 in this mode).
+        if let Some(name) = spec.name.as_deref().filter(|n| !n.is_empty()) {
+            argv.extend(["--name".to_string(), name.to_string()]);
         }
         argv.extend(spec.extra_args.iter().cloned());
         argv
@@ -112,6 +128,34 @@ impl DriverDescriptor for ClaudeDescriptor {
     /// stream-json user message are seen by the model; other files are named by path.
     fn prompt_input(&self) -> PromptInput {
         PromptInput::images_and(FileInput::PathReference, 5 * 1024 * 1024)
+    }
+
+    /// A version 4 UUID (what `--session-id` requires: "Invalid session ID. Must be a valid
+    /// UUID.").
+    fn chosen_session_id(&self, entropy: [u8; 16]) -> Option<String> {
+        let mut b = entropy;
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        Some(format!(
+            "{}-{}-{}-{}-{}",
+            &h[0..8],
+            &h[8..12],
+            &h[12..16],
+            &h[16..20],
+            &h[20..32]
+        ))
+    }
+
+    /// `claude --resume <id>` in the session's directory. Claude's own picker (`/resume`,
+    /// `claude -c`) hides conversations that tools started (it filters on the entry point);
+    /// resuming by id is not filtered.
+    fn user_resume_argv(&self, native_session_id: &str) -> Option<Vec<String>> {
+        Some(vec![
+            self.default_binary().to_string(),
+            "--resume".to_string(),
+            native_session_id.to_string(),
+        ])
     }
 
     fn new_protocol(&self) -> Box<dyn Protocol> {

@@ -147,6 +147,20 @@ impl DriverDescriptor for AcpDescriptor {
         PromptInput::images_and(FileInput::Embedded, 5 * 1024 * 1024)
     }
 
+    /// Kilo (7.8.8, `kilo --help`): `-s, --session  session id to continue`. OpenCode (the
+    /// project Kilo forks) has no CLI installed where this was written, so no command is
+    /// claimed for it.
+    fn user_resume_argv(&self, native_session_id: &str) -> Option<Vec<String>> {
+        match self.flavor {
+            Flavor::Kilo => Some(vec![
+                self.default_binary().to_string(),
+                "--session".to_string(),
+                native_session_id.to_string(),
+            ]),
+            Flavor::OpenCode => None,
+        }
+    }
+
     fn new_protocol(&self) -> Box<dyn Protocol> {
         Box::new(AcpProtocol::new(self.flavor.client_name()))
     }

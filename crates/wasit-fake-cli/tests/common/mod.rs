@@ -58,15 +58,42 @@ mod tempdir {
     }
 }
 
+/// A scratch directory for tests that run several fake processes over the same "agent storage".
+pub fn scratch_dir() -> impl AsRef<std::path::Path> {
+    struct Scratch(tempdir::Dir);
+    impl AsRef<std::path::Path> for Scratch {
+        fn as_ref(&self) -> &std::path::Path {
+            &(self.0).0
+        }
+    }
+    Scratch(tempdir::Dir::new())
+}
+
 impl Fake {
+    /// A fake with storage of its own (nothing it stores is seen by another fake).
     pub fn spawn(args: &[&str], persona: Option<&str>, scenario: &Scenario) -> Fake {
+        Fake::spawn_in(args, persona, scenario, None, None)
+    }
+
+    /// A fake over the storage `state` (several fakes over one `state` are successive runs of
+    /// one CLI) running in `cwd`; `None`: its own.
+    pub fn spawn_in(
+        args: &[&str],
+        persona: Option<&str>,
+        scenario: &Scenario,
+        state: Option<&std::path::Path>,
+        cwd: Option<&std::path::Path>,
+    ) -> Fake {
         let dir = tempdir::Dir::new();
         let scenario_path = dir.0.join("scenario.json");
         scenario.write_to(&scenario_path).expect("write scenario");
+        let own_state = dir.0.join("state");
         let mut cmd = Command::new(BIN);
         cmd.args(args)
             .env("WASIT_FAKE_SCENARIO", &scenario_path)
-            .current_dir(&dir.0)
+            .env("WASIT_FAKE_STATE_DIR", state.unwrap_or(&own_state))
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .current_dir(cwd.unwrap_or(&dir.0))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

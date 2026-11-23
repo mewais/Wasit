@@ -464,3 +464,157 @@ async fn live_discovery() {
     }
     let _ = DriverId::new("claude");
 }
+
+/// The real claude's own storage for a scratch project: `<config dir>/projects/<cwd with every
+/// non-alphanumeric character as `-`>`. Only names and the fields `type`, `sessionId`,
+/// `customTitle` are ever read, in a directory this test made.
+fn claude_project_dir(cwd: &std::path::Path) -> std::path::PathBuf {
+    let config = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(c) => std::path::PathBuf::from(c),
+        None => std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".claude"),
+    };
+    let enc: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    config.join("projects").join(enc)
+}
+
+/// The conversation lifecycle against the real claude, through the whole runtime: created under
+/// an id the runtime chose and a name; ended before any prompt (nothing stored yet) and
+/// continued (the conversation starts under the same id: a resume would fail); a prompt; ended
+/// and continued by sending a prompt to the ended session (now it resumes). The conversation id
+/// never changes and claude's own storage holds one transcript for it, titled with the name.
+///
+/// Opt-in like the other live tests (`-- --ignored`); it sends two tiny prompts to haiku.
+#[tokio::test]
+#[ignore = "live: needs an authenticated claude CLI (two tiny haiku prompts)"]
+async fn live_claude_conversation_lifecycle() {
+    require("claude");
+    let d = TempDir::new();
+    let scratch = std::path::PathBuf::from("/tmp/marsad-lifecycle").join(format!(
+        "rt-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    let work = scratch.join("proj");
+    std::fs::create_dir_all(&work).unwrap();
+    let work = std::fs::canonicalize(&work).unwrap();
+    let project = claude_project_dir(&work);
+    let mgr = live_manager(d.path()).await;
+    let mut req = CreateSession::new("claude");
+    req.cwd = Some(work.to_string_lossy().into_owned());
+    req.model = Some("haiku".into());
+    req.name = Some("Lifecycle live test".into());
+    let id = mgr.create(req).await.unwrap().id;
+
+    // The conversation id is known from creation; the name is the display name at once.
+    let snap = mgr.snapshot(&id).unwrap();
+    let native = snap.native_session_id.clone().expect("an id from creation");
+    assert_eq!(native.len(), 36, "{native}");
+    assert_eq!(snap.display_name.as_deref(), Some("Lifecycle live test"));
+    assert_eq!(snap.cwd.as_deref(), Some(work.to_str().unwrap()));
+    let mut seen_ids = vec![native.clone()];
+    let idle = |g: u32| move |s: &SessionSnapshot| s.generation == g && s.phase == Phase::Idle;
+    let snap = wait_snapshot_within(&mgr, &id, "idle", LIVE, idle(1)).await;
+    seen_ids.push(snap.native_session_id.clone().unwrap());
+
+    // Ended before any prompt: claude stored nothing, and the session can still be continued.
+    let ended = stop(&mgr, &id).await;
+    assert!(ended.continuable, "{:?}", ended.not_continuable);
+    assert!(
+        !project.join(format!("{native}.jsonl")).exists(),
+        "claude stored a conversation nobody spoke in"
+    );
+    mgr.continue_session(&id).await.unwrap();
+    let snap = wait_snapshot_within(&mgr, &id, "generation 2 idle", LIVE, idle(2)).await;
+    seen_ids.push(snap.native_session_id.clone().unwrap());
+
+    // The first prompt stores the conversation, titled with the name.
+    let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
+    mgr.command(&id, Command::prompt("Reply with exactly the word: ok"))
+        .await
+        .unwrap();
+    let evs = tokio::time::timeout(LIVE, until(&mut s, is_turn_completed))
+        .await
+        .expect("first turn");
+    assert!(!assistant_text(&evs).is_empty(), "{evs:#?}");
+    let transcript = project.join(format!("{native}.jsonl"));
+    assert!(transcript.is_file(), "{}", transcript.display());
+    let (mut titles, mut ids) = (Vec::new(), std::collections::BTreeSet::new());
+    for line in std::fs::read_to_string(&transcript).unwrap().lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["type"] == "custom-title" {
+            titles.push(v["customTitle"].as_str().unwrap().to_string());
+        }
+        if let Some(sid) = v["sessionId"].as_str() {
+            ids.insert(sid.to_string());
+        }
+    }
+    assert!(
+        titles.iter().any(|t| t == "Lifecycle live test"),
+        "{titles:?}"
+    );
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert!(ids.contains(&native), "{ids:?}");
+    let snap = wait_snapshot_within(&mgr, &id, "idle again", LIVE, idle(2)).await;
+    seen_ids.push(snap.native_session_id.clone().unwrap());
+
+    // Ended after a turn: the user's own command for it is offered, and a prompt sent to the
+    // ended session continues it (resuming now) and is answered.
+    let ended = stop(&mgr, &id).await;
+    let cmd = ended.resume_command.clone().expect("a resume command");
+    assert_eq!(cmd.argv, ["claude", "--resume", native.as_str()]);
+    assert_eq!(cmd.cwd, work.to_str().unwrap());
+    let mut s = mgr.subscribe(&id, Some(ended.cursor)).await.unwrap();
+    mgr.command(&id, Command::prompt("Reply with exactly the word: ok"))
+        .await
+        .unwrap();
+    let evs = tokio::time::timeout(LIVE, until(&mut s, is_turn_completed))
+        .await
+        .expect("second turn");
+    assert!(!assistant_text(&evs).is_empty(), "{evs:#?}");
+    let snap = wait_snapshot_within(&mgr, &id, "generation 3 idle", LIVE, idle(3)).await;
+    seen_ids.push(snap.native_session_id.clone().unwrap());
+    let ended = stop(&mgr, &id).await;
+    seen_ids.push(ended.native_session_id.clone().unwrap());
+
+    // How each process was started, from the journal.
+    let history = mgr.history(&id, None, 2000).await.unwrap().events;
+    let argvs: Vec<Vec<String>> = history
+        .iter()
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::Spawned { argv, .. } => Some(argv.clone()),
+            _ => None,
+        })
+        .collect();
+    let has = |a: &[String], f: &str| a.windows(2).any(|w| w[0] == f && w[1] == native);
+    assert!(has(&argvs[0], "--session-id"), "{:?}", argvs[0]);
+    assert!(has(&argvs[1], "--session-id"), "{:?}", argvs[1]);
+    assert!(!argvs[1].contains(&"--resume".to_string()));
+    assert!(has(&argvs[2], "--resume"), "{:?}", argvs[2]);
+    assert!(argvs[0].iter().any(|a| a == "Lifecycle live test"));
+    assert!(argvs[1].iter().any(|a| a == "Lifecycle live test"));
+    assert!(!argvs[2].contains(&"--name".to_string()));
+
+    // One conversation: the id never changed, and the project holds exactly one transcript.
+    assert!(seen_ids.iter().all(|i| *i == native), "{seen_ids:?}");
+    let mut files: Vec<String> = std::fs::read_dir(&project)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+    eprintln!(
+        "[claude] conversation {native}; project {}; transcripts {files:?}; argv[1] {:?}; argv[2] {:?}",
+        project.display(),
+        argvs[1],
+        argvs[2]
+    );
+    assert_eq!(files, [format!("{native}.jsonl")]);
+}

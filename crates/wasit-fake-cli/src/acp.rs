@@ -33,6 +33,7 @@ impl Flavor {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Sess {
     id: String,
     cwd: String,
@@ -75,6 +76,18 @@ fn kind_of(tool: &str) -> &'static str {
 }
 
 impl Acp {
+    /// Where this flavor's sessions are kept (see [`crate::store`]).
+    fn store_kind(&self) -> String {
+        format!("acp-{}", self.flavor.persona())
+    }
+
+    /// Write the session down. The real agents (kilo 7.8.8, verified; opencode keeps every
+    /// session it opens too) store a session when it is created, before any prompt, so
+    /// `session/load` of it works in the next process.
+    fn store_session(&self, i: usize) {
+        crate::store::put(&self.store_kind(), &self.sessions[i].id, &self.sessions[i]);
+    }
+
     pub fn new(flavor: Flavor, scenario: &Scenario) -> Acp {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -106,6 +119,12 @@ impl Acp {
                 history: s.history.clone(),
             })
             .collect();
+        // Sessions earlier processes stored.
+        for s in crate::store::list::<Sess>(&a.store_kind()) {
+            if !a.sessions.iter().any(|x| x.id == s.id) {
+                a.sessions.push(s);
+            }
+        }
         a
     }
 
@@ -243,7 +262,9 @@ impl Acp {
             mode: self.default_mode(),
             history: vec![],
         });
-        self.sessions.len() - 1
+        let i = self.sessions.len() - 1;
+        self.store_session(i);
+        i
     }
 
     fn idx(&self, sid: &str) -> Option<usize> {
@@ -349,6 +370,7 @@ impl Acp {
                     self.sessions[n].model = model;
                     self.sessions[n].mode = mode;
                     self.sessions[n].history = history;
+                    self.store_session(n);
                     let nid = self.sessions[n].id.clone();
                     let r = json!({"sessionId": nid, "configOptions": self.config_options(&self.sessions[n])});
                     self.rpc_result(io, &id, r);
@@ -358,7 +380,8 @@ impl Acp {
             "session/close" => match self.idx(&sid) {
                 None => self.session_not_found(io, &id, &sid),
                 Some(i) => {
-                    self.sessions.remove(i);
+                    let gone = self.sessions.remove(i);
+                    crate::store::remove(&self.store_kind(), &gone.id);
                     self.rpc_result(io, &id, json!({}));
                 }
             },
@@ -467,6 +490,7 @@ impl Acp {
                         role: "user".into(),
                         text: text.clone(),
                     });
+                    self.store_session(i);
                     return Incoming::Prompt(text);
                 }
             },
@@ -785,6 +809,7 @@ impl Persona for Acp {
                         role: "assistant".into(),
                         text: stats.final_text.clone(),
                     });
+                    self.store_session(i);
                 }
             }
             Outcome::Interrupted => {

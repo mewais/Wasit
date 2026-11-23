@@ -412,8 +412,19 @@ async fn crash_mid_turn(driver: &str) {
     assert!(tail.iter().any(|l| l.contains("out of cheese")), "{tail:?}");
     assert!(snap.turn.is_none() && snap.pending_gates.is_empty());
     assert_eq!(snap.exit.as_ref().unwrap().code, Some(3));
-    let r = mgr.command(&id, Command::prompt("x")).await;
+    // Only a prompt carries on an ended session (it continues it first); every other command
+    // still says the session is not running.
+    let r = mgr.command(&id, Command::Interrupt).await;
     assert!(matches!(r, Err(CommandError::NotRunning { .. })), "{r:?}");
+    let r = mgr.command(&id, Command::prompt("x")).await;
+    assert!(
+        matches!(r, Ok(CommandOutcome::Queued) | Ok(CommandOutcome::Sent)),
+        "{r:?}"
+    );
+    wait_snapshot(&mgr, &id, "the prompt continued the session", |s| {
+        s.generation == 2
+    })
+    .await;
 }
 
 #[tokio::test]

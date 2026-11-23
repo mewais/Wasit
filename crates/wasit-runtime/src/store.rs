@@ -29,7 +29,7 @@ use wasit_core::{DriverDescriptor, DriverId, SpawnSpec, Unsupported};
 use wasit_shim::ShimSpec;
 
 use crate::config::RuntimeConfig;
-use crate::core::SessionMeta;
+use crate::core::{Conversation, SessionMeta};
 use crate::wire::{RuntimeError, SessionId};
 
 pub(crate) const SESSION_FILE: &str = "session.json";
@@ -48,6 +48,8 @@ pub(crate) struct SessionFile {
     pub cwd: Option<String>,
     /// Spec of the latest process generation (used when its `start` note is still missing).
     pub spec: SpawnSpec,
+    /// The agent's own id of the conversation: the one chosen or resumed at create, else the one
+    /// the agent reported.
     #[serde(default)]
     pub native_session_id: Option<String>,
     #[serde(default)]
@@ -73,8 +75,8 @@ impl SessionFile {
             created_at_ms,
             labels,
             cwd: spec.cwd.clone(),
+            native_session_id: spec.known_native_id().map(str::to_string),
             spec,
-            native_session_id: None,
             unsupported,
             display_name: None,
         }
@@ -89,6 +91,7 @@ impl SessionFile {
             created_at_ms: self.created_at_ms,
             display_name: self.display_name.clone(),
             command: self.spec.bin.clone(),
+            conversation: Conversation::of_spec(&self.spec),
         }
     }
 }

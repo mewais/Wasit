@@ -619,6 +619,64 @@ fn argv_shapes() {
     assert!(argv.contains(&"--continue".to_string()));
 }
 
+/// A caller-chosen conversation id and a name go to the CLI only the way the real one takes them
+/// (claude 2.1.293): `--session-id` starts a fresh conversation under the id, never together
+/// with `--resume`; `--name` writes the title into claude's own transcript.
+#[test]
+fn argv_passes_a_chosen_id_and_a_name() {
+    let d = ClaudeDescriptor;
+    let id = "3b241101-e2bb-4255-8caf-4136c566a962";
+    let argv = d.argv(&SpawnSpec {
+        native_session_id: Some(id.into()),
+        name: Some("My session".into()),
+        ..SpawnSpec::default()
+    });
+    assert!(argv
+        .windows(2)
+        .any(|w| w[0] == "--session-id" && w[1] == id));
+    assert!(argv
+        .windows(2)
+        .any(|w| w[0] == "--name" && w[1] == "My session"));
+    // Resuming: the conversation has its id; a chosen id is not passed on top of it.
+    let argv = d.argv(&SpawnSpec {
+        resume: ResumeMode::Resume(id.into()),
+        native_session_id: Some(id.into()),
+        ..SpawnSpec::default()
+    });
+    assert!(argv.windows(2).any(|w| w[0] == "--resume" && w[1] == id));
+    assert!(!argv.contains(&"--session-id".to_string()));
+    assert!(!argv.contains(&"--name".to_string()));
+    // Nothing chosen, nothing named: the argv of a session of an older build.
+    let argv = d.argv(&SpawnSpec::default());
+    assert!(!argv.contains(&"--session-id".to_string()));
+    assert!(!argv.contains(&"--name".to_string()));
+}
+
+/// The id the runtime asks for is a version 4 UUID, which `--session-id` requires.
+#[test]
+fn chosen_ids_are_version_4_uuids_of_the_entropy_given() {
+    let d = ClaudeDescriptor;
+    let id = d.chosen_session_id([0xff; 16]).unwrap();
+    assert_eq!(id, "ffffffff-ffff-4fff-bfff-ffffffffffff");
+    let id = d.chosen_session_id([0; 16]).unwrap();
+    assert_eq!(id, "00000000-0000-4000-8000-000000000000");
+    let a = d.chosen_session_id([1; 16]);
+    assert_eq!(a, d.chosen_session_id([1; 16]));
+    assert_ne!(a, d.chosen_session_id([2; 16]));
+}
+
+#[test]
+fn the_users_own_command_resumes_by_id() {
+    assert_eq!(
+        ClaudeDescriptor.user_resume_argv("abc").unwrap(),
+        ["claude", "--resume", "abc"]
+    );
+    assert_eq!(
+        ClaudeDescriptor.saves_conversation(),
+        wasit_core::SavesConversation::WhenReported
+    );
+}
+
 #[test]
 fn render_config_all_items() {
     let d = ClaudeDescriptor;

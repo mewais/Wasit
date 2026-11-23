@@ -151,6 +151,18 @@ impl RuntimeService {
         &self.manager
     }
 
+    /// The project folder a discovery request names, as a session started there would see it
+    /// ([`crate::cwd`]): the inventory a client lists resumable sessions from and the session it
+    /// launches then agree on the folder. One that cannot be resolved is passed on as given:
+    /// discovery reports why in the inventory's `error`.
+    async fn project(&self, given: Option<String>) -> Option<String> {
+        let home = self.manager.config().home.as_deref();
+        match given {
+            Some(p) => Some(crate::cwd::resolve(&p, home).await.unwrap_or(p)),
+            None => None,
+        }
+    }
+
     pub fn discovery(&self) -> &Discovery {
         &self.discovery
     }
@@ -194,7 +206,8 @@ impl Service for RuntimeService {
                 } else {
                     params(p)?
                 };
-                ok(self.discovery.inventory(r.project.as_deref()))
+                let project = self.project(r.project).await;
+                ok(self.discovery.inventory(project.as_deref()))
             }
             methods::DRIVERS_REFRESH => {
                 let r: RefreshRequest = if p.is_null() {
@@ -202,8 +215,9 @@ impl Service for RuntimeService {
                 } else {
                     params(p)?
                 };
+                let project = self.project(r.project).await;
                 self.discovery
-                    .refresh(r.driver.as_ref(), r.project.as_deref())
+                    .refresh(r.driver.as_ref(), project.as_deref())
                     .map_err(|e| runtime_err(RuntimeError::UnknownDriver(e)))?;
                 ok(Ack {})
             }
@@ -301,9 +315,10 @@ impl Service for RuntimeService {
             } else {
                 params(p)?
             };
+            let project = self.project(r.project).await;
             let s = self
                 .discovery
-                .subscribe(r.project, from.as_ref().map(Cursor::as_str));
+                .subscribe(project, from.as_ref().map(Cursor::as_str));
             return Ok(s
                 .map(|item| match item {
                     Ok((c, inv)) => serde_json::to_value(inv)

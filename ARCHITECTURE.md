@@ -171,6 +171,29 @@ re-adopt on daemon start (scan session dirs, attach to live shims, replay finish
 stop, delete. It persists `session.json` (spec, driver id, native session id, labels) beside the
 journal.
 
+Lifecycle facts, each decided in one place on the session's host:
+
+- **Working directory.** `wasit_runtime::cwd` normalises the project folder once, where the
+  session is created: a leading `~` is the home of the user the daemon runs as (`HOME`,
+  `USERPROFILE` on Windows), the result must be absolute, and it is resolved to the canonical
+  directory the agent process sees (refused, naming the path as given, if it is not one). The
+  spawn, `session.json`, the snapshot and discovery of resumable sessions use that one value.
+- **Conversation id.** The agent's own conversation id is known from creation when the driver can
+  take a caller-chosen one (`DriverDescriptor::chosen_session_id`: the runtime draws the entropy
+  and journals the id with the `start` note), or the session resumes one. When the agent's storage
+  holds a conversation is the driver's fact too (`saves_conversation`): the runtime resumes a
+  conversation that is stored, starts one that is not stored yet fresh under its chosen id, and
+  never tries one and falls back to the other.
+- **`continuable`.** The snapshot says whether `sessions.continue` can start a new generation,
+  and when not, why (`not_continuable`); only the runtime derives it (core, from the driver's
+  capabilities and the replayed state). `resume_command` is the argv (and directory) with which
+  the user opens the conversation in their own CLI, when the driver has one.
+- **A prompt (or slash command) to an ended session** continues it and then delivers it, as one
+  operation owned by the session actor (`continuation`): the prompt waits until the new shim is
+  attached, is then journaled as an ordinary `command` note of the new generation, and replays
+  as one. If the continue cannot start, nothing is journaled and the sender gets
+  `CommandError::ContinueFailed`. Every way out of a continue answers everybody who waited for it.
+
 ### 3.4 Images and files
 
 - **One model** (`wasit-core::content`): `ContentPart` = text | image {mime, source, dims} |

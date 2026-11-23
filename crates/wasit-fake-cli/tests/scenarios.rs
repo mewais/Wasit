@@ -688,22 +688,320 @@ fn claude_control_requests() {
     );
 }
 
-#[test]
-fn claude_resume_argument_sets_session_id() {
-    let mut fake = Fake::spawn(
-        &[CLAUDE_ARGV.as_slice(), &["--resume", "abc-123"]].concat(),
+// ── conversations outlive the process (what each real CLI stores, and when) ──────────────────
+
+const CONVERSATION: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
+
+/// One run of the claude persona over `state`, in `cwd`: handshake, then `prompt` when given
+/// (run to its result), then stdin closes. Returns the fake (for what it wrote and how it ended).
+fn claude_run(
+    state: &std::path::Path,
+    cwd: &std::path::Path,
+    extra: &[&str],
+    prompt: Option<&str>,
+) -> Fake {
+    let mut fake = Fake::spawn_in(
+        &[CLAUDE_ARGV.as_slice(), extra].concat(),
         Some("claude"),
         &Scenario::default(),
+        Some(state),
+        Some(cwd),
     );
-    fake.send(
-        &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}),
+    fake.send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
+    fake.recv_until(|m| m["type"] == "control_response");
+    if let Some(p) = prompt {
+        fake.send(
+            &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":p}]}}),
+        );
+        fake.recv_until(|m| m["type"] == "result");
+    }
+    fake.close_stdin();
+    fake
+}
+
+fn transcript(state: &std::path::Path, cwd: &std::path::Path, id: &str) -> std::path::PathBuf {
+    let project: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    state
+        .join("claude-config/projects")
+        .join(project)
+        .join(format!("{id}.jsonl"))
+}
+
+fn exit_code(f: &mut Fake) -> Option<i32> {
+    f.wait_exit().and_then(|s| s.code())
+}
+
+/// Real claude 2.1.293: a conversation is stored from its first prompt on; `--resume` finds it
+/// (from any directory) and fails for one that was never stored; `--session-id` starts a
+/// conversation under a UUID and is refused once one is stored for it in the directory's project.
+#[test]
+fn claude_stores_a_conversation_with_its_first_prompt_and_resume_needs_it() {
+    let (state, cwd) = (common::scratch_dir(), common::scratch_dir());
+    let (state, cwd) = (state.as_ref(), cwd.as_ref());
+    let other = common::scratch_dir();
+
+    // Started under a chosen id and closed before any prompt: nothing is stored, so resuming
+    // it fails the way the real CLI fails, and starting it again under the same id works.
+    let mut f = claude_run(state, cwd, &["--session-id", CONVERSATION], None);
+    assert_eq!(exit_code(&mut f), Some(0));
+    assert!(!transcript(state, cwd, CONVERSATION).exists());
+    let mut f = Fake::spawn_in(
+        &[CLAUDE_ARGV.as_slice(), &["--resume", CONVERSATION]].concat(),
+        Some("claude"),
+        &Scenario::default(),
+        Some(state),
+        Some(cwd),
     );
-    let init = fake
-        .recv_until(|m| m["type"] == "system" && m["subtype"] == "init")
-        .pop()
+    f.send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
+    // The real CLI answers with an error result for the requested id, never with the
+    // initialize response; and says so on stderr.
+    let line = f.recv_until(|m| m["type"] == "result").pop().unwrap();
+    assert!(f.seen.iter().all(|m| m["type"] != "control_response"));
+    assert_eq!(line["subtype"], "error_during_execution");
+    assert_eq!(line["is_error"], true);
+    assert_eq!(line["session_id"], CONVERSATION);
+    assert_eq!(exit_code(&mut f), Some(1));
+    assert_eq!(
+        f.stderr_to_end().trim(),
+        format!("No conversation found with session ID: {CONVERSATION}")
+    );
+
+    // The first prompt stores it, under the chosen id; the init line reports the same id.
+    let mut f = claude_run(state, cwd, &["--session-id", CONVERSATION], Some("hello"));
+    assert_eq!(exit_code(&mut f), Some(0));
+    let init = f
+        .seen
+        .iter()
+        .find(|m| m["type"] == "system" && m["subtype"] == "init")
+        .expect("init");
+    assert_eq!(init["session_id"], CONVERSATION);
+    assert!(transcript(state, cwd, CONVERSATION).is_file());
+
+    // Resuming works, also from another directory (claude finds the conversation in whatever
+    // project it is stored), and keeps the id.
+    for dir in [cwd, other.as_ref()] {
+        let mut f = claude_run(state, dir, &["--resume", CONVERSATION], Some("again"));
+        assert_eq!(exit_code(&mut f), Some(0));
+        let init = f
+            .seen
+            .iter()
+            .find(|m| m["type"] == "system" && m["subtype"] == "init")
+            .expect("init");
+        assert_eq!(init["session_id"], CONVERSATION);
+    }
+
+    // A stored id cannot be started again in the same project (the real message and exit
+    // status), but can in another one.
+    let mut f = Fake::spawn_in(
+        &[CLAUDE_ARGV.as_slice(), &["--session-id", CONVERSATION]].concat(),
+        Some("claude"),
+        &Scenario::default(),
+        Some(state),
+        Some(cwd),
+    );
+    assert_eq!(exit_code(&mut f), Some(1));
+    assert_eq!(
+        f.stderr_to_end().trim(),
+        format!("Error: Session ID {CONVERSATION} is already in use.")
+    );
+    let mut f = claude_run(
+        state,
+        common::scratch_dir().as_ref(),
+        &["--session-id", CONVERSATION],
+        None,
+    );
+    assert_eq!(exit_code(&mut f), Some(0));
+
+    // An id that is not a UUID is refused.
+    let mut f = Fake::spawn_in(
+        &[CLAUDE_ARGV.as_slice(), &["--session-id", "not-a-uuid"]].concat(),
+        Some("claude"),
+        &Scenario::default(),
+        Some(state),
+        Some(cwd),
+    );
+    assert_eq!(exit_code(&mut f), Some(1));
+    assert_eq!(
+        f.stderr_to_end().trim(),
+        "Error: Invalid session ID. Must be a valid UUID."
+    );
+}
+
+/// Real claude 2.1.293: `--name` is announced (`session_title_changed`) before the initialize
+/// response, even before a prompt; the title records reach the transcript with the first prompt
+/// (a conversation closed before it leaves no file); resuming announces the stored title again.
+#[test]
+fn claude_names_its_conversation_and_stores_the_title_with_the_first_prompt() {
+    let (state, cwd) = (common::scratch_dir(), common::scratch_dir());
+    let (state, cwd) = (state.as_ref(), cwd.as_ref());
+    let mut f = Fake::spawn_in(
+        &[
+            CLAUDE_ARGV.as_slice(),
+            &["--session-id", CONVERSATION, "--name", "My title"],
+        ]
+        .concat(),
+        Some("claude"),
+        &Scenario::default(),
+        Some(state),
+        Some(cwd),
+    );
+    f.send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
+    let seen = f.recv_until(|m| m["type"] == "control_response");
+    let title = seen
+        .iter()
+        .position(|m| m["subtype"] == "session_title_changed")
+        .expect("the title is announced before the initialize response");
+    assert_eq!(seen[title]["title"], "My title");
+    assert_eq!(seen[title]["session_id"], CONVERSATION);
+    f.close_stdin();
+    assert_eq!(exit_code(&mut f), Some(0));
+    assert!(!transcript(state, cwd, CONVERSATION).exists());
+
+    let mut f = claude_run(
+        state,
+        cwd,
+        &["--session-id", CONVERSATION, "--name", "My title"],
+        Some("hello"),
+    );
+    assert_eq!(exit_code(&mut f), Some(0));
+    let text = std::fs::read_to_string(transcript(state, cwd, CONVERSATION)).unwrap();
+    let types: Vec<String> = text
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(&types[..2], ["custom-title", "agent-name"]);
+    assert!(types.contains(&"user".to_string()) && types.contains(&"assistant".to_string()));
+
+    let f = claude_run(state, cwd, &["--resume", CONVERSATION], None);
+    assert!(
+        f.seen
+            .iter()
+            .any(|m| m["subtype"] == "session_title_changed" && m["title"] == "My title"),
+        "{:#?}",
+        f.seen
+    );
+}
+
+/// Real claude 2.1.293 (E6 of the lifecycle investigation): `--continue` in a directory with no
+/// conversation starts a new one without a word; with one, it continues the newest.
+#[test]
+fn claude_continue_takes_the_newest_conversation_of_the_directory_or_starts_a_new_one() {
+    let (state, cwd) = (common::scratch_dir(), common::scratch_dir());
+    let (state, cwd) = (state.as_ref(), cwd.as_ref());
+    let f = claude_run(state, cwd, &["--continue"], Some("first"));
+    let fresh = f
+        .seen
+        .iter()
+        .find(|m| m["type"] == "system" && m["subtype"] == "init")
+        .unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(transcript(state, cwd, &fresh).is_file());
+    let f = claude_run(state, cwd, &["--continue"], Some("second"));
+    let again = f
+        .seen
+        .iter()
+        .find(|m| m["type"] == "system" && m["subtype"] == "init")
+        .unwrap()["session_id"]
+        .as_str()
         .unwrap();
-    assert_eq!(init["session_id"], "abc-123");
-    assert_eq!(init["model"], "claude-haiku-5-5");
+    assert_eq!(again, fresh);
+}
+
+/// Real codex-cli 0.161.0: `thread/start` reports an id at once, but no rollout is written until
+/// a turn runs; `thread/resume` of a thread without one fails "no rollout found for thread id".
+#[test]
+fn codex_stores_a_thread_with_its_first_turn() {
+    let state = common::scratch_dir();
+    let state = state.as_ref();
+    let open = |method: &str, params: Value| -> (Fake, Value) {
+        let mut f = Fake::spawn_in(
+            &["app-server", "--stdio"],
+            Some("codex"),
+            &Scenario::default(),
+            Some(state),
+            None,
+        );
+        f.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"t","version":"0"},"capabilities":{"experimentalApi":true}}}));
+        f.recv_until(|m| m["id"] == 1);
+        f.send(&json!({"jsonrpc":"2.0","method":"initialized"}));
+        f.send(&json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}));
+        let r = f
+            .recv_until(|m| m["id"] == 2 && m["method"].is_null())
+            .pop()
+            .unwrap();
+        (f, r)
+    };
+    let (mut f, r) = open(
+        "thread/start",
+        json!({"cwd":"/tmp","approvalPolicy":"untrusted"}),
+    );
+    let thread = r["result"]["thread"]["id"].as_str().unwrap().to_string();
+    f.close_stdin();
+    // Never had a turn: the next process cannot resume it.
+    let (_f, r) = open("thread/resume", json!({"threadId": thread, "cwd":"/tmp"}));
+    assert_eq!(r["error"]["code"], -32600);
+    assert_eq!(
+        r["error"]["message"],
+        format!("no rollout found for thread id {thread}")
+    );
+    // After a turn it can.
+    let (mut f, r) = open(
+        "thread/start",
+        json!({"cwd":"/tmp","approvalPolicy":"untrusted"}),
+    );
+    let thread = r["result"]["thread"]["id"].as_str().unwrap().to_string();
+    f.send(&json!({"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":thread,"input":[{"type":"text","text":"hi"}]}}));
+    f.recv_until(|m| m["method"] == "turn/completed");
+    f.close_stdin();
+    let (_f, r) = open("thread/resume", json!({"threadId": thread, "cwd":"/tmp"}));
+    assert_eq!(r["result"]["thread"]["id"], thread, "{r}");
+}
+
+/// Real kilo 7.8.8 (ACP): a session is stored when it is created, before any prompt, and
+/// `session/load` of it works in the next process.
+#[test]
+fn acp_stores_a_session_when_it_is_created() {
+    for persona in ["opencode", "kilo"] {
+        let state = common::scratch_dir();
+        let state = state.as_ref();
+        let open = |method: &str, params: Value| -> (Fake, Value) {
+            let mut f = Fake::spawn_in(
+                &["acp"],
+                Some(persona),
+                &Scenario::default(),
+                Some(state),
+                None,
+            );
+            f.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}));
+            f.recv_until(|m| m["id"] == 1);
+            f.send(&json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}));
+            let r = f
+                .recv_until(|m| m["id"] == 2 && m["method"].is_null())
+                .pop()
+                .unwrap();
+            (f, r)
+        };
+        let (mut f, r) = open("session/new", json!({"cwd":"/tmp","mcpServers":[]}));
+        let session = r["result"]["sessionId"].as_str().unwrap().to_string();
+        f.close_stdin();
+        let (_f, r) = open(
+            "session/load",
+            json!({"sessionId": session, "cwd":"/tmp","mcpServers":[]}),
+        );
+        assert!(r["error"].is_null(), "{persona}: {r}");
+        assert!(r["result"]["configOptions"].is_array(), "{persona}: {r}");
+    }
 }
 
 #[test]

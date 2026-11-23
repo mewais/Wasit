@@ -24,6 +24,10 @@ pub struct ClaudeArgs {
     pub permission_mode: Option<String>,
     pub resume: Option<String>,
     pub session_id: Option<String>,
+    /// `--continue`: the most recent conversation of the working directory.
+    pub continue_latest: bool,
+    /// `--name`: the conversation's title.
+    pub name: Option<String>,
     pub partial_messages: bool,
     pub mcp_config: Option<String>,
 }
@@ -39,6 +43,12 @@ impl ClaudeArgs {
                 "--permission-mode" => a.permission_mode = next,
                 "--resume" | "-r" => a.resume = next,
                 "--session-id" => a.session_id = next,
+                "--name" | "-n" => a.name = next,
+                "--continue" | "-c" => {
+                    a.continue_latest = true;
+                    i += 1;
+                    continue;
+                }
                 "--mcp-config" => a.mcp_config = next,
                 "--include-partial-messages" => a.partial_messages = true,
                 _ => {
@@ -52,8 +62,22 @@ impl ClaudeArgs {
     }
 }
 
+/// Why the CLI refuses to start (what the real one prints, then exits 1).
+#[derive(Debug, Clone)]
+pub struct Refusal {
+    /// The line it writes to stdout first, when it writes one.
+    pub stdout: Option<Value>,
+    pub stderr: String,
+}
+
 pub struct Claude {
     session_id: String,
+    /// The conversation's title, announced before the first reply (`session_title_changed`).
+    title: Option<String>,
+    /// `<config dir>/projects/<project>`: where this working directory's transcripts live.
+    project_dir: std::path::PathBuf,
+    /// The conversation was started with `--name` and its title is not in a transcript yet.
+    name_unsaved: Option<String>,
     model: String,
     mode: String,
     cwd: String,
@@ -89,8 +113,134 @@ fn ty(m: &Value, t: &str) -> bool {
     m["type"] == t
 }
 
+/// Claude's per-project transcript directory name: every non-alphanumeric character of the
+/// absolute working directory becomes `-`.
+fn encode_project_dir(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Where the real CLI keeps its state: `CLAUDE_CONFIG_DIR`, else (the fake never touches the
+/// real home) `<state>/claude-config`.
+fn config_dir() -> std::path::PathBuf {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(d) => d.into(),
+        None => crate::store::state_dir().join("claude-config"),
+    }
+}
+
+fn is_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The transcript of conversation `id`, in any project (`--resume` finds a conversation from
+/// whatever directory it is run in).
+fn find_transcript(id: &str) -> Option<std::path::PathBuf> {
+    let projects = config_dir().join("projects");
+    std::fs::read_dir(projects)
+        .ok()?
+        .flatten()
+        .map(|d| d.path().join(format!("{id}.jsonl")))
+        .find(|p| p.is_file())
+}
+
+/// The newest conversation of a project directory (`--continue`).
+fn latest_in(project_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_dir(project_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .max()
+        .and_then(|(_, p)| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+}
+
+/// The last `custom-title` of a transcript.
+fn title_of(transcript: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(transcript).ok()?;
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["type"] == "custom-title")
+        .filter_map(|v| v["customTitle"].as_str().map(str::to_string))
+        .next_back()
+}
+
 impl Claude {
-    pub fn new(args: &ClaudeArgs, scenario: &Scenario) -> Claude {
+    /// Start as the real CLI does (verified with claude 2.1.293, see the README): `--session-id`
+    /// starts a conversation under a UUID unless one is stored for it in this directory's
+    /// project ("Session ID … is already in use."); `--resume` finds a stored conversation in
+    /// any project and fails ("No conversation found with session ID: …") for one that was
+    /// never stored; a conversation is stored from its first prompt on, not before; `--name`
+    /// is the conversation's title, announced with `session_title_changed`.
+    pub fn start(args: &ClaudeArgs, scenario: &Scenario) -> Result<Claude, Refusal> {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "/".into());
+        let project_dir = config_dir().join("projects").join(encode_project_dir(&cwd));
+        let mut title = args.name.clone();
+        let mut resumed = args.resume.clone();
+        if resumed.is_none() && args.continue_latest && args.session_id.is_none() {
+            // No conversation to continue: a fresh one, silently.
+            resumed = latest_in(&project_dir);
+        }
+        if let Some(id) = &resumed {
+            let stored = find_transcript(id);
+            let known = scenario.sessions.iter().any(|s| &s.id == id);
+            if stored.is_none() && !known {
+                let msg = format!("No conversation found with session ID: {id}");
+                return Err(Refusal {
+                    stdout: Some(json!({
+                        "type":"result","subtype":"error_during_execution","duration_ms":0,
+                        "duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,
+                        "session_id":id,"total_cost_usd":0,
+                        "usage":{"input_tokens":0,"output_tokens":0,
+                                 "cache_creation_input_tokens":0,"cache_read_input_tokens":0},
+                        "modelUsage":{},"permission_denials":[],"uuid":uuid(),
+                        "errors":[msg],"result_index":0})),
+                    stderr: msg,
+                });
+            }
+            if title.is_none() {
+                title = stored.as_deref().and_then(title_of);
+            }
+        }
+        if resumed.is_none() {
+            if let Some(id) = &args.session_id {
+                if !is_uuid(id) {
+                    return Err(Refusal {
+                        stdout: None,
+                        stderr: "Error: Invalid session ID. Must be a valid UUID.".into(),
+                    });
+                }
+                if project_dir.join(format!("{id}.jsonl")).is_file() {
+                    return Err(Refusal {
+                        stdout: None,
+                        stderr: format!("Error: Session ID {id} is already in use."),
+                    });
+                }
+            }
+        }
+        let name_unsaved = (resumed.is_none()).then(|| args.name.clone()).flatten();
+        let mut c = Claude::new(
+            &ClaudeArgs {
+                resume: resumed,
+                ..args.clone()
+            },
+            scenario,
+        );
+        c.title = title;
+        c.project_dir = project_dir;
+        c.name_unsaved = name_unsaved;
+        Ok(c)
+    }
+
+    fn new(args: &ClaudeArgs, scenario: &Scenario) -> Claude {
         let session_id = args
             .resume
             .clone()
@@ -112,6 +262,9 @@ impl Claude {
             .unwrap_or_else(|| "claude-fake-1".into());
         Claude {
             session_id,
+            title: None,
+            project_dir: std::path::PathBuf::new(),
+            name_unsaved: None,
             model,
             mode: args
                 .permission_mode
@@ -150,6 +303,44 @@ impl Claude {
         set(&mut m, "state", json!(state));
         let m = self.envelope(m);
         io.send(&m);
+    }
+
+    /// Append records to this conversation's transcript, creating it (with the title records
+    /// first, as the real CLI writes them for `--name`) when it is the first write: the
+    /// conversation exists in storage from its first prompt on, not before.
+    fn store_records(&mut self, records: Vec<Value>) {
+        use std::io::Write;
+        let mut lines: Vec<Value> = Vec::new();
+        if let Some(name) = self.name_unsaved.take() {
+            lines.push(
+                json!({"type":"custom-title","customTitle":name,"sessionId":self.session_id}),
+            );
+            lines.push(json!({"type":"agent-name","agentName":name,"sessionId":self.session_id}));
+        }
+        lines.extend(records);
+        let path = self.project_dir.join(format!("{}.jsonl", self.session_id));
+        let written = std::fs::create_dir_all(&self.project_dir).and_then(|_| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            for l in &lines {
+                writeln!(f, "{l}")?;
+            }
+            Ok(())
+        });
+        // A transcript that cannot be written is a conversation the next process cannot resume:
+        // say so.
+        if let Err(e) = written {
+            eprintln!("wasit-fake-cli: cannot write {}: {e}", path.display());
+        }
+    }
+
+    /// A user or assistant record of the transcript.
+    fn transcript_message(&self, role: &str, text: &str) -> Value {
+        json!({"type":role,"uuid":uuid(),"sessionId":self.session_id,"cwd":self.cwd,
+               "entrypoint":"sdk-cli","version":self.version,"timestamp":iso_now(),
+               "message":{"role":role,"content":[{"type":"text","text":text}]}})
     }
 
     fn envelope(&self, mut m: Value) -> Value {
@@ -482,6 +673,13 @@ impl Persona for Claude {
                 let req = &v["request"];
                 match req["subtype"].as_str().unwrap_or("") {
                     "initialize" => {
+                        if let Some(title) = self.title.take() {
+                            // A named or resumed-with-a-title conversation announces it first.
+                            let m = json!({"type":"system","subtype":"session_title_changed",
+                                           "title":title});
+                            let m = self.envelope(m);
+                            io.send(&m);
+                        }
                         for t in ["active_goal", "autocompact_state"] {
                             let m = first_where("simple", |m| ty(m, t));
                             let m = self.envelope(m);
@@ -589,7 +787,9 @@ impl Persona for Claude {
         }
     }
 
-    fn turn_begin(&mut self, io: &mut Io, _prompt: &str, id: Option<&str>, _stats: &mut TurnStats) {
+    fn turn_begin(&mut self, io: &mut Io, prompt: &str, id: Option<&str>, _stats: &mut TurnStats) {
+        let user = self.transcript_message("user", prompt);
+        self.store_records(vec![user]);
         self.current = id.map(str::to_string);
         if let Some(uuid) = id {
             self.waiting.retain(|w| w != uuid);
@@ -858,6 +1058,10 @@ impl Persona for Claude {
                 let a = self.envelope(a);
                 io.send(&a);
             }
+        }
+        if matches!(outcome, Outcome::Completed) {
+            let assistant = self.transcript_message("assistant", &stats.final_text);
+            self.store_records(vec![assistant]);
         }
         let mut r = self.result_message(outcome, stats);
         if let Some(uuid) = &self.current {

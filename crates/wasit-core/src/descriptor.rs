@@ -53,6 +53,23 @@ pub enum BusyPrompt {
     QueuedByProtocol,
 }
 
+/// When a CLI's own storage holds a conversation, relative to what its protocol reports. The
+/// runtime resumes a conversation only once it is saved; before that a conversation cannot be
+/// resumed (and, with a caller-chosen id, is started again under the same id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SavesConversation {
+    /// By the time the CLI reports the conversation's id it holds the conversation (claude
+    /// reports its session id with the first turn; ACP agents write the session when they create
+    /// it).
+    #[default]
+    WhenReported,
+    /// The CLI reports an id when the thread is opened but writes nothing until the first turn
+    /// starts (codex: `thread/resume` of a thread without a turn fails "no rollout found").
+    OnFirstTurn,
+}
+
 /// Honest capability report. A `false` is honest; a rounded-up `true` is a bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -105,6 +122,26 @@ pub trait DriverDescriptor: ConfigRenderer + Send + Sync {
     /// What a prompt may carry besides text (default: text only).
     fn prompt_input(&self) -> PromptInput {
         PromptInput::default()
+    }
+    /// A conversation id for a fresh conversation, built from `entropy` (random bytes the
+    /// runtime draws), when the CLI accepts a caller-chosen id at start (the driver then passes
+    /// [`SpawnSpec::native_session_id`] as the CLI wants it); `None` when the CLI chooses its own
+    /// ids, which it then reports through the protocol. The runtime journals the id with the
+    /// start, so a replay never draws again.
+    fn chosen_session_id(&self, _entropy: [u8; 16]) -> Option<String> {
+        None
+    }
+    /// When the CLI's own storage holds a conversation (see [`SavesConversation`]).
+    fn saves_conversation(&self) -> SavesConversation {
+        SavesConversation::default()
+    }
+    /// The command (argv, element 0 the CLI's own name for the user's terminal; never a shell
+    /// string) with which the user opens the conversation `native_session_id` in their own CLI,
+    /// to be run in the session's working directory; `None` when the CLI has no such command.
+    /// Marsad only shows it. Not every CLI lists the conversations other programs started in
+    /// its own picker; opening one by id is what this command does.
+    fn user_resume_argv(&self, _native_session_id: &str) -> Option<Vec<String>> {
+        None
     }
     /// A fresh protocol state machine for one session.
     fn new_protocol(&self) -> Box<dyn Protocol>;

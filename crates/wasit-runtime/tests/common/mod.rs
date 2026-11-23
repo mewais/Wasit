@@ -249,7 +249,15 @@ pub fn config(dir: &Path, timeouts: Timeouts) -> RuntimeConfig {
             DriverId::new(d),
             DriverOverride {
                 binary: Some(fake().to_string_lossy().into_owned()),
-                env: vec![("WASIT_FAKE_PERSONA".into(), d.into())],
+                env: vec![
+                    ("WASIT_FAKE_PERSONA".into(), d.into()),
+                    // The agents' own storage (transcripts, threads, sessions) is the test's:
+                    // conversations outlive a process, and never leak into another test.
+                    (
+                        "WASIT_FAKE_STATE_DIR".into(),
+                        dir.join("agent-state").to_string_lossy().into_owned(),
+                    ),
+                ],
             },
         );
     }

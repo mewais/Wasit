@@ -6,9 +6,13 @@ use crate::io::Io;
 use crate::reference::find_out;
 use crate::scenario::{AskStep, HistoryMessage, PlanEntry, Scenario, ToolStep};
 use crate::util::{alnum, now_ms, now_secs, set, uuid7};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-#[derive(Clone)]
+/// Where the persona keeps its threads (see [`crate::store`]).
+const STORE: &str = "codex-threads";
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Thread {
     id: String,
     cwd: String,
@@ -67,7 +71,7 @@ impl Codex {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "/".into());
-        let threads = scenario
+        let mut threads: Vec<Thread> = scenario
             .sessions
             .iter()
             .map(|s| Thread {
@@ -84,6 +88,12 @@ impl Codex {
                 created: now_secs(),
             })
             .collect();
+        // Threads earlier processes stored: codex keeps a rollout per thread on disk.
+        for t in crate::store::list::<Thread>(STORE) {
+            if !threads.iter().any(|x| x.id == t.id) {
+                threads.push(t);
+            }
+        }
         Codex {
             version: scenario
                 .version
@@ -300,6 +310,16 @@ impl Codex {
         self.threads.iter().find(|t| t.id == id)
     }
 
+    /// Write the thread's rollout. Real codex-cli 0.161.0 writes none when a thread is opened:
+    /// `thread/resume` of a thread that never had a turn fails with "no rollout found for
+    /// thread id" (the rollout appears with the first turn), so a thread is stored from its
+    /// first `turn/start` on.
+    fn store_thread(&self, id: &str) {
+        if let Some(t) = self.find_thread(id) {
+            crate::store::put(STORE, id, t);
+        }
+    }
+
     fn handle_request(&mut self, io: &mut Io, v: &Value, in_turn: bool) -> Incoming {
         let id = v["id"].clone();
         let params = &v["params"];
@@ -475,6 +495,7 @@ impl Codex {
                         t.preview = text.clone();
                     }
                 }
+                self.store_thread(&tid);
                 Incoming::Prompt(text)
             }
             // Shapes recorded from codex-cli 0.161.0 (`reference/codex/steer.jsonl`): the result
@@ -894,6 +915,8 @@ impl Persona for Codex {
                 text: stats.final_text.clone(),
             });
         }
+        let tid = self.thread_id.clone();
+        self.store_thread(&tid);
     }
 }
 
