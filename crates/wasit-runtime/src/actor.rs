@@ -29,17 +29,19 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
+use wasit_control::TraceId;
 use wasit_core::{Command, DriverDescriptor, ResumeMode, SpawnSpec};
 use wasit_shim::{Error as ShimError, Record, RecordStream, ShimClient, ShimState, Sig};
 
 use crate::config::RuntimeConfig;
 use crate::core::Core;
+use crate::diag::{self, Intent};
 use crate::note::RuntimeNote;
 use crate::store::{self, SessionFile};
 use crate::stream::Subscriber;
 use crate::wire::{
     CommandError, CommandOutcome, HistoryPage, RuntimeError, SessionEvent, SessionId,
-    SessionSnapshot,
+    SessionSnapshot, TrailPage,
 };
 
 /// Bound on commands awaiting their journal round trip, and on messages deferred while the
@@ -57,6 +59,8 @@ pub(crate) type UnitReply = oneshot::Sender<Result<(), RuntimeError>>;
 pub(crate) enum Msg {
     Command {
         command: Command,
+        /// The trace id of the request that carried it, journaled with the command.
+        trace: Option<TraceId>,
         reply: CommandReply,
     },
     /// Raise or withdraw an external gate (see [`RuntimeNote::RaiseGate`]).
@@ -82,7 +86,13 @@ pub(crate) enum Msg {
     History {
         before: Option<u64>,
         limit: usize,
-        reply: oneshot::Sender<HistoryLocal>,
+        reply: oneshot::Sender<Local<HistoryPage>>,
+    },
+    /// The same window of the session's trail.
+    Trail {
+        before: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<Local<TrailPage>>,
     },
 }
 
@@ -90,6 +100,16 @@ pub(crate) enum Msg {
 pub(crate) enum GateOp {
     Raise(wasit_core::GateRequest),
     Resolve { request_id: String },
+}
+
+impl GateOp {
+    /// What the operation is called in the records about it.
+    fn name(&self) -> &'static str {
+        match self {
+            GateOp::Raise(_) => "raise_gate",
+            GateOp::Resolve { .. } => "resolve_gate",
+        }
+    }
 }
 
 /// A live subscription handed out by the actor.
@@ -102,9 +122,9 @@ pub(crate) struct SubscribeReply {
     pub lagged: Arc<AtomicBool>,
 }
 
-/// History served from memory, or "replay the journal".
-pub(crate) enum HistoryLocal {
-    Page(HistoryPage),
+/// A page served from memory, or "replay the journal".
+pub(crate) enum Local<P> {
+    Page(P),
     Replay,
 }
 
@@ -119,6 +139,9 @@ pub(crate) struct ActorInit {
     pub file: SessionFile,
     pub snapshot: watch::Sender<Arc<SessionSnapshot>>,
     pub notify: SnapshotNotify,
+    /// The trace id of the request that creates the session: journaled with its `start` note
+    /// (`None` for a session adopted or restarted).
+    pub start_trace: Option<TraceId>,
 }
 
 enum Op {
@@ -141,6 +164,9 @@ enum Reply {
 struct Pending {
     reply: Reply,
     deadline: Instant,
+    /// What the request is, for the records about it (commands and gate operations; a stop has
+    /// none).
+    intent: Option<Intent>,
 }
 
 enum Source {
@@ -192,6 +218,8 @@ pub(crate) struct Actor {
     deferred: VecDeque<Msg>,
     pending_continue: Option<UnitReply>,
     pending_spec: SpawnSpec,
+    /// The trace id journaled with the `start` note of the first generation.
+    start_trace: Option<TraceId>,
 
     handshake_deadline: Option<Instant>,
     stop_stage: Option<(Instant, StopStage)>,
@@ -326,6 +354,7 @@ impl Actor {
             pending: HashMap::new(),
             deferred: VecDeque::new(),
             pending_continue: None,
+            start_trace: init.start_trace,
             handshake_deadline: None,
             stop_stage: None,
             reconnect_at: None,
@@ -499,8 +528,9 @@ impl Actor {
 
     fn fail_pending(&mut self, reason: &str) {
         self.outbox.clear();
-        for (_, p) in self.pending.drain() {
-            reply_not_running(p.reply, reason);
+        let pending: Vec<Pending> = self.pending.drain().map(|(_, p)| p).collect();
+        for p in pending {
+            self.answer_not_running(p, reason);
         }
     }
 
@@ -587,6 +617,7 @@ impl Actor {
         if self.core.awaiting_start() {
             let data = RuntimeNote::Start {
                 spec: Box::new(self.pending_spec.clone()),
+                trace: self.start_trace.clone(),
             }
             .to_value();
             self.push_op(Op::Note {
@@ -656,7 +687,7 @@ impl Actor {
             tracing::error!(session = %self.id, "shim request queue overflow; dropping the oldest request");
             if let Some(Op::Note { token: Some(t), .. }) = self.outbox.pop_front() {
                 if let Some(p) = self.pending.remove(&t) {
-                    reply_busy(p.reply);
+                    self.answer_busy(p);
                 }
             }
         }
@@ -694,7 +725,7 @@ impl Actor {
         match op {
             Op::Note { token: Some(t), .. } => {
                 if let Some(p) = self.pending.remove(&t) {
-                    reply_not_running(p.reply, &e.to_string());
+                    self.answer_not_running(p, &e.to_string());
                 }
             }
             Op::Note { attach: true, .. } => {
@@ -779,6 +810,10 @@ impl Actor {
             .collect();
         for k in expired {
             if let Some(p) = self.pending.remove(&k) {
+                // The note may still be journaled and applied later: the trail shows it.
+                if let Some(i) = &p.intent {
+                    diag::command_timeout(&self.id, i);
+                }
                 match p.reply {
                     Reply::Command(r) => {
                         let _ = r.send(Err(CommandError::Timeout)); // requester may have given up
@@ -807,20 +842,36 @@ impl Actor {
                 reply,
             } => {
                 let r = if self.loading {
-                    HistoryLocal::Replay
+                    Local::Replay
                 } else {
                     self.history(before, limit)
                 };
                 let _ = reply.send(r); // requester may have given up
             }
+            Msg::Trail {
+                before,
+                limit,
+                reply,
+            } => {
+                let r = if self.loading {
+                    Local::Replay
+                } else {
+                    self.trail(before, limit)
+                };
+                let _ = reply.send(r); // requester may have given up
+            }
             m if self.loading => {
                 if self.deferred.len() >= MAX_PENDING {
-                    reply_msg_busy(m);
+                    self.answer_msg_busy(m);
                 } else {
                     self.deferred.push_back(m);
                 }
             }
-            Msg::Command { command, reply } => self.command(command, reply),
+            Msg::Command {
+                command,
+                trace,
+                reply,
+            } => self.command(command, trace, reply),
             Msg::Gate { op, reply } => self.gate(op, reply),
             Msg::Stop { reply } => {
                 if !self.core.process_running() {
@@ -842,6 +893,7 @@ impl Actor {
                     Pending {
                         reply: Reply::Stop(reply),
                         deadline: Instant::now() + self.cfg.timeouts.command,
+                        intent: None,
                     },
                 );
             }
@@ -873,7 +925,8 @@ impl Actor {
         }
     }
 
-    fn command(&mut self, command: Command, reply: CommandReply) {
+    fn command(&mut self, command: Command, trace: Option<TraceId>, reply: CommandReply) {
+        let intent = Intent::new(command.name(), trace);
         let caps = self.desc.capabilities();
         let unsupported = match &command {
             Command::Interrupt => !caps.interrupt,
@@ -883,30 +936,37 @@ impl Actor {
             _ => false,
         };
         if unsupported {
-            let _ = reply.send(Err(CommandError::Unsupported {
-                operation: command.name().to_string(),
-            })); // requester may have given up
+            self.refuse(
+                &intent,
+                reply,
+                CommandError::Unsupported {
+                    operation: command.name().to_string(),
+                },
+            );
             return;
         }
         if matches!(command, Command::Shutdown) {
-            let _ = reply.send(Err(CommandError::Rejected {
-                reason: "use sessions.stop to end a session".into(),
-            })); // requester may have given up
+            self.refuse(
+                &intent,
+                reply,
+                CommandError::Rejected {
+                    reason: "use sessions.stop to end a session".into(),
+                },
+            );
             return;
         }
         if let Some(request_id) = self.core.answers_withdrawn(&command) {
             // Also after the process ended: say why the answer did nothing.
-            let _ = reply.send(Err(CommandError::GateWithdrawn { request_id })); // requester may have given up
+            self.refuse(&intent, reply, CommandError::GateWithdrawn { request_id });
             return;
         }
         if !self.core.process_running() {
-            let _ = reply.send(Err(CommandError::NotRunning {
-                reason: format!("the session is {}", self.core.snapshot().phase.name()),
-            })); // requester may have given up
+            let reason = format!("the session is {}", self.core.snapshot().phase.name());
+            self.refuse(&intent, reply, CommandError::NotRunning { reason });
             return;
         }
         if self.pending.len() >= MAX_PENDING {
-            let _ = reply.send(Err(CommandError::Busy)); // requester may have given up
+            self.refuse(&intent, reply, CommandError::Busy);
             return;
         }
         let tok = token();
@@ -914,6 +974,7 @@ impl Actor {
             data: RuntimeNote::Command {
                 token: tok.clone(),
                 command,
+                trace: intent.trace.clone(),
             }
             .to_value(),
             token: Some(tok.clone()),
@@ -924,19 +985,83 @@ impl Actor {
             Pending {
                 reply: Reply::Command(reply),
                 deadline: Instant::now() + self.cfg.timeouts.command,
+                intent: Some(intent),
             },
         );
     }
 
+    /// Answers a command-like request that cannot be journaled, and records that it was refused.
+    fn refuse(&self, intent: &Intent, reply: CommandReply, err: CommandError) {
+        diag::command_refused(&self.id, intent, &err);
+        let _ = reply.send(Err(err)); // requester may have given up
+    }
+
+    /// A journaled-note request whose note could not be journaled: the session is not running.
+    fn answer_not_running(&self, p: Pending, reason: &str) {
+        match p.reply {
+            Reply::Command(r) => {
+                let err = CommandError::NotRunning {
+                    reason: reason.to_string(),
+                };
+                if let Some(i) = &p.intent {
+                    diag::command_refused(&self.id, i, &err);
+                }
+                let _ = r.send(Err(err)); // requester may have given up
+            }
+            Reply::Stop(r) => {
+                // The process is gone, which is what a stop wants.
+                let _ = r.send(Ok(())); // requester may have given up
+            }
+        }
+    }
+
+    fn answer_busy(&self, p: Pending) {
+        match p.reply {
+            Reply::Command(r) => {
+                if let Some(i) = &p.intent {
+                    diag::command_refused(&self.id, i, &CommandError::Busy);
+                }
+                let _ = r.send(Err(CommandError::Busy)); // requester may have given up
+            }
+            Reply::Stop(r) => {
+                let _ = r.send(Err(RuntimeError::Busy("request queue overflow".into())));
+                // requester may have given up
+            }
+        }
+    }
+
+    /// A message that arrived while the session loads and could not even be deferred.
+    fn answer_msg_busy(&self, m: Msg) {
+        match m {
+            Msg::Command {
+                command,
+                trace,
+                reply,
+            } => self.refuse(
+                &Intent::new(command.name(), trace),
+                reply,
+                CommandError::Busy,
+            ),
+            Msg::Gate { op, reply } => {
+                self.refuse(&Intent::new(op.name(), None), reply, CommandError::Busy)
+            }
+            Msg::Stop { reply } | Msg::Continue { reply } | Msg::Rename { reply, .. } => {
+                let _ = reply.send(Err(RuntimeError::Busy("session is loading".into())));
+                // requester may have given up
+            }
+            Msg::Subscribe { .. } | Msg::History { .. } | Msg::Trail { .. } => {}
+        }
+    }
+
     fn gate(&mut self, op: GateOp, reply: CommandReply) {
+        let intent = Intent::new(op.name(), None);
         if !self.core.process_running() {
-            let _ = reply.send(Err(CommandError::NotRunning {
-                reason: format!("the session is {}", self.core.snapshot().phase.name()),
-            })); // requester may have given up
+            let reason = format!("the session is {}", self.core.snapshot().phase.name());
+            self.refuse(&intent, reply, CommandError::NotRunning { reason });
             return;
         }
         if self.pending.len() >= MAX_PENDING {
-            let _ = reply.send(Err(CommandError::Busy)); // requester may have given up
+            self.refuse(&intent, reply, CommandError::Busy);
             return;
         }
         let tok = token();
@@ -961,6 +1086,7 @@ impl Actor {
             Pending {
                 reply: Reply::Command(reply),
                 deadline: Instant::now() + self.cfg.timeouts.command,
+                intent: Some(intent),
             },
         );
     }
@@ -1021,6 +1147,8 @@ impl Actor {
             }
         };
         self.pending_spec = spec.clone();
+        // The trace of the request that created the session belongs to its first generation.
+        self.start_trace = None;
         self.file.spec = spec;
         self.save_file(None);
         self.reconnect_attempt = 0;
@@ -1052,67 +1180,48 @@ impl Actor {
         }
     }
 
-    fn history(&self, before: Option<u64>, limit: usize) -> HistoryLocal {
+    fn history(&self, before: Option<u64>, limit: usize) -> Local<HistoryPage> {
         let below: Vec<&SessionEvent> = self
             .ring
             .iter()
             .filter(|e| before.is_none_or(|b| e.cursor < b))
             .collect();
-        let complete = self.evicted_max.is_none();
-        if below.len() > limit || (below.len() == limit && limit > 0) {
-            let start = below.len() - limit;
-            let has_more = start > 0 || !complete;
-            HistoryLocal::Page(HistoryPage {
-                events: below[start..].iter().map(|e| (*e).clone()).collect(),
+        match last_window(below, limit, self.evicted_max.is_none()) {
+            Some((events, has_more)) => Local::Page(HistoryPage {
+                events: events.into_iter().cloned().collect(),
                 has_more,
-            })
-        } else if complete {
-            HistoryLocal::Page(HistoryPage {
-                events: below.into_iter().cloned().collect(),
-                has_more: false,
-            })
-        } else {
-            HistoryLocal::Replay
+            }),
+            None => Local::Replay,
+        }
+    }
+
+    /// The same window of the trail: the projection of the events in memory, the way a replay
+    /// projects them ([`crate::trail::item`]).
+    fn trail(&self, before: Option<u64>, limit: usize) -> Local<TrailPage> {
+        let below: Vec<crate::wire::TrailItem> = self
+            .ring
+            .iter()
+            .filter(|e| before.is_none_or(|b| e.cursor < b))
+            .filter_map(crate::trail::item)
+            .collect();
+        match last_window(below, limit, self.evicted_max.is_none()) {
+            Some((entries, has_more)) => Local::Page(TrailPage { entries, has_more }),
+            None => Local::Replay,
         }
     }
 }
 
-fn reply_not_running(reply: Reply, reason: &str) {
-    match reply {
-        Reply::Command(r) => {
-            let _ = r.send(Err(CommandError::NotRunning {
-                reason: reason.to_string(),
-            })); // requester may have given up
-        }
-        Reply::Stop(r) => {
-            // The process is gone, which is what a stop wants.
-            let _ = r.send(Ok(())); // requester may have given up
-        }
-    }
-}
-
-fn reply_busy(reply: Reply) {
-    match reply {
-        Reply::Command(r) => {
-            let _ = r.send(Err(CommandError::Busy)); // requester may have given up
-        }
-        Reply::Stop(r) => {
-            let _ = r.send(Err(RuntimeError::Busy("request queue overflow".into())));
-            // requester may have given up
-        }
-    }
-}
-
-fn reply_msg_busy(m: Msg) {
-    match m {
-        Msg::Command { reply, .. } | Msg::Gate { reply, .. } => {
-            let _ = reply.send(Err(CommandError::Busy)); // requester may have given up
-        }
-        Msg::Stop { reply } | Msg::Continue { reply } | Msg::Rename { reply, .. } => {
-            let _ = reply.send(Err(RuntimeError::Busy("session is loading".into())));
-            // requester may have given up
-        }
-        Msg::Subscribe { .. } | Msg::History { .. } => {}
+/// The last `limit` of `items` (oldest first) and whether older ones may exist, when memory can
+/// answer: `items` fill the window, or nothing was ever evicted from it (`complete`). `None`:
+/// the page reaches back past what memory holds; replay the journal.
+fn last_window<T>(mut items: Vec<T>, limit: usize, complete: bool) -> Option<(Vec<T>, bool)> {
+    if items.len() >= limit {
+        let start = items.len() - limit;
+        Some((items.split_off(start), start > 0 || !complete))
+    } else if complete {
+        Some((items, false))
+    } else {
+        None
     }
 }
 

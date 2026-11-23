@@ -5,6 +5,7 @@
 //! trusting the `in` lines that followed it.
 
 use serde::{Deserialize, Serialize};
+use wasit_control::TraceId;
 use wasit_core::{Command, GateRequest, SpawnSpec};
 
 use crate::wire::NoticeCode;
@@ -18,9 +19,21 @@ pub(crate) enum RuntimeNote {
     /// `Protocol::start(spec)` for the current process generation. A `first_prompt` in the
     /// spec is the session's first input, encoded right after `start` with this note's seq as
     /// its id: journaled in the same record as the start, so neither exists without the other.
-    Start { spec: Box<SpawnSpec> },
-    /// `Protocol::encode(seq, command)`, where `seq` is this note's journal seq.
-    Command { token: String, command: Command },
+    /// `trace` is the trace id of the request that started the session, when it had one; the
+    /// first prompt's `input` event carries it. A journal of an older build has none.
+    Start {
+        spec: Box<SpawnSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TraceId>,
+    },
+    /// `Protocol::encode(seq, command)`, where `seq` is this note's journal seq. `trace` is the
+    /// trace id of the request that carried the command, when it had one.
+    Command {
+        token: String,
+        command: Command,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TraceId>,
+    },
     /// A graceful stop was requested (`Protocol::encode(Shutdown)`).
     Stop { token: String },
     /// The handshake deadline passed; the process is being killed.
@@ -99,10 +112,33 @@ mod tests {
         let n = RuntimeNote::Command {
             token: "t".into(),
             command: Command::Interrupt,
+            trace: None,
         };
         let v = n.to_value();
         assert_eq!(v["wasit"], "command");
+        assert!(v.get("trace").is_none());
         assert_eq!(classify(&v), NoteKind::Runtime(n));
+        // With a trace it is journaled and read back; a note of a build without traces reads
+        // as none.
+        let traced = RuntimeNote::Command {
+            token: "t".into(),
+            command: Command::Interrupt,
+            trace: Some(TraceId::new("u-0123456789abcdef").unwrap()),
+        };
+        let v = traced.to_value();
+        assert_eq!(v["trace"], "u-0123456789abcdef");
+        assert_eq!(classify(&v), NoteKind::Runtime(traced));
+        let old =
+            serde_json::json!({"wasit":"command","token":"t","command":{"command":"interrupt"}});
+        assert!(matches!(
+            classify(&old),
+            NoteKind::Runtime(RuntimeNote::Command { trace: None, .. })
+        ));
+        let old_start = serde_json::json!({"wasit":"start","spec":SpawnSpec::default()});
+        assert!(matches!(
+            classify(&old_start),
+            NoteKind::Runtime(RuntimeNote::Start { trace: None, .. })
+        ));
         assert_eq!(
             classify(&serde_json::json!({"stdin": "closed"})),
             NoteKind::StdinClosed

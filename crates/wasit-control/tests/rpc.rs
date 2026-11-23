@@ -284,6 +284,7 @@ async fn server_side_lag_closes_only_that_subscription() {
                         method: "echo".into(),
                         params: json!("alive"),
                         hops: 0,
+                        trace: None,
                     },
                     1 << 20,
                 )
@@ -665,4 +666,44 @@ async fn supervised_parks_failed_after_repeated_bridge_unavailable() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     sup.stop().await;
+}
+
+/// The frames of a peer that predates traces (no `trace` key) are served, and a frame that has
+/// one reaches the service with it: the field is additive.
+#[tokio::test]
+async fn requests_with_and_without_a_trace_key_are_both_served() {
+    let server = ControlServer::new(Arc::new(DemoService::new("srv")), hello("srv"), cfg());
+    let (raw, b) = memory_pair(64 * 1024);
+    server.serve_connection(b);
+    let (r, mut w) = tokio::io::split(raw);
+    let mut lines = BufReader::new(r).lines();
+    let hello_line = wasit_control::wire::encode(&Frame::Hello(hello("raw")), 1 << 20).unwrap();
+    w.write_all(&hello_line).await.unwrap();
+    assert!(within(lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .contains("\"hello\""));
+
+    // Exactly what a build without traces writes.
+    w.write_all(b"{\"type\":\"request\",\"id\":1,\"method\":\"trace\",\"params\":null}\n")
+        .await
+        .unwrap();
+    w.write_all(
+        b"{\"type\":\"request\",\"id\":2,\"method\":\"trace\",\"params\":null,\"trace\":\"w-task-00000001\"}\n",
+    )
+    .await
+    .unwrap();
+    let mut got = std::collections::BTreeMap::new();
+    while got.len() < 2 {
+        let line = within(lines.next_line()).await.unwrap().unwrap();
+        if let Some(Frame::Response { id, result, error }) =
+            wasit_control::wire::decode(line.as_bytes()).unwrap()
+        {
+            assert!(error.is_none(), "{error:?}");
+            got.insert(id, result);
+        }
+    }
+    assert_eq!(got[&1], Value::Null);
+    assert_eq!(got[&2], json!("w-task-00000001"));
 }

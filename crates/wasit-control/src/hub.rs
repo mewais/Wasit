@@ -481,6 +481,8 @@ impl Service for RoutingService {
                     host: ctx.host.clone(),
                     hops: ctx.hops + 1,
                     deadline: self.hub.inner.cfg.forward_timeout,
+                    // The next hop records the same intent.
+                    trace: ctx.trace.clone(),
                 };
                 link.call(method, params, opts).await.map_err(|e| {
                     forwarded_error(e, |code| {

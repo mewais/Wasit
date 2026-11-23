@@ -100,6 +100,7 @@ impl Uplink {
             host: Some(host.clone()),
             hops: 0,
             deadline,
+            trace: None,
         };
         conn.call(method, params, opts).await
     }

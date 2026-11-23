@@ -104,6 +104,77 @@ impl fmt::Display for SubId {
     }
 }
 
+/// Correlates the hops of one user intent (a click, a task, a launch): chosen by whoever
+/// originates the intent, carried by [`Frame::Request`], handed to the serving code in
+/// `CallContext::trace`, forwarded by the router and recorded by whoever serves a request that
+/// has one. `[A-Za-z0-9_-]{8,40}` (e.g. `u-3f9a1c2e5b7d0846`): it names a request, never what it
+/// asks, so every hop may log it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(transparent)]
+pub struct TraceId(String);
+
+/// A text that is not a [`TraceId`]. The text itself is not kept: it came from outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTraceId;
+
+impl fmt::Display for InvalidTraceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a trace id is 8 to 40 characters of letters, digits, '_' and '-'")
+    }
+}
+
+impl std::error::Error for InvalidTraceId {}
+
+impl TraceId {
+    pub const MIN: usize = 8;
+    pub const MAX: usize = 40;
+
+    pub fn new(s: &str) -> Result<TraceId, InvalidTraceId> {
+        let ok = (Self::MIN..=Self::MAX).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if ok {
+            Ok(TraceId(s.to_owned()))
+        } else {
+            Err(InvalidTraceId)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TraceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for TraceId {
+    type Err = InvalidTraceId;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        TraceId::new(s)
+    }
+}
+
+impl TryFrom<String> for TraceId {
+    type Error = InvalidTraceId;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        TraceId::new(&s)
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceId {
+    /// Validated: a frame whose trace is not a trace id is malformed (a peer that sends one has
+    /// a bug; the connection says so instead of recording a text nobody vetted).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TraceId, D::Error> {
+        let s = String::deserialize(d)?;
+        TraceId::new(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// First frame each side sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -270,6 +341,10 @@ pub enum Frame {
         /// Number of times this request has been forwarded by a router.
         #[serde(default, skip_serializing_if = "is_zero")]
         hops: u32,
+        /// The user intent this request serves, when it has one. Absent from the frames of
+        /// peers that predate it, which therefore interoperate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TraceId>,
     },
     Response {
         id: u64,
@@ -456,6 +531,15 @@ mod tests {
                 method: "m".into(),
                 params: json!({"a": 1}),
                 hops: 2,
+                trace: None,
+            },
+            Frame::Request {
+                id: 4,
+                host: None,
+                method: "m".into(),
+                params: Value::Null,
+                hops: 0,
+                trace: Some(TraceId::new("u-0123456789abcdef").unwrap()),
             },
             Frame::Response {
                 id: 1,
@@ -523,6 +607,7 @@ mod tests {
                 method: "ping".into(),
                 params: json!({}),
                 hops: 0,
+                trace: None,
             },
             DEFAULT_MAX_FRAME,
         )
@@ -530,6 +615,22 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&bytes).unwrap(),
             "{\"type\":\"request\",\"id\":5,\"method\":\"ping\",\"params\":{}}\n"
+        );
+        let traced = encode(
+            &Frame::Request {
+                id: 6,
+                host: None,
+                method: "ping".into(),
+                params: json!({}),
+                hops: 1,
+                trace: Some(TraceId::new("u-0123456789abcdef").unwrap()),
+            },
+            DEFAULT_MAX_FRAME,
+        )
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&traced).unwrap(),
+            "{\"type\":\"request\",\"id\":6,\"method\":\"ping\",\"params\":{},\"hops\":1,\"trace\":\"u-0123456789abcdef\"}\n"
         );
         let closed = serde_json::to_value(Frame::SubscriptionClosed {
             sub: SubId(1),
@@ -540,6 +641,77 @@ mod tests {
             closed,
             json!({"type": "subscription_closed", "sub": 1, "reason": {"kind": "host_lost"}})
         );
+    }
+
+    #[test]
+    fn a_frame_of_a_peer_that_predates_traces_decodes_and_a_bad_trace_is_malformed() {
+        // The frame an old peer sends: no `trace` key.
+        let f = decode(br#"{"type":"request","id":5,"method":"ping","params":{},"hops":1}"#)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                f,
+                Frame::Request {
+                    trace: None,
+                    hops: 1,
+                    ..
+                }
+            ),
+            "{f:?}"
+        );
+        // A new peer's frame carries it.
+        let f = decode(br#"{"type":"request","id":5,"method":"ping","trace":"w-task-0000001"}"#)
+            .unwrap()
+            .unwrap();
+        match f {
+            Frame::Request { trace, .. } => assert_eq!(trace.unwrap().as_str(), "w-task-0000001"),
+            other => panic!("{other:?}"),
+        }
+        // A trace that is not one is a malformed frame, and its text is not repeated.
+        for bad in [
+            r#""short""#,
+            r#""has space in it""#,
+            r#""é-0123456789""#,
+            "7",
+            r#""""#,
+        ] {
+            let line = format!(r#"{{"type":"request","id":1,"method":"m","trace":{bad}}}"#);
+            assert!(
+                matches!(decode(line.as_bytes()), Err(FrameError::Malformed(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_ids_are_validated_and_transparent() {
+        for ok in [
+            "u-0123456789abcdef",
+            "h_ABCdef12",
+            "12345678",
+            &"x".repeat(40),
+        ] {
+            let t = TraceId::new(ok).unwrap();
+            assert_eq!(t.as_str(), ok);
+            assert_eq!(serde_json::to_string(&t).unwrap(), format!("\"{ok}\""));
+            assert_eq!(
+                serde_json::from_str::<TraceId>(&format!("\"{ok}\"")).unwrap(),
+                t
+            );
+        }
+        for bad in [
+            "",
+            "short",
+            "1234567",
+            "has space",
+            "slash/slash",
+            "é-1234567",
+            &"x".repeat(41),
+        ] {
+            assert_eq!(TraceId::new(bad), Err(InvalidTraceId), "{bad}");
+        }
+        assert!(!InvalidTraceId.to_string().contains("slash"));
     }
 
     #[test]

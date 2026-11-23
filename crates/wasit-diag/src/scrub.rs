@@ -152,8 +152,11 @@ fn update<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let r = f(&mut reg);
     let snap = Arc::new(build(&reg));
-    drop(reg);
+    // Swapped in while the registry is still locked: two updates cannot publish their snapshots
+    // out of order (the older one overwriting the newer, losing a registration). Readers take
+    // only the snapshot lock, and its initializer (forced above) is not waiting for this one.
     *SNAPSHOT.write().unwrap_or_else(|e| e.into_inner()) = snap;
+    drop(reg);
     r
 }
 

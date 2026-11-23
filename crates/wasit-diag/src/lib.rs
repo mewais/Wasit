@@ -7,6 +7,10 @@
 //!   [`diag_enum!`], and validated newtypes registered with [`diag_value!`]. Strings, paths and
 //!   `Debug` output are not values; free text exists only as [`DiagText`], made by
 //!   [`DiagText::new`], which scrubs registered secrets and project paths ([`scrub`]).
+//! * **What may be served over a wire** under the same rule: [`diag_data!`] declares an enum
+//!   with data whose every field is a value type (a projection of something that carries
+//!   content, like the session trail), with serde and TypeScript from the one declaration; the
+//!   JSON of a value on a wire is the JSON it has in a log record.
 //! * **Where records go:** one sink per process ([`install`]); [`emit`] serializes, keeps the
 //!   record in a ring for live tails and hands it to one writer thread through a bounded queue.
 //!   It never waits; when the queue is full the record is dropped and counted.
@@ -89,6 +93,7 @@ mod text;
 #[cfg(feature = "tracing")]
 mod tracing_bridge;
 mod value;
+mod wire;
 mod writer;
 
 use std::sync::{Mutex, OnceLock};
@@ -113,12 +118,37 @@ pub use writer::{FsTarget, Target};
 #[doc(hidden)]
 pub mod __private {
     pub use crate::event::{valid_ev, Budget, Fields, SealedEvent};
+
     pub use crate::json::Json;
     pub use crate::value::Sealed;
+
+    /// `a == b`, usable in a `const`.
+    pub const fn same_str(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
 
     /// Writes a `diag_enum!` variant name as its `snake_case` code.
     pub fn write_variant(out: &mut Json, name: &'static str) {
         out.camel_as_snake(name)
+    }
+
+    /// Writes a `diag_data!` value as its serde form (every field of one is a value type, whose
+    /// serde form is its log form).
+    pub fn write_serde<T: serde::Serialize>(out: &mut Json, v: &T) {
+        // A type made of value types serializes without failing; `null` is what a record shows
+        // should that ever not hold.
+        out.raw(&serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned()));
     }
 }
 

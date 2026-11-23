@@ -23,6 +23,7 @@
 //! | [`methods::SESSIONS_RENAME`] | [`RenameSession`] | [`Ack`] |
 //! | [`methods::SESSION_SNAPSHOT`] | [`SessionRef`] | [`SessionSnapshot`] |
 //! | [`methods::SESSION_HISTORY`] | [`HistoryRequest`] | [`HistoryPage`] |
+//! | [`methods::SESSION_TRAIL_PAGE`] | [`TrailRequest`] | [`TrailPage`] |
 //! | [`methods::SESSION_COMMAND`] | [`CommandRequest`] | [`CommandReply`] |
 //! | [`methods::SESSION_ATTACHMENT_PUT`] | [`crate::media::AttachmentPut`] | [`crate::media::AttachmentPutReply`] |
 //! | [`methods::SESSION_FILE_READ`] | [`crate::media::FileReadRequest`] | [`crate::media::FileChunk`] |
@@ -37,11 +38,13 @@
 //! |---|---|---|
 //! | [`topics::HOST_SESSIONS`] | [`HostEvent`] | `"<epoch>.<n>"`; an unknown or expired cursor restarts with [`HostEvent::Reset`] |
 //! | `session.events:<id>` ([`topics::session_events`]) | [`SessionEvent`] | [`SessionEvent::cursor`] as a decimal `u64`; stable across daemon restarts |
+//! | `session.trail:<id>` ([`topics::session_trail`]) | [`TrailItem`] | the cursor of the [`SessionEvent`] it was projected from, as a decimal `u64`: the same cursors as `session.events:<id>`, stable across daemon restarts |
 //! | [`topics::DRIVERS_INVENTORY`] | [`InventoryReply`] | `"<epoch>.<n>"`; every event is a full inventory |
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use wasit_control::TraceId;
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
     GateRequest, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput, ResumableSession,
@@ -65,6 +68,7 @@ pub mod methods {
     pub const SESSIONS_RENAME: &str = "sessions.rename";
     pub const SESSION_SNAPSHOT: &str = "session.snapshot";
     pub const SESSION_HISTORY: &str = "session.history";
+    pub const SESSION_TRAIL_PAGE: &str = "session.trail.page";
     pub const SESSION_COMMAND: &str = "session.command";
     pub const SESSION_ATTACHMENT_PUT: &str = "session.attachment.put";
     pub const SESSION_FILE_READ: &str = "session.file.read";
@@ -77,10 +81,17 @@ pub mod topics {
     pub const DRIVERS_INVENTORY: &str = "drivers.inventory";
     /// Prefix of the per-session event topic.
     pub const SESSION_EVENTS_PREFIX: &str = "session.events:";
+    /// Prefix of the per-session trail topic (the content-free projection of the events).
+    pub const SESSION_TRAIL_PREFIX: &str = "session.trail:";
 
     /// The event topic of one session.
     pub fn session_events(id: &str) -> String {
         format!("{SESSION_EVENTS_PREFIX}{id}")
+    }
+
+    /// The trail topic of one session.
+    pub fn session_trail(id: &str) -> String {
+        format!("{SESSION_TRAIL_PREFIX}{id}")
     }
 }
 
@@ -554,6 +565,9 @@ pub enum SessionEventKind {
         /// The first prompt journaled with the start (its `input` event follows).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_input: Option<InputId>,
+        /// The trace id of the request that started the session, when it had one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TraceId>,
     },
     /// Something the driver reported.
     Agent { event: AgentEvent },
@@ -566,6 +580,10 @@ pub enum SessionEventKind {
         input: InputId,
         command: Command,
         status: CommandStatus,
+        /// The trace id of the request that carried the command, when it had one (a first
+        /// prompt takes the one of the request that started the session).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TraceId>,
     },
     /// The lines an input asked to write all reached the shim's journal of stdin writes (the
     /// shim records a line, then writes it; a failure follows as [`Self::WriteFailed`]).
@@ -742,6 +760,38 @@ pub struct HistoryRequest {
 pub struct HistoryPage {
     pub events: Vec<SessionEvent>,
     /// Older events exist (page again with `before = events[0].cursor`).
+    pub has_more: bool,
+}
+
+/// `session.trail.page`: the trail entries with `cursor < before` (all when `None`), the last
+/// `limit` of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TrailRequest {
+    pub id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<u64>,
+    pub limit: u32,
+}
+
+/// One entry of a session's trail with the cursor and journal time of the event it was
+/// projected from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TrailItem {
+    pub cursor: u64,
+    /// Journal time of the record (ms since the Unix epoch).
+    pub t: u64,
+    #[serde(flatten)]
+    pub entry: crate::trail::TrailEntry,
+}
+
+/// Result of `session.trail.page`, oldest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TrailPage {
+    pub entries: Vec<TrailItem>,
+    /// Older entries exist (page again with `before = entries[0].cursor`).
     pub has_more: bool,
 }
 

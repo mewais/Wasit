@@ -16,7 +16,7 @@ use wasit_core::DriverDescriptor;
 use wasit_shim::ShimState;
 
 use crate::core::{Core, SessionMeta};
-use crate::wire::{cursor_seq, HistoryPage, SessionEvent, SessionSnapshot};
+use crate::wire::{cursor_seq, HistoryPage, SessionEvent, SessionSnapshot, TrailPage};
 
 /// Feed every journal record with `seq <= until` (all when `None`) through `core`, handing each
 /// event to `f`. Stops early when `f` returns `false`.
@@ -74,6 +74,36 @@ pub(crate) async fn snapshot(
     Ok(core.snapshot().clone())
 }
 
+/// The last `limit` of what `pick` makes of the events with `cursor < before`, oldest first,
+/// and whether older ones exist. One replay serves every kind of page: history picks the events
+/// themselves, the trail their projection.
+async fn window<T>(
+    dir: &Path,
+    desc: Arc<dyn DriverDescriptor>,
+    meta: &SessionMeta,
+    before: Option<u64>,
+    limit: usize,
+    mut pick: impl FnMut(SessionEvent) -> Option<T>,
+) -> Result<(Vec<T>, bool), String> {
+    let mut core = Core::new(desc, meta);
+    let mut window: VecDeque<T> = VecDeque::with_capacity(limit.min(4096));
+    let mut has_more = false;
+    run(dir, &mut core, before.map(cursor_seq), |e| {
+        if before.is_none_or(|b| e.cursor < b) {
+            if let Some(item) = pick(e) {
+                window.push_back(item);
+                if window.len() > limit {
+                    window.pop_front();
+                    has_more = true;
+                }
+            }
+        }
+        true
+    })
+    .await?;
+    Ok((window.into(), has_more))
+}
+
 /// The last `limit` events with `cursor < before`.
 pub(crate) async fn history(
     dir: &Path,
@@ -82,24 +112,21 @@ pub(crate) async fn history(
     before: Option<u64>,
     limit: usize,
 ) -> Result<HistoryPage, String> {
-    let mut core = Core::new(desc, meta);
-    let mut window: VecDeque<SessionEvent> = VecDeque::with_capacity(limit.min(4096));
-    let mut has_more = false;
-    run(dir, &mut core, before.map(cursor_seq), |e| {
-        if before.is_none_or(|b| e.cursor < b) {
-            window.push_back(e);
-            if window.len() > limit {
-                window.pop_front();
-                has_more = true;
-            }
-        }
-        true
-    })
-    .await?;
-    Ok(HistoryPage {
-        events: window.into(),
-        has_more,
-    })
+    let (events, has_more) = window(dir, desc, meta, before, limit, Some).await?;
+    Ok(HistoryPage { events, has_more })
+}
+
+/// The last `limit` trail entries with `cursor < before`: the projection of the same replay.
+pub(crate) async fn trail(
+    dir: &Path,
+    desc: Arc<dyn DriverDescriptor>,
+    meta: &SessionMeta,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<TrailPage, String> {
+    let (entries, has_more) =
+        window(dir, desc, meta, before, limit, |e| crate::trail::item(&e)).await?;
+    Ok(TrailPage { entries, has_more })
 }
 
 /// Stream the events with `after < cursor < below` (bounded channel; the replay runs as its own

@@ -76,6 +76,12 @@ impl DiagText {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A text read back from the wire: it was scrubbed and bounded where it was made, so it is
+    /// kept as it is (see [`crate::wire`]).
+    pub(crate) fn from_wire(s: String) -> DiagText {
+        DiagText(s)
+    }
 }
 
 impl Sealed for DiagText {}

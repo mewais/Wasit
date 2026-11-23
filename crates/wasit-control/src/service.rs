@@ -5,7 +5,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use crate::connection::Connection;
-use crate::wire::{CloseReason, Cursor, Hello, HostId, RpcError};
+use crate::wire::{CloseReason, Cursor, Hello, HostId, RpcError, TraceId};
 
 /// Events of one subscription. An `Err` item ends the subscription with that reason
 /// (`Err(Ended)` is the same as the stream ending); stream end means `Ended`.
@@ -23,6 +23,9 @@ pub struct CallContext {
     pub host: Option<HostId>,
     /// Number of router hops this request has already taken.
     pub hops: u32,
+    /// The user intent the request serves, when it has one (always `None` for a subscription:
+    /// a subscription is not an intent).
+    pub trace: Option<TraceId>,
 }
 
 impl CallContext {

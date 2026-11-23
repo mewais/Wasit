@@ -9,6 +9,9 @@
 //! * `conn.*` are the accepting side's view of a connection ([`crate::server`]).
 //! * `rpc.forward_failed` and `sub.closed` are the router's and the subscription pump's
 //!   failures; never a record per request, per event or per frame.
+//! * `rpc.traced` is the serving side's record of a request that carries a trace id (a user
+//!   intent: a prompt, a launch), one per such request on every connection that serves it (the
+//!   hub's from the app, the host's from the hub), and none for any other request.
 //!
 //! **Free text.** Two kinds exist here and both are scrubbed by `wasit-diag`: the text of a link
 //! state or of a closed link (a transport's stderr, the reason a parked link shows), as
@@ -25,13 +28,14 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use wasit_diag::{Bytes, Code, DiagText, ErrorInfo, Ident, Ms, Origin};
 
 use crate::client::TransportFacts;
 use crate::command::{ExitInfo, TransportTrace};
 use crate::error::{ConnClose, ConnectError};
 use crate::supervised::{LinkState, ProvisionError, ProvisionReason};
-use crate::wire::{CloseReason, HostId};
+use crate::wire::{CloseReason, HostId, RpcError, TraceId};
 
 wasit_diag::diag_enum! {
     /// What the supervisor decided when an attempt ended.
@@ -72,6 +76,22 @@ wasit_diag::diag_enum! {
         Error,
         /// The host serving the topic (or the link to it) was lost.
         HostLost,
+    }
+}
+
+// A trace id is `[A-Za-z0-9_-]{8,40}`: an `Ident` by every rule of that type, so it may be a
+// field of a record and of a trail entry. Pinned in `wasit-diag/tests/value_sites.rs`.
+wasit_diag::diag_value!(TraceId => Ident, |t| Ident::new(t.as_str()));
+
+wasit_diag::diag_enum! {
+    /// How a traced request was served.
+    pub(crate) enum TracedOutcome {
+        /// The service answered with a result.
+        Ok,
+        /// The service (or the router, or the limiter) answered with an error; see `code`.
+        Error,
+        /// The connection closed before the service answered.
+        Cancelled,
     }
 }
 
@@ -163,6 +183,20 @@ wasit_diag::diag_events! {
             host: Ident,
             code: Code,
             ms: Ms,
+        },
+        /// A request that carries a trace id was served on this connection: `host` is the
+        /// frame's target (absent when this side serves it itself), `hops` the router hops it
+        /// had taken, `ms` the time from its arrival to the service's answer (a forwarded
+        /// request includes the wait for the next hop), `code` the error code of an error.
+        #[diag(ev = "rpc.traced", budget = 600)]
+        RpcTraced {
+            trace: TraceId,
+            method: Code,
+            host: Option<Ident>,
+            hops: u32,
+            ms: Ms,
+            outcome: TracedOutcome,
+            code: Option<Code>,
         },
         /// A served subscription ended abnormally. `topic` is the part before `:`; `code` is
         /// the service's error code with `error`.
@@ -391,6 +425,53 @@ pub(crate) fn conn_closed(hello: &crate::wire::Hello, close: &ConnClose, started
         reason: Code::st(close.code()),
         ms: Ms::of(started.elapsed()),
     });
+}
+
+/// A request that carries a trace id, from its arrival until it is answered.
+pub(crate) struct TracedCall {
+    trace: TraceId,
+    method: Code,
+    host: Option<Ident>,
+    hops: u32,
+    started: Instant,
+}
+
+impl TracedCall {
+    pub(crate) fn new(trace: &TraceId, method: &str, host: Option<&HostId>, hops: u32) -> Self {
+        TracedCall {
+            trace: trace.clone(),
+            method: Code::new(method),
+            host: host.map(|h| Ident::new(h.as_str())),
+            hops,
+            started: Instant::now(),
+        }
+    }
+
+    fn emit(self, outcome: TracedOutcome, code: Option<Code>) {
+        emit(ControlEvent::RpcTraced {
+            trace: self.trace,
+            method: self.method,
+            host: self.host,
+            hops: self.hops,
+            ms: Ms::of(self.started.elapsed()),
+            outcome,
+            code,
+        });
+    }
+
+    /// The request was answered with `res`. Only the error's code is recorded, never its
+    /// message (it may quote a parameter).
+    pub(crate) fn done(self, res: &Result<Value, RpcError>) {
+        match res {
+            Ok(_) => self.emit(TracedOutcome::Ok, None),
+            Err(e) => self.emit(TracedOutcome::Error, Some(Code::new(&e.code))),
+        }
+    }
+
+    /// The connection closed first.
+    pub(crate) fn cancelled(self) {
+        self.emit(TracedOutcome::Cancelled, None);
+    }
 }
 
 // ── routing and subscriptions ───────────────────────────────────────────────
@@ -632,6 +713,38 @@ mod tests {
             "rpc.forward_failed",
             "warn",
             &["method", "host", "code", "ms"],
+        );
+        let v = check(
+            ControlEvent::RpcTraced {
+                trace: TraceId::new("u-0123456789abcdef").unwrap(),
+                method: Code::st("session.command"),
+                host: Some(Ident::st("gpu")),
+                hops: 1,
+                ms: Ms(8),
+                outcome: TracedOutcome::Error,
+                code: Some(Code::st("busy")),
+            },
+            "rpc.traced",
+            "info",
+            &["trace", "method", "host", "hops", "ms", "outcome", "code"],
+        );
+        assert_eq!(
+            (v["trace"].as_str(), v["outcome"].as_str()),
+            (Some("u-0123456789abcdef"), Some("error"))
+        );
+        check(
+            ControlEvent::RpcTraced {
+                trace: TraceId::new("u-0123456789abcdef").unwrap(),
+                method: Code::st("whoami"),
+                host: None,
+                hops: 0,
+                ms: Ms(1),
+                outcome: TracedOutcome::Ok,
+                code: None,
+            },
+            "rpc.traced",
+            "info",
+            &["trace", "method", "hops", "ms", "outcome"],
         );
         let v = check(
             ControlEvent::SubClosed {

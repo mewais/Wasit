@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use wasit_control::{
     connector, CallError, ClientOptions, ControlClient, Cursor, DurableOpts, DurableSubscription,
-    Endpoint, Hello, HostId, RequestOpts, RpcError, Supervised, SupervisedOptions,
+    Endpoint, Hello, HostId, RequestOpts, RpcError, Supervised, SupervisedOptions, TraceId,
 };
 use wasit_core::{Command, DriverId};
 
@@ -17,7 +17,7 @@ use crate::wire::{
     methods, topics, Ack, CommandError, CommandOutcome, CommandReply, CommandRequest,
     CreateSession, CreateSessionReply, HistoryPage, HistoryRequest, HostEvent, HostInfo,
     InventoryReply, InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent,
-    SessionId, SessionList, SessionRef, SessionSnapshot,
+    SessionId, SessionList, SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
 };
 
 /// A failed client call.
@@ -92,6 +92,7 @@ impl<T: DeserializeOwned> TypedSubscription<T> {
 pub struct RuntimeClient {
     link: Supervised,
     host: Option<HostId>,
+    trace: Option<TraceId>,
     deadline: Duration,
     wait_connected: Duration,
 }
@@ -102,6 +103,7 @@ impl RuntimeClient {
         RuntimeClient {
             link,
             host: None,
+            trace: None,
             deadline: Duration::from_secs(60),
             wait_connected: Duration::from_secs(10),
         }
@@ -120,6 +122,13 @@ impl RuntimeClient {
     /// Address requests to `host` (routed by a hub).
     pub fn with_host(mut self, host: impl Into<HostId>) -> Self {
         self.host = Some(host.into());
+        self
+    }
+
+    /// Carry `trace` with every request this client makes (a clone made for one user intent:
+    /// `client.clone().with_trace(t).command(..)`).
+    pub fn with_trace(mut self, trace: TraceId) -> Self {
+        self.trace = Some(trace);
         self
     }
 
@@ -148,7 +157,7 @@ impl RuntimeClient {
         params: P,
         deadline: Duration,
     ) -> Result<R, ClientError> {
-        let mut opts = RequestOpts::new(deadline);
+        let mut opts = RequestOpts::new(deadline).trace(self.trace.clone());
         opts.host = self.host.clone();
         self.link
             .request(method, params, opts, self.wait_connected)
@@ -290,6 +299,25 @@ impl RuntimeClient {
         .await
     }
 
+    /// The last `limit` entries of the session's trail with `cursor < before` (all when `None`),
+    /// oldest first: what the session's events become when only facts are kept.
+    pub async fn trail_page(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<TrailPage, ClientError> {
+        self.call(
+            methods::SESSION_TRAIL_PAGE,
+            TrailRequest {
+                id: id.clone(),
+                before,
+                limit,
+            },
+        )
+        .await
+    }
+
     pub async fn command(
         &self,
         id: &SessionId,
@@ -385,6 +413,21 @@ impl RuntimeClient {
     ) -> TypedSubscription<SessionEvent> {
         self.durable(
             topics::session_events(id.as_str()),
+            serde_json::Value::Null,
+            from.map(Cursor::from_u64),
+        )
+    }
+
+    /// A session's trail entries after `from` (from the beginning when `None`): the same
+    /// cursors as [`RuntimeClient::subscribe_session`], so a resume is exact. Open it only while
+    /// something shows it.
+    pub fn subscribe_trail(
+        &self,
+        id: &SessionId,
+        from: Option<u64>,
+    ) -> TypedSubscription<TrailItem> {
+        self.durable(
+            topics::session_trail(id.as_str()),
             serde_json::Value::Null,
             from.map(Cursor::from_u64),
         )

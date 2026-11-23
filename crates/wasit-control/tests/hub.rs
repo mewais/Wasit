@@ -16,6 +16,7 @@ use wasit_control::{
     ControlServer, DurableOpts, Hello, HostId, HostSpec, Hub, HubConfig, HubError, LinkConnector,
     LinkEvent, LinkState, ProvisionError, ProvisionReason, Provisioner, RequestOpts,
     RoutingService, Service, SubscribeOpts, Supervised, SupervisedConfig, SupervisedOptions,
+    TraceId,
 };
 
 const D: Duration = Duration::from_secs(10);
@@ -561,6 +562,33 @@ async fn requests_are_routed_by_host() {
     }
     assert_eq!(got, vec![6, 7, 8, 9, 10]);
     assert_eq!(sub.close_reason(), Some(&wasit_control::CloseReason::Ended));
+    hub.shutdown().await;
+}
+
+/// A trace id travels with a request: client → hub → remote service, and on a chain
+/// client → hub → host → hub → host; a request without one arrives without one.
+#[tokio::test]
+async fn a_trace_survives_every_hop_of_a_routed_request() {
+    let (hub, _mc, _front, gui) = routed_setup().await;
+    let t = TraceId::new("u-0123456789abcdef").unwrap();
+    for h in ["hub", "a", "b"] {
+        let seen: Option<TraceId> = gui
+            .request_with("trace", Value::Null, to(h).trace(Some(t.clone())))
+            .await
+            .unwrap();
+        assert_eq!(seen.as_ref(), Some(&t), "served by {h}");
+        let none: Option<TraceId> = gui.request_with("trace", Value::Null, to(h)).await.unwrap();
+        assert_eq!(none, None, "an untraced request to {h}");
+    }
+    let seen: Option<TraceId> = gui
+        .request_with(
+            "peer_call",
+            json!({"host": "b", "method": "trace"}),
+            to("a").trace(Some(t.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen, Some(t), "gui -> hub -> a -> hub -> b");
     hub.shutdown().await;
 }
 

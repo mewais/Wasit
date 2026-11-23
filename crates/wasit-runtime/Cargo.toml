@@ -18,7 +18,7 @@ path = "src/bin/wasit-hostd.rs"
 # on itself below, so no build for use has it.
 panic-test = []
 # TypeScript definitions of the wire types (ts-rs), for GUI clients.
-ts = ["dep:ts-rs", "wasit-core/ts", "wasit-control/ts"]
+ts = ["dep:ts-rs", "wasit-core/ts", "wasit-control/ts", "wasit-diag/ts"]
 
 [dependencies]
 wasit-process = { path = "../wasit-process" }

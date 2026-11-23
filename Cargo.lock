@@ -771,12 +771,14 @@ dependencies = [
 name = "wasit-diag"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ts-rs",
  "wasit-process",
 ]
 

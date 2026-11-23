@@ -119,6 +119,19 @@ impl Word {
         }
     }
 
+    /// Reads back what [`Word::write`] wrote: `<other:N>` is a word that failed validation on
+    /// the writing side (its length is all that is known), anything else is validated again.
+    fn from_wire(s: &str, max: usize, ok: fn(u8) -> bool) -> Word {
+        if let Some(n) = s
+            .strip_prefix("<other:")
+            .and_then(|r| r.strip_suffix('>'))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            return Word::Other(n);
+        }
+        Word::check(Cow::Owned(s.to_owned()), max, ok)
+    }
+
     fn write(&self, out: &mut Json) {
         match self {
             // Validated: no character that needs escaping.
@@ -174,6 +187,11 @@ impl Ident {
     pub fn as_str(&self) -> Option<&str> {
         self.0.as_str()
     }
+
+    /// Reads an identifier back from the wire (see [`crate::wire`]).
+    pub(crate) fn from_wire(s: &str) -> Ident {
+        Ident(Word::from_wire(s, Self::MAX, ident_byte))
+    }
 }
 
 /// A machine word: error codes, enum names, CLI result subtypes, JSON-RPC method names, tool
@@ -196,6 +214,11 @@ impl Code {
     /// The word, `None` when it failed validation.
     pub fn as_str(&self) -> Option<&str> {
         self.0.as_str()
+    }
+
+    /// Reads a word back from the wire (see [`crate::wire`]).
+    pub(crate) fn from_wire(s: &str) -> Code {
+        Code(Word::from_wire(s, Self::MAX, code_byte))
     }
 }
 
@@ -274,6 +297,26 @@ impl Sealed for Fp {}
 impl DiagValue for Fp {
     fn __write(&self, out: &mut Json) {
         out.str(&hex(&self.0));
+    }
+}
+
+impl Fp {
+    /// Reads a fingerprint back from the wire: exactly eight hex digits.
+    pub(crate) fn from_hex(s: &str) -> Option<Fp> {
+        let b = s.as_bytes();
+        if b.len() != 8 {
+            return None;
+        }
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        };
+        let mut out = [0u8; 4];
+        for (i, pair) in b.chunks(2).enumerate() {
+            out[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        }
+        Some(Fp(out))
     }
 }
 
@@ -362,6 +405,25 @@ impl DiagValue for ErrorInfo {
     }
 }
 
+impl ErrorInfo {
+    /// Reads an error back from the wire (see [`crate::wire`]); what was written is what is read.
+    pub(crate) fn from_wire(
+        code: Code,
+        text: Option<DiagText>,
+        len: Option<u32>,
+        fp: Option<Fp>,
+        os: Option<i32>,
+    ) -> ErrorInfo {
+        ErrorInfo {
+            code,
+            text,
+            len,
+            fp,
+            os,
+        }
+    }
+}
+
 /// `NotFound` → `not_found`.
 fn snake(camel: &str) -> String {
     let mut s = String::with_capacity(camel.len() + 4);
@@ -417,6 +479,11 @@ impl ProjectPath {
     pub fn from_text(path: &str) -> ProjectPath {
         ProjectPath(policy::project_path(path))
     }
+
+    /// Reads a tag back from the wire (see [`crate::wire`]).
+    pub(crate) fn from_tag(tag: PathTag) -> ProjectPath {
+        ProjectPath(tag)
+    }
 }
 
 impl Sealed for ProjectPath {}
@@ -463,6 +530,21 @@ impl PathKind {
         }
     }
 
+    /// The kind written as `code`.
+    pub(crate) fn from_code(code: &str) -> Option<PathKind> {
+        Some(match code {
+            "posix" => PathKind::Posix,
+            "win" => PathKind::Win,
+            "unc" => PathKind::Unc,
+            "wsl_unc" => PathKind::WslUnc,
+            "wsl_mnt" => PathKind::WslMnt,
+            "tilde" => PathKind::Tilde,
+            "relative" => PathKind::Relative,
+            "empty" => PathKind::Empty,
+            _ => return None,
+        })
+    }
+
     fn windows(self) -> bool {
         matches!(self, PathKind::Win | PathKind::Unc | PathKind::WslUnc)
     }
@@ -478,6 +560,16 @@ impl PathKind {
 }
 
 impl PathTag {
+    /// A tag read back from the wire; the hash is the ten hex digits [`PathTag::of`] makes.
+    pub(crate) fn from_parts(kind: PathKind, depth: u32, hash: &str) -> Option<PathTag> {
+        let ok = hash.len() == 10 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        ok.then(|| PathTag {
+            kind,
+            depth,
+            hash: hash.to_owned(),
+        })
+    }
+
     pub(crate) fn of(raw: &str) -> PathTag {
         let kind = Self::classify(raw);
         let mut norm = if kind.windows() {

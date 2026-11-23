@@ -16,19 +16,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use futures::stream::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinHandle;
+use wasit_control::TraceId;
 use wasit_core::{DriverDescriptor, ResumeMode, SpawnSpec};
 use wasit_shim::ShimState;
 
-use crate::actor::{Actor, ActorInit, GateOp, HistoryLocal, Msg};
+use crate::actor::{Actor, ActorInit, GateOp, Local, Msg};
 use crate::config::RuntimeConfig;
 use crate::core::blank_snapshot;
+use crate::diag::{self, Intent};
 use crate::host::HostFeed;
 use crate::replay;
 use crate::store::{self, SessionFile};
 use crate::stream::{live, EventStream, StreamEnd};
 use crate::wire::{
     CommandError, CommandOutcome, CreateSession, CreateSessionReply, HistoryPage, HostEvent, Phase,
-    ResumeRequest, RuntimeError, SessionEvent, SessionId, SessionSnapshot,
+    ResumeRequest, RuntimeError, SessionEvent, SessionId, SessionSnapshot, TrailPage,
 };
 
 /// Bound on a user-given display name.
@@ -161,6 +163,16 @@ impl SessionManager {
     /// Create and launch a session. Returns once the shim is up (the handshake progresses as
     /// events). Config items the driver cannot honour come back as `unsupported`.
     pub async fn create(&self, req: CreateSession) -> Result<CreateSessionReply, RuntimeError> {
+        self.create_traced(req, None).await
+    }
+
+    /// [`SessionManager::create`] for a request that carries a trace id: it is journaled with the
+    /// session's `start` note, so the first prompt's `input` event (and `started`) carry it.
+    pub async fn create_traced(
+        &self,
+        req: CreateSession,
+        trace: Option<TraceId>,
+    ) -> Result<CreateSessionReply, RuntimeError> {
         let cfg = &self.inner.cfg;
         let desc = cfg
             .registry
@@ -269,10 +281,11 @@ impl SessionManager {
             Phase::Starting,
             true,
         ));
-        self.insert(id.clone(), dir, file, desc, snap, true);
+        self.insert(id.clone(), dir, file, desc, snap, trace);
         Ok(CreateSessionReply { id, unsupported })
     }
 
+    /// Registers a session and starts its actor; `start_trace` is journaled with its `start` note.
     fn insert(
         &self,
         id: SessionId,
@@ -280,7 +293,7 @@ impl SessionManager {
         file: SessionFile,
         desc: Arc<dyn DriverDescriptor>,
         snap: Arc<SessionSnapshot>,
-        start_actor: bool,
+        start_trace: Option<TraceId>,
     ) {
         let (snapshot, _) = watch::channel(snap.clone());
         let mut entry = Entry {
@@ -291,14 +304,12 @@ impl SessionManager {
             actor: None,
             loader: None,
         };
-        if start_actor {
-            entry.actor = Some(self.start_actor(&entry));
-        }
+        entry.actor = Some(self.start_actor(&entry, start_trace));
         lock(&self.inner.sessions).insert(id, entry);
         self.inner.feed.upsert(snap);
     }
 
-    fn start_actor(&self, e: &Entry) -> ActorHandle {
+    fn start_actor(&self, e: &Entry, start_trace: Option<TraceId>) -> ActorHandle {
         let feed = self.inner.feed.clone();
         let mut actor = Actor::new(ActorInit {
             dir: e.dir.clone(),
@@ -307,6 +318,7 @@ impl SessionManager {
             file: e.file.clone(),
             snapshot: e.snapshot.clone(),
             notify: Arc::new(move |s| feed.upsert(s.clone())),
+            start_trace,
         });
         let writer = actor.take_writer();
         let (tx, rx) = mpsc::channel(MAILBOX);
@@ -372,7 +384,7 @@ impl SessionManager {
         let meta = file.meta();
         if state == ShimState::Running {
             let snap = Arc::new(blank_snapshot(&meta, desc.as_ref(), Phase::Starting, false));
-            self.insert(id.clone(), dir.to_path_buf(), file, desc, snap, true);
+            self.insert(id.clone(), dir.to_path_buf(), file, desc, snap, None);
             return Ok(true);
         }
         let phase = match state {
@@ -559,7 +571,7 @@ impl SessionManager {
         if let Some(l) = e.loader.take() {
             l.abort();
         }
-        let handle = self.start_actor(e);
+        let handle = self.start_actor(e, None);
         let tx = handle.tx.clone();
         e.actor = Some(handle);
         Ok(tx)
@@ -601,37 +613,71 @@ impl SessionManager {
     pub async fn command(
         &self,
         id: &SessionId,
-        mut command: wasit_core::Command,
+        command: wasit_core::Command,
     ) -> Result<CommandOutcome, CommandError> {
+        self.command_traced(id, command, None).await
+    }
+
+    /// [`SessionManager::command`] for a request that carries a trace id: it is journaled with
+    /// the command and shows on its `input` event. A command refused before it was journaled is
+    /// recorded (`session.command_refused`) with the trace.
+    pub async fn command_traced(
+        &self,
+        id: &SessionId,
+        mut command: wasit_core::Command,
+        trace: Option<TraceId>,
+    ) -> Result<CommandOutcome, CommandError> {
+        let intent = Intent::new(command.name(), trace.clone());
+        let refused = |e: CommandError| {
+            diag::command_refused(id, &intent, &e);
+            e
+        };
         if let wasit_core::Command::Prompt { attachments, .. } = &mut command {
             if !attachments.is_empty() {
                 let (dir, input) = {
                     let map = lock(&self.inner.sessions);
-                    let e = map
-                        .get(id)
-                        .ok_or_else(|| CommandError::SessionNotFound { id: id.to_string() })?;
+                    let e = map.get(id).ok_or_else(|| {
+                        refused(CommandError::SessionNotFound { id: id.to_string() })
+                    })?;
                     (e.dir.clone(), e.desc.prompt_input())
                 };
                 crate::media::load_attachments(&dir, &input, attachments)
                     .await
-                    .map_err(|e| match e {
-                        RuntimeError::Unsupported(operation) => {
-                            CommandError::Unsupported { operation }
-                        }
-                        e => CommandError::Rejected {
-                            reason: e.to_string(),
-                        },
+                    .map_err(|e| {
+                        refused(match e {
+                            RuntimeError::Unsupported(operation) => {
+                                CommandError::Unsupported { operation }
+                            }
+                            e => CommandError::Rejected {
+                                reason: e.to_string(),
+                            },
+                        })
                     })?;
             }
         }
-        match self.ask(id, |reply| Msg::Command { command, reply }).await {
+        match self
+            .ask(id, |reply| Msg::Command {
+                command,
+                trace,
+                reply,
+            })
+            .await
+        {
+            // The actor answered: what it refused before journaling it has recorded itself.
             Ok(r) => r,
-            Err(RuntimeError::SessionNotFound(id)) => Err(CommandError::SessionNotFound { id }),
-            Err(RuntimeError::Busy(_)) => Err(CommandError::Busy),
-            Err(RuntimeError::Timeout(_)) => Err(CommandError::Timeout),
-            Err(e) => Err(CommandError::Rejected {
+            Err(RuntimeError::SessionNotFound(id)) => {
+                Err(refused(CommandError::SessionNotFound { id }))
+            }
+            Err(RuntimeError::Busy(_)) => Err(refused(CommandError::Busy)),
+            // Nobody answered within the bound: the requester gives up, the actor may still
+            // journal the command.
+            Err(RuntimeError::Timeout(_)) => {
+                diag::command_timeout(id, &intent);
+                Err(CommandError::Timeout)
+            }
+            Err(e) => Err(refused(CommandError::Rejected {
                 reason: e.to_string(),
-            }),
+            })),
         }
     }
 
@@ -777,7 +823,7 @@ impl SessionManager {
             )
         };
         if has_actor {
-            if let HistoryLocal::Page(p) = self
+            if let Local::Page(p) = self
                 .ask(id, |reply| Msg::History {
                     before,
                     limit,
@@ -789,6 +835,46 @@ impl SessionManager {
             }
         }
         replay::history(&dir, desc, &meta, before, limit)
+            .await
+            .map_err(RuntimeError::Io)
+    }
+
+    /// The last `limit` entries of the session's trail with `cursor < before` (all when
+    /// `None`), oldest first: the content-free projection of the events `history` returns
+    /// ([`crate::trail`]), from the actor's memory when it holds them, else from a replay of the
+    /// journal.
+    pub async fn trail_page(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<TrailPage, RuntimeError> {
+        let limit = limit.clamp(1, MAX_HISTORY_PAGE);
+        let (has_actor, dir, desc, meta) = {
+            let map = lock(&self.inner.sessions);
+            let e = map
+                .get(id)
+                .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+            (
+                e.actor.as_ref().is_some_and(|a| !a.task.is_finished()),
+                e.dir.clone(),
+                e.desc.clone(),
+                e.file.meta(),
+            )
+        };
+        if has_actor {
+            if let Local::Page(p) = self
+                .ask(id, |reply| Msg::Trail {
+                    before,
+                    limit,
+                    reply,
+                })
+                .await?
+            {
+                return Ok(p);
+            }
+        }
+        replay::trail(&dir, desc, &meta, before, limit)
             .await
             .map_err(RuntimeError::Io)
     }

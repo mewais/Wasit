@@ -29,7 +29,7 @@ use crate::service::{CallContext, EventStream, Service};
 use crate::transport::BoxDuplex;
 use crate::wire::{
     codes, decode, encode, CloseReason, Cursor, Frame, FrameError, FrameReader, Hello, HostId,
-    RpcError, SubId, DEFAULT_MAX_FRAME,
+    RpcError, SubId, TraceId, DEFAULT_MAX_FRAME,
 };
 
 /// Tunables of one connection. Every wait has a bound.
@@ -89,6 +89,8 @@ pub struct RequestOpts {
     pub host: Option<HostId>,
     pub hops: u32,
     pub deadline: Duration,
+    /// The user intent the request serves; recorded by every hop that serves it.
+    pub trace: Option<TraceId>,
 }
 
 impl RequestOpts {
@@ -97,11 +99,18 @@ impl RequestOpts {
             host: None,
             hops: 0,
             deadline,
+            trace: None,
         }
     }
 
     pub fn host(mut self, host: impl Into<HostId>) -> Self {
         self.host = Some(host.into());
+        self
+    }
+
+    /// Carry `trace` with the request (`None`: none).
+    pub fn trace(mut self, trace: Option<TraceId>) -> Self {
+        self.trace = trace;
         self
     }
 }
@@ -422,6 +431,7 @@ impl Connection {
                 method: method.to_owned(),
                 params,
                 hops: opts.hops,
+                trace: opts.trace,
             },
             inner.cfg.max_frame,
         )
@@ -675,7 +685,8 @@ impl Inner {
                 method,
                 params,
                 hops,
-            } => self.serve_request(guard, id, host, method, params, hops),
+                trace,
+            } => self.serve_request(guard, id, host, method, params, hops, trace),
             Frame::Response { id, result, error } => {
                 let pending = lock(&self.pending).remove(&id);
                 let res = match error {
@@ -797,6 +808,7 @@ impl Inner {
         guard: &Weak<Guard>,
         host: Option<HostId>,
         hops: u32,
+        trace: Option<TraceId>,
     ) -> Option<CallContext> {
         let guard = guard.upgrade()?;
         Some(CallContext {
@@ -806,9 +818,11 @@ impl Inner {
             },
             host,
             hops,
+            trace,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn serve_request(
         self: &Arc<Self>,
         guard: &Weak<Guard>,
@@ -817,41 +831,56 @@ impl Inner {
         method: String,
         params: Value,
         hops: u32,
+        trace: Option<TraceId>,
     ) {
+        // The record of a traced request, written before its response is queued (so whoever
+        // got the answer finds it) and never for an untraced one.
+        let traced = trace
+            .as_ref()
+            .map(|t| diag::TracedCall::new(t, &method, host.as_ref(), hops));
         let Some(service) = self.service.clone() else {
             let inner = self.clone();
             tokio::spawn(async move {
-                inner
-                    .send_response(id, Err(RpcError::method_not_found(&method)))
-                    .await
+                let res = Err(RpcError::method_not_found(&method));
+                if let Some(t) = traced {
+                    t.done(&res);
+                }
+                inner.send_response(id, res).await
             });
             return;
         };
-        let Some(ctx) = self.context(guard, host, hops) else {
+        let Some(ctx) = self.context(guard, host, hops, trace) else {
             return; // closing
         };
         let inner = self.clone();
         let Ok(permit) = self.limiter.clone().try_acquire_owned() else {
             tokio::spawn(async move {
-                inner
-                    .send_response(
-                        id,
-                        Err(RpcError::new(
-                            codes::OVERLOADED,
-                            "too many concurrent requests",
-                        )),
-                    )
-                    .await
+                let res = Err(RpcError::new(
+                    codes::OVERLOADED,
+                    "too many concurrent requests",
+                ));
+                if let Some(t) = traced {
+                    t.done(&res);
+                }
+                inner.send_response(id, res).await
             });
             return;
         };
         tokio::spawn(async move {
             let fut = AssertUnwindSafe(service.call(ctx, &method, params)).catch_unwind();
             let res = tokio::select! {
-                _ = inner.cancel.cancelled() => return,
+                _ = inner.cancel.cancelled() => {
+                    if let Some(t) = traced {
+                        t.cancelled();
+                    }
+                    return;
+                }
                 r = fut => r.unwrap_or_else(|_| Err(RpcError::internal("request handler panicked"))),
             };
             drop(permit);
+            if let Some(t) = traced {
+                t.done(&res);
+            }
             inner.send_response(id, res).await;
         });
     }
@@ -877,7 +906,7 @@ impl Inner {
             });
             return;
         };
-        let Some(ctx) = self.context(guard, host.clone(), hops) else {
+        let Some(ctx) = self.context(guard, host.clone(), hops, None) else {
             return;
         };
         let inner = self.clone();

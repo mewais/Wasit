@@ -85,6 +85,8 @@ impl Service for DemoService {
         match method {
             "echo" => Ok(params),
             "whoami" => Ok(json!(self.host)),
+            // The trace id the request arrived with (`null` without one).
+            "trace" => Ok(json!(ctx.trace)),
             "sleep" => {
                 let ms = params.get("ms").and_then(Value::as_u64).unwrap_or(0);
                 tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -106,6 +108,7 @@ impl Service for DemoService {
                     host,
                     hops: ctx.hops,
                     deadline: Duration::from_secs(20),
+                    trace: ctx.trace.clone(),
                 };
                 ctx.peer
                     .call(method, inner, opts)

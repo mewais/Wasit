@@ -39,6 +39,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
+use wasit_control::TraceId;
 use wasit_core::{
     AgentEvent, Command, DriverDescriptor, DriverError, Encoded, InputDropReason, InputId,
     Protocol, ResumeMode, SpawnSpec, Step,
@@ -134,6 +135,7 @@ enum Buffered {
         token: String,
         input: InputId,
         command: Command,
+        trace: Option<TraceId>,
     },
     Stop {
         input: InputId,
@@ -531,6 +533,7 @@ impl Core {
                     token,
                     input,
                     command,
+                    trace,
                 } = b
                 {
                     let status = CommandStatus::NotRunning {
@@ -540,6 +543,7 @@ impl Core {
                         input,
                         command: crate::media::without_bytes(command),
                         status: status.clone(),
+                        trace,
                     });
                     out.resolved.push((token, status));
                 }
@@ -611,8 +615,14 @@ impl Core {
     fn on_note(&mut self, rec: &Record, em: &mut Emitter, out: &mut Output) {
         match classify(&rec.data) {
             NoteKind::Runtime(RuntimeNote::Attach { token }) => out.attach = Some(token),
-            NoteKind::Runtime(RuntimeNote::Start { spec }) => self.on_start(&spec, rec, em, out),
-            NoteKind::Runtime(RuntimeNote::Command { token, command }) => {
+            NoteKind::Runtime(RuntimeNote::Start { spec, trace }) => {
+                self.on_start(&spec, trace, rec, em, out)
+            }
+            NoteKind::Runtime(RuntimeNote::Command {
+                token,
+                command,
+                trace,
+            }) => {
                 self.snap.last_activity_ms = rec.t;
                 let input = InputId(rec.seq);
                 if let Some(request_id) = self.answers_withdrawn(&command) {
@@ -621,12 +631,13 @@ impl Core {
                         input,
                         command,
                         status: status.clone(),
+                        trace,
                     });
                     out.resolved.push((token, status));
                     return;
                 }
                 if self.answers_external(&command) {
-                    self.answer_external(token, input, command, em, out);
+                    self.answer_external(token, input, command, trace, em, out);
                     return;
                 }
                 match &mut self.gen {
@@ -634,8 +645,11 @@ impl Core {
                         token,
                         input,
                         command,
+                        trace,
                     }),
-                    Gen::Running(_) => self.apply_command(Some(token), input, command, em, out),
+                    Gen::Running(_) => {
+                        self.apply_command(Some(token), input, command, trace, em, out)
+                    }
                     Gen::None | Gen::Exited => {
                         let status = CommandStatus::NotRunning {
                             reason: "the process is not running".into(),
@@ -644,6 +658,7 @@ impl Core {
                             input,
                             command: crate::media::without_bytes(command),
                             status: status.clone(),
+                            trace,
                         });
                         out.resolved.push((token, status));
                     }
@@ -704,8 +719,16 @@ impl Core {
         }
     }
 
-    fn on_start(&mut self, spec: &SpawnSpec, rec: &Record, em: &mut Emitter, out: &mut Output) {
-        // The first prompt is the generation's first input, journaled in this very note.
+    fn on_start(
+        &mut self,
+        spec: &SpawnSpec,
+        trace: Option<TraceId>,
+        rec: &Record,
+        em: &mut Emitter,
+        out: &mut Output,
+    ) {
+        // The first prompt is the generation's first input, journaled in this very note, and it
+        // carries the trace of the request that started the session.
         let (spec, first) = spec.split_first_prompt();
         let input = InputId(rec.seq);
         if !matches!(self.gen, Gen::Awaiting(_)) {
@@ -727,6 +750,7 @@ impl Core {
                     input,
                     command,
                     status,
+                    trace,
                 });
             }
             return;
@@ -746,6 +770,7 @@ impl Core {
             model: spec.model.clone().filter(|m| !m.is_empty()),
             mode: Some(spec.mode.clone()).filter(|m| !m.is_empty()),
             first_input: first.as_ref().map(|_| input),
+            trace: trace.clone(),
         });
         let mut p = self.desc.new_protocol();
         let step = p.start(&spec);
@@ -760,7 +785,7 @@ impl Core {
         }
         self.step(step, None, em, out);
         if let Some(command) = first {
-            self.apply_command(None, input, command, em, out);
+            self.apply_command(None, input, command, trace, em, out);
         }
         for b in buf {
             match b {
@@ -774,7 +799,8 @@ impl Core {
                     token,
                     input,
                     command,
-                } => self.apply_command(Some(token), input, command, em, out),
+                    trace,
+                } => self.apply_command(Some(token), input, command, trace, em, out),
                 Buffered::Stop { input } => self.apply_stop(input, em, out),
             }
         }
@@ -787,6 +813,7 @@ impl Core {
         token: Option<String>,
         input: InputId,
         command: Command,
+        trace: Option<TraceId>,
         em: &mut Emitter,
         out: &mut Output,
     ) {
@@ -846,6 +873,7 @@ impl Core {
             input,
             command: crate::media::without_bytes(command),
             status: status.clone(),
+            trace,
         });
         if let Some(token) = token {
             out.resolved.push((token, status));
@@ -895,6 +923,7 @@ impl Core {
         token: String,
         input: InputId,
         command: Command,
+        trace: Option<TraceId>,
         em: &mut Emitter,
         out: &mut Output,
     ) {
@@ -917,6 +946,7 @@ impl Core {
                     input,
                     command,
                     status: status.clone(),
+                    trace,
                 });
                 out.resolved.push((token, status));
                 return;
@@ -938,6 +968,7 @@ impl Core {
             input,
             command,
             status: CommandStatus::Sent,
+            trace,
         });
         out.resolved.push((token, CommandStatus::Sent));
     }
@@ -1494,6 +1525,7 @@ mod tests {
                 Kind::Note,
                 RuntimeNote::Start {
                     spec: Box::new(SpawnSpec::default()),
+                    trace: None,
                 }
                 .to_value(),
             ),
@@ -1552,6 +1584,7 @@ mod tests {
             Kind::Note,
             RuntimeNote::Start {
                 spec: Box::new(spec),
+                trace: None,
             }
             .to_value(),
         );
@@ -1582,6 +1615,7 @@ mod tests {
                     request_id: "g1".into(),
                     decision: GateDecision::choose("allow"),
                 },
+                trace: None,
             }
             .to_value(),
         );
@@ -1595,6 +1629,7 @@ mod tests {
                 command: Command::SetModel {
                     model: "haiku".into(),
                 },
+                trace: None,
             }
             .to_value(),
         );
@@ -1634,6 +1669,7 @@ mod tests {
             Kind::Note,
             RuntimeNote::Start {
                 spec: Box::new(SpawnSpec::default()),
+                trace: None,
             }
             .to_value(),
         );
@@ -1721,6 +1757,7 @@ mod tests {
                     first_prompt: Some("go".into()),
                     ..SpawnSpec::default()
                 }),
+                trace: None,
             }
             .to_value(),
         );
@@ -1772,6 +1809,7 @@ mod tests {
                     request_id: "x1".into(),
                     decision: GateDecision::choose("allow"),
                 },
+                trace: None,
             }
             .to_value(),
         );
@@ -1822,6 +1860,7 @@ mod tests {
                     request_id: "x2".into(),
                     decision: GateDecision::choose("allow"),
                 },
+                trace: None,
             }
             .to_value(),
         );
@@ -1891,6 +1930,7 @@ mod tests {
                     request_id: "x3".into(),
                     decision: GateDecision::choose("allow"),
                 },
+                trace: None,
             }
             .to_value(),
         );
@@ -1917,6 +1957,7 @@ mod tests {
                     Kind::Note,
                     RuntimeNote::Start {
                         spec: Box::default(),
+                        trace: None,
                     }
                     .to_value(),
                 ),
@@ -1965,6 +2006,7 @@ mod tests {
                 Kind::Note,
                 RuntimeNote::Start {
                     spec: Box::default(),
+                    trace: None,
                 }
                 .to_value(),
             ),
@@ -2034,6 +2076,7 @@ mod tests {
             let out = self.note(RuntimeNote::Command {
                 token: format!("t{}", self.j.seq + 1),
                 command,
+                trace: None,
             });
             (InputId(self.j.seq - out.writes.len() as u64), out)
         }
@@ -2046,6 +2089,7 @@ mod tests {
                     session_id: Some("aaaaaaaaaaaa".into()),
                     ..SpawnSpec::default()
                 }),
+                trace: None,
             })
         }
 
@@ -2158,6 +2202,62 @@ mod tests {
         sim.assert_replay_exact();
     }
 
+    fn trace(s: &str) -> Option<TraceId> {
+        Some(TraceId::new(s).unwrap())
+    }
+
+    /// The trace journaled with a note shows on the `input` event it produces and on `started`:
+    /// the first prompt takes the one of the start note, a command its own, and a command
+    /// without one has none. A replay reproduces all of it.
+    #[test]
+    fn the_trace_of_a_request_reaches_its_input_event() {
+        let mut sim = Sim::new();
+        sim.feed(Kind::Spawned, json!({"pid": 7, "argv": ["claude"]}));
+        let start = sim.note(RuntimeNote::Start {
+            spec: Box::new(SpawnSpec {
+                first_prompt: Some("first".into()),
+                session_id: Some("aaaaaaaaaaaa".into()),
+                ..SpawnSpec::default()
+            }),
+            trace: trace("u-create-0000001"),
+        });
+        assert!(matches!(
+            &start.events[0].kind,
+            SessionEventKind::Started { trace: Some(t), .. } if t.as_str() == "u-create-0000001"
+        ));
+        sim.feed(Kind::Out, json!(INIT_OK));
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        for (text, t) in [("second", trace("u-prompt-0000002")), ("third", None)] {
+            sim.note(RuntimeNote::Command {
+                token: format!("t-{text}"),
+                command: Command::prompt(text),
+                trace: t,
+            });
+            sim.feed(Kind::Out, json!(RESULT_OK));
+        }
+        let traces: Vec<(String, Option<String>)> = sim
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Input {
+                    command: Command::Prompt { text, .. },
+                    trace,
+                    ..
+                } => Some((text.clone(), trace.as_ref().map(|t| t.as_str().to_owned()))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            traces,
+            [
+                ("first".to_string(), Some("u-create-0000001".to_string())),
+                ("second".to_string(), Some("u-prompt-0000002".to_string())),
+                ("third".to_string(), None),
+            ]
+        );
+        sim.assert_replay_exact();
+    }
+
     /// A journal written by the build before input ids (the first prompt inside the journaled
     /// spec, no session id, the lines that build wrote) replays with the `input` event and
     /// without owing anything: nothing would be written twice after an upgrade.
@@ -2227,6 +2327,7 @@ mod tests {
             RuntimeNote::Command {
                 token: "i".into(),
                 command: Command::Interrupt,
+                trace: None,
             }
             .to_value(),
         );
@@ -2304,6 +2405,7 @@ mod tests {
             RuntimeNote::Command {
                 token: "p".into(),
                 command: Command::prompt("go"),
+                trace: None,
             }
             .to_value(),
         );
@@ -2491,6 +2593,7 @@ mod tests {
                 session_id: Some("aaaaaaaaaaaa".into()),
                 ..SpawnSpec::default()
             }),
+            trace: None,
         });
         assert!(matches!(
             &out.events[0].kind,

@@ -228,7 +228,12 @@ One protocol for GUI↔daemon, daemon↔daemon and (later) phone↔daemon.
 - `Hello {protocol, build, host_id, capabilities}` both ways first; incompatible major ⇒ typed
   refusal the UI can explain ("helper on host X is older; updating").
 - `Request {id, method, params}` → `Response {id, result | error{code,message}}`; long-running
-  work replies immediately with an operation id and finishes with an event.
+  work replies immediately with an operation id and finishes with an event. A request may carry
+  a `trace` (`TraceId`, `[A-Za-z0-9_-]{8,40}`): the id of the user intent it serves, chosen by
+  whoever originates the intent, forwarded by the router, handed to services in
+  `CallContext::trace`, recorded (`rpc.traced`) by every connection that serves a request that
+  has one, and journaled by the runtime with the command or the session start it carried (it
+  shows on the `Input` event, so the session trail names it). Peers that predate it ignore it.
 - `Subscribe {topic, from_cursor}` → `Event {sub, cursor, payload}` …; topics: host (session
   list + snapshots, link states, capability inventory), session (events), task/edge (Wasl).
   Resubscribing with the last cursor is the whole reconnect story.
@@ -376,6 +381,13 @@ reasons), never content.
   titles, workstream names: never (people type the task into them). Transport stderr: bounded,
   scrubbed `DiagText(Transport)`. Env capture notes / setup errors: first line only. Panics:
   location, thread, payload kind and length; text only of a static payload.
+- **The session trail** (`wasit_runtime::trail`) is a typed, content-free projection of a
+  session's events — `TrailEntry`, declared with `diag_data!` (the same field-type rule as a log
+  record, plus serde and TypeScript from the one declaration) and computed by `project` on the
+  session's host, never written to a log file: topic `session.trail:<id>` (the cursors of
+  `session.events:<id>`, so a resume is exact, also after a daemon restart) and method
+  `session.trail.page`. Sizes and counts instead of content, tool names as `Code`, argv as
+  flag names, CLI error text as length + fingerprint.
 - **Free text** exists only as `DiagText::new(Origin, &str)`: registered secrets and project
   paths replaced, home → `~`, token-shaped runs redacted, control characters escaped, bounded.
 - **Who may read.** Session directories are `0700` and everything written in them

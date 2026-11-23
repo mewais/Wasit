@@ -54,5 +54,6 @@ pub use transport::{
 };
 pub use uplink::{Uplink, UplinkChanges};
 pub use wire::{
-    codes, CloseReason, Cursor, Frame, Hello, HostId, ProtocolVersion, RpcError, SubId, PROTOCOL,
+    codes, CloseReason, Cursor, Frame, Hello, HostId, InvalidTraceId, ProtocolVersion, RpcError,
+    SubId, TraceId, PROTOCOL,
 };

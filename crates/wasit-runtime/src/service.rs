@@ -11,6 +11,8 @@ use serde::Serialize;
 use serde_json::Value;
 use wasit_control::{CallContext, CloseReason, Cursor, EventStream, RpcError, Service};
 
+use crate::trail;
+
 use crate::discovery::Discovery;
 use crate::manager::SessionManager;
 use crate::store::now_ms;
@@ -18,7 +20,7 @@ use crate::stream::StreamEnd;
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandReply, CommandRequest, ConfigureEnvironment,
     CreateSession, DriverSummary, EnvironmentTest, HistoryRequest, HostInfo, InventoryRequest,
-    RefreshRequest, RenameSession, RuntimeError, SessionId, SessionList, SessionRef,
+    RefreshRequest, RenameSession, RuntimeError, SessionId, SessionList, SessionRef, TrailRequest,
 };
 
 /// How long `host.environment.test` waits for discovery after the setup ran (a test then
@@ -63,6 +65,20 @@ fn close_reason(e: StreamEnd) -> CloseReason {
             error: RpcError::internal(m),
         },
     }
+}
+
+/// The session and the cursor a `session.events:<id>` / `session.trail:<id>` subscription names.
+fn session_topic(rest: &str, from: Option<&Cursor>) -> Result<(SessionId, Option<u64>), RpcError> {
+    let id = SessionId::parse(rest)
+        .ok_or_else(|| RpcError::invalid_params(format!("bad session id {rest:?}")))?;
+    let from = match from {
+        None => None,
+        Some(c) => Some(
+            c.as_u64()
+                .ok_or_else(|| RpcError::invalid_params(format!("bad cursor {c}")))?,
+        ),
+    };
+    Ok((id, from))
 }
 
 impl RuntimeService {
@@ -142,7 +158,7 @@ impl RuntimeService {
 
 #[async_trait]
 impl Service for RuntimeService {
-    async fn call(&self, _ctx: CallContext, method: &str, p: Value) -> Result<Value, RpcError> {
+    async fn call(&self, ctx: CallContext, method: &str, p: Value) -> Result<Value, RpcError> {
         let m = &self.manager;
         match method {
             methods::HOST_INFO => ok(&self.info),
@@ -194,7 +210,7 @@ impl Service for RuntimeService {
             methods::SESSIONS_LIST => ok(SessionList { sessions: m.list() }),
             methods::SESSIONS_CREATE => {
                 let r: CreateSession = params(p)?;
-                ok(m.create(r).await.map_err(runtime_err)?)
+                ok(m.create_traced(r, ctx.trace).await.map_err(runtime_err)?)
             }
             methods::SESSIONS_CONTINUE => {
                 let r: SessionRef = params(p)?;
@@ -226,9 +242,18 @@ impl Service for RuntimeService {
                     .await
                     .map_err(runtime_err)?)
             }
+            methods::SESSION_TRAIL_PAGE => {
+                let r: TrailRequest = params(p)?;
+                ok(m.trail_page(&r.id, r.before, r.limit as usize)
+                    .await
+                    .map_err(runtime_err)?)
+            }
             methods::SESSION_COMMAND => {
                 let r: CommandRequest = params(p)?;
-                let outcome = m.command(&r.id, r.command).await.map_err(command_err)?;
+                let outcome = m
+                    .command_traced(&r.id, r.command, ctx.trace)
+                    .await
+                    .map_err(command_err)?;
                 ok(CommandReply { outcome })
             }
             methods::SESSION_ATTACHMENT_PUT => {
@@ -286,15 +311,7 @@ impl Service for RuntimeService {
                 .boxed());
         }
         if let Some(rest) = topic.strip_prefix(topics::SESSION_EVENTS_PREFIX) {
-            let id = SessionId::parse(rest)
-                .ok_or_else(|| RpcError::invalid_params(format!("bad session id {rest:?}")))?;
-            let from = match &from {
-                None => None,
-                Some(c) => Some(
-                    c.as_u64()
-                        .ok_or_else(|| RpcError::invalid_params(format!("bad cursor {c}")))?,
-                ),
-            };
+            let (id, from) = session_topic(rest, from.as_ref())?;
             let s = self
                 .manager
                 .subscribe(&id, from)
@@ -306,6 +323,29 @@ impl Service for RuntimeService {
                         .map(|v| (Cursor::from_u64(ev.cursor), v))
                         .map_err(|e| close_reason(StreamEnd::Error(e.to_string()))),
                     Err(e) => Err(close_reason(e)),
+                })
+                .boxed());
+        }
+        if let Some(rest) = topic.strip_prefix(topics::SESSION_TRAIL_PREFIX) {
+            // The session's events, projected: the same stream (so the same cursors, replay and
+            // lag handling as `session.events:`), the events that are not part of the trail
+            // left out.
+            let (id, from) = session_topic(rest, from.as_ref())?;
+            let s = self
+                .manager
+                .subscribe(&id, from)
+                .await
+                .map_err(runtime_err)?;
+            return Ok(s
+                .filter_map(|item| {
+                    futures::future::ready(match item {
+                        Ok(ev) => trail::item(&ev).map(|it| {
+                            serde_json::to_value(&it)
+                                .map(|v| (Cursor::from_u64(ev.cursor), v))
+                                .map_err(|e| close_reason(StreamEnd::Error(e.to_string())))
+                        }),
+                        Err(e) => Some(Err(close_reason(e))),
+                    })
                 })
                 .boxed());
         }

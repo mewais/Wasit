@@ -8,6 +8,8 @@
 //!   journal; see the `actor` and `core` module docs for the replay-exactness design.
 //! * [`Discovery`] — runs the drivers' discovery probes with deadlines and publishes a
 //!   [`wire::DriverInventory`] per driver.
+//! * [`trail`] — the content-free projection of a session's events (`session.trail:<id>`,
+//!   `session.trail.page`).
 //! * [`RuntimeService`] — the [`wasit_control::Service`] serving all of the above; [`wire`]
 //!   holds every payload type and [`RuntimeClient`] is the typed client.
 
@@ -17,6 +19,7 @@ mod actor;
 mod client;
 mod config;
 mod core;
+mod diag;
 mod discovery;
 pub mod environment;
 mod host;
@@ -28,6 +31,7 @@ mod replay;
 mod service;
 mod store;
 mod stream;
+pub mod trail;
 pub mod wire;
 
 pub use client::{ClientError, RuntimeClient, TypedSubscription};

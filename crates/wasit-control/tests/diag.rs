@@ -24,6 +24,7 @@ use wasit_control::{
     EventStream, Hello, HostId, HostSpec, Hub, HubConfig, LinkConnector, LinkState,
     ProtocolVersion, ProvisionError, ProvisionReason, RequestOpts, RoutingService, RpcError,
     Service, SubscribeOpts, Supervised, SupervisedConfig, SupervisedOptions, SupervisorHooks,
+    TraceId,
 };
 use wasit_diag::{Code, Ident, SinkConfig};
 
@@ -1402,4 +1403,182 @@ async fn a_link_without_a_label_records_nothing() {
     // the marker.
     let text = serde_json::to_string(&all()).unwrap();
     assert!(!text.contains("UNLABELLED-MARKER"));
+}
+
+// ── traced requests ─────────────────────────────────────────────────────────
+
+fn traced_for(host: &str) -> Vec<Value> {
+    all()
+        .into_iter()
+        .filter(|v| v["ev"] == "rpc.traced" && v["host"] == host)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_traced_request_is_recorded_by_every_hop_that_serves_it_and_an_untraced_one_is_not() {
+    dir();
+    let r = routed("hub-trc", &[("trc-a", Arc::new(DemoService::new("trc-a")))]).await;
+
+    // Untraced requests, answered or failed, leave no record at all.
+    r.gui
+        .request_with::<Value>("whoami", Value::Null, to("trc-a"))
+        .await
+        .unwrap();
+    r.gui
+        .request_with::<Value>("fail", Value::Null, to("trc-a"))
+        .await
+        .unwrap_err();
+    assert!(traced_for("trc-a").is_empty(), "{:#?}", traced_for("trc-a"));
+
+    // A traced one is recorded where the hub served it (it forwarded it) and where the host did.
+    let t = TraceId::new("u-trc00000000000a1").unwrap();
+    let opts = to("trc-a").trace(Some(t.clone()));
+    r.gui
+        .request_with::<Value>("whoami", Value::Null, opts.clone())
+        .await
+        .unwrap();
+    let rec = traced_for("trc-a");
+    assert_eq!(rec.len(), 2, "{rec:#?}");
+    let (hub_side, host_side) = (
+        rec.iter()
+            .find(|v| v["hops"] == 0)
+            .expect("the hub's record"),
+        rec.iter()
+            .find(|v| v["hops"] == 1)
+            .expect("the host's record"),
+    );
+    for v in [hub_side, host_side] {
+        assert_eq!(v["trace"], "u-trc00000000000a1");
+        assert_eq!(v["method"], "whoami");
+        assert_eq!(v["outcome"], "ok");
+        assert!(v["ms"].is_u64());
+        assert!(v.get("code").is_none());
+    }
+
+    // An error is recorded with its code and never its message.
+    let before = traced_for("trc-a").len();
+    r.gui
+        .request_with::<Value>("fail", Value::Null, opts)
+        .await
+        .unwrap_err();
+    let rec = traced_for("trc-a");
+    assert_eq!(rec.len(), before + 2, "{rec:#?}");
+    let failed: Vec<&Value> = rec.iter().filter(|v| v["method"] == "fail").collect();
+    assert_eq!(failed.len(), 2);
+    for v in &failed {
+        assert_eq!(
+            (v["outcome"].as_str(), v["code"].as_str()),
+            (Some("error"), Some("demo_failure"))
+        );
+    }
+    assert!(!serde_json::to_string(&rec)
+        .unwrap()
+        .contains("asked to fail"));
+
+    // A request the hub itself refuses is recorded too: the hub is the serving side.
+    let t2 = TraceId::new("u-trc00000000000b2").unwrap();
+    r.gui
+        .request_with::<Value>("whoami", Value::Null, to("trc-ghost").trace(Some(t2)))
+        .await
+        .unwrap_err();
+    let rec = traced_for("trc-ghost");
+    assert_eq!(rec.len(), 1, "{rec:#?}");
+    assert_eq!(
+        (
+            rec[0]["outcome"].as_str(),
+            rec[0]["code"].as_str(),
+            rec[0]["hops"].as_u64()
+        ),
+        (Some("error"), Some("host_unknown"), Some(0))
+    );
+    r.hub.shutdown().await;
+}
+
+/// A service with `trace` (answers with the trace id it got) and `hold` (never answers; says
+/// when it started and when its request was dropped).
+struct Hold {
+    started: Arc<tokio::sync::Notify>,
+    dropped: Arc<tokio::sync::Notify>,
+}
+
+struct OnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[async_trait]
+impl Service for Hold {
+    async fn call(
+        &self,
+        ctx: wasit_control::CallContext,
+        m: &str,
+        _p: Value,
+    ) -> Result<Value, RpcError> {
+        match m {
+            "trace" => Ok(json!(ctx.trace)),
+            "hold" => {
+                let _dropped = OnDrop(self.dropped.clone());
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(Value::Null)
+            }
+            other => Err(RpcError::method_not_found(other)),
+        }
+    }
+}
+
+fn of_trace(trace: &str) -> Vec<Value> {
+    all()
+        .into_iter()
+        .filter(|v| v["ev"] == "rpc.traced" && v["trace"] == trace)
+        .collect()
+}
+
+/// Runs on the default current-thread runtime: the serving task drops the request and records it
+/// in one go, with no await between, so when the test is woken by the drop the record exists.
+#[tokio::test]
+async fn a_traced_request_without_a_host_has_none_and_a_dropped_connection_is_recorded() {
+    dir();
+    let (started, dropped) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let svc = Arc::new(Hold {
+        started: started.clone(),
+        dropped: dropped.clone(),
+    });
+    let (client, server) = mem_pair(svc, "trc-local", cfg(), cfg()).await;
+    let t = TraceId::new("u-trc00000000000c3").unwrap();
+    let v: Option<TraceId> = client
+        .request_with(
+            "trace",
+            Value::Null,
+            RequestOpts::new(D).trace(Some(t.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v, Some(t));
+    let rec = of_trace("u-trc00000000000c3");
+    assert_eq!(rec.len(), 1, "{rec:#?}");
+    assert!(rec[0].get("host").is_none());
+    assert_eq!(rec[0]["method"], "trace");
+
+    // The connection goes away while the service works: the record says it never answered.
+    let t2 = TraceId::new("u-trc00000000000d4").unwrap();
+    let c2 = client.clone();
+    let pending = tokio::spawn(async move {
+        c2.request_with::<Value>("hold", Value::Null, RequestOpts::new(D).trace(Some(t2)))
+            .await
+    });
+    within(started.notified()).await;
+    server.connections().pop().unwrap().close();
+    within(dropped.notified()).await;
+    assert!(pending.await.unwrap().is_err());
+    let rec = of_trace("u-trc00000000000d4");
+    assert_eq!(rec.len(), 1, "{rec:#?}");
+    assert_eq!(rec[0]["outcome"], "cancelled");
+    assert_eq!(rec[0]["method"], "hold");
 }

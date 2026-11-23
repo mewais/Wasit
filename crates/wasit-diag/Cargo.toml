@@ -10,9 +10,13 @@ default = ["tracing"]
 # The counts-only `tracing` bridge (`tracing_layer()`): records `trace.counted` per minute,
 # never a message or a field value.
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
+# TypeScript definitions (ts-rs) of the value types that cross a wire inside a `diag_data!` type.
+ts = ["dep:ts-rs"]
 
 [dependencies]
 sha2 = { workspace = true }
+serde = { workspace = true }
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 serde_json = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 tracing = { workspace = true, optional = true }
