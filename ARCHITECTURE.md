@@ -140,7 +140,11 @@ Unix; `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` + job object on Windows). It
   for ONE controller at a time: `attach {from_seq}` → streams journal records from `from_seq`
   then live, with no gap and no duplicate; `write {line}`, `signal {int|term|kill}`, `close`;
 - holds an exclusive lock on `<run>/shim.lock` for its lifetime (liveness = lock held; no pidfile
-  guessing), and exits once the CLI has exited and the final record is durable.
+  guessing), and exits once the CLI has exited and the final record is durable. The lock is also
+  the right to the endpoint's name: on the way out the shim takes its endpoint down while still
+  holding the lock, then releases the lock, then closes its connections — so the next generation
+  of the session, which binds the same name the moment the lock is free, never meets (or loses) a
+  stale one, and a controller whose stream ended finds the lock free.
 - `<run>` (`--run`) is the session's directory in the **machine-local runtime directory**
   (§4.2); the journal directory may be on a home shared by several machines, where Unix
   sockets are per-kernel and advisory locks unreliable. The journal there is append + fsync

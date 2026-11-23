@@ -1103,19 +1103,28 @@ async fn supervise(mut r: Running) -> i32 {
     }
     let linger_ms = Ms::of(lingered.elapsed());
 
-    // Release liveness first so that anyone who sees the endpoint close also sees the lock free.
+    // The lock is the right to the endpoint's name: the next generation of this session binds
+    // the same path the moment the lock is free, and a path-based removal by this shim after
+    // that would take the successor's endpoint. So the name is released first, while the lock
+    // is still held (the accept loop removes it when it stops; a loop that does not stop is cut
+    // off so it cannot remove anything later).
+    shared.stop_accepting.send_replace(true);
+    if timeout(Duration::from_secs(1), &mut r.accept)
+        .await
+        .is_err()
+    {
+        r.accept.abort();
+        emit(ShimEvent::AcceptNotStopped {});
+    }
+    // Then liveness, before the connections close, so that a controller whose stream ends also
+    // sees the lock free.
     if let Err(e) = r.lock.unlock() {
         emit(ShimEvent::UnlockFailed {
             error: diag::io(&e),
         });
     }
     drop(r.lock);
-    // Then the endpoint, then the connections: a controller that sees its stream end also sees
-    // the endpoint gone (a Windows pipe name lives as long as any server-side instance).
-    shared.stop_accepting.send_replace(true);
-    if timeout(Duration::from_secs(1), r.accept).await.is_err() {
-        emit(ShimEvent::AcceptNotStopped {});
-    }
+    // A Windows pipe name lives as long as any server-side instance: the connections follow.
     shared.shutdown.send_replace(true);
     emit(ShimEvent::Exit {
         code: exit.code,

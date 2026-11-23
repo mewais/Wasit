@@ -236,6 +236,9 @@ pub(crate) struct Actor {
     stop_stage: Option<(Instant, StopStage)>,
     reconnect_at: Option<Instant>,
     reconnect_attempt: u32,
+    /// The new generation's shim, to be spawned when the previous generation's shim has closed
+    /// its connection (see `begin_continue`).
+    spawn_after_close: Option<wasit_shim::ShimSpec>,
 }
 
 /// Why a continue could not start.
@@ -410,6 +413,7 @@ impl Actor {
             stop_stage: None,
             reconnect_at: None,
             reconnect_attempt: 0,
+            spawn_after_close: None,
         }
     }
 
@@ -538,7 +542,16 @@ impl Actor {
         if self.stream_is_live {
             self.drop_connection();
             if self.core.process_ended() {
+                // The journal is closed: every request still pending asked for a note that
+                // never reached it (the connection ended with the note in flight or unsent),
+                // and nothing can answer it any more.
+                self.answer_unreached();
                 self.finish_loading();
+                // The old shim is gone (its connection closed after it let go of the lock and
+                // the endpoint name): the continue that waited for that can start its shim.
+                if let Some(spec) = self.spawn_after_close.take() {
+                    self.source = Some(spawn_source(spec, self.core.last_seq() + 1));
+                }
                 return;
             }
             // The shim went away without us seeing `exited`: find out what happened.
@@ -607,6 +620,7 @@ impl Actor {
     /// requests that asked for it get `error`; the commands held behind it were never journaled
     /// and get [`CommandError::ContinueFailed`] saying why.
     fn fail_continue(&mut self, error: RuntimeError) {
+        self.spawn_after_close = None;
         let waiting = self.continuation.failed();
         for r in waiting.continues {
             let _ = r.send(Err(error.clone())); // requester may have given up
@@ -640,6 +654,7 @@ impl Actor {
             return;
         }
         self.loading = false;
+        self.snapshot_dirty = true;
         let deferred: Vec<Msg> = self.deferred.drain(..).collect();
         for m in deferred {
             self.on_msg(m);
@@ -794,6 +809,12 @@ impl Actor {
 
     fn publish_snapshot(&mut self) {
         if !self.snapshot_dirty {
+            return;
+        }
+        if self.loading && !self.snapshot_tx.borrow().loaded {
+            // An adopted session is still being rebuilt from its journal: what the core shows
+            // now is a placeholder (and says `loaded`). The snapshot stays as it is, `loaded:
+            // false`, until `finish_loading` publishes the rebuilt one.
             return;
         }
         self.snapshot_dirty = false;
@@ -1254,6 +1275,25 @@ impl Actor {
         }
     }
 
+    /// The process ended and its shim closed the journal: every request that is still pending
+    /// had a note that did not reach it, and the requests queued behind them never will. Each is
+    /// answered with how the process ended (the continue's failure for a held prompt).
+    fn answer_unreached(&mut self) {
+        self.outbox.clear();
+        let how = describe_end(&self.core.snapshot().phase);
+        let pending: Vec<Pending> = self.pending.drain().map(|(_, p)| p).collect();
+        for p in pending {
+            if p.continued {
+                self.answer_ended_before_prompt(p);
+            } else {
+                self.answer_not_running(
+                    p,
+                    &format!("the process ended before the request reached it ({how})"),
+                );
+            }
+        }
+    }
+
     fn answer_busy(&self, p: Pending) {
         match p.reply {
             Reply::Command(r) => {
@@ -1390,10 +1430,13 @@ impl Actor {
                 blocked: Some(blocked),
             }
         })?;
-        if self.stream.is_some() {
-            // The previous generation's journal (a lingering shim, or the file of a finished
-            // one) is only still being read for records we already have, the last of which
-            // ended its process: let it go.
+        // The previous generation's shim may still be on its way out (its last records are
+        // synced, then it lets go of the endpoint and of `shim.lock`, in that order, and only
+        // then closes its connections). The new shim takes the same lock and the same endpoint
+        // name, so it starts when the old connection has ended: the end of the stream is what
+        // says the old shim is gone. A finished shim's journal file has nothing to wait for.
+        let old_shim_closing = self.stream.is_some() && self.stream_is_live;
+        if self.stream.is_some() && !old_shim_closing {
             self.stream = None;
             self.drop_connection();
         }
@@ -1444,7 +1487,11 @@ impl Actor {
         self.save_file(None);
         self.reconnect_attempt = 0;
         self.continuation.begin();
-        self.source = Some(spawn_source(shim_spec, self.core.last_seq() + 1));
+        if old_shim_closing {
+            self.spawn_after_close = Some(shim_spec);
+        } else {
+            self.source = Some(spawn_source(shim_spec, self.core.last_seq() + 1));
+        }
         Ok(())
     }
 
@@ -1792,6 +1839,193 @@ mod tests {
         assert!(matches!(a.core.snapshot().phase, Phase::Failed { .. }));
         assert_eq!(a.core.snapshot().generation, 2);
         assert!(a.core.snapshot().continuable);
+    }
+
+    /// The previous generation's shim is still connected (finishing: it releases the lock and the
+    /// endpoint name before it closes the connection): the new generation's shim is spawned when
+    /// that connection has ended, not before, because it takes the same lock and the same name.
+    #[tokio::test]
+    async fn a_continue_spawns_its_shim_when_the_old_shim_has_closed_its_connection() {
+        let (mut a, s) = ended();
+        let journal: String = [
+            r#"{"seq":1,"t":1,"kind":"spawned","data":{"pid":7,"argv":["claude"]}}"#,
+            r#"{"seq":2,"t":2,"kind":"exited","data":{"code":0}}"#,
+        ]
+        .map(|l| format!("{l}\n"))
+        .concat();
+        std::fs::write(s.0.join("journal.ndjson"), journal).unwrap();
+        // (The records are already applied: this stream only has its end left to deliver.)
+        a.stream = Some(wasit_shim::read_journal(&s.0, 3).await.unwrap());
+        a.stream_is_live = true;
+        let mut waiter = explicit_continue(&mut a);
+        let mut one = prompt(&mut a, "one");
+        assert!(a.continuation.is_starting());
+        assert!(
+            a.source.is_none(),
+            "spawned while the old shim was still connected"
+        );
+        assert!(a.spawn_after_close.is_some());
+        assert!(a.stream.is_some(), "the old connection was let go");
+        assert!(waiter.try_recv().is_err() && one.try_recv().is_err());
+        // The old shim closes its connection: now the new one starts.
+        let item = a.stream.as_mut().unwrap().next().await;
+        assert!(item.is_none());
+        a.on_stream_item(item);
+        assert!(a.spawn_after_close.is_none());
+        assert!(a.source.is_some(), "the new shim is being spawned");
+        assert!(a.continuation.is_starting());
+        // And a continue that fails answers everybody as before.
+        a.source = None;
+        a.on_source(Source::SpawnFailed("no such file".into()));
+        assert!(matches!(waiter.try_recv(), Ok(Err(RuntimeError::Spawn(_)))));
+        continue_failed(one.try_recv());
+        assert_clean(&a);
+    }
+
+    /// An adopted session's snapshot says `loaded: false` until the journal is read: what the
+    /// core holds meanwhile is a placeholder (a `Starting` generation 0 that claims to be
+    /// loaded) and must not replace it.
+    #[tokio::test]
+    async fn a_session_being_loaded_publishes_nothing_until_it_is_rebuilt() {
+        let (mut a, _s) = ended();
+        let mut unloaded = a.core.snapshot().clone();
+        unloaded.loaded = false;
+        a.snapshot_tx.send_replace(Arc::new(unloaded));
+        a.loading = true;
+        a.snapshot_dirty = true;
+        a.publish_snapshot();
+        assert!(
+            !a.snapshot_tx.borrow().loaded,
+            "a placeholder was published"
+        );
+        assert!(a.snapshot_dirty, "nothing was lost");
+        a.finish_loading();
+        a.publish_snapshot();
+        let shown = a.snapshot_tx.borrow().clone();
+        assert!(shown.loaded);
+        assert!(
+            matches!(shown.phase, Phase::Exited { .. }),
+            "{:?}",
+            shown.phase
+        );
+    }
+
+    /// A prompt journaled into the window of a continue whose process ends at once is refused by
+    /// the shim ("the process had exited"): the answer is how it ended, whichever comes first,
+    /// the refusal or the journal's `exited` record.
+    #[tokio::test]
+    async fn a_held_prompt_the_shim_refuses_is_answered_with_how_the_process_ended() {
+        for refusal_first in [true, false] {
+            let (mut a, _s) = ended();
+            let mut one = prompt(&mut a, "one");
+            // The new shim is attached: the held prompt is journaled (its note queued).
+            let waiting = a.continuation.attached();
+            for h in waiting.held {
+                a.journal_command(h.command, h.reply, h.intent, true);
+            }
+            let Some(Op::Note {
+                token: Some(tok), ..
+            }) = a.outbox.pop_front()
+            else {
+                panic!("the held prompt's note was not queued");
+            };
+            let refusal = || Err(ShimError::Remote("the process has exited".into()));
+            let note = || Op::Note {
+                data: serde_json::Value::Null,
+                token: Some(tok.clone()),
+                attach: false,
+            };
+            let records = [
+                (
+                    3,
+                    Kind::Spawned,
+                    serde_json::json!({"pid": 8, "argv": ["claude"]}),
+                ),
+                (4, Kind::Err, serde_json::json!("boom")),
+                (5, Kind::Exited, serde_json::json!({"code": 2})),
+            ];
+            let apply = |a: &mut Actor| {
+                for (seq, kind, data) in records.clone() {
+                    a.on_record(Record {
+                        seq,
+                        t: seq,
+                        kind,
+                        data,
+                        partial: false,
+                    });
+                }
+            };
+            if refusal_first {
+                let op = note();
+                a.on_op_done(op, refusal());
+                assert!(
+                    one.try_recv().is_err(),
+                    "answered before the journal said how"
+                );
+                apply(&mut a);
+            } else {
+                apply(&mut a);
+                assert!(one.try_recv().is_err(), "nothing told it yet");
+                let op = note();
+                a.on_op_done(op, refusal());
+            }
+            let reason = continue_failed(one.try_recv());
+            assert!(reason.contains("code 2"), "{refusal_first}: {reason}");
+            assert_clean(&a);
+        }
+    }
+
+    /// The shim of a process that ended closed its connection while a request's note was still
+    /// on its way to it (in flight, or not yet sent): nothing will ever answer the note, so the
+    /// close of the journal answers the request, with how the process ended.
+    #[tokio::test]
+    async fn a_connection_that_ends_after_the_process_answers_the_requests_it_never_took() {
+        let (mut a, _s) = ended();
+        a.core.apply(&Record {
+            seq: 3,
+            t: 3,
+            kind: Kind::Spawned,
+            data: serde_json::json!({"pid": 8, "argv": ["claude"]}),
+            partial: false,
+        });
+        a.core.apply(&Record {
+            seq: 4,
+            t: 4,
+            kind: Kind::Exited,
+            data: serde_json::json!({"code": 2}),
+            partial: false,
+        });
+        assert!(a.core.process_ended());
+        // A prompt held behind a continue, one sent to the process directly, and a stop.
+        let (held, mut held_rx) = oneshot::channel();
+        a.journal_command(
+            Command::prompt("held"),
+            held,
+            Intent::new("prompt", None),
+            true,
+        );
+        let (direct, mut direct_rx) = oneshot::channel();
+        a.journal_command(
+            Command::prompt("direct"),
+            direct,
+            Intent::new("prompt", None),
+            false,
+        );
+        assert_eq!((a.pending.len(), a.outbox.len()), (2, 2));
+        a.stream_is_live = true;
+        a.stream_ended();
+        let reason = continue_failed(held_rx.try_recv());
+        assert!(reason.contains("code 2"), "{reason}");
+        match direct_rx.try_recv() {
+            Ok(Err(CommandError::NotRunning { reason })) => {
+                assert!(reason.contains("code 2"), "{reason}")
+            }
+            other => panic!("expected NotRunning, got {other:?}"),
+        }
+        // Nothing stays queued for a connection that is gone (the next generation's shim must
+        // not be handed what its requesters were told failed).
+        assert_clean(&a);
+        assert!(a.outbox.is_empty());
     }
 
     #[tokio::test]
