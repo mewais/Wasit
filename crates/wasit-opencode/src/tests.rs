@@ -89,10 +89,7 @@ fn handshake_applies_launch_model_and_mode_then_first_prompt() {
         step.events[step.events.len() - 2..],
         [
             AgentEvent::InputSent { input: InputId(1) },
-            AgentEvent::TurnStarted {
-                native_turn_id: None,
-                input: Some(InputId(1))
-            }
+            AgentEvent::turn_started(None, Some(InputId(1)))
         ]
     );
 }
@@ -719,10 +716,9 @@ fn drops(events: &[AgentEvent]) -> Vec<(InputId, InputDropReason)> {
 fn interrupt_drops_the_prompts_queued_behind_the_turn() {
     let mut p = ready();
     let step = sent(p.encode(InputId(10), Command::prompt("go")));
-    assert!(step.events.contains(&AgentEvent::TurnStarted {
-        native_turn_id: None,
-        input: Some(InputId(10))
-    }));
+    assert!(step
+        .events
+        .contains(&AgentEvent::turn_started(None, Some(InputId(10)))));
     assert_eq!(
         p.encode(InputId(11), Command::prompt("a")).unwrap(),
         Encoded::Queued

@@ -270,6 +270,41 @@ pub enum Step {
     /// `--mcp-config`) and show it as a tool call. `save_as` keeps the result (parsed as JSON
     /// when it is JSON) for `{{name.path}}` placeholders in later steps' text and arguments.
     McpCall(McpCallStep),
+    /// Start a task in the background (claude persona; other personas ignore it): a subagent or a
+    /// shell command. The turn goes on and ends; the task runs for `after_ms`, then the agent
+    /// starts a turn of its own (`then`). See [`BackgroundStep`].
+    Background(BackgroundStep),
+}
+
+/// A task the agent runs in the background, as the real claude 2.1.293 does (recorded in
+/// `reference/claude/background_*.jsonl`, `stop_task.jsonl`, `agent_turn_*.jsonl`): the tool call
+/// that starts it returns at once (`task_started` with `is_backgrounded`), the turn ends, the
+/// task's own lines stream while the session is idle (a subagent's are tagged with the spawning
+/// call), and when it ends (`task_notification`) the agent starts a turn by itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BackgroundStep {
+    /// `local_agent` (default) or `local_bash`.
+    pub kind: String,
+    pub description: String,
+    /// The subagent's type (`general-purpose` by default).
+    pub subagent_type: Option<String>,
+    /// The command a `local_bash` task runs (shown in the spawning call).
+    pub command: Option<String>,
+    /// How long the task runs after it started, in milliseconds.
+    pub after_ms: u64,
+    /// What a subagent does while it runs: its own conversation (`say`, `think`, `tool` steps;
+    /// its lines carry `parent_tool_use_id`, `agent_id`, `subagent_type`, `task_description`).
+    pub steps: Vec<Step>,
+    /// `completed` (default) or `failed`.
+    pub status: Option<String>,
+    /// The agent's one-line account of the end (default: derived from the description).
+    pub summary: Option<String>,
+    /// The turn the agent starts by itself when the task ended (none: it does not).
+    pub then: Vec<Step>,
+    /// The turn the agent starts when the task was stopped with `stop_task`: a stopped subagent
+    /// makes the agent report it, a stopped shell command starts no turn (both recorded).
+    pub on_stop: Vec<Step>,
 }
 
 /// See [`Step::McpCall`].
@@ -568,6 +603,10 @@ impl TurnBuilder {
     }
     pub fn stderr(self, text: impl Into<String>) -> Self {
         self.step(Step::Stderr { text: text.into() })
+    }
+    /// Start a background task (see [`BackgroundStep`]).
+    pub fn background(self, task: BackgroundStep) -> Self {
+        self.step(Step::Background(task))
     }
 }
 

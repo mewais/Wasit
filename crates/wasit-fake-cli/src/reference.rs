@@ -19,7 +19,9 @@ macro_rules! refs {
 refs! {
     "claude"/"simple", "claude"/"tool_allow", "claude"/"tool_deny", "claude"/"ask_question",
     "claude"/"interrupt", "claude"/"resume", "claude"/"set_mode", "claude"/"turn_error",
-    "claude"/"partial_messages", "claude"/"lifecycle",
+    "claude"/"partial_messages", "claude"/"lifecycle", "claude"/"background_bash",
+    "claude"/"background_agent", "claude"/"stop_task", "claude"/"agent_turn_interrupt",
+    "claude"/"agent_turn_prompt",
     "codex"/"handshake", "codex"/"simple", "codex"/"tool_allow", "codex"/"tool_deny",
     "codex"/"interrupt", "codex"/"resume", "codex"/"mode", "codex"/"error", "codex"/"question",
     "codex"/"lifecycle", "codex"/"steer",

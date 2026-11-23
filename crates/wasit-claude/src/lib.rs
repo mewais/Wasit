@@ -121,6 +121,7 @@ impl DriverDescriptor for ClaudeDescriptor {
             continue_latest: true,
             streaming_output: false,
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
+            stop_task: true,
         }
     }
 

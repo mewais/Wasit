@@ -29,8 +29,9 @@ use crate::replay;
 use crate::store::{self, SessionFile};
 use crate::stream::{live, EventStream, StreamEnd};
 use crate::wire::{
-    CommandError, CommandOutcome, CreateSession, CreateSessionReply, HistoryPage, HostEvent, Phase,
-    ResumeRequest, RuntimeError, SessionEvent, SessionId, SessionSnapshot, TrailPage,
+    CommandError, CommandOutcome, CreateSession, CreateSessionReply, HistoryPage, HistoryScope,
+    HostEvent, Phase, ResumeRequest, RuntimeError, SessionEvent, SessionId, SessionSnapshot,
+    TrailPage,
 };
 
 /// Bound on a user-given display name.
@@ -872,6 +873,20 @@ impl SessionManager {
         before: Option<u64>,
         limit: usize,
     ) -> Result<HistoryPage, RuntimeError> {
+        self.history_scoped(id, before, limit, HistoryScope::All)
+            .await
+    }
+
+    /// [`Self::history`] restricted to `scope` ([`HistoryScope`]): the session's own transcript
+    /// or one subagent's. The cursors are those of the full stream; the limit and `has_more`
+    /// count only events of the scope.
+    pub async fn history_scoped(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+        scope: HistoryScope,
+    ) -> Result<HistoryPage, RuntimeError> {
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
         let (has_actor, dir, desc, meta) = {
             let map = lock(&self.inner.sessions);
@@ -890,6 +905,7 @@ impl SessionManager {
                 .ask(id, |reply| Msg::History {
                     before,
                     limit,
+                    scope: scope.clone(),
                     reply,
                 })
                 .await?
@@ -897,7 +913,7 @@ impl SessionManager {
                 return Ok(p);
             }
         }
-        replay::history(&dir, desc, &meta, before, limit)
+        replay::history(&dir, desc, &meta, before, limit, scope)
             .await
             .map_err(RuntimeError::Io)
     }

@@ -126,8 +126,11 @@ pub enum Command {
         request_id: String,
         answer: QuestionAnswer,
     },
-    /// Stop the running turn. Pending gates are declined first. A no-op when
-    /// no turn is running.
+    /// Stop what the agent is doing: the running turn (a turn it started by itself too), after
+    /// declining pending gates and dropping prompts that never started; when no turn is running
+    /// but the agent works in the background, stop that background work. A no-op when nothing
+    /// runs. With a turn running, background tasks are left alone (stop them one by one with
+    /// [`Command::StopTask`]).
     Interrupt,
     /// Switch model for subsequent turns.
     SetModel { model: String },
@@ -135,6 +138,11 @@ pub enum Command {
     SetMode { mode: String },
     /// Run a slash command. `name` has no leading `/`.
     RunSlash { name: String, args: String },
+    /// Stop one task the agent runs (a background subagent or shell command): `task_id` is a
+    /// [`TaskInfo::task_id`](crate::TaskInfo::task_id) of the session. Needs
+    /// [`DriverCapabilities::stop_task`](crate::DriverCapabilities::stop_task). The agent reports
+    /// the end of the task as [`AgentEvent::TaskEnded`](crate::AgentEvent::TaskEnded).
+    StopTask { task_id: String },
     /// End the session gracefully (close stdin).
     Shutdown,
 }
@@ -158,6 +166,7 @@ impl Command {
             Command::SetModel { .. } => "set_model",
             Command::SetMode { .. } => "set_mode",
             Command::RunSlash { .. } => "run_slash",
+            Command::StopTask { .. } => "stop_task",
             Command::Shutdown => "shutdown",
         }
     }

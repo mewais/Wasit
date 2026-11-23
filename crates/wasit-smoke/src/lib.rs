@@ -63,6 +63,8 @@ pub(crate) struct Live {
     stdin: Option<ChildStdin>,
     record: Option<std::fs::File>,
     last_gate: Option<GateRequest>,
+    /// The id of the latest task the agent started (`"@running"` in a script's command).
+    last_task: Option<String>,
     echo: bool,
     outcome: Outcome,
 }
@@ -84,6 +86,7 @@ impl Live {
                 println!("event: {}", serde_json::to_string(ev).unwrap_or_default());
             }
             match ev {
+                AgentEvent::TaskStarted { task_id, .. } => self.last_task = Some(task_id.clone()),
                 AgentEvent::GateRequested { gate } => self.last_gate = Some(gate.clone()),
                 AgentEvent::GateResolved { request_id, .. }
                     if self.last_gate.as_ref().map(|g| g.request_id()) == Some(request_id) =>
@@ -223,6 +226,7 @@ pub async fn run(mut opts: RunOptions) -> Result<Outcome, String> {
             None => None,
         },
         last_gate: None,
+        last_task: None,
         echo: opts.echo,
         outcome: Outcome::default(),
     };
@@ -360,6 +364,13 @@ async fn run_script(
 ) -> Result<(), String> {
     for st in steps {
         let cmd = if let Some(c) = st.get("cmd") {
+            // `"@running"` names the latest task the agent started.
+            let mut c = c.clone();
+            if let (Some(obj), Some(task)) = (c.as_object_mut(), live.last_task.clone()) {
+                if obj.get("task_id").and_then(Value::as_str) == Some("@running") {
+                    obj.insert("task_id".into(), Value::String(task));
+                }
+            }
             Some(
                 serde_json::from_value::<Command>(c.clone())
                     .map_err(|e| format!("bad cmd {c}: {e}"))?,

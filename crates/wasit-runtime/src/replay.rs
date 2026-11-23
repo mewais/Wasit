@@ -16,7 +16,9 @@ use wasit_core::DriverDescriptor;
 use wasit_shim::ShimState;
 
 use crate::core::{Core, SessionMeta};
-use crate::wire::{cursor_seq, HistoryPage, SessionEvent, SessionSnapshot, TrailPage};
+use crate::wire::{
+    cursor_seq, HistoryPage, HistoryScope, SessionEvent, SessionSnapshot, TrailPage,
+};
 
 /// Feed every journal record with `seq <= until` (all when `None`) through `core`, handing each
 /// event to `f`. Stops early when `f` returns `false`.
@@ -111,8 +113,12 @@ pub(crate) async fn history(
     meta: &SessionMeta,
     before: Option<u64>,
     limit: usize,
+    scope: HistoryScope,
 ) -> Result<HistoryPage, String> {
-    let (events, has_more) = window(dir, desc, meta, before, limit, Some).await?;
+    let (events, has_more) = window(dir, desc, meta, before, limit, |e| {
+        scope.admits(&e).then_some(e)
+    })
+    .await?;
     Ok(HistoryPage { events, has_more })
 }
 

@@ -26,6 +26,7 @@ mod discovery;
 mod event;
 mod protocol;
 mod spec;
+pub mod tasks;
 pub mod transcript;
 pub mod wire;
 
@@ -45,10 +46,11 @@ pub use discovery::{
     FileHead, ProbeAction, ProbeOutput, ProbeParse, ResumableSession,
 };
 pub use event::{
-    AgentEvent, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind, GateDecision,
-    GateReason, GateRequest, InputDropReason, McpServerInfo, ModelInfo, ModelUsage, PlanEntry,
-    QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, SessionMode, SlashCommandInfo,
-    SpawnGate, Usage,
+    AgentEvent, BackgroundTask, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind,
+    GateDecision, GateReason, GateRequest, InputDropReason, McpServerInfo, ModelInfo, ModelUsage,
+    PlanEntry, QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, Scope, SessionMode,
+    SlashCommandInfo, SpawnGate, TaskUsage, TurnOrigin, TurnTrigger, Usage,
 };
 pub use protocol::{Command, DriverError, Encoded, InputId, OutLine, Protocol, Step};
 pub use spec::{GeneratedFile, ResumeMode, SpawnSpec};
+pub use tasks::TaskInfo;

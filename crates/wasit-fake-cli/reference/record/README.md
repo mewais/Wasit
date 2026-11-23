@@ -17,6 +17,14 @@ kilo 7.8.27, codex-cli 0.169.1). They are kept for reproducibility, not run by `
   machine), same fake Responses server, port changed. A raw JSON-RPC client: `turn/start` `SLOW please`,
   after the first delta a `turn/steer` with a wrong `expectedTurnId`, one with the right one, and after
   `turn/completed` one more. The host name and installation id were replaced by hand.
+* `background/` (claude 2.1.293): the background-task recordings (`wasit-claude/tests/fixtures/{background-bash,
+  background-agent,stop-task,agent-turn-interrupt,agent-turn-prompt}.ndjson`, and the `claude/*.jsonl` here made from
+  them). Recorded through the driver itself: `wasit-smoke claude --model haiku --cwd <scratch> --record X.raw
+  --script X.script.json --timeout 80 "<first prompt>"` (the prompts are in the test docs: a background `Bash`
+  `sleep` or an `Agent` with `run_in_background`; `"task_id": "@running"` in a script command names the latest
+  task), then `python3 -I background/sanitize.py X.raw > fixture.ndjson` (home path, MCP / skill / plugin names,
+  catalogues trimmed; `in` records untouched) and `python3 -I background/to_reference.py fixture.ndjson >
+  claude/X.jsonl`.
 * `trim.py` shortens long lists (models, commands, tools) so the recordings stay small.
 
 Run from this directory with `REF_DIR=..` set.

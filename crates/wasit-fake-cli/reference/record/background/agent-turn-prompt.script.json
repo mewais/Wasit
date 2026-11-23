@@ -1,0 +1,6 @@
+[{"wait":"turn_completed"},
+ {"wait":"turn_started","contains":"\"agent\""},
+ {"wait":"tool_call_started"},
+ {"cmd":{"command":"prompt","text":"Reply with just the word PONG."}},
+ {"wait":"turn_completed"},
+ {"wait":"turn_completed"}]

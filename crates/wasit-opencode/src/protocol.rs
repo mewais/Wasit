@@ -291,6 +291,11 @@ impl AcpProtocol {
                     ),
                 });
             }
+            Command::StopTask { .. } => {
+                return Err(DriverError::Unsupported {
+                    operation: "stop_task".into(),
+                })
+            }
             Command::Interrupt => step = self.interrupt(),
             Command::SetModel { model } => {
                 let line = self.set_option(Req::SetModel, "model", &model);
@@ -323,10 +328,7 @@ impl AcpProtocol {
             json!({"sessionId": self.sid(), "prompt": blocks}),
         );
         Step {
-            events: vec![AgentEvent::TurnStarted {
-                native_turn_id: None,
-                input: Some(input),
-            }],
+            events: vec![AgentEvent::turn_started(None, Some(input))],
             write: vec![line],
             close_stdin: false,
         }
@@ -460,6 +462,7 @@ impl AcpProtocol {
                     usage: Usage::default(),
                     per_model: HashMap::new(),
                     reply: Some(message),
+                    origin: None,
                 });
                 step.extend(self.drain());
                 step
@@ -516,6 +519,7 @@ impl AcpProtocol {
             },
             per_model: HashMap::new(),
             reply: None,
+            origin: None,
         });
         step.extend(self.drain());
         step

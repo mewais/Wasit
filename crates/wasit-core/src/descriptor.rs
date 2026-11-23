@@ -100,6 +100,9 @@ pub struct DriverCapabilities {
     pub streaming_output: bool,
     /// Semantics of a prompt sent during a running turn.
     pub prompt_while_busy: BusyPrompt,
+    /// `Command::StopTask` stops a background task the CLI reports.
+    #[serde(default)]
+    pub stop_task: bool,
 }
 
 /// Everything the runtime needs to know about one CLI. Implemented by each
@@ -265,6 +268,7 @@ mod tests {
                 continue_latest: false,
                 streaming_output: false,
                 prompt_while_busy: BusyPrompt::QueuedByProtocol,
+                stop_task: false,
             }
         }
         fn new_protocol(&self) -> Box<dyn Protocol> {

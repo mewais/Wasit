@@ -37,7 +37,9 @@
 //! one forces a decision here: project it, or list it as not projected.
 
 use wasit_control::TraceId;
-use wasit_core::{AgentEvent, Command, EndReason, GateRequest, InputDropReason, InputId};
+use wasit_core::{
+    AgentEvent, Command, EndReason, GateRequest, InputDropReason, InputId, TurnTrigger,
+};
 use wasit_diag::{Bytes, Code, DiagText, ErrorInfo, Ident, Origin, VEC_MAX};
 
 use crate::wire::{
@@ -56,9 +58,16 @@ wasit_diag::diag_data! {
         /// The CLI completed its handshake.
         #[diag(ev = "handshake_done")]
         HandshakeDone {},
-        /// A turn started, for this input when it is one of ours.
+        /// A turn started, for this input when it is one of ours; `trigger` is `input`, `agent`
+        /// (the agent started it by itself) or `unreported`.
         #[diag(ev = "turn_started")]
-        TurnStarted { ; input: u64 },
+        TurnStarted { trigger: Code ; input: u64 },
+        /// A background task started running: the agent works in the background.
+        #[diag(ev = "task_started")]
+        TaskStarted { task_id: Ident },
+        /// A background task stopped running.
+        #[diag(ev = "task_ended")]
+        TaskEnded { task_id: Ident },
         /// A turn ended.
         #[diag(ev = "turn_completed")]
         TurnCompleted { interrupted: bool ; end_reason: Code },
@@ -167,9 +176,10 @@ wasit_diag::diag_data! {
             reason: Code
             ; error: ErrorInfo
         },
-        /// A turn started.
+        /// A turn started, whoever started it: `trigger` is `input` (it runs for `input`),
+        /// `agent` (the agent started it by itself) or `unreported` (the driver cannot tell).
         #[diag(ev = "turn.started")]
-        TurnStarted { ; input: u64, native_turn_id: Ident },
+        TurnStarted { trigger: Code ; input: u64, native_turn_id: Ident },
         /// A turn ended: how, and what it cost.
         #[diag(ev = "turn.completed")]
         TurnCompleted {
@@ -180,16 +190,50 @@ wasit_diag::diag_data! {
             cost_usd_micros: u64,
             reply_chars: u32
             ; end_reason: Code,
+            /// Why the agent ran the turn it started by itself, as it said (the `kind` of its
+            /// origin word).
+            origin: Code,
             /// Length and fingerprint of the failure the CLI reported (only when the turn
             /// ended in an execution error).
             error: ErrorInfo
         },
-        /// A tool call started.
+        /// A tool call started; `scope` is the tool call that spawned the subagent making it
+        /// (absent for the session's own).
         #[diag(ev = "tool.started")]
-        ToolStarted { call_id: Ident, name: Code, subagent: bool },
+        ToolStarted { call_id: Ident, name: Code, subagent: bool ; scope: Ident },
         /// A tool call finished.
         #[diag(ev = "tool.finished")]
-        ToolFinished { call_id: Ident, ok: bool },
+        ToolFinished { call_id: Ident, ok: bool ; scope: Ident },
+        /// A task (subagent, shell command) started: its id, the agent's word for the kind of
+        /// work and whether it runs in the background.
+        #[diag(ev = "task.started")]
+        TaskStarted { task_id: Ident, background: bool ; kind: Code, call_id: Ident },
+        /// A task made progress: what the agent says it used so far.
+        #[diag(ev = "task.progress")]
+        TaskProgress {
+            task_id: Ident
+            ; tool: Code,
+            total_tokens: u64,
+            tool_uses: u64,
+            duration_ms: u64
+        },
+        /// A task's status changed (the agent's status word).
+        #[diag(ev = "task.updated")]
+        TaskUpdated { task_id: Ident ; status: Code },
+        /// A task ended: how, and the length of the agent's account of it.
+        #[diag(ev = "task.ended")]
+        TaskEnded {
+            task_id: Ident,
+            ok: bool,
+            summary_chars: u32
+            ; status: Code,
+            call_id: Ident,
+            total_tokens: u64,
+            duration_ms: u64
+        },
+        /// The agent listed its background tasks: how many run.
+        #[diag(ev = "background.tasks")]
+        BackgroundTasks { running: u32 },
         /// The agent is blocked on a human decision.
         #[diag(ev = "gate.raised")]
         GateRaised {
@@ -389,7 +433,9 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
         AgentEvent::TurnStarted {
             native_turn_id,
             input,
+            trigger,
         } => TrailEntry::TurnStarted {
+            trigger: trigger_code(*trigger),
             input: input.map(|i| i.0),
             native_turn_id: native_turn_id.as_deref().map(Ident::new),
         },
@@ -422,6 +468,7 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
             num_turns,
             usage,
             reply,
+            origin,
             ..
         } => TrailEntry::TurnCompleted {
             interrupted: *was_interrupted,
@@ -431,6 +478,7 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
             cost_usd_micros: micros(usage.cost_usd),
             reply_chars: reply.as_deref().map_or(0, chars),
             end_reason: end_reason.map(end_reason_code),
+            origin: origin.as_ref().map(|o| Code::new(&o.kind)),
             // The reply of a failed turn is the CLI's error message.
             error: match (end_reason, reply) {
                 (Some(EndReason::ExecutionError), Some(r)) => {
@@ -448,10 +496,73 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
             call_id: Ident::new(call_id),
             name: Code::new(name),
             subagent: *is_subagent,
+            scope: None,
         },
         AgentEvent::ToolCallFinished { call_id, ok, .. } => TrailEntry::ToolFinished {
             call_id: Ident::new(call_id),
             ok: *ok,
+            scope: None,
+        },
+        // A subagent's own tool calls are tool calls with a scope; the rest of what it
+        // produces is content like the session's own.
+        AgentEvent::Scoped { scope, event } => {
+            let mut entry = project_agent(event)?;
+            let id = Some(Ident::new(&scope.call_id));
+            match &mut entry {
+                TrailEntry::ToolStarted { scope, .. } | TrailEntry::ToolFinished { scope, .. } => {
+                    *scope = id
+                }
+                _ => return None,
+            }
+            entry
+        }
+        AgentEvent::TaskStarted {
+            task_id,
+            kind,
+            call_id,
+            background,
+            ..
+        } => TrailEntry::TaskStarted {
+            task_id: Ident::new(task_id),
+            background: *background,
+            kind: non_empty(kind).map(Code::new),
+            call_id: call_id.as_deref().map(Ident::new),
+        },
+        AgentEvent::TaskProgress {
+            task_id,
+            last_tool,
+            usage,
+            ..
+        } => TrailEntry::TaskProgress {
+            task_id: Ident::new(task_id),
+            tool: last_tool.as_deref().map(Code::new),
+            total_tokens: usage.map(|u| u.total_tokens),
+            tool_uses: usage.map(|u| u.tool_uses),
+            duration_ms: usage.map(|u| u.duration_ms),
+        },
+        AgentEvent::TaskUpdated { task_id, status } => TrailEntry::TaskUpdated {
+            task_id: Ident::new(task_id),
+            status: status.as_deref().map(Code::new),
+        },
+        AgentEvent::TaskEnded {
+            task_id,
+            call_id,
+            status,
+            ok,
+            summary,
+            usage,
+        } => TrailEntry::TaskEnded {
+            task_id: Ident::new(task_id),
+            ok: *ok,
+            // The agent's account is content: only its length.
+            summary_chars: summary.as_deref().map_or(0, chars),
+            status: non_empty(status).map(Code::new),
+            call_id: call_id.as_deref().map(Ident::new),
+            total_tokens: usage.map(|u| u.total_tokens),
+            duration_ms: usage.map(|u| u.duration_ms),
+        },
+        AgentEvent::BackgroundTasksChanged { tasks } => TrailEntry::BackgroundTasks {
+            running: count(tasks.len()),
         },
         AgentEvent::GateRequested { gate } => raised(gate),
         AgentEvent::GateResolved { request_id, reason } => TrailEntry::GateResolved {
@@ -549,6 +660,7 @@ fn applied(
             n_chars = chars(args);
             target = Some(Ident::new(name));
         }
+        Command::StopTask { task_id } => target = Some(Ident::new(task_id)),
         Command::Interrupt | Command::Shutdown => {}
     }
     // Why a command was not accepted is worded by the protocol or the runtime from what the
@@ -603,8 +715,15 @@ fn cause_of(cause: &PhaseCause) -> TrailCause {
             generation: *generation,
         },
         PhaseCause::HandshakeDone => TrailCause::HandshakeDone {},
-        PhaseCause::TurnStarted { input } => TrailCause::TurnStarted {
+        PhaseCause::TurnStarted { input, trigger } => TrailCause::TurnStarted {
+            trigger: trigger_code(*trigger),
             input: input.map(|i| i.0),
+        },
+        PhaseCause::TaskStarted { task_id } => TrailCause::TaskStarted {
+            task_id: Ident::new(task_id),
+        },
+        PhaseCause::TaskEnded { task_id } => TrailCause::TaskEnded {
+            task_id: Ident::new(task_id),
         },
         PhaseCause::TurnCompleted {
             end_reason,
@@ -642,6 +761,14 @@ fn cause_of(cause: &PhaseCause) -> TrailCause {
         PhaseCause::Lost => TrailCause::Lost {},
         PhaseCause::Other => TrailCause::Other {},
     }
+}
+
+fn trigger_code(t: TurnTrigger) -> Code {
+    Code::st(match t {
+        TurnTrigger::Input => "input",
+        TurnTrigger::Agent => "agent",
+        TurnTrigger::Unreported => "unreported",
+    })
 }
 
 fn end_reason_code(r: EndReason) -> Code {
@@ -713,7 +840,16 @@ mod tests {
         vec![
             TrailCause::Spawned { generation: 1 },
             TrailCause::HandshakeDone {},
-            TrailCause::TurnStarted { input: Some(5) },
+            TrailCause::TurnStarted {
+                trigger: Code::st("input"),
+                input: Some(5),
+            },
+            TrailCause::TaskStarted {
+                task_id: Ident::st("t1"),
+            },
+            TrailCause::TaskEnded {
+                task_id: Ident::st("t1"),
+            },
             TrailCause::TurnCompleted {
                 interrupted: false,
                 end_reason: Some(Code::st("cancelled")),
@@ -795,6 +931,7 @@ mod tests {
                 error: Some(err()),
             },
             TrailEntry::TurnStarted {
+                trigger: code(),
                 input: Some(5),
                 native_turn_id: Some(id()),
             },
@@ -806,17 +943,47 @@ mod tests {
                 cost_usd_micros: 4,
                 reply_chars: 5,
                 end_reason: Some(code()),
+                origin: Some(code()),
                 error: Some(err()),
             },
             TrailEntry::ToolStarted {
                 call_id: id(),
                 name: code(),
                 subagent: false,
+                scope: Some(id()),
             },
             TrailEntry::ToolFinished {
                 call_id: id(),
                 ok: true,
+                scope: Some(id()),
             },
+            TrailEntry::TaskStarted {
+                task_id: id(),
+                background: true,
+                kind: Some(code()),
+                call_id: Some(id()),
+            },
+            TrailEntry::TaskProgress {
+                task_id: id(),
+                tool: Some(code()),
+                total_tokens: Some(1),
+                tool_uses: Some(2),
+                duration_ms: Some(3),
+            },
+            TrailEntry::TaskUpdated {
+                task_id: id(),
+                status: Some(code()),
+            },
+            TrailEntry::TaskEnded {
+                task_id: id(),
+                ok: true,
+                summary_chars: 4,
+                status: Some(code()),
+                call_id: Some(id()),
+                total_tokens: Some(1),
+                duration_ms: Some(3),
+            },
+            TrailEntry::BackgroundTasks { running: 2 },
             TrailEntry::GateRaised {
                 request_id: id(),
                 gate_type: code(),
@@ -1095,6 +1262,11 @@ mod tests {
                     usage: Default::default(),
                     per_model: Default::default(),
                     reply: Some(format!("{M} failure")),
+                    origin: Some(wasit_core::TurnOrigin {
+                        kind: "task-notification".into(),
+                        producer: Some(format!("{M} producer")),
+                        run_id: Some(format!("{M} run")),
+                    }),
                 },
             }),
             ev(SessionEventKind::Agent {
@@ -1120,6 +1292,55 @@ mod tests {
             ev(SessionEventKind::Notice {
                 message: format!("{M} shim note"),
                 code: NoticeCode::Shim,
+            }),
+            // Background work: the description, the summary and the subagent's own tool input
+            // are content; the ids, kinds, statuses and counts are not.
+            ev(SessionEventKind::Agent {
+                event: AgentEvent::TaskStarted {
+                    task_id: "bk1".into(),
+                    kind: "local_agent".into(),
+                    call_id: Some("toolu_1".into()),
+                    description: format!("{M} description"),
+                    subagent_type: Some("general-purpose".into()),
+                    background: true,
+                    run_id: Some("run-1".into()),
+                },
+            }),
+            ev(SessionEventKind::Agent {
+                event: AgentEvent::TaskProgress {
+                    task_id: "bk1".into(),
+                    call_id: Some("toolu_1".into()),
+                    description: format!("{M} doing"),
+                    last_tool: Some("Bash".into()),
+                    usage: Some(wasit_core::TaskUsage {
+                        total_tokens: 9,
+                        tool_uses: 2,
+                        duration_ms: 30,
+                    }),
+                },
+            }),
+            ev(SessionEventKind::Agent {
+                event: AgentEvent::TaskEnded {
+                    task_id: "bk1".into(),
+                    call_id: Some("toolu_1".into()),
+                    status: "completed".into(),
+                    ok: true,
+                    summary: Some(format!("{M} summary")),
+                    usage: None,
+                },
+            }),
+            ev(SessionEventKind::Agent {
+                event: AgentEvent::ToolCallStarted {
+                    name: "Bash".into(),
+                    call_id: "call_2".into(),
+                    input: serde_json::json!({"command": M}),
+                    is_subagent: false,
+                    subagent_model: None,
+                }
+                .scoped(Some(wasit_core::Scope {
+                    call_id: "toolu_1".into(),
+                    agent_id: Some("agent-1".into()),
+                })),
             }),
         ];
         let mut shown = Vec::new();
@@ -1156,7 +1377,19 @@ mod tests {
         assert_eq!(shown[9]["end_reason"], "execution_error");
         assert_eq!(shown[9]["error"]["len"], 19);
         assert_eq!(shown[10]["tool"], "Bash");
+        assert_eq!(shown[9]["origin"], "task-notification");
         assert_eq!(shown[11]["reason"], "the CLI exited with code 3");
+        assert_eq!(
+            shown[13],
+            serde_json::json!({"ev": "task.started", "task_id": "bk1", "background": true,
+                               "kind": "local_agent", "call_id": "toolu_1"})
+        );
+        assert_eq!(shown[14]["total_tokens"], 9);
+        assert_eq!(shown[15]["summary_chars"], M.len() + 8);
+        assert_eq!(shown[15]["status"], "completed");
+        // A subagent's tool call is a tool call with the call that spawned the subagent.
+        assert_eq!(shown[16]["ev"], "tool.started");
+        assert_eq!(shown[16]["scope"], "toolu_1");
         assert!(events.len() == shown.len());
     }
 
@@ -1167,6 +1400,15 @@ mod tests {
                 text: "x".into(),
                 message_id: None,
             },
+            // The text of a subagent is content like the session's own.
+            AgentEvent::AssistantDelta {
+                text: "x".into(),
+                message_id: None,
+            }
+            .scoped(Some(wasit_core::Scope {
+                call_id: "toolu_1".into(),
+                agent_id: None,
+            })),
             AgentEvent::ThinkingDelta {
                 text: "x".into(),
                 message_id: None,
@@ -1262,7 +1504,9 @@ mod ts_tests {
             "{entry}"
         );
         assert!(
-            cause.contains("{ \"kind\": \"turn_started\", input?: bigint | null, }"),
+            cause.contains(
+                "{ \"kind\": \"turn_started\", trigger: string, input?: bigint | null, }"
+            ),
             "{cause}"
         );
         assert!(

@@ -1,11 +1,11 @@
 //! The `claude` persona: `--print --input-format stream-json --output-format stream-json`
 //! with `--permission-prompt-tool stdio` (control requests on the same pipe).
 
-use crate::engine::{Incoming, Outcome, Persona, TurnStats};
+use crate::engine::{Incoming, Outcome, Persona, TaskEnd, TaskIds, TurnStats};
 use crate::io::Io;
 use crate::reference::find_out;
-use crate::scenario::{AskStep, PlanEntry, Scenario, ToolStep};
-use crate::util::{alnum, chunk_text, hex, iso_now, set, unset, uuid};
+use crate::scenario::{AskStep, BackgroundStep, PlanEntry, Scenario, ToolStep};
+use crate::util::{alnum, chunk_text, hex, iso_now, now_ms, set, unset, uuid};
 use serde_json::{json, Value};
 
 const PERMISSION_MODES: [&str; 6] = [
@@ -83,7 +83,6 @@ pub struct Claude {
     cwd: String,
     version: String,
     partial: bool,
-    init_sent: bool,
     scenario: Scenario,
     /// Pending gated tool call: (tool_use_id, request_id).
     tool_use_id: String,
@@ -93,6 +92,34 @@ pub struct Claude {
     waiting: Vec<String>,
     /// `uuid` of the message the running turn is for.
     current: Option<String>,
+    /// The lines printed now are a subagent's own conversation.
+    scope: Option<ScopeTag>,
+    /// The tool calls the subagent made so far (its `task_progress` counters).
+    scope_tools: u64,
+    /// The tasks the agent runs in the background, oldest first.
+    running: Vec<RunningTask>,
+    /// The run whose end the agent's next turn of its own answers (`origin` of its `result`).
+    answers_run: Option<String>,
+    /// The turn running was started by the agent itself.
+    agent_turn: bool,
+}
+
+/// What a subagent's lines are tagged with.
+#[derive(Debug, Clone)]
+struct ScopeTag {
+    call_id: String,
+    agent_id: String,
+    subagent_type: String,
+    description: String,
+}
+
+/// A task the agent runs in the background.
+#[derive(Debug, Clone)]
+struct RunningTask {
+    ids: TaskIds,
+    kind: String,
+    description: String,
+    subagent_type: Option<String>,
 }
 
 fn resolve_model(m: &str) -> String {
@@ -279,7 +306,6 @@ impl Claude {
                 .clone()
                 .unwrap_or_else(|| "2.1.326".to_string()),
             partial: args.partial_messages,
-            init_sent: false,
             scenario: scenario.clone(),
             tool_use_id: String::new(),
             msg_id: String::new(),
@@ -290,6 +316,11 @@ impl Claude {
                 .unwrap_or_default(),
             waiting: Vec::new(),
             current: None,
+            scope: None,
+            scope_tools: 0,
+            running: Vec::new(),
+            answers_run: None,
+            agent_turn: false,
         }
     }
 
@@ -343,9 +374,46 @@ impl Claude {
                "message":{"role":role,"content":[{"type":"text","text":text}]}})
     }
 
+    /// `tasks` of a `background_tasks_changed`: the background tasks running now, in the shape of
+    /// the recording `rec`.
+    fn task_list(&self, rec: &str) -> Value {
+        let proto = first_where(rec, |m| {
+            ty(m, "system")
+                && m["subtype"] == "background_tasks_changed"
+                && m["tasks"].as_array().is_some_and(|t| !t.is_empty())
+        })["tasks"][0]
+            .clone();
+        Value::Array(
+            self.running
+                .iter()
+                .map(|t| {
+                    let mut e = proto.clone();
+                    set(&mut e, "task_id", json!(t.ids.task_id));
+                    set(&mut e, "run_id", json!(t.ids.run_id));
+                    set(&mut e, "task_type", json!(t.kind));
+                    set(&mut e, "description", json!(t.description));
+                    match &t.subagent_type {
+                        Some(st) => set(&mut e, "subagent_type", json!(st)),
+                        None => unset(&mut e, "subagent_type"),
+                    }
+                    e
+                })
+                .collect(),
+        )
+    }
+
     fn envelope(&self, mut m: Value) -> Value {
         set(&mut m, "session_id", json!(self.session_id));
         set(&mut m, "uuid", json!(uuid()));
+        // A subagent's own conversation carries what the real CLI tags it with.
+        if let Some(scope) = &self.scope {
+            if m["type"] == "assistant" || m["type"] == "user" {
+                set(&mut m, "parent_tool_use_id", json!(scope.call_id));
+                set(&mut m, "agent_id", json!(scope.agent_id));
+                set(&mut m, "subagent_type", json!(scope.subagent_type));
+                set(&mut m, "task_description", json!(scope.description));
+            }
+        }
         m
     }
 
@@ -401,11 +469,9 @@ impl Claude {
         full
     }
 
+    /// `system/init`: printed at the start of every turn, whoever started it (claude 2.1.293,
+    /// every recording; the first one is the session's identification).
     fn send_system_init(&mut self, io: &mut Io) {
-        if self.init_sent {
-            return;
-        }
-        self.init_sent = true;
         let mut m = first_where("tool_allow", |m| ty(m, "system") && m["subtype"] == "init");
         set(&mut m, "cwd", json!(self.cwd));
         set(&mut m, "original_cwd", json!(self.cwd));
@@ -573,6 +639,10 @@ impl Claude {
         for (k, v) in extra {
             set(&mut m, k, v);
         }
+        if self.scope.is_some() {
+            // A subagent's tool results carry no `tool_use_result` (recorded).
+            unset(&mut m, "tool_use_result");
+        }
         self.envelope(m)
     }
 
@@ -734,6 +804,17 @@ impl Persona for Claude {
                     "cancel_async_message" => Incoming::Cancel {
                         request: id,
                         id: req["message_uuid"].as_str().unwrap_or("").to_string(),
+                    },
+                    // Any id is answered with success (recorded); only a missing one is refused.
+                    "stop_task" => match req["task_id"].as_str() {
+                        Some(task_id) => Incoming::StopTask {
+                            request: id,
+                            task_id: task_id.to_string(),
+                        },
+                        None => {
+                            self.control_err(io, &id, "stop_task: task_id must be a string", None);
+                            Incoming::Handled
+                        }
                     },
                     "" => {
                         self.control_err(io, &id, "Missing request subtype", None);
@@ -1017,6 +1098,218 @@ impl Persona for Claude {
         self.mcp.get(name).cloned()
     }
 
+    fn background(&self) -> bool {
+        true
+    }
+
+    fn task_started(
+        &mut self,
+        io: &mut Io,
+        task: &BackgroundStep,
+        stats: &mut TurnStats,
+    ) -> TaskIds {
+        let agent = task.kind != "local_bash";
+        let kind = if agent { "local_agent" } else { "local_bash" };
+        let rec = if agent {
+            "background_agent"
+        } else {
+            "background_bash"
+        };
+        let ids_task = format!(
+            "{}{}",
+            if agent { "a" } else { "b" },
+            hex(if agent { 16 } else { 8 })
+        );
+        let subagent_type = agent.then(|| {
+            task.subagent_type
+                .clone()
+                .unwrap_or_else(|| "general-purpose".into())
+        });
+        // The spawning call, as the model makes it.
+        let input = if agent {
+            json!({"description": task.description, "subagent_type": subagent_type,
+                   "prompt": task.description, "run_in_background": true})
+        } else {
+            json!({"command": task.command.clone().unwrap_or_else(|| "sleep 1".into()),
+                   "description": task.description, "run_in_background": true})
+        };
+        self.tool_use_message(io, if agent { "Agent" } else { "Bash" }, &input, stats);
+        // The subagent's own id is its task's (recorded).
+        let ids = TaskIds {
+            agent_id: ids_task.clone(),
+            task_id: ids_task,
+            run_id: format!("{}-{}", alnum(9).to_lowercase(), hex(8)),
+            call_id: self.tool_use_id.clone(),
+        };
+        self.running.push(RunningTask {
+            ids: ids.clone(),
+            kind: kind.into(),
+            description: task.description.clone(),
+            subagent_type: subagent_type.clone(),
+        });
+        // The list of background tasks, then the start, then the result of the spawning call
+        // (the real order, both kinds).
+        let mut list = first_where(rec, |m| {
+            ty(m, "system")
+                && m["subtype"] == "background_tasks_changed"
+                && m["tasks"].as_array().is_some_and(|t| !t.is_empty())
+        });
+        list["tasks"] = self.task_list(rec);
+        let list = self.envelope(list);
+        io.send(&list);
+        let mut started = first_where(rec, |m| ty(m, "system") && m["subtype"] == "task_started");
+        set(&mut started, "task_id", json!(ids.task_id));
+        set(&mut started, "run_id", json!(ids.run_id));
+        set(&mut started, "tool_use_id", json!(ids.call_id));
+        set(&mut started, "description", json!(task.description));
+        if let Some(t) = &subagent_type {
+            set(&mut started, "subagent_type", json!(t));
+            set(&mut started, "prompt", json!(task.description));
+        }
+        let started = self.envelope(started);
+        io.send(&started);
+        let content = if agent {
+            "Async agent launched successfully. (This tool result is internal metadata — it is not for the user.)".to_string()
+        } else {
+            format!(
+                "Command running in background with ID: {}. Output is being written to: /tmp/claude-fake/{}/tasks/{}.output",
+                ids.task_id, self.session_id, ids.task_id
+            )
+        };
+        let result = self.tool_result_message(
+            rec,
+            json!([{"tool_use_id": ids.call_id, "type": "tool_result", "content": content}]),
+            vec![],
+        );
+        io.send(&result);
+        ids
+    }
+
+    fn set_scope(&mut self, scope: Option<(&BackgroundStep, &TaskIds)>) {
+        self.scope = scope.map(|(task, ids)| ScopeTag {
+            call_id: ids.call_id.clone(),
+            agent_id: ids.agent_id.clone(),
+            subagent_type: task
+                .subagent_type
+                .clone()
+                .unwrap_or_else(|| "general-purpose".into()),
+            description: task.description.clone(),
+        });
+        self.scope_tools = 0;
+    }
+
+    fn task_progress(&mut self, io: &mut Io, tool: &str) {
+        let Some(scope) = self.scope.clone() else {
+            return;
+        };
+        self.scope_tools += 1;
+        let mut m = first_where("background_agent", |m| {
+            ty(m, "system") && m["subtype"] == "task_progress"
+        });
+        set(&mut m, "task_id", json!(scope.agent_id));
+        set(&mut m, "tool_use_id", json!(scope.call_id));
+        set(&mut m, "description", json!(format!("Running {tool}")));
+        set(&mut m, "last_tool_name", json!(tool));
+        set(&mut m, "usage.tool_uses", json!(self.scope_tools));
+        set(
+            &mut m,
+            "usage.total_tokens",
+            json!(59_000 + 900 * self.scope_tools),
+        );
+        let m = self.envelope(m);
+        io.send(&m);
+    }
+
+    fn task_ended(&mut self, io: &mut Io, task: &BackgroundStep, ids: &TaskIds, how: TaskEnd) {
+        let agent = task.kind != "local_bash";
+        let rec = if agent {
+            "background_agent"
+        } else {
+            "background_bash"
+        };
+        self.running.retain(|t| t.ids.task_id != ids.task_id);
+        let (patch, status) = match how {
+            TaskEnd::Completed => ("completed", "completed"),
+            TaskEnd::Failed => ("failed", "failed"),
+            TaskEnd::Stopped => ("killed", "stopped"),
+        };
+        let mut u = first_where(rec, |m| ty(m, "system") && m["subtype"] == "task_updated");
+        set(&mut u, "task_id", json!(ids.task_id));
+        set(&mut u, "run_id", json!(ids.run_id));
+        set(&mut u, "patch.status", json!(patch));
+        set(&mut u, "patch.end_time", json!(now_ms()));
+        let u = self.envelope(u);
+        io.send(&u);
+        let summary = task.summary.clone().unwrap_or_else(|| {
+            if agent {
+                task.description.clone()
+            } else {
+                match how {
+                    TaskEnd::Completed => format!(
+                        "Background command \"{}\" completed (exit code 0)",
+                        task.description
+                    ),
+                    TaskEnd::Failed => format!(
+                        "Background command \"{}\" failed with exit code 1",
+                        task.description
+                    ),
+                    TaskEnd::Stopped => task.description.clone(),
+                }
+            }
+        });
+        let mut n = first_where(rec, |m| {
+            ty(m, "system") && m["subtype"] == "task_notification"
+        });
+        set(&mut n, "task_id", json!(ids.task_id));
+        set(&mut n, "run_id", json!(ids.run_id));
+        set(&mut n, "tool_use_id", json!(ids.call_id));
+        set(&mut n, "status", json!(status));
+        set(
+            &mut n,
+            "output_file",
+            json!(format!(
+                "/tmp/claude-fake/{}/tasks/{}.output",
+                self.session_id, ids.task_id
+            )),
+        );
+        set(&mut n, "summary", json!(summary));
+        let n = self.envelope(n);
+        io.send(&n);
+        let mut list = first_where(rec, |m| {
+            ty(m, "system")
+                && m["subtype"] == "background_tasks_changed"
+                && m["tasks"].as_array().is_some_and(|t| t.is_empty())
+        });
+        list["tasks"] = self.task_list(rec);
+        let list = self.envelope(list);
+        io.send(&list);
+        // The agent's next turn of its own answers this end.
+        self.answers_run = Some(ids.run_id.clone());
+    }
+
+    fn stop_wakes(&self, task: &BackgroundStep) -> bool {
+        // Recorded: stopping a subagent makes the agent report it with a turn of its own;
+        // stopping a background command starts none.
+        task.kind != "local_bash"
+    }
+
+    fn agent_turn_begin(&mut self, io: &mut Io, _ids: &TaskIds, _stats: &mut TurnStats) {
+        self.current = None;
+        self.agent_turn = true;
+        // `system/init`, with no lifecycle frame before it: no message of the client's started it.
+        self.send_system_init(io);
+    }
+
+    fn prompt_joined(&mut self, io: &mut Io, id: &str) {
+        self.waiting.retain(|w| w != id);
+        self.lifecycle(io, id, "started");
+    }
+
+    fn control_done(&mut self, io: &mut Io, request: &Value, _found: bool) {
+        // Answered with success whatever the id (recorded).
+        self.control_ok(io, request, json!({}));
+    }
+
     fn cancel_answered(&mut self, io: &mut Io, request: &Value, id: &str, cancelled: bool) {
         if cancelled {
             self.waiting.retain(|w| w != id);
@@ -1064,9 +1357,25 @@ impl Persona for Claude {
             self.store_records(vec![assistant]);
         }
         let mut r = self.result_message(outcome, stats);
-        if let Some(uuid) = &self.current {
-            set(&mut r, "user_message_uuids", json!([uuid]));
+        let listed: Vec<&String> = self.current.iter().chain(stats.joined.iter()).collect();
+        if !listed.is_empty() {
+            set(&mut r, "user_message_uuids", json!(listed));
         }
+        // Messages the agent took into its turn are done just before the turn's `result`
+        // (recorded; a message that started the turn is done after it).
+        for id in stats.joined.clone() {
+            self.lifecycle(io, &id, "completed");
+        }
+        if self.agent_turn {
+            if let Some(run) = self.answers_run.take() {
+                set(
+                    &mut r,
+                    "origin",
+                    json!({"kind":"task-notification","producer":"session-task","runId":run}),
+                );
+            }
+        }
+        self.agent_turn = false;
         io.send(&r);
         if let Some(uuid) = self.current.take() {
             // Not recorded for a failed turn; `completed` is assumed (it ran).

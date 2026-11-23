@@ -16,7 +16,7 @@ use wasit_core::{Command, DriverId};
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandOutcome, CommandReply, CommandRequest,
     CreateSession, CreateSessionReply, DiagChunk, DiagReadRequest, DiagSources, DiagTailEvent,
-    DiagTailParams, HistoryPage, HistoryRequest, HostEvent, HostInfo, InventoryReply,
+    DiagTailParams, HistoryPage, HistoryRequest, HistoryScope, HostEvent, HostInfo, InventoryReply,
     InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent, SessionId,
     SessionList, SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
 };
@@ -289,12 +289,27 @@ impl RuntimeClient {
         before: Option<u64>,
         limit: u32,
     ) -> Result<HistoryPage, ClientError> {
+        self.history_scoped(id, before, limit, HistoryScope::All)
+            .await
+    }
+
+    /// [`Self::history`] restricted to `scope`: the session's own transcript
+    /// ([`HistoryScope::Main`]) or one subagent's ([`HistoryScope::Subagent`]). Pages exactly
+    /// like the unscoped history: `before` is the cursor of the oldest event held.
+    pub async fn history_scoped(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: u32,
+        scope: HistoryScope,
+    ) -> Result<HistoryPage, ClientError> {
         self.call(
             methods::SESSION_HISTORY,
             HistoryRequest {
                 id: id.clone(),
                 before,
                 limit,
+                scope,
             },
         )
         .await

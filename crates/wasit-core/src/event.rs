@@ -612,6 +612,92 @@ pub enum EndReason {
     CompactionNeeded,
 }
 
+// ── Turn starts ───────────────────────────────────────────────────────────────
+
+/// What started a turn, as far as the agent said ([`AgentEvent::TurnStarted::trigger`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTrigger {
+    /// The driver cannot tell: the agent did not report what started the turn, or its protocol
+    /// has no such report. [`AgentEvent::TurnStarted::input`] is `None` unless the driver
+    /// knows the input from its own protocol (codex, ACP).
+    #[default]
+    Unreported,
+    /// The turn runs for an input of ours: `input` names it.
+    Input,
+    /// The agent started the turn by itself, for no input of ours (claude: after a background
+    /// task ended). The agent's own account of why, when it gives one, is
+    /// [`AgentEvent::TurnCompleted::origin`].
+    Agent,
+}
+
+/// Why a turn the agent started by itself ran, in the agent's own words (claude `result.origin`:
+/// `{kind:"task-notification", producer:"session-task", runId}`). Nothing here is a preset list:
+/// the values are what the agent reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub struct TurnOrigin {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
+    /// The run (background task) it answers, when the agent names one: the `run_id` of the
+    /// [`AgentEvent::TaskStarted`] that began it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+// ── Subagent scope and background tasks ───────────────────────────────────────
+
+/// Which subagent an event belongs to ([`AgentEvent::Scoped`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub struct Scope {
+    /// The tool call that spawned the subagent (claude `parent_tool_use_id`): what
+    /// `session.history` filters by and what [`ToolCallStarted::is_subagent`] calls carry as
+    /// their `call_id`.
+    ///
+    /// [`ToolCallStarted::is_subagent`]: AgentEvent::ToolCallStarted
+    pub call_id: String,
+    /// The subagent's own id, when the agent names it (claude `agent_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+/// What a background task has used so far (claude `usage` of `task_progress` /
+/// `task_notification`). As the agent reports it: cumulative for the task, never added to the
+/// session's own usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub struct TaskUsage {
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub tool_uses: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+/// One task the agent says it runs in the background right now
+/// ([`AgentEvent::BackgroundTasksChanged`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub struct BackgroundTask {
+    pub task_id: String,
+    /// The agent's word for the kind of work (claude `local_bash`, `local_agent`).
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
 // ── Inputs ────────────────────────────────────────────────────────────────────
 
 /// Why an input was dropped ([`AgentEvent::InputDropped`]).
@@ -673,16 +759,22 @@ pub enum AgentEvent {
         cli_version: String,
     },
 
-    /// A turn started. Emitted when the protocol writes the prompt (claude,
-    /// ACP) or when the CLI announces it (codex `turn/started`).
+    /// A turn started, whoever started it. claude: the CLI's `system/init`, printed at the start
+    /// of every turn; codex: `turn/started`; ACP: the `session/prompt` the protocol wrote. A
+    /// [`TurnCompleted`](AgentEvent::TurnCompleted) is never reported without one.
     TurnStarted {
         /// Native turn id (codex only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_turn_id: Option<String>,
-        /// The input (prompt / slash command) the turn runs for; `None` when the turn is not
-        /// one of ours or the driver cannot tell.
+        /// The input (prompt / slash command) the turn runs for: set when the agent said so (or
+        /// the driver wrote the prompt that is the turn itself), `None` for a turn that is not
+        /// one of ours or that the driver cannot attribute. Never a guess: a turn is attributed
+        /// to an input only on the agent's own report.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<InputId>,
+        /// What started it. [`TurnTrigger::Input`] exactly when `input` is set.
+        #[serde(default)]
+        trigger: TurnTrigger,
     },
 
     /// A command the protocol had buffered ([`Encoded::Queued`](crate::Encoded::Queued)) was
@@ -731,6 +823,10 @@ pub enum AgentEvent {
         /// Final reply text or error message, when the CLI surfaces one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<String>,
+        /// Why the agent ran this turn when it started it by itself and says why (claude
+        /// `result.origin`); `None` for a turn of ours and for agents that do not say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<TurnOrigin>,
     },
 
     /// Assistant prose (claude: whole text blocks; codex/ACP: deltas).
@@ -801,6 +897,81 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<ContentPart>,
     },
+
+    /// An event of a subagent's own conversation (claude: a line tagged with
+    /// `parent_tool_use_id`). Carries only per-message events (`assistant_delta`,
+    /// `assistant_content`, `thinking_delta`, `user_content`, `tool_call_*`, `usage_update`),
+    /// never nested. A consumer that does not know scopes sees no subagent text in the session's
+    /// own conversation, which is the safe default: the session's transcript is the events that
+    /// are not `scoped`, a subagent's is the `scoped` events of its `call_id`.
+    Scoped {
+        scope: Scope,
+        event: Box<AgentEvent>,
+    },
+
+    /// A task started (claude `system/task_started`): a subagent, a shell command, whatever the
+    /// agent tracks. `background` tasks outlive the turn that started them.
+    TaskStarted {
+        task_id: String,
+        /// The agent's word for the kind of work (claude `local_bash`, `local_agent`).
+        kind: String,
+        /// The tool call that spawned it, when the agent says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_type: Option<String>,
+        /// It runs in the background: the turn that started it may end while it runs.
+        #[serde(default)]
+        background: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+
+    /// Progress of a task (claude `system/task_progress`).
+    TaskProgress {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+        /// The tool the task ran last.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TaskUsage>,
+    },
+
+    /// A task's state changed (claude `system/task_updated`: its `patch`). Does not end the
+    /// task: [`AgentEvent::TaskEnded`] does.
+    TaskUpdated {
+        task_id: String,
+        /// The agent's status word (`completed`, `killed`, `failed`, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+
+    /// A task ended (claude `system/task_notification`). A subagent runs until this event, not
+    /// until the tool call that spawned it returned.
+    TaskEnded {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        /// The agent's status word (`completed`, `failed`, `stopped`, …).
+        status: String,
+        /// The task succeeded (the driver's reading of `status`).
+        ok: bool,
+        /// The agent's one-line account of the outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TaskUsage>,
+    },
+
+    /// The agent's complete list of the tasks it runs in the background now (claude
+    /// `system/background_tasks_changed`): the authority for which tasks are background work.
+    BackgroundTasksChanged { tasks: Vec<BackgroundTask> },
 
     /// The agent is blocked on a human decision.
     GateRequested { gate: GateRequest },
@@ -879,9 +1050,121 @@ pub enum AgentEvent {
     Unknown { raw: serde_json::Value },
 }
 
+impl AgentEvent {
+    /// `TurnStarted` for a driver whose protocol names the input itself (or none): the trigger
+    /// is [`TurnTrigger::Input`] when there is an input, else [`TurnTrigger::Unreported`].
+    pub fn turn_started(native_turn_id: Option<String>, input: Option<InputId>) -> AgentEvent {
+        AgentEvent::TurnStarted {
+            native_turn_id,
+            input,
+            trigger: if input.is_some() {
+                TurnTrigger::Input
+            } else {
+                TurnTrigger::Unreported
+            },
+        }
+    }
+
+    /// `self` attributed to `scope` (unchanged for `None`).
+    pub fn scoped(self, scope: Option<Scope>) -> AgentEvent {
+        match scope {
+            Some(scope) => AgentEvent::Scoped {
+                scope,
+                event: Box::new(self),
+            },
+            None => self,
+        }
+    }
+
+    /// The scope of the event and the event itself with the wrapper removed.
+    pub fn unscoped(&self) -> (Option<&Scope>, &AgentEvent) {
+        match self {
+            AgentEvent::Scoped { scope, event } => (Some(scope), event),
+            other => (None, other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The serde shapes of what the agent says about turns, tasks and subagents are persisted
+    /// and sent over the control protocol: pinned.
+    #[test]
+    fn turns_tasks_and_scopes_have_their_wire_shapes() {
+        let started = AgentEvent::turn_started(None, Some(InputId(7)));
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            serde_json::json!({"type": "turn_started", "input": 7, "trigger": "input"})
+        );
+        // An event from before triggers existed reads as "unreported".
+        let old: AgentEvent =
+            serde_json::from_value(serde_json::json!({"type": "turn_started", "input": 7}))
+                .unwrap();
+        assert_eq!(
+            old,
+            AgentEvent::TurnStarted {
+                native_turn_id: None,
+                input: Some(InputId(7)),
+                trigger: TurnTrigger::Unreported
+            }
+        );
+        let agent = AgentEvent::TurnStarted {
+            native_turn_id: None,
+            input: None,
+            trigger: TurnTrigger::Agent,
+        };
+        assert_eq!(
+            serde_json::to_value(&agent).unwrap(),
+            serde_json::json!({"type": "turn_started", "trigger": "agent"})
+        );
+        let scope = Scope {
+            call_id: "toolu_1".into(),
+            agent_id: Some("a1".into()),
+        };
+        let scoped = AgentEvent::AssistantDelta {
+            text: "hi".into(),
+            message_id: None,
+        }
+        .scoped(Some(scope.clone()));
+        let json = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "scoped", "scope": {"call_id": "toolu_1", "agent_id": "a1"},
+                               "event": {"type": "assistant_delta", "text": "hi"}})
+        );
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), scoped);
+        assert_eq!(scoped.unscoped().0, Some(&scope));
+        assert_eq!(
+            AgentEvent::Notice {
+                message: "x".into()
+            }
+            .scoped(None),
+            AgentEvent::Notice {
+                message: "x".into()
+            }
+        );
+        let ended = AgentEvent::TaskEnded {
+            task_id: "t".into(),
+            call_id: None,
+            status: "completed".into(),
+            ok: true,
+            summary: None,
+            usage: Some(TaskUsage {
+                total_tokens: 1,
+                tool_uses: 2,
+                duration_ms: 3,
+            }),
+        };
+        let json = serde_json::to_value(&ended).unwrap();
+        assert_eq!(json["type"], "task_ended");
+        assert_eq!(
+            json["usage"],
+            serde_json::json!({"total_tokens": 1, "tool_uses": 2, "duration_ms": 3})
+        );
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), ended);
+    }
 
     #[test]
     fn spawn_gate_round_trips_and_exposes_its_choices() {
