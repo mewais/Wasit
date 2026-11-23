@@ -309,6 +309,39 @@ fn permission_gate_approve_echoes_input_and_deny_has_message() {
 }
 
 #[test]
+fn allow_always_lists_each_suggestion_as_an_effect() {
+    let (mut p, _) = ready();
+    let ev = p.on_line(r#"{"type":"control_request","request_id":"g5","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"npm test"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"npm test:*"}],"behavior":"allow","destination":"localSettings"},{"type":"addDirectories","directories":["/data/reports"],"destination":"session"},{"type":"setMode","mode":"acceptEdits","destination":"session"}]}}"#).events;
+    match &ev[0] {
+        AgentEvent::GateRequested {
+            gate: GateRequest::Permission { choices, .. },
+        } => {
+            let by_id = |id: &str| choices.iter().find(|c| c.id == id).expect(id);
+            assert_eq!(
+                by_id("allow_always").effects,
+                [
+                    "allow rule Bash(npm test:*) (localSettings)",
+                    "add directory /data/reports (session)",
+                    "switch to mode acceptEdits (session)",
+                ]
+            );
+            assert!(by_id("allow").effects.is_empty());
+            assert!(by_id("deny").effects.is_empty());
+            assert!(by_id("deny_stop").effects.is_empty());
+        }
+        e => panic!("{e:?}"),
+    }
+    // A choice from a document without the field still deserializes, with no effects.
+    let old: wasit_core::GateChoice = serde_json::from_value(json!({
+        "id": "allow",
+        "label": "Allow",
+        "kind": "allow_once"
+    }))
+    .unwrap();
+    assert!(old.effects.is_empty());
+}
+
+#[test]
 fn question_and_plan_and_elicitation_gates() {
     let (mut p, _) = ready();
     let ev = p.on_line(r#"{"type":"control_request","request_id":"q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Color?","header":"C","multiSelect":true,"options":[{"label":"Red","description":"r"}]}]}}}"#).events;

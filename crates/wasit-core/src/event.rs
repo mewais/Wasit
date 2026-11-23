@@ -384,6 +384,12 @@ pub struct GateChoice {
     /// rules claude would remember: `Bash(npm test:*)`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// What choosing this will apply beyond answering this one request, one entry per effect,
+    /// in the agent's own terms (e.g. a rule it will remember, a directory it will allow, a mode
+    /// it will switch to). Empty when the choice does nothing more. A UI must show these before
+    /// the user chooses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<String>,
     /// Free text accepted with this choice.
     #[serde(default, skip_serializing_if = "ChoiceText::is_none")]
     pub text: ChoiceText,
@@ -398,6 +404,7 @@ impl GateChoice {
             kind,
             neutral_label: false,
             description: String::new(),
+            effects: Vec::new(),
             text: ChoiceText::None,
         }
     }
@@ -412,6 +419,12 @@ impl GateChoice {
 
     pub fn with_description(mut self, d: impl Into<String>) -> Self {
         self.description = d.into();
+        self
+    }
+
+    /// What choosing this applies beyond the answer; see [`GateChoice::effects`].
+    pub fn with_effects(mut self, effects: Vec<String>) -> Self {
+        self.effects = effects;
         self
     }
 
