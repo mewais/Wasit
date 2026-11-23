@@ -13,7 +13,14 @@
 //! - Turns: `turn/start` → `turn/started` … `turn/completed`. Usage arrives as
 //!   `thread/tokenUsage/updated` (`total` is cumulative for the thread).
 //! - A prompt during a running turn is sent as `turn/steer` with
-//!   `expectedTurnId` (injected into the running turn).
+//!   `expectedTurnId` (injected into the running turn). Its result `{turnId}` is the
+//!   acknowledgement ([`AgentEvent::InputAcknowledged`] `steered`); an error (`no active turn to
+//!   steer`, `expected active turn id … but found …`; codex-cli 0.161.0) means the prompt did not
+//!   join the turn and is reported [`AgentEvent::InputDropped`] `Refused`. It is never re-sent as
+//!   a new turn on its own: that is the user's decision.
+//! - A `turn/start` is acknowledged by its result `{turn}` or by the `turn/started`
+//!   notification, whichever arrives first (0.169.1 and 0.161.0 send the result first); a
+//!   `turn/start` error before either is `Refused` (and ends the turn as `ExecutionError`).
 //! - Interrupt: `turn/interrupt {threadId, turnId}` with the tracked turn id.
 //! - Model / collaboration mode: `thread/settings/update`, confirmed by
 //!   `thread/settings/updated`.
@@ -59,8 +66,10 @@ enum Req {
     ThreadOpen,
     CollabList,
     ModeAtStart,
-    TurnStart,
-    Steer,
+    /// `turn/start` for this input.
+    TurnStart(InputId),
+    /// `turn/steer` for this input.
+    Steer(InputId),
     Interrupt,
     SetModel,
     SetMode,
@@ -76,12 +85,19 @@ impl Req {
             Req::ThreadOpen => "thread/start",
             Req::CollabList => "collaborationMode/list",
             Req::ModeAtStart | Req::SetMode => "set_mode",
-            Req::TurnStart => "prompt",
-            Req::Steer => "prompt",
+            Req::TurnStart(_) | Req::Steer(_) => "prompt",
             Req::Interrupt => "interrupt",
             Req::SetModel => "set_model",
         }
     }
+}
+
+/// A `turn/start` we wrote, until the CLI announces its turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Starting {
+    input: InputId,
+    /// `InputAcknowledged` was reported (the `turn/start` result came first).
+    acknowledged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,8 +117,8 @@ pub struct CodexProtocol {
     next_id: u64,
     outstanding: HashMap<u64, Req>,
     queue: VecDeque<(InputId, Command)>,
-    /// The input of the `turn/start` whose turn has not been announced yet.
-    starting_input: Option<InputId>,
+    /// The `turn/start` whose turn the CLI has not announced (`turn/started`) yet.
+    starting: Option<Starting>,
     spec: SpawnSpec,
     thread_id: Option<String>,
     model: Option<String>,
@@ -131,7 +147,7 @@ impl CodexProtocol {
             next_id: 1,
             outstanding: HashMap::new(),
             queue: VecDeque::new(),
-            starting_input: None,
+            starting: None,
             spec: SpawnSpec::default(),
             thread_id: None,
             model: None,
@@ -268,15 +284,18 @@ impl CodexProtocol {
                 let items = Value::Array(user_input(&text, &attachments));
                 let line = match self.active_turn.clone() {
                     Some(turn) => self.request(
-                        Req::Steer,
+                        Req::Steer(input),
                         "turn/steer",
                         json!({"threadId": self.thread(), "expectedTurnId": turn, "input": items}),
                     ),
                     None => {
                         self.turn_pending = true;
-                        self.starting_input = Some(input);
+                        self.starting = Some(Starting {
+                            input,
+                            acknowledged: false,
+                        });
                         self.request(
-                            Req::TurnStart,
+                            Req::TurnStart(input),
                             "turn/start",
                             json!({"threadId": self.thread(), "input": items}),
                         )
@@ -391,6 +410,21 @@ impl CodexProtocol {
             _ => {}
         }
         step
+    }
+
+    /// The CLI took the `turn/start` for `input` (its result): report it once, whichever of the
+    /// result and the `turn/started` notification comes first.
+    fn acknowledge_start(&mut self, input: InputId) -> Vec<AgentEvent> {
+        match self.starting.as_mut() {
+            Some(s) if s.input == input && !s.acknowledged => {
+                s.acknowledged = true;
+                vec![AgentEvent::InputAcknowledged {
+                    input,
+                    steered: false,
+                }]
+            }
+            _ => vec![],
+        }
     }
 
     /// Called when the running turn's id becomes known.
@@ -512,20 +546,26 @@ impl CodexProtocol {
                     current_mode: self.mode.clone(),
                 }])
             }
-            Req::TurnStart => match result.get("turn").and_then(|t| opt_s(t, "id")) {
-                Some(turn) if self.turn_pending && self.active_turn.is_none() => {
-                    self.on_turn_id(turn)
+            // The CLI took the prompt as a turn (its `turn/started` may come before or after).
+            Req::TurnStart(input) => {
+                let mut step = events(self.acknowledge_start(input));
+                if let Some(turn) = result.get("turn").and_then(|t| opt_s(t, "id")) {
+                    if self.turn_pending && self.active_turn.is_none() {
+                        step.extend(self.on_turn_id(turn));
+                    }
                 }
-                _ => Step::default(),
-            },
+                step
+            }
+            // The CLI folded the prompt into the running turn.
+            Req::Steer(input) => events(vec![AgentEvent::InputAcknowledged {
+                input,
+                steered: true,
+            }]),
             // Confirmed by notifications (`thread/settings/updated`,
             // `turn/completed`) or nothing to report.
-            Req::SkillRoots
-            | Req::ModeAtStart
-            | Req::Steer
-            | Req::Interrupt
-            | Req::SetModel
-            | Req::SetMode => Step::default(),
+            Req::SkillRoots | Req::ModeAtStart | Req::Interrupt | Req::SetModel | Req::SetMode => {
+                Step::default()
+            }
         }
     }
 
@@ -536,21 +576,33 @@ impl CodexProtocol {
             }]);
         };
         match req {
-            Req::TurnStart => {
+            Req::TurnStart(input) => {
                 self.turn_pending = false;
                 self.interrupt_wanted = false;
-                self.starting_input = None;
-                let mut step = events(vec![AgentEvent::TurnCompleted {
+                // Refused: the CLI never took the prompt (unless it had already announced the
+                // turn, in which case this error is about something else).
+                let unacknowledged = self
+                    .starting
+                    .take()
+                    .is_some_and(|s| s.input == input && !s.acknowledged);
+                let mut step = Step::default();
+                if unacknowledged {
+                    step.events.push(refused(input, &message));
+                }
+                step.events.push(AgentEvent::TurnCompleted {
                     end_reason: Some(EndReason::ExecutionError),
                     was_interrupted: false,
                     num_turns: 0,
                     usage: self.total_usage.clone(),
                     per_model: HashMap::new(),
                     reply: Some(message),
-                }]);
+                });
                 step.extend(self.drain());
                 step
             }
+            // The prompt did not join the turn (it ended meanwhile, or the CLI said otherwise):
+            // reported as refused, never sent again on its own.
+            Req::Steer(input) => events(vec![refused(input, &message)]),
             Req::ThreadList => {
                 // Cannot find the latest thread: start a fresh one, and say so.
                 let line = self.thread_start();
@@ -622,10 +674,22 @@ impl CodexProtocol {
         match method {
             "turn/started" => {
                 let turn = params.get("turn").and_then(|t| opt_s(t, "id"));
+                let starting = self.starting.take();
                 let mut step = events(vec![AgentEvent::TurnStarted {
                     native_turn_id: turn.clone(),
-                    input: self.starting_input.take(),
+                    input: starting.map(|s| s.input),
                 }]);
+                // The notification came before the `turn/start` result: it says the same.
+                if let Some(Starting {
+                    input,
+                    acknowledged: false,
+                }) = starting
+                {
+                    step.events.push(AgentEvent::InputAcknowledged {
+                        input,
+                        steered: false,
+                    });
+                }
                 if let Some(t) = turn {
                     if self.active_turn.as_deref() != Some(t.as_str()) {
                         step.extend(self.on_turn_id(t));
@@ -1021,6 +1085,15 @@ fn dropped(input: InputId, reason: InputDropReason) -> AgentEvent {
         input,
         reason,
         error: None,
+    }
+}
+
+/// The CLI answered an input's request with an error: it will not run it.
+fn refused(input: InputId, message: &str) -> AgentEvent {
+    AgentEvent::InputDropped {
+        input,
+        reason: InputDropReason::Refused,
+        error: Some(message.to_string()),
     }
 }
 

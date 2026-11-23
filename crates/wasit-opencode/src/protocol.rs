@@ -14,7 +14,10 @@
 //! - Turns: `session/prompt` (one at a time) → `session/update`
 //!   notifications → the prompt result `{stopReason, usage}`. Prompts sent
 //!   during a turn are held by this protocol. Text starting with `/name`
-//!   runs that command / skill.
+//!   runs that command / skill. A prompt is acknowledged by the first `session/update` that is
+//!   the agent working on it (message / thought chunk, tool call, plan; for this session) or
+//!   by the prompt's result, whichever comes first; an error answering a prompt nothing had
+//!   acknowledged is [`AgentEvent::InputDropped`] `Refused`.
 //! - Interrupt: `session/cancel` (a notification); pending permission
 //!   requests are answered `{"outcome":{"outcome":"cancelled"}}` first.
 //! - Gates: `session/request_permission {toolCall, options}` answered with
@@ -54,7 +57,8 @@ enum Req {
     Open,
     SetModel,
     SetMode,
-    Prompt,
+    /// `session/prompt` for this input.
+    Prompt(InputId),
 }
 
 impl Req {
@@ -65,7 +69,7 @@ impl Req {
             Req::Open => "session/open",
             Req::SetModel => "set_model",
             Req::SetMode => "set_mode",
-            Req::Prompt => "prompt",
+            Req::Prompt(_) => "prompt",
         }
     }
 }
@@ -91,6 +95,8 @@ pub struct AcpProtocol {
     /// `session/load` in flight: its history replay is not live activity.
     loading: bool,
     prompt_active: bool,
+    /// The written `session/prompt` the CLI has not shown any sign of taking yet.
+    awaiting_ack: Option<InputId>,
     cancel_sent: bool,
     model: Option<String>,
     mode: Option<String>,
@@ -117,6 +123,7 @@ impl AcpProtocol {
             can_list: false,
             loading: false,
             prompt_active: false,
+            awaiting_ack: None,
             cancel_sent: false,
             model: None,
             mode: None,
@@ -307,10 +314,11 @@ impl AcpProtocol {
 
     fn prompt(&mut self, input: InputId, text: &str, attachments: &[Attachment]) -> Step {
         self.prompt_active = true;
+        self.awaiting_ack = Some(input);
         self.cancel_sent = false;
         let blocks = prompt_blocks(text, attachments, self.prompt_image, self.prompt_embedded);
         let line = self.request(
-            Req::Prompt,
+            Req::Prompt(input),
             "session/prompt",
             json!({"sessionId": self.sid(), "prompt": blocks}),
         );
@@ -420,7 +428,7 @@ impl AcpProtocol {
             }
             Req::Open => self.on_opened(&result),
             Req::SetModel | Req::SetMode => events(self.on_config(&result)),
-            Req::Prompt => self.on_prompt_result(&result),
+            Req::Prompt(input) => self.on_prompt_result(input, &result),
         }
     }
 
@@ -431,17 +439,28 @@ impl AcpProtocol {
             }]);
         };
         match req {
-            Req::Prompt => {
+            Req::Prompt(input) => {
                 self.prompt_active = false;
                 self.cancel_sent = false;
-                let mut step = events(vec![AgentEvent::TurnCompleted {
+                let mut step = Step::default();
+                // Refused: the CLI never showed a sign of taking the prompt (an error after it
+                // streamed something is the turn failing, not the prompt being refused).
+                if self.awaiting_ack == Some(input) {
+                    self.awaiting_ack = None;
+                    step.events.push(AgentEvent::InputDropped {
+                        input,
+                        reason: InputDropReason::Refused,
+                        error: Some(message.clone()),
+                    });
+                }
+                step.events.push(AgentEvent::TurnCompleted {
                     end_reason: Some(EndReason::ExecutionError),
                     was_interrupted: false,
                     num_turns: 0,
                     usage: Usage::default(),
                     per_model: HashMap::new(),
                     reply: Some(message),
-                }]);
+                });
                 step.extend(self.drain());
                 step
             }
@@ -463,7 +482,7 @@ impl AcpProtocol {
         }
     }
 
-    fn on_prompt_result(&mut self, result: &Value) -> Step {
+    fn on_prompt_result(&mut self, input: InputId, result: &Value) -> Step {
         let stop = s(result, "stopReason");
         let cancelled = stop == "cancelled";
         let end_reason = match stop {
@@ -476,6 +495,8 @@ impl AcpProtocol {
         self.prompt_active = false;
         self.cancel_sent = false;
         let mut step = Step::default();
+        // A result is the CLI's own answer to the prompt, even for a turn that produced nothing.
+        step.events.extend(self.acknowledge(input));
         for g in std::mem::take(&mut self.gates) {
             step.events.push(AgentEvent::GateResolved {
                 request_id: g.routing_id,
@@ -576,7 +597,59 @@ impl AcpProtocol {
         events(vec![AgentEvent::GateRequested { gate }])
     }
 
+    /// The CLI took the prompt written as `input` (the first sign of it, or its result): report
+    /// it once.
+    fn acknowledge(&mut self, input: InputId) -> Vec<AgentEvent> {
+        if self.awaiting_ack != Some(input) {
+            return vec![];
+        }
+        self.awaiting_ack = None;
+        vec![AgentEvent::InputAcknowledged {
+            input,
+            steered: false,
+        }]
+    }
+
+    /// `session/update`: the events it carries, after the acknowledgement it may be the first
+    /// sign of.
+    ///
+    /// Only updates that are the agent working on the prompt acknowledge it, and only for this
+    /// session: `available_commands_update` and `config_option_update` follow `session/new` and
+    /// `set_config_option` and arrive after the prompt was written whether or not it is taken
+    /// (all recordings), and `usage_update` precedes the error of a prompt kilo refuses
+    /// (`reference/kilo/error.jsonl`, `kilo-refused.ndjson`: "You need to sign in to use this
+    /// model."). History replayed by `session/load` is never activity. An update from the
+    /// previous prompt cannot arrive after this one was written: ACP sends all of a turn's
+    /// updates before its result (every recording), and one prompt is in flight at a time here.
     fn on_update(&mut self, params: &Value) -> Vec<AgentEvent> {
+        let kind = params
+            .get("update")
+            .and_then(|u| u.get("sessionUpdate"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let ours = params.get("sessionId").and_then(Value::as_str) == self.session_id.as_deref();
+        let mut out = match self.awaiting_ack {
+            Some(input)
+                if !self.loading
+                    && ours
+                    && matches!(
+                        kind,
+                        "agent_message_chunk"
+                            | "agent_thought_chunk"
+                            | "tool_call"
+                            | "tool_call_update"
+                            | "plan"
+                    ) =>
+            {
+                self.acknowledge(input)
+            }
+            _ => vec![],
+        };
+        out.extend(self.update_events(params));
+        out
+    }
+
+    fn update_events(&mut self, params: &Value) -> Vec<AgentEvent> {
         let Some(update) = params.get("update") else {
             return vec![];
         };

@@ -33,6 +33,8 @@ pub struct Codex {
     turn_request: Value,
     pending_item: Option<(String, String)>,
     items: Vec<Value>,
+    /// Prompts accepted by `turn/steer` during the running turn, answered when it ends.
+    steered: Vec<String>,
 }
 
 fn rec(name: &str, pred: impl Fn(&Value) -> bool) -> Value {
@@ -98,7 +100,21 @@ impl Codex {
             turn_request: Value::Null,
             pending_item: None,
             items: vec![],
+            steered: vec![],
         }
+    }
+
+    /// The error the scenario refuses `text` with, if it does.
+    fn refusal(&self, text: &str) -> Option<String> {
+        self.scenario
+            .refuse
+            .iter()
+            .find(|r| {
+                regex::Regex::new(&r.when)
+                    .map(|re| re.is_match(text))
+                    .unwrap_or(false)
+            })
+            .map(|r| r.message.clone())
     }
 
     fn default_model(&self) -> String {
@@ -441,6 +457,10 @@ impl Codex {
                             .join("\n")
                     })
                     .unwrap_or_default();
+                if let Some(message) = self.refusal(&text) {
+                    self.error(io, &id, -32600, &message);
+                    return Incoming::Handled;
+                }
                 self.thread_id = tid.clone();
                 self.turn_id = uuid7();
                 self.turn_request = id;
@@ -456,6 +476,36 @@ impl Codex {
                     }
                 }
                 Incoming::Prompt(text)
+            }
+            // Shapes recorded from codex-cli 0.161.0 (`reference/codex/steer.jsonl`): the result
+            // names the running turn; the prompt joins it and is answered with the turn.
+            "turn/steer" => {
+                let text = params["input"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|i| i["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                let expected = params["expectedTurnId"].as_str().unwrap_or("");
+                if !in_turn {
+                    self.error(io, &id, -32600, "no active turn to steer");
+                } else if expected != self.turn_id {
+                    let msg = format!(
+                        "expected active turn id `{expected}` but found `{}`",
+                        self.turn_id
+                    );
+                    self.error(io, &id, -32600, &msg);
+                } else if let Some(message) = self.refusal(&text) {
+                    self.error(io, &id, -32600, &message);
+                } else {
+                    self.steered.push(text);
+                    let turn = self.turn_id.clone();
+                    self.reply(io, &id, json!({"turnId": turn}));
+                }
+                Incoming::Handled
             }
             "thread/settings/update" => {
                 let tid = params["threadId"].as_str().unwrap_or("").to_string();
@@ -509,7 +559,7 @@ impl Codex {
                     &id,
                     -32600,
                     &format!(
-                        "Invalid request: unknown variant `{other}`, expected one of `initialize`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`"
+                        "Invalid request: unknown variant `{other}`, expected one of `initialize`, `thread/start`, `thread/resume`, `turn/start`, `turn/steer`, `turn/interrupt`"
                     ),
                 );
                 Incoming::Handled
@@ -583,6 +633,7 @@ impl Persona for Codex {
     fn turn_begin(&mut self, io: &mut Io, prompt: &str, _id: Option<&str>, stats: &mut TurnStats) {
         stats.started = Some(std::time::Instant::now());
         self.items.clear();
+        self.steered.clear();
         let turn = self.turn_obj("inProgress", json!([]), false, now_ms());
         let mut turn_start = turn.clone();
         set(&mut turn_start, "startedAt", Value::Null);
@@ -598,18 +649,7 @@ impl Persona for Codex {
             "turn/started",
             json!({"threadId": self.thread_id, "turn": turn}),
         );
-        let now = now_ms();
-        let mut item = self.item("item/started", "userMessage");
-        set(&mut item, "id", json!(uuid7()));
-        set(
-            &mut item,
-            "content",
-            json!([{"type":"text","text":prompt,"text_elements":[]}]),
-        );
-        set(&mut item, "startedAtMs", json!(now));
-        self.item_note(io, "item/started", &item);
-        set(&mut item, "completedAtMs", json!(now));
-        self.item_note(io, "item/completed", &item);
+        self.user_message(io, prompt);
     }
 
     fn say(&mut self, io: &mut Io, text: &str, chunks: usize, _stats: &mut TurnStats) {
@@ -779,6 +819,24 @@ impl Persona for Codex {
     }
 
     fn turn_end(&mut self, io: &mut Io, outcome: &Outcome, stats: &mut TurnStats) {
+        // Prompts steered into the turn are taken in when the model call in flight ends, and
+        // answered by one more (codex-cli 0.161.0, `reference/codex/steer.jsonl`): a `userMessage`
+        // item and a reply, inside the same turn. An interrupted or failed turn drops them.
+        let steered = std::mem::take(&mut self.steered);
+        if matches!(outcome, Outcome::Completed) {
+            let prefix = self
+                .scenario
+                .echo_prefix
+                .clone()
+                .unwrap_or_else(|| "echo: ".into());
+            for text in steered {
+                self.user_message(io, &text);
+                let reply = format!("{prefix}{text}");
+                self.say(io, &reply, 1, stats);
+                stats.final_text = reply.clone();
+                stats.said.push(reply);
+            }
+        }
         let started = stats
             .started
             .map(|s| now_ms().saturating_sub(s.elapsed().as_millis() as u64))
@@ -840,6 +898,22 @@ impl Persona for Codex {
 }
 
 impl Codex {
+    /// A `userMessage` item for `text`, started and completed.
+    fn user_message(&mut self, io: &mut Io, text: &str) {
+        let now = now_ms();
+        let mut item = self.item("item/started", "userMessage");
+        set(&mut item, "id", json!(uuid7()));
+        set(
+            &mut item,
+            "content",
+            json!([{"type":"text","text":text,"text_elements":[]}]),
+        );
+        set(&mut item, "startedAtMs", json!(now));
+        self.item_note(io, "item/started", &item);
+        set(&mut item, "completedAtMs", json!(now));
+        self.item_note(io, "item/completed", &item);
+    }
+
     fn finish_item(&mut self, io: &mut Io, tool: &ToolStep, allow: bool) {
         let Some((call_id, _)) = self.pending_item.take() else {
             return;

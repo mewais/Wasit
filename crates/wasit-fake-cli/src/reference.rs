@@ -22,7 +22,7 @@ refs! {
     "claude"/"partial_messages", "claude"/"lifecycle",
     "codex"/"handshake", "codex"/"simple", "codex"/"tool_allow", "codex"/"tool_deny",
     "codex"/"interrupt", "codex"/"resume", "codex"/"mode", "codex"/"error", "codex"/"question",
-    "codex"/"lifecycle",
+    "codex"/"lifecycle", "codex"/"steer",
     "opencode"/"handshake", "opencode"/"simple", "opencode"/"tool_allow", "opencode"/"tool_deny",
     "opencode"/"interrupt", "opencode"/"load", "opencode"/"mode", "opencode"/"error",
     "opencode"/"lifecycle", "opencode"/"plan",

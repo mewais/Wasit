@@ -1113,3 +1113,123 @@ fn codex_thread_settings_update_confirms_model_and_mode() {
     );
     assert!(!r["error"].is_null());
 }
+
+// ---------------------------------------------------------------------------------------------
+// codex `turn/steer` and refused prompts (shapes: reference/codex/steer.jsonl, codex-cli 0.161.0)
+// ---------------------------------------------------------------------------------------------
+
+fn steer(c: &mut Client, turn: &Value, text: &str) -> Value {
+    c.request(
+        "turn/steer",
+        json!({"threadId": c.session.clone(), "expectedTurnId": turn,
+               "input": [{"type":"text","text":text}]}),
+    )
+}
+
+#[test]
+fn codex_steered_prompt_joins_the_running_turn_and_is_answered_in_it() {
+    let sc = Scenario::builder()
+        .turn(Turn::builder().say("working").sleep_ms(1000))
+        .build();
+    let mut c = Client::start("codex", &sc);
+    c.prompt("go");
+    let started = c
+        .fake
+        .recv_until(|m| m["method"] == "item/agentMessage/delta")
+        .into_iter()
+        .find(|m| m["method"] == "turn/started")
+        .expect("turn/started");
+    let turn = started["params"]["turn"]["id"].clone();
+    // Wrong turn id: refused, as the real CLI words it.
+    let r = steer(&mut c, &json!("01a20687-0000-7000-8000-000000000000"), "no");
+    assert_eq!(r["error"]["code"], -32600);
+    assert!(
+        r["error"]["message"].as_str().unwrap().starts_with(
+            "expected active turn id `01a20687-0000-7000-8000-000000000000` but found "
+        ),
+        "{r}"
+    );
+    let r = steer(&mut c, &turn, "steer me");
+    assert_eq!(r["result"], json!({"turnId": turn}), "{r}");
+    // The one turn ends with a reply to the steered text.
+    let rest = c.fake.recv_until(|m| m["method"] == "turn/completed");
+    let user_texts: Vec<&str> = rest
+        .iter()
+        .filter(|m| m["method"] == "item/started" && m["params"]["item"]["type"] == "userMessage")
+        .filter_map(|m| m["params"]["item"]["content"][0]["text"].as_str())
+        .collect();
+    assert_eq!(user_texts, ["steer me"]);
+    let done = rest.last().unwrap();
+    assert_eq!(done["params"]["turn"]["status"], "completed");
+    let items = done["params"]["turn"]["items"].as_array().unwrap();
+    assert_eq!(items.last().unwrap()["text"], "echo: steer me");
+    // The turn is over: a late steer is refused.
+    let r = steer(&mut c, &turn, "too late");
+    assert_eq!(r["error"]["message"], "no active turn to steer");
+}
+
+#[test]
+fn codex_interrupted_turn_drops_steered_prompts() {
+    let sc = Scenario::builder()
+        .turn(Turn::builder().say("working").wait_for_interrupt())
+        .build();
+    let mut c = Client::start("codex", &sc);
+    c.prompt("go");
+    let started = c
+        .fake
+        .recv_until(|m| m["method"] == "item/agentMessage/delta")
+        .into_iter()
+        .find(|m| m["method"] == "turn/started")
+        .unwrap();
+    let turn = started["params"]["turn"]["id"].clone();
+    assert!(steer(&mut c, &turn, "steer me")["result"].is_object());
+    c.request(
+        "turn/interrupt",
+        json!({"threadId": c.session.clone(), "turnId": turn}),
+    );
+    let rest = c.fake.recv_until(|m| m["method"] == "turn/completed");
+    assert_eq!(
+        rest.last().unwrap()["params"]["turn"]["status"],
+        "interrupted"
+    );
+    assert!(!rest
+        .iter()
+        .any(|m| m["params"]["item"]["type"] == "userMessage"));
+}
+
+#[test]
+fn codex_refuses_the_prompts_the_scenario_says_it_refuses() {
+    let sc = Scenario::builder()
+        .refuse("^refuse me", "no thread for you")
+        .turn(Turn::builder().say("working").sleep_ms(500))
+        .build();
+    let mut c = Client::start("codex", &sc);
+    // A refused `turn/start` is an error reply and starts nothing.
+    c.prompt("refuse me now");
+    let r = c
+        .fake
+        .recv_until(|m| m["id"] == c.prompt_id && m["method"].is_null())
+        .pop()
+        .unwrap();
+    assert_eq!(r["error"]["message"], "no thread for you");
+    assert!(c.fake.drain(Duration::from_millis(200)).is_empty());
+    // A prompt that is not refused runs, and a refused steer leaves the turn alone.
+    c.prompt("go");
+    let started = c
+        .fake
+        .recv_until(|m| m["method"] == "item/agentMessage/delta")
+        .into_iter()
+        .find(|m| m["method"] == "turn/started")
+        .unwrap();
+    let turn = started["params"]["turn"]["id"].clone();
+    let r = steer(&mut c, &turn, "refuse me too");
+    assert_eq!(r["error"]["message"], "no thread for you");
+    let rest = c.fake.recv_until(|m| m["method"] == "turn/completed");
+    assert_eq!(
+        rest.last().unwrap()["params"]["turn"]["status"],
+        "completed"
+    );
+    assert!(!rest
+        .iter()
+        .any(|m| m["params"]["item"]["type"] == "userMessage"));
+}

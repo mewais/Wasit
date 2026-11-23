@@ -3,8 +3,8 @@
 //! `AcpProtocol` and checks the events and the exact lines written back.
 
 use serde_json::Value;
-use wasit_core::transcript::{parse, replay, Record, Replay};
-use wasit_core::{AgentEvent, EndReason, ResumeMode};
+use wasit_core::transcript::{input_id, parse, replay, Record, Replay};
+use wasit_core::{AgentEvent, Command, EndReason, InputDropReason, InputId, ResumeMode};
 use wasit_opencode::{AcpProtocol, Flavor};
 
 fn load(name: &str) -> Vec<Record> {
@@ -300,4 +300,170 @@ fn opencode_read_of_a_png_reports_the_image_as_a_tool_part() {
             RED_PNG_B64
         )]
     );
+}
+
+// ── acknowledgement and refusal of prompts ─────────────────────────────────
+
+/// The inputs a transcript sends the CLI: the start record's first prompt, then each prompt command.
+fn prompt_inputs(records: &[Record]) -> Vec<InputId> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| match r {
+            Record::Start(spec) => spec.first_prompt.is_some(),
+            Record::Cmd(Command::Prompt { .. } | Command::RunSlash { .. }) => true,
+            _ => false,
+        })
+        .map(|(i, _)| input_id(i))
+        .collect()
+}
+
+fn acks(r: &Replay) -> Vec<(InputId, bool)> {
+    r.events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputAcknowledged { input, steered } => Some((*input, *steered)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// New with the acknowledgements: in every recording (opencode 1.19.6, kilo 7.8.27) each prompt
+/// the CLI took is acknowledged exactly once, no prompt is dropped, and what acknowledges it is
+/// the agent working (or the prompt's result), never `session/load` history, `session/new`
+/// follow-ups (`available_commands_update`, `config_option_update`), or a usage update.
+#[test]
+fn every_prompt_is_acknowledged_once_by_the_agent_working() {
+    let all = [
+        ("basic", Flavor::OpenCode),
+        ("kilo-basic", Flavor::Kilo),
+        ("gates", Flavor::OpenCode),
+        ("kilo-gates", Flavor::Kilo),
+        ("interrupt", Flavor::OpenCode),
+        ("mode", Flavor::OpenCode),
+        ("kilo-mode", Flavor::Kilo),
+        ("resume", Flavor::OpenCode),
+        ("continue", Flavor::OpenCode),
+        ("opencode-image-prompt", Flavor::OpenCode),
+        ("kilo-image-prompt", Flavor::Kilo),
+        ("opencode-read-image", Flavor::OpenCode),
+    ];
+    for (name, flavor) in all {
+        let r = run(name, flavor);
+        let expected: Vec<(InputId, bool)> = prompt_inputs(&load(name))
+            .into_iter()
+            .map(|i| (i, false))
+            .collect();
+        assert_eq!(acks(&r), expected, "{name}");
+        assert!(
+            !r.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::InputDropped { .. })),
+            "{name}"
+        );
+        // Whatever acknowledges is followed by the agent's own output or the end of the turn:
+        // never by the bookkeeping updates that merely arrive after the prompt was written.
+        for (i, e) in r.events.iter().enumerate() {
+            if matches!(e, AgentEvent::InputAcknowledged { .. }) {
+                assert!(
+                    !matches!(
+                        r.events.get(i + 1),
+                        Some(
+                            AgentEvent::SlashCommandsUpdated { .. }
+                                | AgentEvent::ModelChanged { .. }
+                                | AgentEvent::ModesUpdated { .. }
+                                | AgentEvent::UsageUpdate { .. }
+                        )
+                    ),
+                    "{name}: acknowledged on a bookkeeping update: {:?}",
+                    &r.events[i..i + 2]
+                );
+            }
+        }
+    }
+}
+
+/// In `basic` (opencode) `available_commands_update` and `config_option_update` arrive between
+/// `session/prompt` and the first text chunk: the acknowledgement waits for the chunk.
+#[test]
+fn bookkeeping_updates_after_the_prompt_do_not_acknowledge() {
+    let r = run("basic", Flavor::OpenCode);
+    let pos = |f: &dyn Fn(&AgentEvent) -> bool| r.events.iter().position(f).unwrap();
+    let commands = pos(&|e| matches!(e, AgentEvent::SlashCommandsUpdated { .. }));
+    let ack = pos(&|e| matches!(e, AgentEvent::InputAcknowledged { .. }));
+    let text = pos(&|e| matches!(e, AgentEvent::AssistantDelta { .. }));
+    assert!(commands < ack && ack + 1 == text, "{:?}", r.events);
+    // kilo: the first activity is a thought chunk.
+    let r = run("kilo-basic", Flavor::Kilo);
+    let ack = r
+        .events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::InputAcknowledged { .. }))
+        .unwrap();
+    assert!(matches!(
+        r.events[ack + 1],
+        AgentEvent::ThinkingDelta { .. }
+    ));
+}
+
+/// History replayed by `session/load` precedes the load result in `resume` / `continue`; the
+/// prompt goes out after it, and only the agent's answer to it acknowledges.
+#[test]
+fn session_load_history_does_not_acknowledge() {
+    for name in ["resume", "continue"] {
+        let r = run(name, Flavor::OpenCode);
+        let ack = r
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::InputAcknowledged { .. }))
+            .unwrap();
+        let init = r
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::SessionInit { .. }))
+            .unwrap();
+        assert!(init < ack, "{name}");
+        assert_eq!(acks(&r).len(), 1, "{name}");
+    }
+}
+
+/// Recorded with kilo 7.8.8 (no credentials, scratch HOME: the CLI answers without calling a
+/// model, so it costs nothing): `available_commands_update` and `usage_update` follow the prompt,
+/// then the prompt is answered with an error. Not acknowledged by either update, so it is
+/// reported refused, and the turn ends as an execution error.
+#[test]
+fn kilo_refused_prompt_is_reported_dropped() {
+    let r = run("kilo-refused", Flavor::Kilo);
+    let input = input_id(0);
+    assert!(acks(&r).is_empty(), "{:?}", r.events);
+    let dropped: Vec<_> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputDropped {
+                input,
+                reason,
+                error,
+            } => Some((*input, *reason, error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dropped.len(), 1, "{:?}", r.events);
+    assert_eq!(dropped[0].0, input);
+    assert_eq!(dropped[0].1, InputDropReason::Refused);
+    assert!(
+        dropped[0].2.as_deref().unwrap_or("").contains("sign in"),
+        "{dropped:?}"
+    );
+    assert!(r
+        .events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UsageUpdate { .. })));
+    assert_eq!(turns(&r), vec![(Some(EndReason::ExecutionError), false)]);
+    // Order: the usage update, the refusal, the end of the turn.
+    let at = |f: &dyn Fn(&AgentEvent) -> bool| r.events.iter().position(f).unwrap();
+    let usage = at(&|e| matches!(e, AgentEvent::UsageUpdate { .. }));
+    let drop = at(&|e| matches!(e, AgentEvent::InputDropped { .. }));
+    let end = at(&|e| matches!(e, AgentEvent::TurnCompleted { .. }));
+    assert!(usage < drop && drop < end);
 }

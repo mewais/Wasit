@@ -268,6 +268,11 @@ fn setup(persona: &'static str, name: &str, ins: &[Value], ref_discs: &BTreeSet<
             }
             turn = turn.say("partial").wait_for_interrupt();
         }
+        // codex-cli 0.161.0: a prompt steered into a running turn. The recording's turn streams
+        // for a while; the fake's turn waits long enough for the replayed steers to arrive.
+        "steer" => {
+            turn = turn.say("ticks").sleep_ms(1500);
+        }
         "turn_error" | "error"
             if persona == "claude" || persona == "codex" || persona == "kilo" =>
         {
@@ -368,6 +373,15 @@ fn setup(persona: &'static str, name: &str, ins: &[Value], ref_discs: &BTreeSet<
     }
 }
 
+/// What the replay knows about the exchange when it waits.
+struct Exchange<'a> {
+    methods: &'a Methods,
+    /// The claude message-lifecycle recording.
+    lifecycle: bool,
+    /// The line just sent is a `turn/steer` the real CLI accepted.
+    ends_turn: bool,
+}
+
 /// What the fake must have produced before the replay may send the next client line.
 fn wait_for(
     fake: &mut Fake,
@@ -375,9 +389,13 @@ fn wait_for(
     cur: &Value,
     next: Option<&Value>,
     since: usize,
-    methods: &Methods,
-    lifecycle: bool,
+    exchange: &Exchange,
 ) {
+    let Exchange {
+        methods,
+        lifecycle,
+        ends_turn,
+    } = *exchange;
     let found = |fake: &Fake, p: &dyn Fn(&Value) -> bool| fake.seen[since..].iter().any(p);
     let drain_until = |fake: &mut Fake, p: &dyn Fn(&Value) -> bool| {
         while !found(fake, p) {
@@ -437,9 +455,21 @@ fn wait_for(
             return;
         }
     }
+    // An accepted `turn/steer`: the prompt joined the running turn, which ends on its own.
+    if ends_turn {
+        drain_until(fake, &|m| m["method"] == "turn/completed");
+        return;
+    }
     match next {
         Some(n) if is_response_in(n, wire) => drain_until(fake, &|m| is_server_request(m, wire)),
-        Some(n) if !lifecycle && is_interrupt_in(n, wire) => drain_until(fake, &progress),
+        // A steer (or interrupt) is sent once the turn has produced output.
+        Some(n)
+            if !lifecycle
+                && (is_interrupt_in(n, wire)
+                    || (n["method"] == "turn/steer" && cur["method"] == "turn/start")) =>
+        {
+            drain_until(fake, &progress)
+        }
         _ => {
             if !lifecycle && is_interrupt_in(cur, wire) {
                 match wire {
@@ -521,14 +551,22 @@ fn replay(persona: &'static str, name: &str) {
         }
         let since = fake.seen.len();
         fake.send(&msg);
+        // Did the real CLI accept this `turn/steer`?
+        let ends_turn = line["method"] == "turn/steer"
+            && refs
+                .iter()
+                .any(|m| m["id"] == line["id"] && m["result"].is_object());
         wait_for(
             &mut fake,
             wire,
             &msg,
             ins.get(i + 1),
             since,
-            &methods,
-            name == "lifecycle",
+            &Exchange {
+                methods: &methods,
+                lifecycle: name == "lifecycle",
+                ends_turn,
+            },
         );
         // Learn id substitutions from the fake output so far, pairing k-th messages per discriminator.
         let mut fake_by: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
@@ -570,14 +608,17 @@ fn replay(persona: &'static str, name: &str) {
     // The claude lifecycle exchange (2.1.293) grounds the message lifecycle; the other message
     // shapes of that version differ from the 2.1.326 recordings the persona clones, which the
     // other exchanges check.
-    let compared = |d: &str| {
-        !(persona == "claude" && name == "lifecycle")
-            || matches!(
-                d,
-                "command_lifecycle"
-                    | "control_response:success:cancel_async_message"
-                    | "control_response:success:interrupt"
-            )
+    let compared = |d: &str| match (persona, name) {
+        ("claude", "lifecycle") => matches!(
+            d,
+            "command_lifecycle"
+                | "control_response:success:cancel_async_message"
+                | "control_response:success:interrupt"
+        ),
+        // codex-cli 0.161.0, newer thread/turn objects than the 0.169.1 ones the persona clones:
+        // only what is new here, the replies to `turn/steer`, is compared.
+        ("codex", "steer") => matches!(d, "resp:turn/steer" | "err:turn/steer"),
+        _ => true,
     };
     ref_by.retain(|d, _| compared(d));
     fake_by.retain(|d, _| compared(d));
@@ -677,6 +718,7 @@ replays! {
     codex_error => ("codex", "error"),
     codex_question => ("codex", "question"),
     codex_lifecycle => ("codex", "lifecycle"),
+    codex_steer => ("codex", "steer"),
     opencode_handshake => ("opencode", "handshake"),
     opencode_simple => ("opencode", "simple"),
     opencode_tool_allow => ("opencode", "tool_allow"),

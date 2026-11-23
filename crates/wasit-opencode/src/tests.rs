@@ -155,8 +155,14 @@ fn prompt_turn_usage_and_queueing() {
         matches!(&ev[0], AgentEvent::UsageUpdate { usage, context_pct: Some(p) } if usage.cost_usd == 0.25 && (*p - 25.0).abs() < 1e-3)
     );
     let step = p.on_line(r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"inputTokens":136,"outputTokens":10,"cachedReadTokens":11136}}}"#);
+    // (The updates above carry no session id, so they are not known to be ours: the result is
+    // what acknowledges the prompt, ahead of the turn's end.)
+    assert!(matches!(
+        &step.events[0],
+        AgentEvent::InputAcknowledged { .. }
+    ));
     assert!(
-        matches!(&step.events[0], AgentEvent::TurnCompleted { end_reason: None, usage, .. } if usage.input_tokens == 136 && usage.cache_read_tokens == 11136)
+        matches!(&step.events[1], AgentEvent::TurnCompleted { end_reason: None, usage, .. } if usage.input_tokens == 136 && usage.cache_read_tokens == 11136)
     );
     // The held prompt goes out now.
     assert_eq!(w(&step)[0]["params"]["prompt"][0]["text"], "b");
@@ -274,8 +280,10 @@ fn interrupt_cancels_gates_then_sends_cancel_notification() {
     let ev = p
         .on_line(r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled"}}"#)
         .events;
+    // The result acknowledges the prompt (nothing else did), then the turn ends.
+    assert!(matches!(&ev[0], AgentEvent::InputAcknowledged { .. }));
     assert!(matches!(
-        &ev[0],
+        &ev[1],
         AgentEvent::TurnCompleted {
             end_reason: Some(EndReason::Cancelled),
             was_interrupted: true,
@@ -769,4 +777,330 @@ fn interrupt_before_ready_and_shutdown_drop_what_is_queued() {
             (InputId(5), InputDropReason::Shutdown)
         ]
     );
+}
+
+// ── acknowledgement and refusal of prompts ──────────────────────────────────
+
+fn acks(events: &[AgentEvent]) -> Vec<(InputId, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputAcknowledged { input, steered } => Some((*input, *steered)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn refusals(events: &[AgentEvent]) -> Vec<(InputId, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputDropped {
+                input,
+                reason: InputDropReason::Refused,
+                error,
+            } => Some((
+                *input,
+                error.clone().expect("a refusal carries the CLI's error"),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `session/update` of session `ses_1` (the one `ready()` opens).
+fn update(body: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"ses_1","update":{body}}}}}"#
+    )
+}
+
+fn chunk(text: &str) -> String {
+    update(&format!(
+        r#"{{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{{"type":"text","text":"{text}"}}}}"#
+    ))
+}
+
+fn prompt_id(step: &Step) -> u64 {
+    w(step)
+        .iter()
+        .find(|l| l["method"] == "session/prompt")
+        .expect("session/prompt written")["id"]
+        .as_u64()
+        .unwrap()
+}
+
+fn prompt_result(id: u64) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"end_turn"}}}}"#)
+}
+
+#[test]
+fn the_first_sign_of_the_agent_working_acknowledges_the_prompt_once() {
+    let mut p = ready();
+    let step = sent(p.encode(InputId(20), Command::prompt("go")));
+    let id = prompt_id(&step);
+    // Writing it acknowledges nothing.
+    assert!(acks(&step.events).is_empty());
+    let ev = p.on_line(&chunk("Hi")).events;
+    assert_eq!(
+        ev,
+        vec![
+            AgentEvent::InputAcknowledged {
+                input: InputId(20),
+                steered: false
+            },
+            AgentEvent::AssistantDelta {
+                text: "Hi".into(),
+                message_id: Some("m".into())
+            }
+        ]
+    );
+    // More activity and the result add nothing.
+    assert!(acks(&p.on_line(&chunk(" there")).events).is_empty());
+    let ev = p.on_line(&prompt_result(id)).events;
+    assert!(acks(&ev).is_empty());
+    assert!(matches!(&ev[0], AgentEvent::TurnCompleted { .. }));
+}
+
+#[test]
+fn every_kind_of_agent_work_acknowledges() {
+    for body in [
+        r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"hm"}}"#,
+        r#"{"sessionUpdate":"tool_call","toolCallId":"c1","title":"bash","kind":"execute","status":"pending"}"#,
+        r#"{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"in_progress"}"#,
+        r#"{"sessionUpdate":"plan","entries":[]}"#,
+    ] {
+        let mut p = ready();
+        sent(p.encode(InputId(21), Command::prompt("go")));
+        let ev = p.on_line(&update(body)).events;
+        assert_eq!(acks(&ev), vec![(InputId(21), false)], "{body}");
+    }
+}
+
+#[test]
+fn the_result_acknowledges_a_prompt_that_streamed_nothing() {
+    let mut p = ready();
+    let step = sent(p.encode(InputId(22), Command::prompt("go")));
+    let id = prompt_id(&step);
+    let ev = p.on_line(&prompt_result(id)).events;
+    // Acknowledged first, then the turn ends.
+    assert_eq!(
+        ev[0],
+        AgentEvent::InputAcknowledged {
+            input: InputId(22),
+            steered: false
+        }
+    );
+    assert!(matches!(&ev[1], AgentEvent::TurnCompleted { .. }));
+    assert_eq!(acks(&ev).len(), 1);
+}
+
+#[test]
+fn updates_that_are_not_the_agent_working_on_the_prompt_do_not_acknowledge() {
+    let mut p = ready();
+    sent(p.encode(InputId(23), Command::prompt("go")));
+    // What the recordings show between `session/prompt` and the first real activity
+    // (`available_commands_update`, `config_option_update`), usage that precedes an error, a
+    // replayed user message, and activity of another session.
+    for body in [
+        r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#,
+        r#"{"sessionUpdate":"config_option_update","configOptions":[]}"#,
+        r#"{"sessionUpdate":"current_mode_update","currentModeId":"plan"}"#,
+        r#"{"sessionUpdate":"usage_update","used":1,"size":10}"#,
+        r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"go"}}"#,
+    ] {
+        let ev = p.on_line(&update(body)).events;
+        assert!(acks(&ev).is_empty(), "{body}: {ev:?}");
+    }
+    let other = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_child","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}"#;
+    assert!(acks(&p.on_line(other).events).is_empty());
+    // An update with no session id is not known to be ours.
+    let anon = r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}"#;
+    assert!(acks(&p.on_line(anon).events).is_empty());
+    // The real thing does.
+    assert_eq!(
+        acks(&p.on_line(&chunk("Hi")).events),
+        vec![(InputId(23), false)]
+    );
+}
+
+#[test]
+fn history_replayed_by_session_load_is_never_an_acknowledgement() {
+    let mut p = AcpProtocol::new("x");
+    let (spec, first) = SpawnSpec {
+        resume: ResumeMode::Resume("ses_old".into()),
+        first_prompt: Some("go".into()),
+        ..SpawnSpec::default()
+    }
+    .split_first_prompt();
+    p.start(&spec);
+    assert_eq!(
+        p.encode(InputId(1), first.unwrap()).unwrap(),
+        Encoded::Queued
+    );
+    p.on_line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    // The replay of the stored conversation, as `reference/*/load.jsonl` and
+    // `fixtures/resume.ndjson` show it: every kind of message, for the loaded session.
+    let replay = |body: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"ses_old","update":{body}}}}}"#
+        )
+    };
+    for body in [
+        r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old question"}}"#,
+        r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}"#,
+        r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"old thought"}}"#,
+        r#"{"sessionUpdate":"tool_call","toolCallId":"c0","title":"bash","status":"pending"}"#,
+        r#"{"sessionUpdate":"tool_call_update","toolCallId":"c0","status":"completed"}"#,
+        r#"{"sessionUpdate":"plan","entries":[]}"#,
+    ] {
+        let step = p.on_line(&replay(body));
+        assert!(step.events.is_empty(), "{body}: {:?}", step.events);
+    }
+    // The load answers; the queued prompt goes out. Still nothing acknowledged.
+    let step = p.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#);
+    assert!(acks(&step.events).is_empty());
+    assert!(step
+        .events
+        .contains(&AgentEvent::InputSent { input: InputId(1) }));
+    let id = prompt_id(&step);
+    // Only the agent's work on the new prompt acknowledges it.
+    let ev = p
+        .on_line(&replay(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"new"}}"#,
+        ))
+        .events;
+    assert_eq!(acks(&ev), vec![(InputId(1), false)]);
+    assert!(acks(&p.on_line(&prompt_result(id)).events).is_empty());
+}
+
+#[test]
+fn each_prompt_is_acknowledged_once_for_its_own_input() {
+    let mut p = ready();
+    let first = sent(p.encode(InputId(30), Command::prompt("a")));
+    let first_id = prompt_id(&first);
+    assert_eq!(
+        p.encode(InputId(31), Command::prompt("b")).unwrap(),
+        Encoded::Queued
+    );
+    let mut all = acks(&p.on_line(&chunk("A")).events);
+    let step = p.on_line(&prompt_result(first_id));
+    all.extend(acks(&step.events));
+    // The held prompt went out with the end of the turn; session-level noise does not count.
+    let second_id = prompt_id(&step);
+    all.extend(acks(
+        &p.on_line(&update(
+            r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#,
+        ))
+        .events,
+    ));
+    assert_eq!(all, vec![(InputId(30), false)]);
+    all.extend(acks(&p.on_line(&prompt_result(second_id)).events));
+    assert_eq!(all, vec![(InputId(30), false), (InputId(31), false)]);
+}
+
+#[test]
+fn a_refused_prompt_is_reported_dropped_and_ends_the_turn() {
+    let mut p = ready();
+    let step = sent(p.encode(InputId(40), Command::prompt("go")));
+    let id = prompt_id(&step);
+    assert_eq!(
+        p.encode(InputId(41), Command::prompt("next")).unwrap(),
+        Encoded::Queued
+    );
+    // What kilo 7.8.8 / 7.8.27 do without credentials: session-level updates and a usage update,
+    // then this error (`fixtures/kilo-refused.ndjson`, `reference/kilo/error.jsonl`).
+    p.on_line(&update(
+        r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#,
+    ));
+    p.on_line(&update(
+        r#"{"sessionUpdate":"usage_update","used":0,"size":10}"#,
+    ));
+    let step = p.on_line(&format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32603,"message":"Internal error: You need to sign in to use this model."}}}}"#
+    ));
+    assert_eq!(
+        refusals(&step.events),
+        vec![(
+            InputId(40),
+            "Internal error: You need to sign in to use this model.".to_string()
+        )]
+    );
+    assert!(acks(&step.events).is_empty());
+    // The turn ends as before, after the refusal.
+    let dropped = step
+        .events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::InputDropped { .. }))
+        .unwrap();
+    let ended = step
+        .events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::TurnCompleted {
+                    end_reason: Some(EndReason::ExecutionError),
+                    reply: Some(r),
+                    ..
+                } if r.contains("sign in")
+            )
+        })
+        .unwrap();
+    assert!(dropped < ended);
+    // The held prompt follows and is acknowledged on its own.
+    assert!(step
+        .events
+        .contains(&AgentEvent::InputSent { input: InputId(41) }));
+    let next_id = prompt_id(&step);
+    assert_eq!(
+        acks(&p.on_line(&prompt_result(next_id)).events),
+        vec![(InputId(41), false)]
+    );
+}
+
+#[test]
+fn an_error_after_the_agent_worked_is_not_a_refusal() {
+    let mut p = ready();
+    let step = sent(p.encode(InputId(50), Command::prompt("go")));
+    let id = prompt_id(&step);
+    assert_eq!(acks(&p.on_line(&chunk("partial")).events).len(), 1);
+    let step = p.on_line(&format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32603,"message":"Internal error: provider down"}}}}"#
+    ));
+    assert!(refusals(&step.events).is_empty(), "{:?}", step.events);
+    assert!(acks(&step.events).is_empty());
+    assert!(matches!(
+        &step.events[0],
+        AgentEvent::TurnCompleted {
+            end_reason: Some(EndReason::ExecutionError),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn queued_prompts_dropped_by_an_interrupt_are_never_acknowledged() {
+    let mut p = ready();
+    let step = sent(p.encode(InputId(60), Command::prompt("go")));
+    let id = prompt_id(&step);
+    p.encode(InputId(61), Command::prompt("a")).unwrap();
+    p.encode(InputId(62), Command::prompt("b")).unwrap();
+    let step = sent(p.encode(InputId(63), Command::Interrupt));
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(61), InputDropReason::Interrupted),
+            (InputId(62), InputDropReason::Interrupted)
+        ]
+    );
+    let mut after = p.on_line(&chunk("tail")).events;
+    after.extend(
+        p.on_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"cancelled"}}}}"#
+        ))
+        .events,
+    );
+    assert_eq!(acks(&after), vec![(InputId(60), false)]);
+    assert!(drops(&after).is_empty());
 }
