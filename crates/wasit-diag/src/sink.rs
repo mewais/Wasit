@@ -407,6 +407,11 @@ impl Sink {
         (st.ring.snapshot(), self.shared.tail.subscribe())
     }
 
+    /// The process's boot id (the record's `b`).
+    pub fn boot(&self) -> &str {
+        &self.shared.boot
+    }
+
     pub fn stats(&self) -> Stats {
         let c = &self.shared.stats;
         Stats {

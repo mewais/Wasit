@@ -26,7 +26,8 @@
 //!
 //! Diagnostics (`wasit-diag`): once `serve` holds its lock it records typed, content-free events
 //! in `<dir>/diag/daemon.ndjson` (8 MiB, three older generations; the directory is `0700`, the
-//! file `0600`), and a panic leaves a `diag.panic` record there instead of text on stderr.
+//! file `0600`) and serves them (`diag.sources`, `diag.read`, topic `diag.tail`, see
+//! [`DiagService`]) next to the runtime's methods, and a panic leaves a `diag.panic` record there instead of text on stderr.
 //! `tracing` output is counted per minute, not written. Developer overrides: `WASIT_LOG=<filter>`
 //! prints plain `tracing` text (no colour) on stderr and lets a panic print its usual message
 //! too; `WASIT_DIAG_QUEUE=<n>` sets the size of the record queue.
@@ -46,9 +47,10 @@ use wasit_control::{
 };
 use wasit_core::DriverId;
 use wasit_diag::{Code, ErrorInfo, HomePath, Ident, Ms, SinkConfig};
-use wasit_runtime::wire::ROUTES;
+use wasit_runtime::wire::{DIAG_ROUTES, ROUTES};
 use wasit_runtime::{
-    Discovery, DiscoveryConfig, RuntimeConfig, RuntimeService, SessionManager, ShimLauncher,
+    DiagService, Discovery, DiscoveryConfig, RuntimeConfig, RuntimeService, SessionManager,
+    ShimLauncher,
 };
 
 const BUILD: &str = concat!("wasit-hostd/", env!("CARGO_PKG_VERSION"));
@@ -323,13 +325,18 @@ async fn serve(a: Args) -> ExitCode {
             error: ErrorInfo::ours(Code::st("scan"), &e),
         }),
     }
+    // Not wrapped in `Observed`: reading the log must not write to it.
+    let diag = DiagService::new(manager.clone());
     let service = Observed(RuntimeService::new(
         manager,
         discovery,
         host_id.clone(),
         BUILD,
     ));
-    let mux = match ServiceMux::new().with(ROUTES.iter().copied(), Arc::new(service)) {
+    let mux = match ServiceMux::new()
+        .with(ROUTES.iter().copied(), Arc::new(service))
+        .and_then(|m| m.with(DIAG_ROUTES.iter().copied(), Arc::new(diag)))
+    {
         Ok(m) => m,
         Err(e) => {
             eprintln!("wasit-hostd: {e}");

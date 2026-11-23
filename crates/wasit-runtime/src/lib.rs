@@ -10,6 +10,8 @@
 //!   [`wire::DriverInventory`] per driver.
 //! * [`trail`] — the content-free projection of a session's events (`session.trail:<id>`,
 //!   `session.trail.page`).
+//! * [`DiagService`] — this process's own diagnostics (`diag.sources`, `diag.read`, topic
+//!   `diag.tail`), mounted next to the runtime service on [`wire::DIAG_ROUTES`].
 //! * [`RuntimeService`] — the [`wasit_control::Service`] serving all of the above; [`wire`]
 //!   holds every payload type and [`RuntimeClient`] is the typed client.
 
@@ -20,6 +22,7 @@ mod client;
 mod config;
 mod core;
 mod diag;
+mod diag_service;
 mod discovery;
 pub mod environment;
 mod host;
@@ -28,6 +31,7 @@ mod manager;
 pub mod media;
 mod note;
 mod replay;
+mod scrub;
 mod service;
 mod store;
 mod stream;
@@ -36,6 +40,7 @@ pub mod wire;
 
 pub use client::{ClientError, RuntimeClient, TypedSubscription};
 pub use config::{AgentCommands, DriverOverride, ModeHints, RuntimeConfig, ShimLauncher, Timeouts};
+pub use diag_service::DiagService;
 pub use discovery::{Discovery, DiscoveryConfig};
 pub use manager::{
     AdoptReport, HostEventStream, SessionEventStream, SessionManager, MAX_HISTORY_PAGE,

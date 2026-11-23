@@ -158,6 +158,20 @@ impl SessionManager {
         self.inner.cfg.sessions_dir().join(id.as_str())
     }
 
+    /// The directory of a session this manager knows (`None`: no such session, so no path is
+    /// ever made from an id a caller merely named).
+    pub(crate) fn known_session_dir(&self, id: &SessionId) -> Option<PathBuf> {
+        lock(&self.inner.sessions).get(id).map(|e| e.dir.clone())
+    }
+
+    /// Every known session and its directory.
+    pub(crate) fn session_dirs(&self) -> Vec<(SessionId, PathBuf)> {
+        lock(&self.inner.sessions)
+            .iter()
+            .map(|(id, e)| (id.clone(), e.dir.clone()))
+            .collect()
+    }
+
     // ── create / adopt ──────────────────────────────────────────────────────
 
     /// Create and launch a session. Returns once the shim is up (the handshake progresses as
@@ -173,6 +187,10 @@ impl SessionManager {
         req: CreateSession,
         trace: Option<TraceId>,
     ) -> Result<CreateSessionReply, RuntimeError> {
+        // First, before anything is awaited, journaled, logged or spawned: from here on no text
+        // recorded by this process can hold the session's secrets or its directory.
+        crate::scrub::agent_config(&req.config);
+        crate::scrub::session_cwd(req.cwd.as_deref());
         let cfg = &self.inner.cfg;
         let desc = cfg
             .registry
@@ -371,6 +389,10 @@ impl SessionManager {
         if &file.id != id {
             return Err(format!("session.json names {} instead", file.id));
         }
+        // Before the session's actor exists: what a restarted daemon records about it must not
+        // hold the values it was launched with or its directory.
+        crate::scrub::spawn_env(&file.spec);
+        crate::scrub::session_cwd(file.cwd.as_deref());
         let desc = self
             .inner
             .cfg
