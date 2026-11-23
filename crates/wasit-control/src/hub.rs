@@ -82,6 +82,13 @@ pub trait LinkConnector: Send + Sync + 'static {
         opts: ClientOptions,
         attempt: Attempt,
     ) -> Result<ControlClient, ConnectError>;
+
+    /// Whether the link to `spec` must wait for a person before its next attempt
+    /// ([`SupervisorHooks::hold`]): `Some(detail)` parks it, saying why in `detail`. The
+    /// default never holds.
+    fn hold(&self, _spec: &HostSpec) -> Option<String> {
+        None
+    }
 }
 
 /// Connects by running `spec.connect_argv` and speaking over its stdio.
@@ -173,6 +180,7 @@ pub struct Hub {
 struct HubHooks {
     spec: HostSpec,
     provisioner: Option<Arc<dyn Provisioner>>,
+    connector: Arc<dyn LinkConnector>,
     expected_build: Option<String>,
 }
 
@@ -191,6 +199,10 @@ impl SupervisorHooks for HubHooks {
     async fn provision(&self, reason: &ProvisionReason) -> Option<Result<(), ProvisionError>> {
         let p = self.provisioner.as_ref()?;
         Some(p.ensure(&self.spec, reason.clone()).await)
+    }
+
+    fn hold(&self) -> Option<String> {
+        self.connector.hold(&self.spec)
     }
 }
 
@@ -306,6 +318,7 @@ impl Hub {
         let hooks = HubHooks {
             spec: spec.clone(),
             provisioner: self.inner.provisioner.clone(),
+            connector: self.inner.connector.clone(),
             expected_build: spec.expected_build.clone().or_else(|| {
                 self.inner
                     .cfg

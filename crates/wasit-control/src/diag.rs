@@ -471,7 +471,9 @@ fn state_reason(s: &LinkState) -> Option<String> {
             }
         }),
         LinkState::Reconnecting { last_error, .. } => Some(last_error.clone()),
-        LinkState::AuthNeeded { problem, detail } => Some(with(Some(*problem), detail)),
+        LinkState::AuthNeeded {
+            problem, detail, ..
+        } => Some(with(Some(*problem), detail)),
         LinkState::Incompatible { ours, theirs } => Some(format!(
             "incompatible protocol: ours {ours}, theirs {theirs}"
         )),
@@ -907,6 +909,8 @@ mod tests {
             LinkState::AuthNeeded {
                 problem: crate::CommandFailureKind::AuthNeeded,
                 detail: String::new(),
+                cause: None,
+                held: false,
             },
             LinkState::Incompatible {
                 ours: ProtocolVersion { major: 1, minor: 0 },

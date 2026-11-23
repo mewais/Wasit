@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,11 +27,21 @@ struct MemConnector {
     targets: Mutex<HashMap<HostId, ControlServer>>,
     scripted: Mutex<HashMap<HostId, VecDeque<ConnectError>>>,
     attempts: watch::Sender<u32>,
+    /// Hosts whose links must wait for a person ([`LinkConnector::hold`]).
+    held: Mutex<HashSet<HostId>>,
 }
 
 impl MemConnector {
     fn set_target(&self, host: &str, server: ControlServer) {
         self.targets.lock().unwrap().insert(host.into(), server);
+    }
+    fn hold_on(&self, host: &str, on: bool) {
+        let mut held = self.held.lock().unwrap();
+        if on {
+            held.insert(host.into());
+        } else {
+            held.remove(&HostId::from(host));
+        }
     }
     fn script(&self, host: &str, errs: Vec<ConnectError>) {
         self.scripted
@@ -64,6 +74,14 @@ impl LinkConnector for MemConnector {
             Some(s) => mem_connect(&s, opts).await,
             None => Err(ConnectError::Io(format!("no route to {}", spec.id))),
         }
+    }
+
+    fn hold(&self, spec: &HostSpec) -> Option<String> {
+        self.held
+            .lock()
+            .unwrap()
+            .contains(&spec.id)
+            .then(|| "a person must start this one".to_owned())
     }
 }
 
@@ -455,6 +473,83 @@ async fn transport_failures_back_off_with_increasing_attempts_then_recover() {
     first.close();
     let states = collect_until(&mut ev, "r1", LinkState::is_connected).await;
     assert_eq!(names(&states), ["reconnecting", "connecting", "connected"]);
+    hub.shutdown().await;
+}
+
+/// A link the connector holds is parked as `AuthNeeded { held }` without any attempt: at its
+/// start, and after a drop (where it never announces a reconnect it will not make and keeps the
+/// reason the link dropped). `reconnect_now` while the hold stands changes nothing; once the
+/// connector lets go, it connects.
+#[tokio::test]
+async fn a_held_link_parks_without_an_attempt_and_keeps_why_it_dropped() {
+    let mc = Arc::new(MemConnector::default());
+    mc.set_target("r1", daemon("r1", "v1"));
+    mc.hold_on("r1", true);
+    let hub = Hub::new(hub_cfg("hub", "v1"), mc.clone(), None);
+    let mut ev = hub.events();
+    let id = HostId::from("r1");
+    hub.add_link(spec("r1")).unwrap();
+
+    // At its start: parked, with no attempt and no cause (it had not been up).
+    let states = collect_until(&mut ev, "r1", |s| matches!(s, LinkState::AuthNeeded { .. })).await;
+    assert_eq!(names(&states), ["auth_needed"]);
+    match &states[0] {
+        LinkState::AuthNeeded {
+            problem,
+            detail,
+            cause,
+            held,
+        } => {
+            assert_eq!(*problem, CommandFailureKind::AuthNeeded);
+            assert_eq!(detail, "a person must start this one");
+            assert_eq!((cause, held), (&None, &true));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*mc.attempts.borrow(), 0);
+
+    // A reconnect request while the hold stands starts nothing: the link says it is still
+    // waiting (the event is the proof the supervisor looked).
+    hub.reconnect_now(&id);
+    let again = collect_until(&mut ev, "r1", |s| matches!(s, LinkState::AuthNeeded { .. })).await;
+    assert_eq!(names(&again), ["auth_needed"]);
+    assert_eq!(*mc.attempts.borrow(), 0);
+
+    // Let go and ask: it connects.
+    mc.hold_on("r1", false);
+    hub.reconnect_now(&id);
+    let states = collect_until(&mut ev, "r1", LinkState::is_connected).await;
+    assert_eq!(names(&states), ["connecting", "connected"]);
+    assert_eq!(*mc.attempts.borrow(), 1);
+
+    // The link drops while the hold stands: parked at once, no "reconnecting", no attempt, and
+    // the drop's own reason is kept next to the held fact.
+    mc.hold_on("r1", true);
+    let first = hub.link(&id).unwrap().current().unwrap();
+    first.close();
+    let states = collect_until(&mut ev, "r1", |s| matches!(s, LinkState::AuthNeeded { .. })).await;
+    assert_eq!(names(&states), ["auth_needed"]);
+    match &states[0] {
+        LinkState::AuthNeeded {
+            detail,
+            cause,
+            held,
+            ..
+        } => {
+            assert_eq!(detail, "a person must start this one");
+            assert!(*held);
+            let cause = cause.as_deref().expect("the drop's reason");
+            assert!(!cause.is_empty() && !cause.contains("person"), "{cause}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*mc.attempts.borrow(), 1, "no attempt after the drop");
+
+    // Another click, hold released: connects once more; the old reason is not carried over.
+    mc.hold_on("r1", false);
+    hub.reconnect_now(&id);
+    collect_until(&mut ev, "r1", LinkState::is_connected).await;
+    assert_eq!(*mc.attempts.borrow(), 2);
     hub.shutdown().await;
 }
 

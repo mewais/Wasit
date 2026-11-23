@@ -121,6 +121,19 @@ pub enum LinkState {
     AuthNeeded {
         problem: CommandFailureKind,
         detail: String,
+        /// Why the link was not connected when it was parked: the reason the connection dropped
+        /// (or the last attempt failed), in the supervisor's words. Kept beside `detail`, never
+        /// replaced by it. `None` when the link had not been up (or tried) before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        cause: Option<String>,
+        /// The link was parked without an attempt because [`SupervisorHooks::hold`] said a
+        /// person must ask for the next one, not because an attempt failed: the next attempt
+        /// is the person's click ([`Supervised::reconnect_now`]), and it will ask them
+        /// something. `detail` is the hook's words.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        held: bool,
     },
     /// Different protocol major and nothing can fix it automatically. Waits for
     /// `reconnect_now`.
@@ -170,6 +183,17 @@ pub trait SupervisorHooks: Send + Sync + 'static {
 
     /// Try to fix `reason`. `None` = provisioning is not available.
     async fn provision(&self, _reason: &ProvisionReason) -> Option<Result<(), ProvisionError>> {
+        None
+    }
+
+    /// Asked before every attempt the supervisor would start by itself (the first one, the one
+    /// after a drop, the one after a backoff, the one after provisioning) and before it
+    /// announces a backoff: `Some(detail)` parks the link as [`LinkState::AuthNeeded`] with
+    /// `held` set, without trying, until [`Supervised::reconnect_now`] and a `None` answer.
+    /// For a link whose every connect asks a person for something (a code, a push approval):
+    /// retrying it on a timer would spend that on nobody. Never a failure of an attempt, so
+    /// nothing is lost: the link keeps the reason it was down.
+    fn hold(&self) -> Option<String> {
         None
     }
 }
@@ -481,6 +505,26 @@ async fn run(
         if stop.is_cancelled() {
             break;
         }
+        // A link the product says must wait for a person (the first attempt of a link that
+        // asks for a sign-in each time, or one that follows a failure) is not tried.
+        if let Some(detail) = hold(&hooks) {
+            if !wait_for_person(
+                &shared,
+                &mut reconnect_rx,
+                detail,
+                &last_error,
+                &last_why,
+                n,
+            )
+            .await
+            {
+                break;
+            }
+            attempt = 0;
+            bridge_unavailable = 0;
+            provisioned = None;
+            continue 'outer;
+        }
         // Requests for a reconnect made before this attempt are satisfied by it.
         reconnect_rx.borrow_and_update();
         n += 1;
@@ -522,6 +566,9 @@ async fn run(
                     attempt = 0;
                     bridge_unavailable = 0;
                     provisioned = None;
+                    // What went wrong before is over: a later park must not quote it.
+                    last_error.clear();
+                    last_why.clear();
                     shared.attempt_end(n, started, AttemptOutcome::Connected, || None);
                     // The client first: whoever is told the link is connected may use it
                     // at once (a request routed in between would find no client).
@@ -662,6 +709,8 @@ async fn run(
                         Next::Park(LinkState::AuthNeeded {
                             problem: *kind,
                             detail: stderr.clone(),
+                            cause: None,
+                            held: false,
                         })
                     }
                     _ => Next::Backoff,
@@ -753,6 +802,26 @@ async fn run(
         match next {
             Next::Immediate => continue,
             Next::Backoff => {
+                // No "reconnecting at …" for a link that will not: it waits for a person, and
+                // says why it was down.
+                if let Some(detail) = hold(&hooks) {
+                    if !wait_for_person(
+                        &shared,
+                        &mut reconnect_rx,
+                        detail,
+                        &last_error,
+                        &last_why,
+                        n,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    attempt = 0;
+                    bridge_unavailable = 0;
+                    provisioned = None;
+                    continue 'outer;
+                }
                 attempt = attempt.saturating_add(1);
                 let delay = shared.backoff.delay_random(attempt);
                 shared.set(
@@ -786,6 +855,38 @@ async fn run(
     }
     shared.client.send_replace(None);
     shared.set(LinkState::Stopped, None, n);
+}
+
+fn hold(hooks: &Option<Arc<dyn SupervisorHooks>>) -> Option<String> {
+    hooks.as_ref().and_then(|h| h.hold())
+}
+
+/// Parks the link as waiting for a person ([`SupervisorHooks::hold`]) and waits for
+/// `reconnect_now`. `cause` and `why` are the reason the link was down (in the supervisor's
+/// words, and as diagnostics may show it); empty when it had not been. `false`: the supervisor
+/// was stopped meanwhile.
+async fn wait_for_person(
+    shared: &Shared,
+    reconnect_rx: &mut watch::Receiver<u64>,
+    detail: String,
+    cause: &str,
+    why: &str,
+    n: u64,
+) -> bool {
+    shared.set(
+        LinkState::AuthNeeded {
+            problem: CommandFailureKind::AuthNeeded,
+            detail,
+            cause: (!cause.is_empty()).then(|| cause.to_owned()),
+            held: true,
+        },
+        (!why.is_empty()).then_some(why),
+        n,
+    );
+    tokio::select! {
+        _ = shared.stop.cancelled() => false,
+        _ = reconnect_rx.changed() => true,
+    }
 }
 
 /// Options of a durable subscription.
