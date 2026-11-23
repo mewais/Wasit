@@ -199,6 +199,10 @@ fn externalize_part(p: &mut ContentPart, blobs: &mut Vec<(String, Vec<u8>)>) {
 /// published event is small. Pure and deterministic.
 pub(crate) fn externalize(ev: &mut AgentEvent, blobs: &mut Vec<(String, Vec<u8>)>) {
     match ev {
+        // The event a subagent or the earlier history wraps carries the media.
+        AgentEvent::Scoped { event, .. } | AgentEvent::History { event, .. } => {
+            externalize(event, blobs)
+        }
         AgentEvent::AssistantContent { parts, .. } | AgentEvent::UserContent { parts } => {
             parts.iter_mut().for_each(|p| externalize_part(p, blobs));
         }

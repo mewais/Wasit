@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use crate::config::ConfigRenderer;
 use crate::content::PromptInput;
-use crate::discovery::{DiscoveryContext, DiscoveryProbe};
+use crate::discovery::{DiscoveryContext, DiscoveryKind, DiscoveryProbe};
+use crate::history::{HistoryDelivery, HistoryLimits, HistoryParser};
 use crate::protocol::Protocol;
 use crate::spec::SpawnSpec;
 
@@ -103,6 +104,11 @@ pub struct DriverCapabilities {
     /// `Command::StopTask` stops a background task the CLI reports.
     #[serde(default)]
     pub stop_task: bool,
+    /// How the CLI gives out the earlier history of a conversation a session resumes (see
+    /// [`HistoryDelivery`]): clients can tell whether a resumed conversation can show what came
+    /// before it.
+    #[serde(default)]
+    pub earlier_history: HistoryDelivery,
 }
 
 /// Everything the runtime needs to know about one CLI. Implemented by each
@@ -150,6 +156,36 @@ pub trait DriverDescriptor: ConfigRenderer + Send + Sync {
     fn new_protocol(&self) -> Box<dyn Protocol>;
     /// Discovery probes for this host.
     fn discovery(&self, ctx: &DiscoveryContext) -> Vec<DiscoveryProbe>;
+
+    /// A probe whose [`Discovered::Sessions`](crate::Discovered::Sessions) lists the
+    /// conversations of the project `ctx.project` and only those, newest activity first or not
+    /// (the runtime picks the greatest `modified_ms`): what "continue the most recent
+    /// conversation here" resolves against. The default is the driver's own sessions probe of
+    /// [`DriverDescriptor::discovery`], which every driver whose listing is per project uses; a
+    /// driver whose listing is host-wide says how to narrow it. `None`: the CLI cannot say.
+    fn conversations_in_project(&self, ctx: &DiscoveryContext) -> Option<DiscoveryProbe> {
+        self.discovery(ctx)
+            .into_iter()
+            .find(|p| p.kind == DiscoveryKind::Sessions)
+    }
+
+    /// For a driver whose [`DriverCapabilities::earlier_history`] is
+    /// [`HistoryDelivery::Storage`]: the file, in the agent's own storage, holding the
+    /// conversation `native_session_id` of the project `ctx.project` (an absolute path the
+    /// runtime opens read-only), derived with the same rules as the listing of resumable
+    /// conversations. `None`: this driver keeps nothing the runtime reads.
+    fn history_storage(&self, _ctx: &DiscoveryContext, _native_session_id: &str) -> Option<String> {
+        None
+    }
+
+    /// The parser of the history in the file `path` ([`DriverDescriptor::history_storage`]).
+    fn history_parser(
+        &self,
+        _path: &str,
+        _limits: &HistoryLimits,
+    ) -> Option<Box<dyn HistoryParser>> {
+        None
+    }
 }
 
 /// Errors from the registry.
@@ -269,6 +305,7 @@ mod tests {
                 streaming_output: false,
                 prompt_while_busy: BusyPrompt::QueuedByProtocol,
                 stop_task: false,
+                earlier_history: HistoryDelivery::None,
             }
         }
         fn new_protocol(&self) -> Box<dyn Protocol> {

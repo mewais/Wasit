@@ -19,9 +19,9 @@ use wasit_core::{
     config_listing, exec_stdout, listed_files, models_from_handshake, modes_from_handshake,
     parse_named_version, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem, ConfigItemKind,
     ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
-    DriverCapabilities, DriverDescriptor, DriverId, FileInput, McpServerConfig, McpTransport,
-    ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession, SavesConversation,
-    SpawnSpec, Unsupported,
+    DriverCapabilities, DriverDescriptor, DriverId, FileInput, HistoryDelivery, McpServerConfig,
+    McpTransport, ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession,
+    SavesConversation, SpawnSpec, Unsupported,
 };
 
 pub use protocol::{CodexProtocol, SKILL_ROOTS_OPTION};
@@ -81,6 +81,7 @@ impl DriverDescriptor for CodexDescriptor {
             streaming_output: true,
             prompt_while_busy: BusyPrompt::Steered,
             stop_task: false,
+            earlier_history: HistoryDelivery::Wire,
         }
     }
 
@@ -112,6 +113,38 @@ impl DriverDescriptor for CodexDescriptor {
 
     fn new_protocol(&self) -> Box<dyn Protocol> {
         Box::new(CodexProtocol::new())
+    }
+
+    /// Codex lists its rollouts host-wide, so the listing for "continue the most recent
+    /// conversation here" is the same files, read deeper (2000 newest, heads only: no message
+    /// count, which would read each file to its end) and narrowed to the rollouts whose
+    /// `session_meta` names the folder.
+    fn conversations_in_project(&self, ctx: &DiscoveryContext) -> Option<DiscoveryProbe> {
+        let home = codex_home(ctx)?;
+        let project = ctx.project.clone();
+        Some(DiscoveryProbe {
+            kind: DiscoveryKind::Sessions,
+            action: ProbeAction::ListFiles {
+                dir: format!("{home}/sessions"),
+                suffix: ".jsonl".into(),
+                recursive: true,
+                max_files: 2000,
+                head_lines: 40,
+                count_containing: vec![],
+            },
+            parse: std::sync::Arc::new(move |out| {
+                let Discovered::Sessions(all) = parse_sessions(out)? else {
+                    return Err("the rollout parser did not list sessions".into());
+                };
+                Ok(Discovered::Sessions(match &project {
+                    Some(p) => all
+                        .into_iter()
+                        .filter(|s| s.project.as_deref().map(bare) == Some(bare(p)))
+                        .collect(),
+                    None => all,
+                }))
+            }),
+        })
     }
 
     fn discovery(&self, ctx: &DiscoveryContext) -> Vec<DiscoveryProbe> {
@@ -151,14 +184,7 @@ impl DriverDescriptor for CodexDescriptor {
                 parse: std::sync::Arc::new(modes_from_handshake),
             },
         ];
-        let home = ctx
-            .var("CODEX_HOME")
-            .map(|h| h.trim_end_matches('/').to_string())
-            .or_else(|| {
-                ctx.home
-                    .as_deref()
-                    .map(|h| format!("{}/.codex", h.trim_end_matches('/')))
-            });
+        let home = codex_home(ctx);
         probes.extend(config_probes(
             ctx.binary.as_deref().unwrap_or(self.default_binary()),
             home.as_deref(),
@@ -180,6 +206,21 @@ impl DriverDescriptor for CodexDescriptor {
         }
         probes
     }
+}
+
+fn codex_home(ctx: &DiscoveryContext) -> Option<String> {
+    ctx.var("CODEX_HOME")
+        .map(|h| h.trim_end_matches('/').to_string())
+        .or_else(|| {
+            ctx.home
+                .as_deref()
+                .map(|h| format!("{}/.codex", h.trim_end_matches('/')))
+        })
+}
+
+/// A path without its trailing separators, for comparing project folders.
+fn bare(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
 }
 
 /// Rollout records that are conversation messages (`response_item` payloads of type

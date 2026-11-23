@@ -9,7 +9,13 @@
 //!   (for `ResumeMode::Continue`: `thread/list {cwd, limit:1}` first). Codex
 //!   drops a `thread/start` sent before the `initialize` response.
 //! - The `thread/start|resume` result carries `thread.id`, `model`, `cwd` →
-//!   [`AgentEvent::SessionInit`]; then `collaborationMode/list` → modes.
+//!   [`AgentEvent::SessionInit`]; then `collaborationMode/list` → modes. A `thread/resume`
+//!   result also carries the thread's earlier turns (`thread.turns[].items[]`, full-history
+//!   hydration, which codex 0.169.1 announces as deprecated in favour of `thread/turns/list`
+//!   and still sends); each item becomes an [`AgentEvent::History`] event ahead of
+//!   `SessionInit`, mapped with the same functions as the live items, and a turn whose items
+//!   codex did not send (`itemsView` not `full`) says so in a history notice. History
+//!   feeds no state of this protocol (usage, turn, tools, gates).
 //! - Turns: `turn/start` → `turn/started` … `turn/completed`. Usage arrives as
 //!   `thread/tokenUsage/updated` (`total` is cumulative for the thread).
 //! - A prompt during a running turn is sent as `turn/steer` with
@@ -132,6 +138,9 @@ pub struct CodexProtocol {
     gates: Vec<PendingGate>,
     tools: HashMap<String, String>,
     total_usage: Usage,
+    /// The open request in flight is a `thread/resume`: its result carries the thread's earlier
+    /// turns.
+    resuming: bool,
 }
 
 impl Default for CodexProtocol {
@@ -158,6 +167,7 @@ impl CodexProtocol {
             gates: Vec::new(),
             tools: HashMap::new(),
             total_usage: Usage::default(),
+            resuming: false,
         }
     }
 
@@ -211,6 +221,7 @@ impl CodexProtocol {
         if let Some(m) = self.spec.model.as_deref().filter(|m| !m.is_empty()) {
             params["model"] = json!(m);
         }
+        self.resuming = false;
         self.request(Req::ThreadOpen, "thread/start", params)
     }
 
@@ -219,6 +230,7 @@ impl CodexProtocol {
         if let Some(m) = self.spec.model.as_deref().filter(|m| !m.is_empty()) {
             params["model"] = json!(m);
         }
+        self.resuming = true;
         self.request(Req::ThreadOpen, "thread/resume", params)
     }
 
@@ -226,7 +238,14 @@ impl CodexProtocol {
         let thread = result.get("thread").cloned().unwrap_or(Value::Null);
         self.thread_id = opt_s(&thread, "id");
         self.model = opt_s(result, "model").or_else(|| opt_s(&thread, "model"));
-        let mut step = events(vec![AgentEvent::SessionInit {
+        // What the agent says happened before, ahead of the event that opens the session: it is
+        // history, never live activity, and touches no state of this protocol.
+        let mut opened = if std::mem::take(&mut self.resuming) {
+            thread_history(&thread)
+        } else {
+            Vec::new()
+        };
+        opened.push(AgentEvent::SessionInit {
             native_session_id: self.thread_id.clone(),
             model: self.model.clone(),
             cwd: opt_s(result, "cwd").or_else(|| opt_s(&thread, "cwd")),
@@ -236,7 +255,8 @@ impl CodexProtocol {
             available_modes: vec![],
             current_mode: String::new(),
             cli_version: String::new(),
-        }]);
+        });
+        let mut step = events(opened);
         step.write
             .push(self.request(Req::CollabList, "collaborationMode/list", json!({})));
         if !self.spec.mode.is_empty() {
@@ -885,38 +905,16 @@ impl CodexProtocol {
 
     fn on_item_started(&mut self, params: &Value) -> Vec<AgentEvent> {
         let item = params.get("item").cloned().unwrap_or(Value::Null);
-        let ty = s(&item, "type");
         let Some(id) = opt_s(&item, "id") else {
             return vec![];
         };
-        let (name, input) = match ty {
-            "userMessage" | "agentMessage" | "reasoning" | "plan" | "contextCompaction" => {
-                return vec![]
-            }
-            "commandExecution" => (s(&item, "command").to_string(), Value::Null),
-            "fileChange" => (
-                "apply_patch".to_string(),
-                item.get("changes").cloned().unwrap_or(Value::Null),
-            ),
-            "mcpToolCall" => (
-                format!("{}.{}", s(&item, "server"), s(&item, "tool")),
-                item.get("arguments").cloned().unwrap_or(Value::Null),
-            ),
-            "dynamicToolCall" => (
-                s(&item, "tool").to_string(),
-                item.get("arguments").cloned().unwrap_or(Value::Null),
-            ),
-            other => (other.to_string(), Value::Null),
+        let Some(start) = tool_started(&item, &id) else {
+            return vec![];
         };
-        self.tools.insert(id.clone(), name.clone());
-        let is_subagent = ty == "collabAgentToolCall";
-        vec![AgentEvent::ToolCallStarted {
-            name,
-            call_id: id,
-            input,
-            is_subagent,
-            subagent_model: None,
-        }]
+        if let AgentEvent::ToolCallStarted { name, .. } = &start {
+            self.tools.insert(id, name.clone());
+        }
+        vec![start]
     }
 
     fn on_item_completed(&mut self, params: &Value) -> Vec<AgentEvent> {
@@ -932,24 +930,259 @@ impl CodexProtocol {
         let Some(name) = self.tools.remove(&id) else {
             return vec![];
         };
-        let status = s(&item, "status");
-        let exit_ok = item
-            .get("exitCode")
-            .and_then(Value::as_i64)
-            .map(|c| c == 0)
-            .unwrap_or(true);
-        let result = item
-            .get("aggregatedOutput")
-            .filter(|v| !v.is_null())
-            .or_else(|| item.get("result").filter(|v| !v.is_null()))
-            .cloned();
-        vec![AgentEvent::ToolCallFinished {
-            call_id: id,
-            name,
-            ok: status == "completed" && exit_ok,
-            result,
-            parts: item_parts(&item),
-        }]
+        vec![tool_finished(&item, id, name)]
+    }
+}
+
+/// The tool call an item starts (`None` for the item types that are not tool calls: messages,
+/// reasoning, plans, compactions). Pure: the live protocol and the replay of a resumed thread's
+/// history map items with this one function.
+fn tool_started(item: &Value, id: &str) -> Option<AgentEvent> {
+    let ty = s(item, "type");
+    let (name, input) = match ty {
+        "userMessage" | "agentMessage" | "reasoning" | "plan" | "contextCompaction" => return None,
+        "commandExecution" => (s(item, "command").to_string(), Value::Null),
+        "fileChange" => (
+            "apply_patch".to_string(),
+            item.get("changes").cloned().unwrap_or(Value::Null),
+        ),
+        "mcpToolCall" => (
+            format!("{}.{}", s(item, "server"), s(item, "tool")),
+            item.get("arguments").cloned().unwrap_or(Value::Null),
+        ),
+        "dynamicToolCall" => (
+            s(item, "tool").to_string(),
+            item.get("arguments").cloned().unwrap_or(Value::Null),
+        ),
+        other => (other.to_string(), Value::Null),
+    };
+    Some(AgentEvent::ToolCallStarted {
+        name,
+        call_id: id.to_string(),
+        input,
+        is_subagent: ty == "collabAgentToolCall",
+        subagent_model: None,
+    })
+}
+
+/// The end of the tool call `item` (named `name` when it started). Pure, see [`tool_started`].
+fn tool_finished(item: &Value, id: String, name: String) -> AgentEvent {
+    let status = s(item, "status");
+    let exit_ok = item
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .map(|c| c == 0)
+        .unwrap_or(true);
+    let result = item
+        .get("aggregatedOutput")
+        .filter(|v| !v.is_null())
+        .or_else(|| item.get("result").filter(|v| !v.is_null()))
+        .cloned();
+    AgentEvent::ToolCallFinished {
+        call_id: id,
+        name,
+        ok: status == "completed" && exit_ok,
+        result,
+        parts: item_parts(item),
+    }
+}
+
+// ── history of a resumed thread ─────────────────────────────────────────────
+
+/// Item types that are tool calls in the history of a resumed thread. (Live, any other type is
+/// shown as a tool call named after it; for history only the types the driver knows are shown,
+/// the rest is counted and said.)
+const HISTORY_TOOL_ITEMS: [&str; 7] = [
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+    "imageView",
+    "imageGeneration",
+];
+
+/// The earlier history a `thread/resume` result carries (`thread.turns[].items[]`) as
+/// [`AgentEvent::History`] events, oldest first. Pure: it reads the result and nothing else, so
+/// the protocol's own state is exactly what it is without history.
+fn thread_history(thread: &Value) -> Vec<AgentEvent> {
+    let mut out = Vec::new();
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if turns.is_empty()
+        && thread
+            .get("preview")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.is_empty())
+    {
+        // A thread that has a first message and no turns in the result: codex sent no history
+        // (a version that only pages it), which must not read as an empty conversation.
+        out.push(
+            AgentEvent::Notice {
+                message: "codex did not send the earlier turns of this thread".into(),
+            }
+            .earlier(None),
+        );
+    }
+    for turn in turns {
+        let turn_ms = turn
+            .get("startedAt")
+            .and_then(Value::as_u64)
+            .map(|secs| secs.saturating_mul(1000));
+        let items = turn.get("items").and_then(Value::as_array);
+        let full = match turn.get("itemsView").and_then(Value::as_str) {
+            Some(view) => view == "full",
+            None => items.is_some(),
+        };
+        if !full {
+            out.push(
+                AgentEvent::Notice {
+                    message: "codex did not send the items of an earlier turn".into(),
+                }
+                .earlier(turn_ms),
+            );
+        }
+        let mut skipped = 0usize;
+        for item in items.map(Vec::as_slice).unwrap_or(&[]) {
+            skipped += history_item(item, turn_ms, &mut out);
+        }
+        if skipped > 0 {
+            out.push(
+                AgentEvent::Notice {
+                    message: format!(
+                        "{skipped} items of an earlier turn are of kinds the driver does not show"
+                    ),
+                }
+                .earlier(turn_ms),
+            );
+        }
+    }
+    out
+}
+
+/// The events of one item of an earlier turn, pushed to `out`; the number of items skipped (0
+/// or 1).
+fn history_item(item: &Value, turn_ms: Option<u64>, out: &mut Vec<AgentEvent>) -> usize {
+    let started = item.get("startedAtMs").and_then(Value::as_u64).or(turn_ms);
+    let completed = item
+        .get("completedAtMs")
+        .and_then(Value::as_u64)
+        .or(started);
+    let id = opt_s(item, "id").unwrap_or_default();
+    match s(item, "type") {
+        "userMessage" => {
+            let mut text: Vec<&str> = Vec::new();
+            let mut parts = Vec::new();
+            for block in item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                match s(block, "type") {
+                    "text" => text.push(s(block, "text")),
+                    "image" => {
+                        if let Some(p) = history_image(block) {
+                            parts.push(p);
+                        }
+                    }
+                    "localImage" => {
+                        if let Some(path) = opt_s(block, "path") {
+                            parts.push(path_image(path));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let text = text.join("\n");
+            if !text.is_empty() {
+                out.push(AgentEvent::UserMessage { text }.earlier(started));
+            }
+            if !parts.is_empty() {
+                out.push(AgentEvent::UserContent { parts }.earlier(started));
+            }
+        }
+        "agentMessage" => {
+            let text = s(item, "text");
+            if !text.is_empty() {
+                out.push(
+                    AgentEvent::AssistantDelta {
+                        text: text.to_string(),
+                        message_id: Some(id).filter(|i| !i.is_empty()),
+                    }
+                    .earlier(started),
+                );
+            }
+        }
+        "reasoning" => {
+            for key in ["summary", "content"] {
+                for text in item
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                {
+                    out.push(
+                        AgentEvent::ThinkingDelta {
+                            text: text.to_string(),
+                            message_id: Some(id.clone()).filter(|i| !i.is_empty()),
+                        }
+                        .earlier(started),
+                    );
+                }
+            }
+        }
+        "contextCompaction" => out.push(
+            AgentEvent::Compaction {
+                info: CompactionInfo::default(),
+            }
+            .earlier(started),
+        ),
+        ty if HISTORY_TOOL_ITEMS.contains(&ty) && !id.is_empty() => {
+            if let Some(start) = tool_started(item, &id) {
+                let name = match &start {
+                    AgentEvent::ToolCallStarted { name, .. } => name.clone(),
+                    _ => String::new(),
+                };
+                out.push(start.earlier(started));
+                // A call that never completed (the turn was cut) has no end to report.
+                if s(item, "status") != "inProgress" {
+                    out.push(tool_finished(item, id, name).earlier(completed));
+                }
+            }
+        }
+        _ => return 1,
+    }
+    0
+}
+
+/// An `image` input block: a `data:` URL carries the bytes, any other URL is a link.
+fn history_image(block: &Value) -> Option<ContentPart> {
+    let url = opt_s(block, "url").or_else(|| opt_s(block, "imageUrl"))?;
+    Some(match data_url(&url) {
+        Some((mime, data)) => ContentPart::inline_image(mime, data),
+        None => ContentPart::Image {
+            mime: sniff_mime(&[], &url),
+            source: MediaSource::Url { url },
+            width: None,
+            height: None,
+            alt: None,
+        },
+    })
+}
+
+fn path_image(path: String) -> ContentPart {
+    ContentPart::Image {
+        mime: sniff_mime(&[], &path),
+        alt: Some(base_name(&path)),
+        source: MediaSource::Path { path },
+        width: None,
+        height: None,
     }
 }
 

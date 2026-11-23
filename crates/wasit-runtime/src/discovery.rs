@@ -374,29 +374,7 @@ impl Discovery {
             e.error = None;
             e.binary_path = Some(path_s.clone());
         });
-        // The environment probes get (the host's base environment), not this process's.
-        let mut env: Vec<(String, String)> = match wasit_process::base_env() {
-            Some(b) => b
-                .iter()
-                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
-                .collect(),
-            None => std::env::vars().collect(),
-        };
-        env.extend(ov.env.iter().cloned());
-        let var = |names: &[&str]| {
-            env.iter()
-                .rev()
-                .find(|(k, _)| names.contains(&k.as_str()))
-                .map(|(_, v)| v.clone())
-        };
-        let home = var(&["HOME", "USERPROFILE"]);
-        let ctx = DiscoveryContext {
-            binary: Some(path_s),
-            // A driver override or a host variable may point the CLI at another home.
-            home,
-            env,
-            project,
-        };
+        let ctx = probe_context(&ov.env, &[], Some(path_s), project);
         let probes = desc.discovery(&ctx);
         let runs = probes.iter().map(|p| {
             let desc = desc.clone();
@@ -477,6 +455,84 @@ impl Discovery {
                 tokio::spawn(async move { this.run_refresh(desc, key).await });
             }
         }
+    }
+}
+
+/// What a driver's probes (and its other storage rules: where a conversation's history is) are
+/// given about the host: the environment children get (the host's base environment, else this
+/// process's) with `overrides` and then `extra` on top (the later of two settings of a variable
+/// wins), the home directory it names, `binary` and `project`.
+pub(crate) fn probe_context(
+    overrides: &[(String, String)],
+    extra: &[(String, String)],
+    binary: Option<String>,
+    project: Option<String>,
+) -> DiscoveryContext {
+    let mut env: Vec<(String, String)> = match wasit_process::base_env() {
+        Some(b) => b
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
+            .collect(),
+        None => std::env::vars().collect(),
+    };
+    env.extend(overrides.iter().cloned());
+    env.extend(extra.iter().cloned());
+    // One setting per variable, the last: `DiscoveryContext::var` reads the first it finds.
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Vec<(String, String)> = env
+        .into_iter()
+        .rev()
+        .filter(|(k, _)| seen.insert(k.clone()))
+        .collect();
+    last.reverse();
+    let home = last
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "HOME" || k == "USERPROFILE")
+        .map(|(_, v)| v.clone());
+    DiscoveryContext {
+        binary,
+        // A driver override or a host variable may point the CLI at another home.
+        home,
+        env: last,
+        project,
+    }
+}
+
+/// The conversation of `cwd` the agent touched last: what "continue the most recent
+/// conversation here" resumes. `Ok(None)`: the agent has none in that folder. The listing is
+/// the driver's own ([`DriverDescriptor::conversations_in_project`]), run as discovery runs
+/// its probes, under the same deadlines.
+pub(crate) async fn latest_conversation(
+    cfg: &RuntimeConfig,
+    desc: &dyn DriverDescriptor,
+    cwd: &str,
+    spec_env: &[(String, String)],
+) -> Result<Option<wasit_core::ResumableSession>, String> {
+    let dcfg = DiscoveryConfig::from_runtime(cfg);
+    let ov = dcfg.overrides.get(&desc.id()).cloned().unwrap_or_default();
+    let wanted = dcfg
+        .commands
+        .get(&desc.id())
+        .or_else(|| ov.binary.clone())
+        .unwrap_or_else(|| desc.default_binary().to_string());
+    let binary = resolve_binary(&wanted)
+        .await
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            format!("`{wanted}` was not found, so its conversations cannot be listed")
+        })?;
+    let ctx = probe_context(&ov.env, spec_env, Some(binary), Some(cwd.to_string()));
+    let probe = desc
+        .conversations_in_project(&ctx)
+        .ok_or_else(|| "the agent cannot list the conversations of a folder".to_string())?;
+    match run_probe(&dcfg, desc, &ov, &probe).await? {
+        // A conversation with no message in it is not one to continue.
+        Discovered::Sessions(list) => Ok(list
+            .into_iter()
+            .filter(|s| s.message_count != Some(0))
+            .max_by_key(|s| s.modified_ms)),
+        _ => Err("the agent's listing of conversations is not a list of conversations".into()),
     }
 }
 
@@ -857,6 +913,39 @@ fn list_files(
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    /// The later of two settings of a variable wins (an override beats the host's value, a
+    /// session's own beats both), and the home is the one the final environment names.
+    #[test]
+    fn the_context_has_one_setting_per_variable_the_last() {
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let ctx = probe_context(
+            &pairs(&[("CLAUDE_CONFIG_DIR", "/override"), ("HOME", "/h1")]),
+            &pairs(&[("CLAUDE_CONFIG_DIR", "/session")]),
+            Some("/bin/x".into()),
+            Some("/proj".into()),
+        );
+        assert_eq!(ctx.var("CLAUDE_CONFIG_DIR"), Some("/session"));
+        assert_eq!(
+            ctx.env
+                .iter()
+                .filter(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .count(),
+            1
+        );
+        assert_eq!(ctx.home.as_deref(), Some("/h1"));
+        assert_eq!(ctx.binary.as_deref(), Some("/bin/x"));
+        assert_eq!(ctx.project.as_deref(), Some("/proj"));
+    }
 }
 
 #[cfg(all(test, unix))]

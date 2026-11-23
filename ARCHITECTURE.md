@@ -124,7 +124,8 @@ CLI's own report about that input), `InputDropped{reason}` (interrupt, shutdown,
 refused), `TurnStarted{input}`; the runtime adds what only the journal knows (`written`,
 `write_failed`, `InputDropped{process_ended}`). `DriverDescriptor` carries: id, display name, default
 binary name, `argv(spec)`, `env(spec)`, capabilities, a `new_protocol()` factory, discovery
-hooks (list models, list resumable sessions, version) and a `ConfigRenderer` (§6).
+hooks (list models, list resumable sessions, version), how the earlier history of a resumed
+conversation is read (§3.7) and a `ConfigRenderer` (§6).
 
 ### 3.2 Shim = the only process that owns a CLI
 
@@ -299,6 +300,101 @@ starts a turn by itself.
   turn runs but background tasks do, it stops them (the CLI's own `interrupt` does not).
   `StopTask{task_id}` stops one task (`capabilities.stop_task`; an id that is not running is
   refused, the CLI would answer success to anything).
+
+### 3.7 Earlier history: a resumed conversation shows what came before it
+
+A session that resumes a conversation its own journal has not seen (a conversation the user
+started in their terminal, or one of a deleted session) shows that conversation's earlier messages
+before its live events. The agent's own storage stays the agent's: Marsad only reads it.
+
+- **When history is missing** is decided from journaled facts alone. The journal covers a
+  conversation's beginning exactly when the session's *first* process generation started it
+  (`ResumeMode::Fresh`). A session whose first generation resumed (`Resume(id)`; "continue most
+  recent" is resolved to a `Resume(id)` at create, below) lacks everything before that point, and
+  gets it until it is complete. Later generations of a session that started its conversation have
+  nothing to import; a later generation of one that resumed continues an interrupted history and
+  otherwise does nothing. Journals of builds before this change carry no plan and no history
+  facts: they replay as before (no history, no error), except that a recorded codex / ACP replay
+  now shows in them, because the protocols turn it into history when the journal is replayed.
+- **Events.** The conversation's earlier messages are the events that already describe a
+  conversation (user text, attachments, assistant text, thinking, tool calls and results,
+  `Scoped` subagent output, compaction), each wrapped in `AgentEvent::History {at_ms, event}`
+  (`at_ms`: when the agent's records say it happened, else absent: never guessed;
+  `AgentEvent::UserMessage` is the one addition: the text of a user message). Nothing in history
+  ever changes the session's phase, turn, gates, tasks, subagents, usage or cost (the agent
+  reports its totals itself), raises a notification, counts as agent activity or reaches Wasl:
+  the core keeps history items **out of the reducer and out of the live event stream**
+  (`Output::earlier`), the in-memory tail and the trail.
+- **Two shapes of delivery**, per driver (`DriverCapabilities::earlier_history`):
+  - `Wire` (codex `thread/resume` result, ACP `session/load` replay): the *protocol* turns what
+    the agent sends into `History` events; they arrive as ordinary journaled CLI output, so replay
+    is exact by construction. The core accepts them while the conversation's history is open:
+    from the first generation's start until the agent's `SessionInit`; a replay that arrives
+    again (every continue reloads the conversation) is ignored and counted
+    (`earlier.gaps.replays_ignored`); a replay interrupted by the process ending resumes in the
+    next generation, skipping the items the journal already holds.
+  - `Storage` (claude): the driver *describes* the source and the parse, the runtime executes it,
+    exactly as discovery executes a probe: `DriverDescriptor::history_storage` names the file
+    (derived from the conversation id and the normalised cwd with the rules the listing of
+    resumable sessions uses), `history_parser` makes a pure `HistoryParser` (a state machine over
+    the lines of the files; claude follows the leaf's `parentUuid` chain, jumping compaction
+    boundaries by `logicalParentUuid`, and asks for the subagents' own files). Before the process
+    starts, `SessionManager::create` looks at the file and journals a plan with the first `start`
+    note (`EarlierPlan::Storage {path, len}` or `Unavailable {reason}`): the history is the first
+    `len` bytes, the file as it was before the agent appends to it again. The actor then reads the
+    file on the blocking pool, line by line, parses it, and journals the result in notes
+    (`earlier_chunk` {first item number, events}, about 1 MiB each, then `earlier_end` with the
+    parser's counts, or `earlier_failed`), **one note at a time and only when nothing else waits
+    for the shim**: a prompt is never queued behind history, and a session is usable (prompts
+    delivered, turns completed) while a huge history is still loading. Chunks are numbered by the
+    first item they hold, so a note journaled twice or an import resumed after a daemon restart
+    (the new actor re-reads the same prefix and sends from the journal's item count) never
+    duplicates anything.
+- **Journal, not reference — the decision.** The imported history is copied into the journal
+  (bounded records, media externalised to blobs like any other). Referencing the agent's file would
+  keep one source of truth and make a 30 MB transcript cost nothing here, but replay would no
+  longer be exact: the agent's file grows with the live conversation (the resumed process appends
+  to the *same* file), can be rewritten or deleted, and cannot be paged by journal cursors or
+  projected to the trail without reading it again. The cost of copying is journal size and replay
+  time (a 30 MB transcript measured at 10 MB of history events, read once per replay like any
+  journal); it is bounded: the import takes the most recent `HistoryLimits::window_bytes` (64 MiB,
+  one budget for the conversation's files together), cuts items at `item_bytes` (256 KiB), replaces
+  an item above `max_event_bytes` (4 MiB, so every record stays far below the 8 MiB cap) by a
+  notice, and reads at most `max_source_bytes` (1 GiB) of the main file. What is left
+  out is visible, never silent: `earlier.gaps.omitted` counts the older messages (the agent's own
+  history still has them, and loading them on demand is **not available**), and the transcript's
+  first history item says so; cut items are counted (`shortened`); lines that are not records
+  (`unreadable`), records of kinds the driver does not know (`unrecognised`, with their kind
+  names), files it could not read (`missing_files`) and a last line that was cut while the agent
+  wrote it (`truncated_tail`) are counted too.
+- **State** (`SessionSnapshot::earlier`, and `SessionEventKind::Earlier` in the stream whenever it
+  moves): `none` (the conversation began here, or the session predates this), `loading`,
+  `loaded {complete}` (`complete: false`: see `gaps`) and `unavailable {reason}` (`source_missing`,
+  `source_unreadable`, `too_large`, `format_not_understood {record}`, `not_offered`, `failed`). A
+  process that ends before all of it arrived leaves `loaded {complete: false}` with
+  `gaps.interrupted`; the next generation continues. The trail has one content-free
+  `earlier.history` entry per move (state, counts, source, reason).
+- **Ordering contract for a client.** History is a separate list: the transcript is
+  `earlier items` then `live events`. Live events keep their journal cursors and
+  `session.history {before, limit, scope}` (default `earlier: false`) pages them exactly as before;
+  history items are paged with `session.history {earlier: true, before, limit, scope}`: the last
+  `limit` items with `cursor < before`, oldest first, `has_more` while older ones exist, `scope`
+  applied to what the items hold (`subagent {call_id}` pages one subagent's earlier conversation).
+  Item cursors are journal cursors, in the order of the conversation among themselves, and
+  greater than the cursors of live events that were shown before the history arrived: render the
+  earlier list above the live one, never merge them by cursor. The live subscription carries the
+  progress (`kind: "earlier"`, the snapshot's `earlier`) and never an item: on `loading` /
+  `loaded` the client pages `earlier: true` (again from the newest, `before` unset) and shows
+  "loading earlier messages" / the gaps / the unavailable reason from `earlier`. Times of items
+  are `History.at_ms`, not the event's `t` (which is when it was journaled).
+- **"Continue most recent" is truthful.** The runtime resolves it itself at create, from the
+  agent's own list of the folder's conversations (`DriverDescriptor::conversations_in_project`:
+  the sessions probe discovery runs, run now; claude lists `projects/<folder>/`, codex narrows its
+  host-wide rollouts to the folder's, ACP agents list the project they run in) taking the one
+  touched last, and resumes it by id (`Started.resume = resume`, `resume_id`). A folder with none
+  fails the create with `RuntimeError::NothingToContinue` (code `nothing_to_continue`); nothing is
+  created and no new conversation is started in its place. The agents' own "continue" paths
+  (`--continue`, `thread/list`, `session/list`) remain only for journals that already used them.
 
 ## 4. Control protocol (`wasit-control`)
 

@@ -6,7 +6,11 @@
 //!   mcpServers}` | `session/load {sessionId, cwd, mcpServers}`. The result
 //!   carries `configOptions` (`model`, `mode`, kilo also `effort`).
 //!   `ResumeMode::Continue` uses `session/list {cwd}` and loads the most
-//!   recently updated session.
+//!   recently updated session. `session/load` replays the conversation as `session/update`
+//!   notifications before it answers: they become [`AgentEvent::History`] events (a user
+//!   message's chunks are one `UserMessage`; no replay carries a time); the replayed usage and
+//!   plan are the past's and are dropped, and nothing replayed acknowledges a prompt or leaves
+//!   state behind.
 //! - Model / mode: `session/set_config_option {sessionId, configId, value}`;
 //!   the agent also pushes `config_option_update` / `current_mode_update`.
 //!   The launch model / mode are applied this way right after the session
@@ -94,6 +98,9 @@ pub struct AcpProtocol {
     can_list: bool,
     /// `session/load` in flight: its history replay is not live activity.
     loading: bool,
+    /// The user message being replayed (its `messageId` and the text of its chunks so far),
+    /// emitted as one event when the replay moves on.
+    replay_user: Option<(Option<String>, String)>,
     prompt_active: bool,
     /// The written `session/prompt` the CLI has not shown any sign of taking yet.
     awaiting_ack: Option<InputId>,
@@ -122,6 +129,7 @@ impl AcpProtocol {
             session_id: None,
             can_list: false,
             loading: false,
+            replay_user: None,
             prompt_active: false,
             awaiting_ack: None,
             cancel_sent: false,
@@ -201,6 +209,14 @@ impl AcpProtocol {
     }
 
     fn on_opened(&mut self, result: &Value) -> Step {
+        // The replay is over: the last replayed message is complete, and the tool calls it
+        // showed are not running (nothing replayed may leave state behind).
+        let replayed = self.flush_replayed_user();
+        if self.loading {
+            self.tools.clear();
+            self.subagents.clear();
+            self.subagents_started.clear();
+        }
         self.loading = false;
         if let Some(id) = opt_s(result, "sessionId") {
             self.session_id = Some(id);
@@ -209,7 +225,8 @@ impl AcpProtocol {
         let (models, model) = config_models(result);
         self.model = model.clone();
         self.mode = mode.clone();
-        let mut step = events(vec![AgentEvent::SessionInit {
+        let mut opened = replayed;
+        opened.push(AgentEvent::SessionInit {
             native_session_id: self.session_id.clone(),
             model,
             cwd: self.spec.cwd.clone(),
@@ -219,7 +236,8 @@ impl AcpProtocol {
             available_modes: modes,
             current_mode: mode.unwrap_or_default(),
             cli_version: String::new(),
-        }]);
+        });
+        let mut step = events(opened);
         if !models.is_empty() {
             step.events.push(AgentEvent::ModelsUpdated {
                 models,
@@ -661,37 +679,13 @@ impl AcpProtocol {
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if self.loading
-            && matches!(
-                kind,
-                "user_message_chunk"
-                    | "agent_message_chunk"
-                    | "agent_thought_chunk"
-                    | "tool_call"
-                    | "tool_call_update"
-                    | "plan"
-                    | "usage_update"
-            )
-        {
-            // History replayed by `session/load`, not live activity.
-            return vec![];
+        if self.loading {
+            if let Some(history) = self.replayed(kind, update) {
+                return history;
+            }
         }
-        let message_id = opt_s(update, "messageId");
         match kind {
-            "agent_message_chunk" => match update.get("content").and_then(acp_part) {
-                Some(part) => vec![AgentEvent::AssistantContent {
-                    parts: vec![part],
-                    message_id,
-                }],
-                None => text_of(update)
-                    .map(|text| AgentEvent::AssistantDelta { text, message_id })
-                    .into_iter()
-                    .collect(),
-            },
-            "agent_thought_chunk" => text_of(update)
-                .map(|text| AgentEvent::ThinkingDelta { text, message_id })
-                .into_iter()
-                .collect(),
+            "agent_message_chunk" | "agent_thought_chunk" => chunk_events(kind, update),
             "user_message_chunk" => vec![],
             "tool_call" => self.on_tool_call(update),
             "tool_call_update" => self.on_tool_update(update),
@@ -765,6 +759,69 @@ impl AcpProtocol {
             _ => vec![AgentEvent::Unknown {
                 raw: update.clone(),
             }],
+        }
+    }
+
+    /// What `session/load` replays of the conversation, as history; `None` for an update that is
+    /// not part of the replay (it is handled like any other). Replayed usage and plans are the
+    /// past's: they change nothing and are not shown. Chunks of one user message are one event.
+    fn replayed(&mut self, kind: &str, update: &Value) -> Option<Vec<AgentEvent>> {
+        let message_id = opt_s(update, "messageId");
+        let mut out = Vec::new();
+        if kind == "user_message_chunk" {
+            let content = update.get("content");
+            let text = content.and_then(|_| text_of(update));
+            let part = content.and_then(acp_part);
+            if self
+                .replay_user
+                .as_ref()
+                .is_some_and(|(id, _)| *id != message_id)
+            {
+                out.extend(self.flush_replayed_user());
+            }
+            if let Some(t) = text {
+                match &mut self.replay_user {
+                    Some((_, buf)) => buf.push_str(&t),
+                    None => self.replay_user = Some((message_id, t)),
+                }
+            }
+            if let Some(part) = part {
+                out.extend(self.flush_replayed_user());
+                out.push(AgentEvent::UserContent { parts: vec![part] }.earlier(None));
+            }
+            return Some(out);
+        }
+        let replayed = matches!(
+            kind,
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+                | "usage_update"
+        );
+        if !replayed {
+            return None;
+        }
+        out.extend(self.flush_replayed_user());
+        let events = match kind {
+            "agent_message_chunk" | "agent_thought_chunk" => chunk_events(kind, update),
+            "tool_call" => self.on_tool_call(update),
+            "tool_call_update" => self.on_tool_update(update),
+            // The past's plan and usage are not the session's.
+            _ => Vec::new(),
+        };
+        out.extend(events.into_iter().map(|e| e.earlier(None)));
+        Some(out)
+    }
+
+    /// The replayed user message, once complete.
+    fn flush_replayed_user(&mut self) -> Vec<AgentEvent> {
+        match self.replay_user.take() {
+            Some((_, text)) if !text.is_empty() => {
+                vec![AgentEvent::UserMessage { text }.earlier(None)]
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -931,6 +988,27 @@ impl Protocol for AcpProtocol {
             return Ok(Encoded::Queued);
         }
         self.encode_now(input, cmd).map(Encoded::Sent)
+    }
+}
+
+/// The events of an agent message / thought chunk (the same live and in a replayed history).
+fn chunk_events(kind: &str, update: &Value) -> Vec<AgentEvent> {
+    let message_id = opt_s(update, "messageId");
+    if kind == "agent_thought_chunk" {
+        return text_of(update)
+            .map(|text| AgentEvent::ThinkingDelta { text, message_id })
+            .into_iter()
+            .collect();
+    }
+    match update.get("content").and_then(acp_part) {
+        Some(part) => vec![AgentEvent::AssistantContent {
+            parts: vec![part],
+            message_id,
+        }],
+        None => text_of(update)
+            .map(|text| AgentEvent::AssistantDelta { text, message_id })
+            .into_iter()
+            .collect(),
     }
 }
 

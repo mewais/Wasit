@@ -24,6 +24,7 @@ pub mod content;
 mod descriptor;
 mod discovery;
 mod event;
+mod history;
 mod protocol;
 mod spec;
 pub mod tasks;
@@ -50,6 +51,10 @@ pub use event::{
     GateDecision, GateReason, GateRequest, InputDropReason, McpServerInfo, ModelInfo, ModelUsage,
     PlanEntry, QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, Scope, SessionMode,
     SlashCommandInfo, SpawnGate, TaskUsage, TurnOrigin, TurnTrigger, Usage,
+};
+pub use history::{
+    FileProblem, HistoryDelivery, HistoryFailure, HistoryLimits, HistoryParse, HistoryParser,
+    HistoryReport,
 };
 pub use protocol::{Command, DriverError, Encoded, InputId, OutLine, Protocol, Step};
 pub use spec::{GeneratedFile, ResumeMode, SpawnSpec};

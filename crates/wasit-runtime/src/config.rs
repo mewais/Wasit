@@ -164,6 +164,8 @@ pub struct RuntimeConfig {
     /// the user the daemon runs as (`HOME`, on Windows `USERPROFILE`, as the host's base
     /// environment has it).
     pub home: Option<PathBuf>,
+    /// How the earlier history of a resumed conversation is imported from an agent's storage.
+    pub history: crate::history::HistoryConfig,
 }
 
 impl RuntimeConfig {
@@ -181,6 +183,7 @@ impl RuntimeConfig {
             subscriber_queue: 1024,
             mode_hints: ModeHints::default(),
             home: None,
+            history: crate::history::HistoryConfig::default(),
         }
     }
 

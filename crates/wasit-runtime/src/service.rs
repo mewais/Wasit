@@ -255,9 +255,14 @@ impl Service for RuntimeService {
             }
             methods::SESSION_HISTORY => {
                 let r: HistoryRequest = params(p)?;
-                ok(m.history_scoped(&r.id, r.before, r.limit as usize, r.scope)
-                    .await
-                    .map_err(runtime_err)?)
+                let page = if r.earlier {
+                    m.earlier_scoped(&r.id, r.before, r.limit as usize, r.scope)
+                        .await
+                } else {
+                    m.history_scoped(&r.id, r.before, r.limit as usize, r.scope)
+                        .await
+                };
+                ok(page.map_err(runtime_err)?)
             }
             methods::SESSION_TRAIL_PAGE => {
                 let r: TrailRequest = params(p)?;

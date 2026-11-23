@@ -21,11 +21,13 @@ use crate::wire::{
 };
 
 /// Feed every journal record with `seq <= until` (all when `None`) through `core`, handing each
-/// event to `f`. Stops early when `f` returns `false`.
+/// event to `f` (the items of the conversation's earlier history instead of the events, with
+/// `earlier`). Stops early when `f` returns `false`.
 async fn run(
     dir: &Path,
     core: &mut Core,
     until: Option<u64>,
+    earlier: bool,
     mut f: impl FnMut(SessionEvent) -> bool,
 ) -> Result<(), String> {
     let mut stream = match wasit_shim::read_journal(dir, 1).await {
@@ -39,7 +41,8 @@ async fn run(
         if until.is_some_and(|u| rec.seq > u) {
             break;
         }
-        for e in core.apply(&rec).events {
+        let out = core.apply(&rec);
+        for e in if earlier { out.earlier } else { out.events } {
             if !f(e) {
                 return Ok(());
             }
@@ -61,7 +64,7 @@ pub(crate) async fn snapshot(
     meta: &SessionMeta,
 ) -> Result<SessionSnapshot, String> {
     let mut core = Core::new(desc, meta);
-    run(dir, &mut core, None, |_| true).await?;
+    run(dir, &mut core, None, false, |_| true).await?;
     if !core.process_ended() {
         match wasit_shim::probe_at(dir, run_dir).await {
             Ok(ShimState::Running) => {}
@@ -85,12 +88,13 @@ async fn window<T>(
     meta: &SessionMeta,
     before: Option<u64>,
     limit: usize,
+    earlier: bool,
     mut pick: impl FnMut(SessionEvent) -> Option<T>,
 ) -> Result<(Vec<T>, bool), String> {
     let mut core = Core::new(desc, meta);
     let mut window: VecDeque<T> = VecDeque::with_capacity(limit.min(4096));
     let mut has_more = false;
-    run(dir, &mut core, before.map(cursor_seq), |e| {
+    run(dir, &mut core, before.map(cursor_seq), earlier, |e| {
         if before.is_none_or(|b| e.cursor < b) {
             if let Some(item) = pick(e) {
                 window.push_back(item);
@@ -106,7 +110,8 @@ async fn window<T>(
     Ok((window.into(), has_more))
 }
 
-/// The last `limit` events with `cursor < before`.
+/// The last `limit` events with `cursor < before`; with `earlier`, the last `limit` items of the
+/// conversation's earlier history instead.
 pub(crate) async fn history(
     dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
@@ -114,8 +119,9 @@ pub(crate) async fn history(
     before: Option<u64>,
     limit: usize,
     scope: HistoryScope,
+    earlier: bool,
 ) -> Result<HistoryPage, String> {
-    let (events, has_more) = window(dir, desc, meta, before, limit, |e| {
+    let (events, has_more) = window(dir, desc, meta, before, limit, earlier, |e| {
         scope.admits(&e).then_some(e)
     })
     .await?;
@@ -130,8 +136,10 @@ pub(crate) async fn trail(
     before: Option<u64>,
     limit: usize,
 ) -> Result<TrailPage, String> {
-    let (entries, has_more) =
-        window(dir, desc, meta, before, limit, |e| crate::trail::item(&e)).await?;
+    let (entries, has_more) = window(dir, desc, meta, before, limit, false, |e| {
+        crate::trail::item(&e)
+    })
+    .await?;
     Ok(TrailPage { entries, has_more })
 }
 

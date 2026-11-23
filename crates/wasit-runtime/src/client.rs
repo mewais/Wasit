@@ -310,6 +310,30 @@ impl RuntimeClient {
                 before,
                 limit,
                 scope,
+                earlier: false,
+            },
+        )
+        .await
+    }
+
+    /// The conversation's *earlier* history ([`wasit_core::AgentEvent::History`] items), the last
+    /// `limit` with `cursor < before`, oldest first, `scope`-filtered by what they hold: the
+    /// part of the transcript that comes before the session's own events.
+    pub async fn earlier_scoped(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: u32,
+        scope: HistoryScope,
+    ) -> Result<HistoryPage, ClientError> {
+        self.call(
+            methods::SESSION_HISTORY,
+            HistoryRequest {
+                id: id.clone(),
+                before,
+                limit,
+                scope,
+                earlier: true,
             },
         )
         .await

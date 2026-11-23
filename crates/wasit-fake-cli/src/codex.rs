@@ -5,7 +5,7 @@ use crate::engine::{Incoming, Outcome, Persona, TurnStats};
 use crate::io::Io;
 use crate::reference::find_out;
 use crate::scenario::{AskStep, HistoryMessage, PlanEntry, Scenario, ToolStep};
-use crate::util::{alnum, now_ms, now_secs, set, uuid7};
+use crate::util::{alnum, iso_from_ms, now_ms, now_secs, set, uuid7};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -20,6 +20,72 @@ struct Thread {
     preview: String,
     history: Vec<HistoryMessage>,
     created: u64,
+    /// When the last turn ended (seconds; `0`: never, `created` stands in).
+    #[serde(default)]
+    updated: u64,
+    /// The turns the thread ran, each as `turn/completed` reported it but with every item the
+    /// turn had (what `thread/resume` hands back as `thread.turns`).
+    #[serde(default)]
+    turns: Vec<Value>,
+}
+
+/// Where the real CLI keeps its state: `CODEX_HOME`, else (the fake never touches the real home)
+/// `<state>/codex-home`.
+fn codex_home() -> std::path::PathBuf {
+    match std::env::var_os("CODEX_HOME") {
+        Some(d) => d.into(),
+        None => crate::store::state_dir().join("codex-home"),
+    }
+}
+
+/// `<home>/sessions/YYYY/MM/DD/rollout-<YYYY-MM-DDThh-mm-ss>-<id>.jsonl` of a thread created at
+/// `created` (seconds), the name the real CLI gives a rollout.
+fn rollout_path(id: &str, created: u64) -> std::path::PathBuf {
+    let stamp = iso_from_ms(created * 1000);
+    let (date, time) = (&stamp[..10], &stamp[11..19]);
+    let (y, rest) = date.split_at(4);
+    let (m, d) = (&rest[1..3], &rest[4..6]);
+    codex_home()
+        .join("sessions")
+        .join(y)
+        .join(m)
+        .join(d)
+        .join(format!(
+            "rollout-{date}T{}-{id}.jsonl",
+            time.replace(':', "-")
+        ))
+}
+
+/// The turns of a conversation known only by its messages (a scenario session's `history`): a
+/// user message starts a turn, the assistant messages after it are its replies.
+fn turns_from_history(history: &[HistoryMessage], created: u64) -> Vec<Value> {
+    let mut turns: Vec<Value> = Vec::new();
+    let mut at = created * 1000;
+    for m in history {
+        at += 10;
+        let user = m.role == "user";
+        if user || turns.is_empty() {
+            let id = uuid7();
+            turns.push(
+                json!({"id":id,"rootTurnId":id,"items":[],"itemsView":"full",
+                "status":"completed","error":null,"startedAt":at/1000,
+                "completedAt":at/1000,"durationMs":10}),
+            );
+        }
+        let item = if user {
+            json!({"type":"userMessage","id":uuid7(),"clientId":null,
+                "content":[{"type":"text","text":m.text,"text_elements":[]}],
+                "startedAtMs":at,"completedAtMs":at})
+        } else {
+            json!({"type":"agentMessage","moderation":null,"id":format!("msg_{}", alnum(8)),
+                "text":m.text,"phase":null,"memoryCitation":null,"delivery":null,
+                "questions":null,"startedAtMs":at,"completedAtMs":at})
+        };
+        if let Some(items) = turns.last_mut().and_then(|t| t["items"].as_array_mut()) {
+            items.push(item);
+        }
+    }
+    turns
 }
 
 pub struct Codex {
@@ -39,6 +105,64 @@ pub struct Codex {
     items: Vec<Value>,
     /// Prompts accepted by `turn/steer` during the running turn, answered when it ends.
     steered: Vec<String>,
+    /// `clientInfo.name` of `initialize`: what the rollout's `session_meta` says started it.
+    originator: String,
+}
+
+/// A rollout line (`{"timestamp","type","payload"}`).
+fn rollout_line(kind: &str, payload: Value) -> Value {
+    json!({"timestamp": iso_from_ms(now_ms()), "type": kind, "payload": payload})
+}
+
+/// The `response_item` of a message, as the real rollouts have it (`input_text` for the user,
+/// `output_text` for the model).
+fn message_line(role: &str, text: &str) -> Value {
+    let ty = if role == "user" {
+        "input_text"
+    } else {
+        "output_text"
+    };
+    rollout_line(
+        "response_item",
+        json!({"type":"message","role":role,"content":[{"type":ty,"text":text}]}),
+    )
+}
+
+/// Append `lines` to the thread's rollout, creating it with its `session_meta` first when it
+/// does not exist (the real CLI writes the rollout with the first turn). A rollout that cannot
+/// be written is a conversation discovery cannot list: say so.
+fn append_rollout(t: &Thread, version: &str, originator: &str, lines: &[Value]) {
+    use std::io::Write;
+    let path = rollout_path(&t.id, t.created);
+    let mut all: Vec<Value> = Vec::new();
+    if !path.is_file() {
+        all.push(
+            json!({"timestamp": iso_from_ms(t.created * 1000), "type": "session_meta",
+            "payload": {"id": t.id, "session_id": t.id,
+                "timestamp": iso_from_ms(t.created * 1000), "cwd": t.cwd,
+                "originator": originator, "cli_version": version, "source": "vscode",
+                "model_provider": "fake", "history_mode": "paginated",
+                "base_instructions": {"text": ""}, "context_window": 258_400}}),
+        );
+    }
+    all.extend(lines.iter().cloned());
+    let written = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .unwrap_or(Ok(()))
+        .and_then(|_| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            for l in &all {
+                writeln!(f, "{l}")?;
+            }
+            Ok(())
+        });
+    if let Err(e) = written {
+        eprintln!("wasit-fake-cli: cannot write {}: {e}", path.display());
+    }
 }
 
 fn rec(name: &str, pred: impl Fn(&Value) -> bool) -> Value {
@@ -86,6 +210,8 @@ impl Codex {
                     .unwrap_or_default(),
                 history: s.history.clone(),
                 created: now_secs(),
+                updated: 0,
+                turns: vec![],
             })
             .collect();
         // Threads earlier processes stored: codex keeps a rollout per thread on disk.
@@ -94,11 +220,27 @@ impl Codex {
                 threads.push(t);
             }
         }
+        let version = scenario
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.169.1".to_string());
+        // A scenario session is a conversation that already exists: its rollout does too.
+        for t in threads
+            .iter()
+            .filter(|t| t.updated == 0 && !t.history.is_empty())
+        {
+            if !scenario.sessions.iter().any(|s| s.id == t.id) {
+                continue;
+            }
+            let lines: Vec<Value> = t
+                .history
+                .iter()
+                .map(|m| message_line(&m.role, &m.text))
+                .collect();
+            append_rollout(t, &version, "codex_cli_rs", &lines);
+        }
         Codex {
-            version: scenario
-                .version
-                .clone()
-                .unwrap_or_else(|| "0.169.1".to_string()),
+            version,
             scenario: scenario.clone(),
             threads,
             first_id: scenario.session_id.clone(),
@@ -111,6 +253,7 @@ impl Codex {
             pending_item: None,
             items: vec![],
             steered: vec![],
+            originator: "codex_cli_rs".into(),
         }
     }
 
@@ -158,13 +301,14 @@ impl Codex {
         set(&mut th, "model", json!(t.model));
         set(&mut th, "preview", json!(t.preview));
         set(&mut th, "createdAt", json!(t.created));
-        set(&mut th, "updatedAt", json!(now_secs()));
-        set(&mut th, "recencyAt", json!(now_secs()));
+        let updated = if t.updated > 0 { t.updated } else { t.created };
+        set(&mut th, "updatedAt", json!(updated));
+        set(&mut th, "recencyAt", json!(updated));
         set(&mut th, "cliVersion", json!(self.version));
         set(
             &mut th,
             "path",
-            json!(format!("/tmp/codex-fake/sessions/rollout-{}.jsonl", t.id)),
+            json!(rollout_path(&t.id, t.created).display().to_string()),
         );
         set(
             &mut th,
@@ -331,6 +475,7 @@ impl Codex {
                 })["result"]
                     .clone();
                 let client = params["clientInfo"]["name"].as_str().unwrap_or("client");
+                self.originator = client.to_string();
                 let cver = params["clientInfo"]["version"].as_str().unwrap_or("0");
                 set(
                     &mut r,
@@ -364,6 +509,8 @@ impl Codex {
                     preview: String::new(),
                     history: vec![],
                     created: now_secs(),
+                    updated: 0,
+                    turns: vec![],
                 };
                 self.remote_status_once(io);
                 let approval = params["approvalPolicy"]
@@ -399,20 +546,43 @@ impl Codex {
                             m["id"] == 2 && m["result"]["thread"].is_object()
                         })["result"]
                             .clone();
+                        let turns = if t.turns.is_empty() {
+                            turns_from_history(&t.history, t.created)
+                        } else {
+                            t.turns.clone()
+                        };
                         let thread = Thread {
-                            id: t.id.clone(),
                             cwd: params["cwd"].as_str().unwrap_or(&t.cwd).to_string(),
-                            model: t.model.clone(),
-                            preview: t.preview.clone(),
-                            history: t.history.clone(),
-                            created: t.created,
+                            ..t.clone()
                         };
                         let mut r = self.start_result(template, &thread, "on-request", None);
-                        // History replay: one completed turn per user/assistant exchange is out of
-                        // scope; the page is reported empty.
-                        if r["initialTurnsPage"]["data"].is_array() {
-                            r["initialTurnsPage"]["data"] = json!([]);
-                        }
+                        // The conversation comes back inside the result, as 0.169.1 still does
+                        // for a paginated thread (and says so in a `deprecationNotice`).
+                        r["thread"]["turns"] = Value::Array(turns);
+                        set(&mut r, "thread.historyMode", json!("paginated"));
+                        set(
+                            &mut r,
+                            "turnsBackwardsCursor",
+                            json!(json!({"requestedThreadId":t.id,"rolloutOrdinal":1,
+                                "includeAnchor":true,"scope":{"kind":"turns"}})
+                            .to_string()),
+                        );
+                        set(
+                            &mut r,
+                            "itemsBackwardsCursor",
+                            json!(json!({"requestedThreadId":t.id,"rolloutOrdinal":9,
+                                "includeAnchor":true,"scope":{"kind":"itemsByCreatedAtOrdinal"}})
+                            .to_string()),
+                        );
+                        set(&mut r, "initialTurnsPage", Value::Null);
+                        let mut n = rec("resume", |m| m["method"] == "deprecationNotice");
+                        set(&mut n, "emittedAtMs", json!(now_ms()));
+                        io.send(&n);
+                        self.notify(
+                            io,
+                            "thread/status/changed",
+                            json!({"threadId": t.id, "status": {"type": "idle"}}),
+                        );
                         self.reply(io, &id, r);
                     }
                 }
@@ -423,9 +593,15 @@ impl Codex {
                     m["id"] == 6 && m["result"]["data"].is_array()
                 })["result"]
                     .clone();
+                let mut listed: Vec<&Thread> = self
+                    .threads
+                    .iter()
+                    .filter(|t| params["cwd"].as_str().is_none_or(|c| c == t.cwd))
+                    .collect();
+                listed.sort_by_key(|t| std::cmp::Reverse(t.updated.max(t.created)));
                 r["data"] = Value::Array(
-                    self.threads
-                        .iter()
+                    listed
+                        .into_iter()
                         .map(|t| self.thread_json(t, false))
                         .collect(),
                 );
@@ -494,8 +670,20 @@ impl Codex {
                     if t.preview.is_empty() {
                         t.preview = text.clone();
                     }
+                    t.history.push(HistoryMessage {
+                        role: "user".into(),
+                        text: text.clone(),
+                    });
                 }
                 self.store_thread(&tid);
+                if let Some(t) = self.find_thread(&tid) {
+                    append_rollout(
+                        t,
+                        &self.version,
+                        &self.originator,
+                        &[message_line("user", &text)],
+                    );
+                }
                 Incoming::Prompt(text)
             }
             // Shapes recorded from codex-cli 0.161.0 (`reference/codex/steer.jsonl`): the result
@@ -706,6 +894,7 @@ impl Persona for Codex {
         item["summary"] = json!([text]);
         item["completedAtMs"] = json!(now_ms());
         self.item_note(io, "item/completed", &item);
+        self.items.push(item);
     }
 
     fn tool_call(&mut self, io: &mut Io, tool: &ToolStep, _stats: &mut TurnStats) -> Option<Value> {
@@ -907,16 +1096,40 @@ impl Persona for Codex {
         if matches!(outcome, Outcome::Interrupted | Outcome::Failed(_)) {
             set(&mut turn, "itemsView", json!("notLoaded"));
         }
-        let t = self.thread_id.clone();
-        self.notify(io, "turn/completed", json!({"threadId": t, "turn": turn}));
+        // What the conversation keeps of the turn: every item, completed.
+        let mut kept = turn.clone();
+        set(&mut kept, "items", Value::Array(self.items.clone()));
+        set(&mut kept, "itemsView", json!("full"));
+        // Rollout messages: the replies, and the prompts steered into the turn (the first
+        // `userMessage` is the prompt, written when the turn started).
+        let lines: Vec<Value> = self
+            .items
+            .iter()
+            .skip(1)
+            .filter_map(|i| match i["type"].as_str() {
+                Some("agentMessage") => Some(message_line("assistant", i["text"].as_str()?)),
+                Some("userMessage") => {
+                    Some(message_line("user", i["content"][0]["text"].as_str()?))
+                }
+                _ => None,
+            })
+            .collect();
         if let Some(th) = self.threads.iter_mut().find(|th| th.id == self.thread_id) {
             th.history.push(HistoryMessage {
                 role: "assistant".into(),
                 text: stats.final_text.clone(),
             });
+            th.turns.push(kept);
+            th.updated = now_secs();
         }
         let tid = self.thread_id.clone();
         self.store_thread(&tid);
+        if let Some(t) = self.find_thread(&tid) {
+            append_rollout(t, &self.version, &self.originator, &lines);
+        }
+        // The turn is in storage before the client hears it ended: a client that resumes the
+        // thread right after `turn/completed` finds all of it.
+        self.notify(io, "turn/completed", json!({"threadId": tid, "turn": turn}));
     }
 }
 
@@ -935,6 +1148,7 @@ impl Codex {
         self.item_note(io, "item/started", &item);
         set(&mut item, "completedAtMs", json!(now));
         self.item_note(io, "item/completed", &item);
+        self.items.push(item);
     }
 
     fn finish_item(&mut self, io: &mut Io, tool: &ToolStep, allow: bool) {

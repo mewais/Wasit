@@ -225,8 +225,47 @@ fn opencode_resume_and_continue() {
         |e| matches!(e, AgentEvent::SessionInit { native_session_id: Some(s), .. } if s == id)
     ));
     assert_eq!(turns(&r), vec![(None, false)]);
+    // What `session/load` replayed (recorded: the earlier prompt and its answer) is the
+    // conversation's history, in order, the user message complete before the session opens.
+    let init = r
+        .events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::SessionInit { .. }))
+        .unwrap();
+    let history: Vec<&AgentEvent> = r
+        .events
+        .iter()
+        .filter_map(|e| e.as_history())
+        .map(|(at, e)| {
+            assert_eq!(at, None, "ACP replays carry no times");
+            e
+        })
+        .collect();
+    assert_eq!(
+        history,
+        vec![
+            &AgentEvent::UserMessage {
+                text: "Reply with just the word hi".into()
+            },
+            &AgentEvent::AssistantDelta {
+                text: "hi".into(),
+                message_id: Some("msg_1ebe1a601001nw72p36ewjiJdu".into())
+            },
+        ]
+    );
+    assert!(
+        r.events[..init]
+            .iter()
+            .filter(|e| e.as_history().is_some())
+            .count()
+            == 2
+    );
 
     let r = run("continue", Flavor::OpenCode);
+    assert!(
+        r.events.iter().any(|e| e.as_history().is_some()),
+        "continue loads the latest session: its history too"
+    );
     let m = methods(&r);
     let list = m
         .iter()

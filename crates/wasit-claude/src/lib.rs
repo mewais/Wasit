@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod history;
 mod protocol;
 
 use std::sync::Arc;
@@ -28,11 +29,12 @@ use wasit_core::{
     config_listing, exec_stdout, listed_files, markdown_items, models_from_handshake,
     parse_version_line, read_file, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem,
     ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
-    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, McpServerConfig,
-    McpTransport, ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession, ResumeMode,
-    SessionMode, SpawnSpec, Unsupported,
+    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, HistoryDelivery,
+    HistoryLimits, HistoryParser, McpServerConfig, McpTransport, ProbeAction, ProbeOutput,
+    PromptInput, Protocol, ResumableSession, ResumeMode, SessionMode, SpawnSpec, Unsupported,
 };
 
+pub use history::ClaudeHistory;
 pub use protocol::{
     encode_allow, encode_deny, encode_elicitation_accept, encode_elicitation_decline,
     encode_question_answer, encode_user_message, ClaudeProtocol,
@@ -122,6 +124,7 @@ impl DriverDescriptor for ClaudeDescriptor {
             streaming_output: false,
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
             stop_task: true,
+            earlier_history: HistoryDelivery::Storage,
         }
     }
 
@@ -161,6 +164,27 @@ impl DriverDescriptor for ClaudeDescriptor {
 
     fn new_protocol(&self) -> Box<dyn Protocol> {
         Box::new(ClaudeProtocol::new())
+    }
+
+    /// The conversation's transcript: where the listing of resumable sessions finds it.
+    fn history_storage(&self, ctx: &DiscoveryContext, native_session_id: &str) -> Option<String> {
+        // The id becomes a file name: a UUID, nothing that could leave the directory.
+        if !is_uuid(native_session_id) {
+            return None;
+        }
+        let project = ctx.project.as_deref()?;
+        Some(format!(
+            "{}/{native_session_id}.jsonl",
+            project_dir(ctx, project)?
+        ))
+    }
+
+    fn history_parser(
+        &self,
+        _path: &str,
+        limits: &HistoryLimits,
+    ) -> Option<Box<dyn HistoryParser>> {
+        Some(Box::new(ClaudeHistory::new(*limits)))
     }
 
     fn discovery(&self, ctx: &DiscoveryContext) -> Vec<DiscoveryProbe> {
@@ -590,15 +614,27 @@ pub fn encode_project_dir(cwd: &str) -> String {
         .collect()
 }
 
+/// The directory of `project`'s transcripts: `<config>/projects/<encoded project>`.
+fn project_dir(ctx: &DiscoveryContext, project: &str) -> Option<String> {
+    Some(format!(
+        "{}/projects/{}",
+        config_dir(ctx)?,
+        encode_project_dir(project)
+    ))
+}
+
 fn sessions_dir(ctx: &DiscoveryContext) -> Option<String> {
-    let base = match ctx.var("CLAUDE_CONFIG_DIR") {
-        Some(d) => d.trim_end_matches('/').to_string(),
-        None => format!("{}/.claude", ctx.home.as_deref()?.trim_end_matches('/')),
-    };
-    Some(match &ctx.project {
-        Some(p) => format!("{base}/projects/{}", encode_project_dir(p)),
-        None => format!("{base}/projects"),
-    })
+    match &ctx.project {
+        Some(p) => project_dir(ctx, p),
+        None => Some(format!("{}/projects", config_dir(ctx)?)),
+    }
+}
+
+/// A canonical UUID (what claude names its conversations).
+fn is_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.split('-').map(str::len).eq([8, 4, 4, 4, 12])
+        && id.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit())
 }
 
 /// Display words for claude's permission modes (`--help` lists bare ids).
@@ -723,5 +759,7 @@ fn first_text(content: Option<&Value>) -> String {
     }
 }
 
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod tests;

@@ -43,8 +43,8 @@ use wasit_core::{
 use wasit_diag::{Bytes, Code, DiagText, ErrorInfo, Ident, Origin, VEC_MAX};
 
 use crate::wire::{
-    AnomalyKind, CommandStatus, GateClearing, NoticeCode, Phase, PhaseCause, SessionEvent,
-    SessionEventKind, StartResume, TrailItem,
+    AnomalyKind, CommandStatus, EarlierSource, EarlierState, EarlierUnavailable, GateClearing,
+    NoticeCode, Phase, PhaseCause, SessionEvent, SessionEventKind, StartResume, TrailItem,
 };
 
 wasit_diag::diag_data! {
@@ -304,6 +304,30 @@ wasit_diag::diag_data! {
         /// the type of the event that showed it.
         #[diag(ev = "anomaly")]
         Anomaly { kind: Code, first: Code },
+        /// The loading of the resumed conversation's earlier history moved: counts only, never
+        /// a word of the conversation.
+        #[diag(ev = "earlier.history")]
+        EarlierHistory {
+            /// `loading`, `loaded` or `unavailable`.
+            state: Code,
+            /// History items in the journal so far.
+            items: u64,
+            /// Messages not shown: older than the import window.
+            omitted: u64,
+            shortened: u64,
+            /// Lines of the agent's file that were not records.
+            unreadable: u64,
+            /// Records of kinds the driver does not know.
+            unrecognised: u64,
+            /// Everything the agent's history holds is shown (`loaded` only).
+            complete: bool,
+            /// The process ended before all of it arrived.
+            interrupted: bool
+            ; /// `agent_replay` or `agent_storage`.
+            source: Code,
+            /// Why it is unavailable (`source_missing`, `format_not_understood`, …).
+            reason: Code
+        },
     }
 }
 
@@ -394,6 +418,38 @@ pub fn project(event: &SessionEvent) -> Option<TrailEntry> {
         },
         SessionEventKind::Lost { reason } => TrailEntry::ProcessLost {
             reason: DiagText::new(Origin::Own, reason),
+        },
+        SessionEventKind::Earlier { earlier } => TrailEntry::EarlierHistory {
+            state: Code::st(match &earlier.state {
+                EarlierState::None => "none",
+                EarlierState::Loading => "loading",
+                EarlierState::Loaded { .. } => "loaded",
+                EarlierState::Unavailable { .. } => "unavailable",
+            }),
+            items: earlier.items,
+            omitted: earlier.gaps.omitted,
+            shortened: earlier.gaps.shortened,
+            unreadable: earlier.gaps.unreadable,
+            unrecognised: earlier.gaps.unrecognised,
+            complete: matches!(earlier.state, EarlierState::Loaded { complete: true }),
+            interrupted: earlier.gaps.interrupted,
+            source: earlier.source.map(|s| {
+                Code::st(match s {
+                    EarlierSource::AgentReplay => "agent_replay",
+                    EarlierSource::AgentStorage => "agent_storage",
+                })
+            }),
+            reason: match &earlier.state {
+                EarlierState::Unavailable { reason } => Some(Code::st(match reason {
+                    EarlierUnavailable::NotOffered => "not_offered",
+                    EarlierUnavailable::SourceMissing => "source_missing",
+                    EarlierUnavailable::SourceUnreadable { .. } => "source_unreadable",
+                    EarlierUnavailable::TooLarge { .. } => "too_large",
+                    EarlierUnavailable::FormatNotUnderstood { .. } => "format_not_understood",
+                    EarlierUnavailable::Failed { .. } => "failed",
+                })),
+                _ => None,
+            },
         },
         SessionEventKind::Notice { code, .. } => TrailEntry::RuntimeNotice {
             code: Code::st(match code {
@@ -609,6 +665,9 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
         AgentEvent::AssistantDelta { .. }
         | AgentEvent::AssistantContent { .. }
         | AgentEvent::UserContent { .. }
+        // The earlier history is content, and never in the stream the trail follows.
+        | AgentEvent::UserMessage { .. }
+        | AgentEvent::History { .. }
         | AgentEvent::ThinkingDelta { .. }
         | AgentEvent::ToolCallUpdated { .. }
         | AgentEvent::UsageUpdate { .. }
@@ -1032,6 +1091,18 @@ mod tests {
                 kind: code(),
                 first: code(),
             },
+            TrailEntry::EarlierHistory {
+                state: code(),
+                items: 1,
+                omitted: 2,
+                shortened: 3,
+                unreadable: 4,
+                unrecognised: 5,
+                complete: true,
+                interrupted: false,
+                source: Some(code()),
+                reason: Some(code()),
+            },
         ]
     }
 
@@ -1177,6 +1248,63 @@ mod tests {
             cursor: 65_536,
             t: 1_000,
             kind,
+        }
+    }
+
+    /// The loading of the earlier history projects to states, counts and a reason word: neither
+    /// the host's wording of why a file could not be read, nor the kind names the parser met, nor
+    /// a word of the conversation is in it.
+    #[test]
+    fn the_earlier_history_projects_to_counts_and_words_only() {
+        use crate::wire::{EarlierGaps, EarlierHistory};
+        const M: &str = "MARKER-EARLIER";
+        let state = |state: EarlierState, items: u64| {
+            let e = ev(SessionEventKind::Earlier {
+                earlier: EarlierHistory {
+                    state,
+                    source: Some(EarlierSource::AgentStorage),
+                    items,
+                    gaps: EarlierGaps {
+                        omitted: 5,
+                        unrecognised: 2,
+                        unrecognised_kinds: vec![format!("{M}-kind")],
+                        ..EarlierGaps::default()
+                    },
+                },
+            });
+            serde_json::to_value(item(&e).unwrap()).unwrap()
+        };
+        let loading = state(EarlierState::Loading, 3);
+        assert_eq!(loading["ev"], "earlier.history");
+        assert_eq!(loading["state"], "loading");
+        assert_eq!(loading["items"], 3);
+        assert_eq!(loading["omitted"], 5);
+        assert_eq!(loading["source"], "agent_storage");
+        assert_eq!(loading["complete"], false);
+        let loaded = state(EarlierState::Loaded { complete: true }, 9);
+        assert_eq!(loaded["state"], "loaded");
+        assert_eq!(loaded["complete"], true);
+        let unreadable = state(
+            EarlierState::Unavailable {
+                reason: EarlierUnavailable::SourceUnreadable {
+                    detail: format!("{M}: Permission denied"),
+                },
+            },
+            0,
+        );
+        assert_eq!(unreadable["state"], "unavailable");
+        assert_eq!(unreadable["reason"], "source_unreadable");
+        let failed = state(
+            EarlierState::Unavailable {
+                reason: EarlierUnavailable::Failed {
+                    detail: format!("{M} details"),
+                },
+            },
+            0,
+        );
+        assert_eq!(failed["reason"], "failed");
+        for v in [&loading, &loaded, &unreadable, &failed] {
+            assert!(!v.to_string().contains(M), "{v}");
         }
     }
 

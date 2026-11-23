@@ -6,7 +6,7 @@ use crate::engine::{Incoming, Outcome, Persona, TurnStats};
 use crate::io::Io;
 use crate::reference::find_out;
 use crate::scenario::{AskStep, HistoryMessage, PlanEntry, Scenario, ToolStep};
-use crate::util::{alnum, hex, iso_now, set};
+use crate::util::{alnum, hex, iso_from_ms, iso_now, now_ms, set};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,61 @@ struct Sess {
     model: String,
     mode: String,
     history: Vec<HistoryMessage>,
+    /// The `session/update` payloads `session/load` replays, as the live turns sent them (text
+    /// messages whole, thoughts, tool calls with their outcome, the usage after each turn).
+    /// A session known only by its `history` (a scenario's) replays that instead.
+    #[serde(default)]
+    replay: Vec<Value>,
+    /// Creation and last change, milliseconds (`session list` reports them).
+    #[serde(default)]
+    created_ms: u64,
+    #[serde(default)]
+    updated_ms: u64,
+}
+
+/// One session as `session list` and `session/list` show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub id: String,
+    pub cwd: String,
+    pub title: String,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+}
+
+/// The sessions a flavor lists: the scenario's and every one an earlier process stored, newest
+/// activity first, those of `cwd` only when it is given. A scenario session counts as created
+/// when this process started.
+pub fn listed_sessions(flavor: Flavor, scenario: &Scenario, cwd: Option<&str>) -> Vec<Listed> {
+    let now = now_ms();
+    let here = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/".into());
+    let mut all: Vec<Listed> = scenario
+        .sessions
+        .iter()
+        .map(|s| Listed {
+            id: s.id.clone(),
+            cwd: s.cwd.clone().unwrap_or_else(|| here.clone()),
+            title: s.title.clone().unwrap_or_else(|| "New session".into()),
+            created_ms: now,
+            updated_ms: now,
+        })
+        .collect();
+    for s in crate::store::list::<Sess>(&format!("acp-{}", flavor.persona())) {
+        if !all.iter().any(|x| x.id == s.id) {
+            all.push(Listed {
+                id: s.id,
+                cwd: s.cwd,
+                title: s.title,
+                created_ms: s.created_ms,
+                updated_ms: s.updated_ms.max(s.created_ms),
+            });
+        }
+    }
+    all.retain(|l| cwd.is_none_or(|c| c == l.cwd));
+    all.sort_by_key(|l| std::cmp::Reverse(l.updated_ms));
+    all
 }
 
 pub struct Acp {
@@ -84,8 +139,16 @@ impl Acp {
     /// Write the session down. The real agents (kilo 7.8.8, verified; opencode keeps every
     /// session it opens too) store a session when it is created, before any prompt, so
     /// `session/load` of it works in the next process.
-    fn store_session(&self, i: usize) {
+    fn store_session(&mut self, i: usize) {
+        self.sessions[i].updated_ms = now_ms();
         crate::store::put(&self.store_kind(), &self.sessions[i].id, &self.sessions[i]);
+    }
+
+    /// Remember an update of the running turn for `session/load` to replay.
+    fn record(&mut self, update: Value) {
+        if let Some(i) = self.idx(&self.session.clone()) {
+            self.sessions[i].replay.push(update);
+        }
     }
 
     pub fn new(flavor: Flavor, scenario: &Scenario) -> Acp {
@@ -117,6 +180,9 @@ impl Acp {
                 model: model.clone(),
                 mode: mode.clone(),
                 history: s.history.clone(),
+                replay: vec![],
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
             })
             .collect();
         // Sessions earlier processes stored.
@@ -126,6 +192,27 @@ impl Acp {
             }
         }
         a
+    }
+
+    /// What `session/load` replays for session `i`: the updates its turns sent, or, for a
+    /// session known only by its messages, one chunk per message.
+    fn replay_of(&self, i: usize) -> Vec<Value> {
+        let s = &self.sessions[i];
+        if !s.replay.is_empty() {
+            return s.replay.clone();
+        }
+        s.history
+            .iter()
+            .map(|m| {
+                let kind = if m.role == "user" {
+                    "user_message_chunk"
+                } else {
+                    "agent_message_chunk"
+                };
+                json!({"sessionUpdate":kind,"messageId":format!("msg_{}", hex(26)),
+                       "content":{"type":"text","text":m.text}})
+            })
+            .collect()
     }
 
     fn models(&self) -> Vec<(String, String)> {
@@ -261,6 +348,9 @@ impl Acp {
             model: self.default_model(),
             mode: self.default_mode(),
             history: vec![],
+            replay: vec![],
+            created_ms: now_ms(),
+            updated_ms: now_ms(),
         });
         let i = self.sessions.len() - 1;
         self.store_session(i);
@@ -326,11 +416,14 @@ impl Acp {
                 self.commands_update(io, &sid);
             }
             "session/list" => {
-                let list: Vec<Value> = self
-                    .sessions
-                    .iter()
-                    .map(|s| json!({"sessionId":s.id,"cwd":s.cwd,"title":s.title,"updatedAt":iso_now()}))
-                    .collect();
+                let list: Vec<Value> =
+                    listed_sessions(self.flavor, &self.scenario, p["cwd"].as_str())
+                        .into_iter()
+                        .map(|s| {
+                            json!({"sessionId":s.id,"cwd":s.cwd,"title":s.title,
+                        "updatedAt":iso_from_ms(s.updated_ms)})
+                        })
+                        .collect();
                 self.rpc_result(io, &id, json!({"sessions": list}));
             }
             "session/load" | "session/resume" => match self.idx(&sid) {
@@ -340,18 +433,8 @@ impl Acp {
                         self.sessions[i].cwd = c.to_string();
                     }
                     if method == "session/load" {
-                        for m in self.sessions[i].history.clone() {
-                            let (kind, mid) = if m.role == "user" {
-                                ("user_message_chunk", format!("msg_{}", hex(26)))
-                            } else {
-                                ("agent_message_chunk", format!("msg_{}", hex(26)))
-                            };
-                            self.update(
-                                io,
-                                &sid,
-                                json!({"sessionUpdate":kind,"messageId":mid,
-                                "content":{"type":"text","text":m.text}}),
-                            );
+                        for u in self.replay_of(i) {
+                            self.update(io, &sid, u);
                         }
                     }
                     let r = json!({"configOptions": self.config_options(&self.sessions[i])});
@@ -363,13 +446,19 @@ impl Acp {
                 None => self.service_failure(io, &id),
                 Some(i) => {
                     let n = self.new_session(p["cwd"].as_str().unwrap_or("/"));
-                    let (model, mode, history) = {
+                    let (model, mode, history, replay) = {
                         let src = &self.sessions[i];
-                        (src.model.clone(), src.mode.clone(), src.history.clone())
+                        (
+                            src.model.clone(),
+                            src.mode.clone(),
+                            src.history.clone(),
+                            src.replay.clone(),
+                        )
                     };
                     self.sessions[n].model = model;
                     self.sessions[n].mode = mode;
                     self.sessions[n].history = history;
+                    self.sessions[n].replay = replay;
                     self.store_session(n);
                     let nid = self.sessions[n].id.clone();
                     let r = json!({"sessionId": nid, "configOptions": self.config_options(&self.sessions[n])});
@@ -490,6 +579,11 @@ impl Acp {
                         role: "user".into(),
                         text: text.clone(),
                     });
+                    self.sessions[i]
+                        .replay
+                        .push(json!({"sessionUpdate":"user_message_chunk",
+                        "messageId":format!("msg_{}", hex(26)),
+                        "content":{"type":"text","text":text}}));
                     self.store_session(i);
                     return Incoming::Prompt(text);
                 }
@@ -535,37 +629,37 @@ impl Acp {
         );
     }
 
-    fn finish_call(&self, io: &mut Io, ok: bool, text: &str) {
+    fn finish_call(&mut self, io: &mut Io, ok: bool, text: &str) {
         self.finish_call_with(io, ok, text, None)
     }
 
-    fn finish_call_with(&self, io: &mut Io, ok: bool, text: &str, image: Option<(String, String)>) {
+    fn finish_call_with(
+        &mut self,
+        io: &mut Io,
+        ok: bool,
+        text: &str,
+        image: Option<(String, String)>,
+    ) {
         let sid = self.session.clone();
-        if ok {
+        let update = if ok {
             let mut content = vec![json!({"type":"content","content":{"type":"text","text":text}})];
             if let Some((mime, data)) = image {
                 content.push(json!({"type":"content","content":{"type":"image","mimeType":mime,"data":data}}));
             }
-            self.update(
-                io,
-                &sid,
-                json!({"sessionUpdate":"tool_call_update","toolCallId":self.call_id,
+            json!({"sessionUpdate":"tool_call_update","toolCallId":self.call_id,
                 "status":"completed","title":self.call_title,
                 "content":content,
-                "rawOutput":{"output":text,"metadata":{"output":text,"exit":0,"truncated":false}}}),
-            );
+                "rawOutput":{"output":text,"metadata":{"output":text,"exit":0,"truncated":false}}})
         } else {
             let cwd = self.cwd();
-            self.update(
-                io,
-                &sid,
-                json!({"sessionUpdate":"tool_call_update","toolCallId":self.call_id,
+            json!({"sessionUpdate":"tool_call_update","toolCallId":self.call_id,
                 "status":"failed","kind":self.call_kind,"title":self.call_title,
                 "locations":[{"path":cwd}],"rawInput":self.call_input,
                 "content":[{"type":"content","content":{"type":"text","text":text}}],
-                "rawOutput":{"error":text}}),
-            );
-        }
+                "rawOutput":{"error":text}})
+        };
+        self.update(io, &sid, update.clone());
+        self.record(update);
     }
 
     fn start_call(&mut self, io: &mut Io, name: &str, title: String, input: &Value) {
@@ -575,13 +669,20 @@ impl Acp {
         self.call_input = input.clone();
         let cwd = self.cwd();
         let sid = self.session.clone();
-        self.update(
-            io,
-            &sid,
-            json!({"sessionUpdate":"tool_call","toolCallId":self.call_id,
+        let call = json!({"sessionUpdate":"tool_call","toolCallId":self.call_id,
             "title":name,"kind":self.call_kind,"status":"pending",
-            "locations":[{"path":cwd}],"rawInput":{"cwd":cwd}}),
-        );
+            "locations":[{"path":cwd}],"rawInput":{"cwd":cwd}});
+        self.update(io, &sid, call.clone());
+        // What a load replays of the call: its start with the arguments it was given.
+        let mut replayed = call;
+        replayed["rawInput"] = {
+            let mut raw = input.clone();
+            if let Some(o) = raw.as_object_mut() {
+                o.insert("cwd".into(), json!(cwd));
+            }
+            raw
+        };
+        self.record(replayed);
         self.in_progress(io);
     }
 
@@ -649,6 +750,10 @@ impl Persona for Acp {
     fn say(&mut self, io: &mut Io, text: &str, chunks: usize, _stats: &mut TurnStats) {
         self.msg_id = format!("msg_{}", hex(26));
         let sid = self.session.clone();
+        self.record(
+            json!({"sessionUpdate":"agent_message_chunk","messageId":self.msg_id,
+            "content":{"type":"text","text":text}}),
+        );
         for c in crate::util::chunk_text(text, chunks) {
             self.update(
                 io,
@@ -661,12 +766,10 @@ impl Persona for Acp {
 
     fn think(&mut self, io: &mut Io, text: &str, _stats: &mut TurnStats) {
         let sid = self.session.clone();
-        self.update(
-            io,
-            &sid,
-            json!({"sessionUpdate":"agent_thought_chunk",
-            "messageId":format!("prt_{}", hex(26)),"content":{"type":"text","text":text}}),
-        );
+        let thought = json!({"sessionUpdate":"agent_thought_chunk",
+            "messageId":format!("prt_{}", hex(26)),"content":{"type":"text","text":text}});
+        self.update(io, &sid, thought.clone());
+        self.record(thought);
     }
 
     fn image(&mut self, io: &mut Io, mime: &str, data: &str, _stats: &mut TurnStats) {
@@ -791,6 +894,18 @@ impl Persona for Acp {
                     u.context_window,
                     u.cost_usd,
                 );
+                self.record(json!({"sessionUpdate":"usage_update",
+                    "used":u.input_tokens + u.output_tokens,"size":u.context_window,
+                    "cost":{"amount":u.cost_usd,"currency":"USD"}}));
+                // Stored before the result: a client that loads the session right after it
+                // finds the whole turn.
+                if let Some(i) = self.idx(&self.session) {
+                    self.sessions[i].history.push(HistoryMessage {
+                        role: "assistant".into(),
+                        text: stats.final_text.clone(),
+                    });
+                    self.store_session(i);
+                }
                 let mut usage = json!({"inputTokens":u.input_tokens,"outputTokens":u.output_tokens,
                     "totalTokens":u.input_tokens+u.output_tokens});
                 if u.thought_tokens > 0 {
@@ -804,13 +919,6 @@ impl Persona for Acp {
                     &id,
                     json!({"stopReason":"end_turn","usage":usage,"_meta":{}}),
                 );
-                if let Some(i) = self.idx(&self.session) {
-                    self.sessions[i].history.push(HistoryMessage {
-                        role: "assistant".into(),
-                        text: stats.final_text.clone(),
-                    });
-                    self.store_session(i);
-                }
             }
             Outcome::Interrupted => {
                 self.usage_update(io, 0, u.context_window, 0.0);
@@ -820,6 +928,9 @@ impl Persona for Acp {
                     json!({"stopReason":"cancelled",
                     "usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0},"_meta":{}}),
                 );
+                if let Some(i) = self.idx(&self.session) {
+                    self.store_session(i);
+                }
             }
             Outcome::Failed(msg) => {
                 self.usage_update(io, 0, u.context_window, 0.0);
@@ -830,6 +941,9 @@ impl Persona for Acp {
                     &format!("Internal error: {msg}"),
                     json!({"service":"session","errorName":"APIError"}),
                 );
+                if let Some(i) = self.idx(&self.session) {
+                    self.store_session(i);
+                }
             }
         }
     }

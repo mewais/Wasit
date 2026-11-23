@@ -1075,3 +1075,286 @@ fn queued_prompts_dropped_by_an_interrupt_are_never_acknowledged() {
     assert_eq!(acks(&after), vec![(InputId(90), false)]);
     assert!(drops(&after).is_empty());
 }
+
+// ── earlier history of a resumed thread ─────────────────────────────────────────
+
+fn history_events(step: &Step) -> Vec<(Option<u64>, AgentEvent)> {
+    step.events
+        .iter()
+        .filter_map(|e| e.as_history().map(|(at, ev)| (at, ev.clone())))
+        .collect()
+}
+
+/// A `thread/resume` result with every item kind the driver shows, plus kinds it does not, and
+/// a turn whose items were not sent.
+fn resume_result() -> String {
+    json!({"id": 3, "result": {
+        "model": "m", "cwd": "/c",
+        "thread": {"id": "t9", "turns": [
+            {"id": "u1", "startedAt": 1000, "itemsView": "full", "status": "completed", "items": [
+                {"type": "userMessage", "id": "i1", "startedAtMs": 1000500,
+                 "content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"},
+                             {"type": "localImage", "path": "/w/a.png"}]},
+                {"type": "reasoning", "id": "i2", "summary": ["thought"], "content": []},
+                {"type": "commandExecution", "id": "i3", "command": "ls", "status": "completed",
+                 "exitCode": 0, "aggregatedOutput": "out", "startedAtMs": 1000600, "completedAtMs": 1000700},
+                {"type": "fileChange", "id": "i4", "status": "inProgress", "changes": [{"path": "x"}]},
+                {"type": "agentMessage", "id": "i5", "text": "answer"},
+                {"type": "contextCompaction", "id": "i6"},
+                {"type": "plan", "id": "i7", "text": "p"},
+                {"type": "somethingNew", "id": "i8"}]},
+            {"id": "u2", "startedAt": 2000, "itemsView": "notLoaded", "status": "completed", "items": []}
+        ]}}})
+    .to_string()
+}
+
+#[test]
+fn a_resumed_threads_turns_become_history_before_session_init() {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        resume: ResumeMode::Resume("t9".into()),
+        ..SpawnSpec::default()
+    });
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    let step = p.on_line(&resume_result());
+    let last = step.events.last().unwrap();
+    assert!(matches!(last, AgentEvent::SessionInit { .. }), "{last:?}");
+    // Everything before it is history, in order.
+    let h = history_events(&step);
+    assert_eq!(h.len(), step.events.len() - 1);
+    let kinds: Vec<&str> = h
+        .iter()
+        .map(|(_, e)| match e {
+            AgentEvent::UserMessage { .. } => "user",
+            AgentEvent::UserContent { .. } => "user_content",
+            AgentEvent::ThinkingDelta { .. } => "think",
+            AgentEvent::ToolCallStarted { .. } => "start",
+            AgentEvent::ToolCallFinished { .. } => "finish",
+            AgentEvent::AssistantDelta { .. } => "say",
+            AgentEvent::Compaction { .. } => "compaction",
+            AgentEvent::Notice { .. } => "notice",
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "user",
+            "user_content",
+            "think",
+            "start",
+            "finish",
+            "start",
+            "say",
+            "compaction",
+            // two items of kinds the driver does not show, said once for the turn; then the
+            // second turn's items, which codex did not send
+            "notice",
+            "notice"
+        ]
+    );
+    // Times: the item's own, else the turn's.
+    assert_eq!(h[0].0, Some(1_000_500));
+    assert_eq!(h[3].0, Some(1_000_600));
+    assert_eq!(h[4].0, Some(1_000_700));
+    assert_eq!(h[6].0, Some(1_000_000));
+    assert_eq!(h[9].0, Some(2_000_000));
+    assert_eq!(
+        h[0].1,
+        AgentEvent::UserMessage {
+            text: "first\nsecond".into()
+        }
+    );
+    // The file change never completed: no end is invented for it.
+    assert!(!h.iter().any(
+        |(_, e)| matches!(e, AgentEvent::ToolCallFinished { call_id, .. } if call_id == "i4")
+    ));
+    match &h[8].1 {
+        AgentEvent::Notice { message } => assert!(message.starts_with("2 items"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    // A fresh thread has no history.
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec::default());
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    let step = p.on_line(&resume_result());
+    assert!(history_events(&step).is_empty());
+}
+
+/// History is not live activity: a protocol that was handed a resumed thread's turns behaves, for
+/// everything after, exactly like one that was not.
+#[test]
+fn history_changes_nothing_of_the_protocols_state() {
+    let live = |opening: &str| {
+        let mut p = CodexProtocol::new();
+        p.start(&SpawnSpec {
+            resume: ResumeMode::Resume("t9".into()),
+            ..SpawnSpec::default()
+        });
+        p.on_line(r#"{"id":1,"result":{}}"#);
+        let open = p.on_line(opening);
+        let mut out = vec![];
+        let s = sent(p.encode(InputId(7), Command::prompt("go")));
+        out.extend(w(&s));
+        let id = w(&s)[0]["id"].as_u64().unwrap();
+        for line in [
+            format!(r#"{{"id":{id},"result":{{"turn":{{"id":"n1","items":[]}}}}}}"#),
+            r#"{"method":"turn/started","params":{"turn":{"id":"n1"}}}"#.to_string(),
+            r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"i3","command":"ls"}}}"#.to_string(),
+            r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"i3","status":"completed","exitCode":0}}}"#.to_string(),
+            r#"{"method":"turn/completed","params":{"turn":{"id":"n1","status":"completed","items":[]}}}"#.to_string(),
+        ] {
+            let step = p.on_line(&line);
+            out.extend(w(&step));
+            out.extend(step.events.iter().map(|e| json!(format!("{e:?}"))));
+        }
+        (open, out)
+    };
+    let with = live(&resume_result());
+    let without = live(r#"{"id":3,"result":{"thread":{"id":"t9"},"model":"m","cwd":"/c"}}"#);
+    let (open_with, rest_with) = with;
+    let (open_without, rest_without) = without;
+    let live_only: Vec<&AgentEvent> = open_with
+        .events
+        .iter()
+        .filter(|e| e.as_history().is_none())
+        .collect();
+    assert_eq!(live_only, open_without.events.iter().collect::<Vec<_>>());
+    assert_eq!(open_with.write, open_without.write);
+    assert_eq!(rest_with, rest_without);
+}
+
+#[test]
+fn history_items_without_ids_or_with_odd_shapes_do_not_panic() {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        resume: ResumeMode::Resume("t9".into()),
+        ..SpawnSpec::default()
+    });
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    let step = p.on_line(
+        r#"{"id":3,"result":{"thread":{"id":"t9","turns":[7,{"items":"x"},{"items":[null,{"type":"commandExecution"},{"type":"userMessage","content":5}]}]}}}"#,
+    );
+    assert!(matches!(
+        step.events.last(),
+        Some(AgentEvent::SessionInit { .. })
+    ));
+}
+
+#[test]
+fn conversations_in_a_project_are_that_projects_rollouts_read_deep() {
+    let desc = crate::descriptor();
+    let ctx = |project: Option<&str>| wasit_core::DiscoveryContext {
+        home: Some("/h".into()),
+        project: project.map(str::to_string),
+        ..Default::default()
+    };
+    let probe = desc.conversations_in_project(&ctx(Some("/p/"))).unwrap();
+    assert_eq!(probe.kind, wasit_core::DiscoveryKind::Sessions);
+    match &probe.action {
+        wasit_core::ProbeAction::ListFiles {
+            dir,
+            max_files,
+            count_containing,
+            recursive,
+            ..
+        } => {
+            assert_eq!(dir, "/h/.codex/sessions");
+            assert_eq!(*max_files, 2000);
+            assert!(count_containing.is_empty(), "no full-file read");
+            assert!(*recursive);
+        }
+        other => panic!("{other:?}"),
+    }
+    let rollout = |id: &str, cwd: &str, ms: u64| wasit_core::FileHead {
+        path: format!("/h/.codex/sessions/2026/11/17/rollout-2026-11-17T23-19-35-{id}.jsonl"),
+        modified_ms: ms,
+        head: vec![format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":{}}}}}"#,
+            serde_json::to_string(cwd).unwrap()
+        )],
+        matching_lines: None,
+    };
+    let out = ProbeOutput::Files {
+        files: vec![
+            rollout("01a1ebcf-0528-7cd2-a32d-e89e91b6a844", "/p", 9),
+            rollout("01a1ebcf-0528-7cd2-a32d-e89e91b6a845", "/other", 8),
+            rollout("01a1ebcf-0528-7cd2-a32d-e89e91b6a846", "/p", 7),
+        ],
+    };
+    let ids = |probe: wasit_core::DiscoveryProbe| match (probe.parse)(&out).unwrap() {
+        Discovered::Sessions(s) => s.into_iter().map(|s| s.id).collect::<Vec<_>>(),
+        d => panic!("{d:?}"),
+    };
+    assert_eq!(
+        ids(probe),
+        [
+            "01a1ebcf-0528-7cd2-a32d-e89e91b6a844",
+            "01a1ebcf-0528-7cd2-a32d-e89e91b6a846"
+        ]
+    );
+    // No project: everything.
+    assert_eq!(
+        ids(desc.conversations_in_project(&ctx(None)).unwrap()).len(),
+        3
+    );
+    // Windows spelling of the same folder.
+    let win = wasit_core::DiscoveryContext {
+        home: Some("C:\\Users\\me".into()),
+        project: Some("C:\\w\\p".into()),
+        ..Default::default()
+    };
+    let out_win = ProbeOutput::Files {
+        files: vec![rollout(
+            "01a1ebcf-0528-7cd2-a32d-e89e91b6a847",
+            "C:\\w\\p\\",
+            1,
+        )],
+    };
+    match (desc.conversations_in_project(&win).unwrap().parse)(&out_win).unwrap() {
+        Discovered::Sessions(s) => assert_eq!(s.len(), 1),
+        d => panic!("{d:?}"),
+    }
+    // No home, no CODEX_HOME: the CLI cannot say.
+    assert!(desc
+        .conversations_in_project(&wasit_core::DiscoveryContext::default())
+        .is_none());
+}
+
+/// A resumed thread that has a first message but arrives without turns is not an empty
+/// conversation: history says codex sent none.
+#[test]
+fn a_resumed_thread_without_turns_that_has_a_preview_says_nothing_was_sent() {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        resume: wasit_core::ResumeMode::Resume("t1".into()),
+        ..SpawnSpec::default()
+    });
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    let step = p.on_line(
+        r#"{"id":3,"result":{"thread":{"id":"t1","preview":"hello","turns":[]},"model":"m"}}"#,
+    );
+    let history: Vec<&AgentEvent> = step
+        .events
+        .iter()
+        .filter_map(|e| e.as_history().map(|(_, e)| e))
+        .collect();
+    assert!(
+        matches!(history.as_slice(), [AgentEvent::Notice { message }] if message.contains("did not send")),
+        "{:?}",
+        step.events
+    );
+    assert!(matches!(
+        step.events.last(),
+        Some(AgentEvent::SessionInit { .. })
+    ));
+    // A thread with no preview and no turns is just a new thread: nothing to say.
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        resume: wasit_core::ResumeMode::Resume("t2".into()),
+        ..SpawnSpec::default()
+    });
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    let step = p.on_line(r#"{"id":3,"result":{"thread":{"id":"t2","preview":"","turns":[]}}}"#);
+    assert!(step.events.iter().all(|e| e.as_history().is_none()));
+}
