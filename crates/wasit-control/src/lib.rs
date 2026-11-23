@@ -34,7 +34,7 @@ pub use connection::{
     ConnConfig, Connection, Negotiated, RequestOpts, SubscribeOpts, Subscription,
 };
 pub use diag::ConnectDiag;
-pub use error::{CallError, ConnClose, ConnectError};
+pub use error::{peer_gone, CallError, ConnClose, ConnectError};
 pub use hub::{
     CommandConnector, HostSpec, Hub, HubConfig, HubError, LinkConnector, LinkEvent, Provisioner,
     RoutingService,

@@ -370,3 +370,126 @@ async fn a_custom_connector_explains_a_failed_hello_exactly_as_connect_does() {
         failed
     );
 }
+
+// ── the transport's end and our hello meet in either order ──────────────────
+
+/// Which side of the handshake sees the child go away first. The two are a race between two
+/// processes that the product does not control, so each is forced here by what the test awaits:
+/// `Write`: the child has already exited when our hello is written, so the write fails (a broken
+/// pipe) before the read sees the end of the stream; `Read`: the child takes our hello and only
+/// then exits, so the write succeeds and the read sees the end of the stream.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum First {
+    Write,
+    Read,
+}
+
+/// The demo binary as `program` ending the way `ends` does, with `--read-hello` for the order
+/// where our hello is taken first.
+#[cfg(unix)]
+fn ends_in_order(program: &str, words: &str, code: u8, first: First) -> CommandSpec {
+    let mut spec = ends(program, words, code);
+    if first == First::Read {
+        spec.argv.push("--read-hello".into());
+    }
+    spec
+}
+
+/// Runs the handshake over a fresh child in the given order; returns the handshake's own error
+/// and what `explain_handshake_failure` makes of it.
+#[cfg(unix)]
+async fn handshake_in_order(spec: &CommandSpec, first: First) -> (ConnectError, ConnectError) {
+    let (io, child) = CommandTransport::spawn(spec).unwrap();
+    if first == First::Write {
+        // The child is gone before we write: awaiting its exit is the signal, not a delay.
+        assert!(within(child.wait_exit(BOUND)).await.is_some());
+    }
+    let raw = ControlClient::connect(io, ClientOptions::new(hello("hub")))
+        .await
+        .unwrap_err();
+    let explained = child.explain_handshake_failure(raw.clone()).await;
+    (raw, explained)
+}
+
+/// The precondition of the pair below: with the child gone, writing to it fails with an error
+/// that means "the peer is gone" while reading from it is the end of the stream. Both are one
+/// event, and `wasit_control::peer_gone` is what says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_that_is_gone_breaks_our_write_and_ends_our_read() {
+    use tokio::io::AsyncWriteExt;
+    let (mut io, child) = CommandTransport::spawn(&ends("ssh", "gone", 2)).unwrap();
+    assert!(within(child.wait_exit(BOUND)).await.is_some());
+    let e = io.write_all(b"{}\n").await.unwrap_err();
+    assert!(wasit_control::peer_gone(&e), "{e:?}");
+    let mut rest = Vec::new();
+    within(io.read_to_end(&mut rest)).await.unwrap();
+    assert!(rest.is_empty());
+}
+
+/// Whether the write or the read noticed first, the handshake ends the same way, and so does
+/// the explanation: the same error, kind, exit code and words.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_that_goes_away_gives_one_handshake_failure_in_either_order() {
+    for (program, words, code, kind) in [
+        (
+            "ssh",
+            "refusing the runtime directory",
+            2,
+            CommandFailureKind::HelperFailed,
+        ),
+        ("ssh", "", 4, CommandFailureKind::HelperFailed),
+        (
+            "ssh",
+            "bash: marsad-agent: command not found",
+            127,
+            CommandFailureKind::CommandNotFound,
+        ),
+        (
+            "ssh",
+            "client_loop: send disconnect: Broken pipe",
+            255,
+            CommandFailureKind::Other,
+        ),
+        (
+            "ssh",
+            "Connection reset by peer",
+            255,
+            CommandFailureKind::Unreachable,
+        ),
+        ("wsl.exe", "bad argument", 2, CommandFailureKind::Other),
+        ("some-other-transport", "", 1, CommandFailureKind::Other),
+    ] {
+        let mut seen = Vec::new();
+        for first in [First::Write, First::Read] {
+            let spec = ends_in_order(program, words, code, first);
+            let (raw, explained) = handshake_in_order(&spec, first).await;
+            assert_eq!(
+                raw,
+                ConnectError::ClosedDuringHandshake,
+                "{program} {first:?}"
+            );
+            let (k, exit, text) = command_failure(explained.clone());
+            assert_eq!(
+                (k, exit),
+                (kind, Some(i32::from(code))),
+                "{program} {code} {words:?} {first:?}"
+            );
+            // Never the raw error of the write.
+            assert!(
+                !text.contains("os error") && !text.contains("i/o error"),
+                "{text}"
+            );
+            if kind == CommandFailureKind::HelperFailed {
+                assert!(
+                    text.contains("connection closed during handshake"),
+                    "{text}"
+                );
+            }
+            seen.push((raw, explained));
+        }
+        assert_eq!(seen[0], seen[1], "{program} {code} {words:?}");
+    }
+}

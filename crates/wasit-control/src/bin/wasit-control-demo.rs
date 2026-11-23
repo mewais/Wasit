@@ -2,7 +2,9 @@
 //!
 //! ```text
 //! wasit-control-demo serve-stdio [--host ID] [--build B] [--major N] [--pause-after-events N]
-//! wasit-control-demo fail STDERR_TEXT [--code N]                  # print STDERR_TEXT to stderr, exit N
+//! wasit-control-demo fail STDERR_TEXT [--code N] [--read-hello]   # print STDERR_TEXT to stderr, exit N
+//!                                       # (--read-hello: first read a line from stdin, as a helper
+//!                                       # that takes the hello and then dies without answering)
 //! wasit-control-demo serve-local PATH [--host ID] [--build B]   # prints "ready" when listening
 //! wasit-control-demo bridge PATH [--host ID] [--build B]       # stdio <-> PATH, starting serve-local if absent
 //! ```
@@ -29,6 +31,7 @@ struct Args {
     major: Option<u16>,
     pause_after_events: Option<u64>,
     code: u8,
+    read_hello: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -42,6 +45,7 @@ fn parse() -> Result<Args, String> {
         major: None,
         pause_after_events: None,
         code: 1,
+        read_hello: false,
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or(format!("{arg} needs a value"));
@@ -49,6 +53,7 @@ fn parse() -> Result<Args, String> {
             "--host" => a.host = val()?,
             "--build" => a.build = val()?,
             "--major" => a.major = Some(val()?.parse().map_err(|e| format!("{e}"))?),
+            "--read-hello" => a.read_hello = true,
             "--code" => a.code = val()?.parse().map_err(|e| format!("{e}"))?,
             "--pause-after-events" => {
                 a.pause_after_events = Some(val()?.parse().map_err(|e| format!("{e}"))?)
@@ -133,6 +138,12 @@ async fn main() -> ExitCode {
     match a.mode.as_str() {
         "fail" => {
             // `fail TEXT CODE`: TEXT arrives as the path positional, CODE via --code.
+            if a.read_hello {
+                // The peer's hello is taken (so its write cannot have failed), then nothing is
+                // answered. Blocking is fine: nothing else runs in this process.
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+            }
             eprintln!("{}", a.path.clone().unwrap_or_default());
             ExitCode::from(a.code)
         }

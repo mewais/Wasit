@@ -707,3 +707,242 @@ async fn requests_with_and_without_a_trace_key_are_both_served() {
     assert_eq!(got[&1], Value::Null);
     assert_eq!(got[&2], json!("w-task-00000001"));
 }
+
+// ── a peer that is gone is one event, whichever of the write and the read finds out first ──
+
+mod peer_gone {
+    use std::collections::VecDeque;
+    use std::io::{Error, ErrorKind};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use wasit_control::wire::encode;
+    use wasit_control::{join_duplex, peer_gone, BoxDuplex, Hello};
+
+    use super::*;
+
+    /// What a stream's read side does once its bytes are given out.
+    #[derive(Clone, Copy)]
+    enum End {
+        Eof,
+        Fail(ErrorKind),
+        /// Nothing more, ever (the peer is alive but silent).
+        Silent,
+    }
+
+    struct Reads {
+        bytes: VecDeque<u8>,
+        end: End,
+    }
+
+    impl AsyncRead for Reads {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.bytes.is_empty() {
+                while buf.remaining() > 0 {
+                    match self.bytes.pop_front() {
+                        Some(b) => buf.put_slice(&[b]),
+                        None => break,
+                    }
+                }
+                return Poll::Ready(Ok(()));
+            }
+            match self.end {
+                End::Eof => Poll::Ready(Ok(())),
+                End::Fail(k) => Poll::Ready(Err(Error::from(k))),
+                End::Silent => Poll::Pending,
+            }
+        }
+    }
+
+    /// Takes `ok` writes, then fails every one with `kind` (`None`: never fails).
+    struct Writes {
+        ok: usize,
+        kind: Option<ErrorKind>,
+    }
+
+    impl AsyncWrite for Writes {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            match self.kind {
+                Some(k) if self.ok == 0 => Poll::Ready(Err(Error::from(k))),
+                _ => {
+                    self.ok = self.ok.saturating_sub(1);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn stream(
+        peer_hello: bool,
+        end: End,
+        ok_writes: usize,
+        write_fails: Option<ErrorKind>,
+    ) -> BoxDuplex {
+        let bytes = if peer_hello {
+            encode(&Frame::Hello(Hello::new("b", "srv", "daemon")), 1 << 20).unwrap()
+        } else {
+            Vec::new()
+        };
+        join_duplex(
+            Reads {
+                bytes: bytes.into(),
+                end,
+            },
+            Writes {
+                ok: ok_writes,
+                kind: write_fails,
+            },
+        )
+    }
+
+    /// The kinds that mean the peer is gone, and some that do not.
+    const GONE: [ErrorKind; 5] = [
+        ErrorKind::BrokenPipe,
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::NotConnected,
+        ErrorKind::UnexpectedEof,
+    ];
+    const ABOUT_US: [ErrorKind; 4] = [
+        ErrorKind::PermissionDenied,
+        ErrorKind::WriteZero,
+        ErrorKind::TimedOut,
+        ErrorKind::InvalidInput,
+    ];
+
+    #[test]
+    fn the_set_of_kinds_that_mean_the_peer_is_gone_is_the_decided_one() {
+        for k in GONE {
+            assert!(peer_gone(&Error::from(k)), "{k:?}");
+        }
+        for k in ABOUT_US {
+            assert!(!peer_gone(&Error::from(k)), "{k:?}");
+        }
+        for k in [
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::Other,
+        ] {
+            assert!(!peer_gone(&Error::from(k)), "{k:?}");
+        }
+    }
+
+    async fn handshake(io: BoxDuplex) -> Result<ControlClient, ConnectError> {
+        ControlClient::connect(io, ClientOptions::new(hello("hub"))).await
+    }
+
+    /// Our hello cannot be written (the peer is gone), or can and the read then fails, or can
+    /// and the stream ends: for a peer that is gone the handshake says one thing.
+    #[tokio::test]
+    async fn a_handshake_with_a_peer_that_is_gone_is_closed_during_handshake_in_every_order() {
+        for k in GONE {
+            // Write first: the hello does not go out; the read then finds the end.
+            let e = handshake(stream(false, End::Eof, 0, Some(k)))
+                .await
+                .unwrap_err();
+            assert_eq!(e, ConnectError::ClosedDuringHandshake, "write {k:?}");
+            // The read first: the hello went out; the read says the peer is gone, or the end.
+            let e = handshake(stream(false, End::Fail(k), usize::MAX, None))
+                .await
+                .unwrap_err();
+            assert_eq!(e, ConnectError::ClosedDuringHandshake, "read {k:?}");
+            // Both say it.
+            let e = handshake(stream(false, End::Fail(k), 0, Some(k)))
+                .await
+                .unwrap_err();
+            assert_eq!(e, ConnectError::ClosedDuringHandshake, "both {k:?}");
+        }
+        let e = handshake(stream(false, End::Eof, usize::MAX, None))
+            .await
+            .unwrap_err();
+        assert_eq!(e, ConnectError::ClosedDuringHandshake, "end");
+        // In memory, with a real peer: it is gone before our write, or after it took our hello.
+        let (a, b) = memory_pair(64 * 1024);
+        drop(b);
+        let e = handshake(a).await.unwrap_err();
+        assert_eq!(e, ConnectError::ClosedDuringHandshake, "dropped first");
+        let (a, mut b) = memory_pair(64 * 1024);
+        let taken = tokio::spawn(async move {
+            let mut line = String::new();
+            BufReader::new(&mut b).read_line(&mut line).await.unwrap();
+            // `b` is dropped with the line taken.
+        });
+        let e = handshake(a).await.unwrap_err();
+        taken.await.unwrap();
+        assert_eq!(
+            e,
+            ConnectError::ClosedDuringHandshake,
+            "dropped after its read"
+        );
+    }
+
+    /// An error that is about us stays an I/O error, from the write or from the read.
+    #[tokio::test]
+    async fn a_handshake_failing_for_a_reason_that_is_not_the_peer_stays_an_io_error() {
+        for k in ABOUT_US {
+            let e = handshake(stream(false, End::Eof, 0, Some(k)))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, ConnectError::Io(_)), "write {k:?}: {e:?}");
+            let e = handshake(stream(false, End::Fail(k), usize::MAX, None))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, ConnectError::Io(_)), "read {k:?}: {e:?}");
+        }
+    }
+
+    /// The same after the handshake: an established connection whose peer is gone closes as
+    /// `Eof` whether its writer (a frame that cannot be written) or its reader (the end, or a
+    /// reset) finds out first; a failure that is about us is `Io`.
+    #[tokio::test]
+    async fn an_established_connection_whose_peer_is_gone_closes_the_same_in_either_order() {
+        for k in GONE {
+            // The writer first: the peer is silent, our request cannot be written.
+            let c = handshake(stream(true, End::Silent, 1, Some(k)))
+                .await
+                .unwrap();
+            let e = c.request::<Value>("echo", json!(1), D).await.unwrap_err();
+            assert_eq!(e, CallError::ConnectionLost(ConnClose::Eof), "write {k:?}");
+            assert_eq!(within(c.closed()).await, ConnClose::Eof, "write {k:?}");
+            // The reader first: the writes would work.
+            for end in [End::Eof, End::Fail(k)] {
+                let c = handshake(stream(true, end, usize::MAX, None))
+                    .await
+                    .unwrap();
+                assert_eq!(within(c.closed()).await, ConnClose::Eof, "read {k:?}");
+            }
+        }
+        for k in ABOUT_US {
+            let c = handshake(stream(true, End::Silent, 1, Some(k)))
+                .await
+                .unwrap();
+            c.request::<Value>("echo", json!(1), D).await.unwrap_err();
+            let ConnClose::Io { message } = within(c.closed()).await else {
+                panic!("write {k:?}");
+            };
+            assert!(!message.is_empty());
+            let c = handshake(stream(true, End::Fail(k), usize::MAX, None))
+                .await
+                .unwrap();
+            assert!(
+                matches!(within(c.closed()).await, ConnClose::Io { .. }),
+                "read {k:?}"
+            );
+        }
+    }
+}

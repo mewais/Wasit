@@ -21,6 +21,9 @@ pub enum ConnectError {
     Refused(RpcError),
     #[error("handshake timed out")]
     HandshakeTimeout,
+    /// The peer went away before the handshake completed: its end of the stream was found
+    /// closed by the read of its hello or by the write of ours ([`peer_gone`]), whichever came
+    /// first.
     #[error("connection closed during handshake")]
     ClosedDuringHandshake,
     #[error("protocol error during handshake: {0}")]
@@ -45,13 +48,51 @@ impl ConnectError {
     pub(crate) fn io(e: impl fmt::Display) -> Self {
         ConnectError::Io(e.to_string())
     }
+
+    /// What an I/O error on the link's stream during the handshake is: the peer having gone
+    /// ([`peer_gone`]) is [`ConnectError::ClosedDuringHandshake`], whether the write of our
+    /// hello or the read of theirs noticed it; anything else is [`ConnectError::Io`].
+    pub(crate) fn stream_io(e: &std::io::Error) -> Self {
+        if peer_gone(e) {
+            ConnectError::ClosedDuringHandshake
+        } else {
+            ConnectError::io(e)
+        }
+    }
+}
+
+/// Whether an I/O error on a link's stream says that the peer is gone, that is, is the same
+/// event as the stream ending (end-of-file): which of a read and a write notices first is a race
+/// between two processes, and the answer must not depend on it. The set is chosen deliberately:
+///
+/// * `BrokenPipe`: writing to a pipe or socket whose reader is gone (`EPIPE`; Windows
+///   `ERROR_BROKEN_PIPE` and `ERROR_NO_DATA`, which `std` maps to it).
+/// * `ConnectionReset`, `ConnectionAborted`: the peer's end was torn down under us (`ECONNRESET`,
+///   `ECONNABORTED`, `WSAECONNRESET`, `WSAECONNABORTED`), seen by a write or by a read.
+/// * `NotConnected`: no peer is attached any more (`ENOTCONN`, `WSAENOTCONN`).
+/// * `UnexpectedEof`: a reader's own report that the stream ended where more was due.
+///
+/// Out: `WriteZero` (a sink that takes no bytes says nothing about a peer), `TimedOut` (the
+/// bounds have their own errors), `Interrupted`/`WouldBlock` (retried by the runtime) and every
+/// error that is about us (permissions, invalid input, ...): those stay I/O errors. Not checked
+/// on Windows (no machine to test on): `ERROR_PIPE_NOT_CONNECTED` is not given a kind by `std`
+/// and so is not recognised.
+pub fn peer_gone(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+    };
+    matches!(
+        e.kind(),
+        BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | UnexpectedEof
+    )
 }
 
 /// Why an established connection closed.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConnClose {
-    /// The peer closed the stream.
+    /// The peer closed the stream: the read found its end, or a write found the peer gone
+    /// ([`peer_gone`]), whichever came first.
     Eof,
     /// The peer said goodbye.
     Goodbye {
@@ -71,6 +112,19 @@ pub enum ConnClose {
 }
 
 impl ConnClose {
+    /// What an I/O error on the stream of an established connection is: the peer having gone
+    /// ([`peer_gone`]) is [`ConnClose::Eof`], whether the writer or the reader noticed it first;
+    /// anything else is [`ConnClose::Io`].
+    pub(crate) fn stream_io(e: &std::io::Error) -> Self {
+        if peer_gone(e) {
+            ConnClose::Eof
+        } else {
+            ConnClose::Io {
+                message: e.to_string(),
+            }
+        }
+    }
+
     /// The kind as the word the `kind` tag serializes to (`eof`, `goodbye`, `io`, `protocol`,
     /// `frame_too_large`, `idle_timeout`, `local`): what diagnostics record of a close, never
     /// the message a peer or a parser produced.

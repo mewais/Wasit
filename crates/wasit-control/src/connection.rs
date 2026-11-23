@@ -259,7 +259,7 @@ impl Connection {
         .await
         {
             Err(_) => return Err(ConnectError::HandshakeTimeout),
-            Ok(Err(e)) => Some(ConnectError::io(e)),
+            Ok(Err(e)) => Some(ConnectError::stream_io(&e)),
             Ok(Ok(())) => None,
         };
 
@@ -268,7 +268,9 @@ impl Connection {
         let theirs = loop {
             let line = match timeout_at(deadline, reader.next_line()).await {
                 Err(_) => return Err(write_err.unwrap_or(ConnectError::HandshakeTimeout)),
-                Ok(Err(FrameError::Io(e))) => return Err(write_err.unwrap_or(ConnectError::io(e))),
+                Ok(Err(FrameError::Io(e))) => {
+                    return Err(write_err.unwrap_or(ConnectError::stream_io(&e)))
+                }
                 Ok(Err(e)) => return Err(ConnectError::Protocol(e.to_string())),
                 Ok(Ok(None)) => {
                     return Err(write_err.unwrap_or(ConnectError::ClosedDuringHandshake))
@@ -1034,19 +1036,23 @@ async fn write_bounded(
     w: &mut WriteHalf<BoxDuplex>,
     bytes: &[u8],
     wt: Duration,
-) -> Result<(), String> {
+) -> Result<(), ConnClose> {
     match timeout(wt, w.write_all(bytes)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("write timed out".into()),
+        Ok(Err(e)) => Err(ConnClose::stream_io(&e)),
+        Err(_) => Err(ConnClose::Io {
+            message: "write timed out".into(),
+        }),
     }
 }
 
-async fn flush_bounded(w: &mut WriteHalf<BoxDuplex>, wt: Duration) -> Result<(), String> {
+async fn flush_bounded(w: &mut WriteHalf<BoxDuplex>, wt: Duration) -> Result<(), ConnClose> {
     match timeout(wt, w.flush()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("flush timed out".into()),
+        Ok(Err(e)) => Err(ConnClose::stream_io(&e)),
+        Err(_) => Err(ConnClose::Io {
+            message: "flush timed out".into(),
+        }),
     }
 }
 
@@ -1056,7 +1062,7 @@ async fn writer_task(
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let wt = inner.cfg.write_timeout;
-    let result: Result<(), String> = async {
+    let result: Result<(), ConnClose> = async {
         loop {
             let bytes = tokio::select! {
                 biased;
@@ -1081,8 +1087,8 @@ async fn writer_task(
         Ok(())
     }
     .await;
-    if let Err(message) = result {
-        inner.close(ConnClose::Io { message });
+    if let Err(reason) = result {
+        inner.close(reason);
     }
     inner.writer_done.send_replace(true);
 }
@@ -1110,11 +1116,7 @@ async fn reader_task(
                 });
                 break ConnClose::FrameTooLarge;
             }
-            Ok(Err(FrameError::Io(e))) => {
-                break ConnClose::Io {
-                    message: e.to_string(),
-                }
-            }
+            Ok(Err(FrameError::Io(e))) => break ConnClose::stream_io(&e),
             Ok(Err(FrameError::Malformed(m))) => {
                 inner.send_soon(Frame::Goodbye {
                     reason: RpcError::new(codes::PROTOCOL, m.clone()),

@@ -1072,6 +1072,127 @@ async fn a_helper_that_ends_by_itself_parks_the_link_with_its_exit_and_scrubbed_
     assert_eq!(one(&r, "link.attempt_end")["outcome"], "backoff");
 }
 
+/// Which side of the handshake sees the helper go away first (see `tests/process.rs`): `Write`
+/// waits for the child's exit before the hello is written, so the write fails; `Read` runs
+/// against a child that takes the hello and then ends, so the write succeeds and the read sees
+/// the end of the stream.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum First {
+    Write,
+    Read,
+}
+
+/// A connector that, like the product's, runs the hello itself and has the child explain a
+/// failure, in the order it is told.
+#[cfg(unix)]
+struct OrderedConnector(First);
+
+#[cfg(unix)]
+#[async_trait]
+impl LinkConnector for OrderedConnector {
+    async fn connect(
+        &self,
+        spec: &HostSpec,
+        opts: ClientOptions,
+        attempt: Attempt,
+    ) -> Result<ControlClient, ConnectError> {
+        let cmd = CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), &attempt);
+        let (io, child) = CommandTransport::spawn(&cmd)?;
+        if matches!(self.0, First::Write) {
+            // Gone before the hello is written: awaiting the exit is the signal, not a delay.
+            within(child.wait_exit(BOUND)).await;
+        }
+        match ControlClient::connect(io, opts).await {
+            Ok(c) => Ok(c),
+            Err(e) => Err(child.explain_handshake_failure(e).await),
+        }
+    }
+}
+
+/// What a link recorded of one failed attempt, without what differs between two links (names,
+/// times, process ids).
+#[cfg(unix)]
+fn attempt_facts(link: &str) -> Value {
+    let r = of_link(link);
+    assert_eq!(find(&r, "link.attempt_begin").len(), 1, "{r:#?}");
+    let end = one(&r, "link.attempt_end");
+    let st = find(&r, "link.state");
+    let exited = one(&r, "transport.exited");
+    json!({
+        "evs": evs(&r),
+        "outcome": end["outcome"],
+        "error": end["error"],
+        "states": st.iter().map(|s| json!({"from": s["from"], "to": s["to"], "error": s["error"]})).collect::<Vec<_>>(),
+        "exit": [exited["code"], exited["stderr_bytes"]],
+    })
+}
+
+/// The helper goes away before the handshake completes: whether our write of the hello or our
+/// read of theirs finds out first, the link records the same attempt and parks as `helper_failed`
+/// (ssh, its status the remote program's own) or retries (ssh's own failure), the same each time.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_helper_that_goes_away_parks_or_retries_the_same_in_either_order() {
+    dir();
+    let cases: [(&str, &str, u8, &str, &str); 3] = [
+        (
+            "ssh",
+            "the helper refused the runtime dir",
+            2,
+            "park",
+            "helper_failed",
+        ),
+        ("ssh", "", 3, "park", "helper_failed"),
+        (
+            "ssh",
+            "client_loop: send disconnect: Broken pipe",
+            255,
+            "backoff",
+            "other",
+        ),
+    ];
+    for (program, words, code, outcome, error_code) in cases {
+        let mut facts = Vec::new();
+        for (which, first) in [("write", First::Write), ("read", First::Read)] {
+            let host = format!("diag-order-{which}-{code}");
+            let mut c = HubConfig::new(Hello::new("b1", "diag-hub-order", "hub"));
+            c.supervise = slow();
+            let h = Hub::new(c, Arc::new(OrderedConnector(first)), None);
+            let mut argv = vec![
+                demo_named(program),
+                "fail".into(),
+                words.to_owned(),
+                "--code".into(),
+                code.to_string(),
+            ];
+            if matches!(first, First::Read) {
+                argv.push("--read-hello".into());
+            }
+            h.add_link(HostSpec::new(host.as_str(), argv)).unwrap();
+            let state = link_state(&h, &host, |s| !matches!(s, LinkState::Connecting)).await;
+            h.shutdown().await;
+            if outcome == "park" {
+                let LinkState::Failed { reason, problem } = &state else {
+                    panic!("{which} {state:?}");
+                };
+                assert_eq!(*problem, Some(CommandFailureKind::HelperFailed), "{which}");
+                assert!(!reason.contains("os error"), "{which}: {reason}");
+            } else {
+                assert!(
+                    matches!(state, LinkState::Reconnecting { .. }),
+                    "{which} {state:?}"
+                );
+            }
+            let f = attempt_facts(&format!("hosts:{host}"));
+            assert_eq!(f["outcome"], outcome, "{which} {f:#}");
+            assert_eq!(f["error"]["code"], error_code, "{which} {f:#}");
+            facts.push(f);
+        }
+        assert_eq!(facts[0], facts[1], "{words:?} {code}");
+    }
+}
+
 #[tokio::test]
 async fn an_established_transport_that_dies_records_its_exit_and_scrubbed_stderr_tail() {
     dir();
