@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wasit_diag::{ErrorInfo, Ident};
 
+use crate::attempt::Attempt;
 use crate::client::ControlClient;
 use crate::command::CommandFailureKind;
 use crate::connection::{RequestOpts, SubscribeOpts, Subscription};
@@ -173,12 +174,14 @@ pub trait SupervisorHooks: Send + Sync + 'static {
     }
 }
 
-/// Produces a fresh connection on each call. The argument is the attempt number: 1 for the
-/// first call of a link, then +1 per call, never reset (not by a successful connect, not by
-/// `reconnect_now`), so what a connector records can be joined with what the supervisor
-/// records for the same attempt.
+/// Produces a fresh connection on each call. The argument is the [`Attempt`]: its number is 1
+/// for the first call of a link, then +1 per call, never reset (not by a successful connect,
+/// not by `reconnect_now`), so what a connector records can be joined with what the supervisor
+/// records for the same attempt; and it is where the connector reports how far it has got, for
+/// the link state if the supervisor ends the attempt at its bound
+/// ([`SupervisedConfig::connect_timeout`]).
 pub type Connector =
-    Arc<dyn Fn(u64) -> BoxFuture<'static, Result<ControlClient, ConnectError>> + Send + Sync>;
+    Arc<dyn Fn(Attempt) -> BoxFuture<'static, Result<ControlClient, ConnectError>> + Send + Sync>;
 
 /// Build a [`Connector`] from an async closure that does not need the attempt number.
 pub fn connector<F, Fut>(f: F) -> Connector
@@ -189,13 +192,23 @@ where
     Arc::new(move |_attempt| Box::pin(f()))
 }
 
+/// Build a [`Connector`] from an async closure that is given the [`Attempt`] (its number, and
+/// the place to report progress).
+pub fn connector_reporting<F, Fut>(f: F) -> Connector
+where
+    F: Fn(Attempt) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<ControlClient, ConnectError>> + Send + 'static,
+{
+    Arc::new(move |attempt| Box::pin(f(attempt)))
+}
+
 /// Build a [`Connector`] from an async closure that is given the attempt number.
 pub fn connector_with_attempt<F, Fut>(f: F) -> Connector
 where
     F: Fn(u64) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<ControlClient, ConnectError>> + Send + 'static,
 {
-    Arc::new(move |attempt| Box::pin(f(attempt)))
+    Arc::new(move |attempt| Box::pin(f(attempt.n())))
 }
 
 pub type StateCallback = Arc<dyn Fn(&LinkState) + Send + Sync>;
@@ -471,13 +484,15 @@ async fn run(
         if let Some(link) = &shared.diag {
             diag::attempt_begin(link, n);
         }
+        let this_attempt = Attempt::new(n);
         let res = tokio::select! {
             _ = stop.cancelled() => break,
-            r = tokio::time::timeout(cfg.connect_timeout, connector(n)) => r,
+            r = tokio::time::timeout(cfg.connect_timeout, connector(this_attempt.clone())) => r,
         };
         let next = match res {
             Err(_) => {
-                last_error = "connect timed out".into();
+                // The connector's future is gone; what it reported is the evidence.
+                last_error = this_attempt.timed_out();
                 last_why = last_error.clone();
                 shared.attempt_end(n, started, AttemptOutcome::Backoff, || {
                     Some(diag::connect_error(&ConnectError::Timeout))

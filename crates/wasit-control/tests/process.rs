@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use wasit_control::{
     codes, ClientOptions, CloseReason, CommandFailureKind, CommandSpec, CommandTransport,
-    ConnClose, ConnectError, ProtocolVersion, SubscribeOpts,
+    ConnClose, ConnectError, ControlClient, ProtocolVersion, SubscribeOpts,
 };
 
 const D: Duration = Duration::from_secs(10);
@@ -211,4 +211,162 @@ async fn bridge_starts_the_daemon_and_pumps_bytes() {
         ConnectError::Refused(r) => assert_eq!(r.code, codes::BRIDGE_UNAVAILABLE),
         other => panic!("unexpected {other:?}"),
     }
+}
+
+// ── the end of a helper: what the transport's status means ──────────────────
+
+/// The demo binary as `program`, failing like a transport whose remote program ended: stderr
+/// `words`, then exit status `code`, with nothing on stdout (the handshake never starts).
+#[cfg(unix)]
+fn ends(program: &str, words: &str, code: u8) -> CommandSpec {
+    CommandSpec::new([
+        demo_named(program),
+        "fail".into(),
+        words.into(),
+        "--code".into(),
+        code.to_string(),
+    ])
+}
+
+#[cfg(unix)]
+fn command_failure(err: ConnectError) -> (CommandFailureKind, Option<i32>, String) {
+    match err {
+        ConnectError::Command {
+            kind,
+            exit_code,
+            stderr,
+        } => (kind, exit_code, stderr),
+        other => panic!("not a command failure: {other:?}"),
+    }
+}
+
+/// The remote program ended by itself (a status of 1 to 254 of an ssh command): that is not
+/// the network and not the sign-in, and running the command again cannot change it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_remote_program_that_ends_by_itself_before_the_hello_is_helper_failed_over_ssh() {
+    let err = CommandTransport::connect(
+        &ends("ssh", "refusing the runtime directory", 2),
+        ClientOptions::new(hello("hub")),
+    )
+    .await
+    .unwrap_err();
+    let (kind, exit, text) = command_failure(err);
+    assert_eq!(kind, CommandFailureKind::HelperFailed);
+    assert_eq!(exit, Some(2));
+    // The reason is the program's words and its status; the handshake's own error says only
+    // that the stream closed.
+    assert!(text.contains("refusing the runtime directory"), "{text}");
+    assert!(text.contains("exit code 2"), "{text}");
+    assert!(
+        text.contains("connection closed during handshake"),
+        "{text}"
+    );
+
+    // Without a word of stderr the status and the handshake's error are all there is.
+    let err = CommandTransport::connect(&ends("ssh", "", 3), ClientOptions::new(hello("hub")))
+        .await
+        .unwrap_err();
+    let (kind, exit, text) = command_failure(err);
+    assert_eq!((kind, exit), (CommandFailureKind::HelperFailed, Some(3)));
+    assert!(text.contains("exit code 3"), "{text}");
+}
+
+/// Everything else keeps the decision it had: ssh's own failure and a clean exit are retried;
+/// what the words recognise keeps its kind; and a transport whose status contract is not known
+/// (`wsl.exe`, any other program) never claims the status is the remote program's.
+#[cfg(unix)]
+#[tokio::test]
+async fn only_a_status_that_is_the_remote_programs_own_is_helper_failed() {
+    let cases = [
+        (
+            "ssh",
+            "client_loop: send disconnect: Broken pipe",
+            255,
+            CommandFailureKind::Other,
+        ),
+        (
+            "ssh",
+            "Connection reset by peer",
+            255,
+            CommandFailureKind::Unreachable,
+        ),
+        (
+            "ssh",
+            "user@h: Permission denied (publickey).",
+            255,
+            CommandFailureKind::AuthNeeded,
+        ),
+        (
+            "ssh",
+            "sh: 1: /x/marsad-agent: Permission denied",
+            126,
+            CommandFailureKind::PermissionDenied,
+        ),
+        ("ssh", "", 127, CommandFailureKind::CommandNotFound),
+        ("ssh", "ended", 0, CommandFailureKind::Other),
+        (
+            "ssh.exe",
+            "bad argument",
+            2,
+            CommandFailureKind::HelperFailed,
+        ),
+        ("wsl.exe", "bad argument", 2, CommandFailureKind::Other),
+        ("wsl", "bad argument", 1, CommandFailureKind::Other),
+        (
+            "some-other-transport",
+            "bad argument",
+            2,
+            CommandFailureKind::Other,
+        ),
+    ];
+    for (program, words, code, want) in cases {
+        let err = CommandTransport::connect(
+            &ends(program, words, code),
+            ClientOptions::new(hello("hub")),
+        )
+        .await
+        .unwrap_err();
+        let (kind, exit, _) = command_failure(err);
+        assert_eq!(kind, want, "{program} {code} {words:?}");
+        assert_eq!(exit, Some(i32::from(code)), "{program}");
+    }
+}
+
+/// A connector that talks to the child before the hello (the product's bootstrap) and then runs
+/// the hello itself gets, from `ChildHandle::explain_handshake_failure`, exactly what
+/// `CommandTransport::connect` gives.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_custom_connector_explains_a_failed_hello_exactly_as_connect_does() {
+    let specs = [
+        ends("ssh", "refusing the runtime directory", 2),
+        ends("ssh", "", 4),
+        ends("ssh", "client_loop: send disconnect: Broken pipe", 255),
+        ends("wsl.exe", "bad argument", 2),
+        ends("ssh", "Connection reset by peer", 255),
+    ];
+    for spec in specs {
+        let direct = CommandTransport::connect(&spec, ClientOptions::new(hello("hub")))
+            .await
+            .unwrap_err();
+        let (io, child) = CommandTransport::spawn(&spec).unwrap();
+        // (The connector's own conversation with the child would be here.)
+        let failed = ControlClient::connect(io, ClientOptions::new(hello("hub")))
+            .await
+            .unwrap_err();
+        let explained = child.explain_handshake_failure(failed).await;
+        assert_eq!(explained, direct, "{spec:?}");
+    }
+
+    // A peer that answered is passed through as it is, with no look at the child.
+    let (io, child) = CommandTransport::spawn(&demo(&["serve-stdio", "--major", "9"])).unwrap();
+    let failed = ControlClient::connect(io, ClientOptions::new(hello("hub")))
+        .await
+        .unwrap_err();
+    assert!(matches!(failed, ConnectError::Incompatible { .. }));
+    assert_eq!(
+        child.explain_handshake_failure(failed.clone()).await,
+        failed
+    );
 }

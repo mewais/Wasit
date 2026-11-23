@@ -6,6 +6,7 @@
 //! This crate is generic: concrete methods and topics are defined by higher layers through the
 //! [`Service`] trait with JSON payloads.
 
+mod attempt;
 pub mod bridge;
 pub mod client;
 pub mod command;
@@ -22,15 +23,17 @@ pub mod transport;
 pub mod uplink;
 pub mod wire;
 
+pub use attempt::Attempt;
 pub use bridge::{bridge, BridgeError, BridgeOptions};
 pub use client::{ClientOptions, ControlClient, Diagnostics, TransportFacts};
 pub use command::{
-    classify_command_failure, ChildHandle, CommandFailureKind, CommandSpec, CommandTransport,
-    ExitInfo, TransportTrace,
+    classify_command_failure, classify_helper_exit, ChildHandle, CommandFailureKind, CommandSpec,
+    CommandTransport, ExitInfo, TransportKind, TransportTrace, CLOSED_EXIT_WAIT,
 };
 pub use connection::{
     ConnConfig, Connection, Negotiated, RequestOpts, SubscribeOpts, Subscription,
 };
+pub use diag::ConnectDiag;
 pub use error::{CallError, ConnClose, ConnectError};
 pub use hub::{
     CommandConnector, HostSpec, Hub, HubConfig, HubError, LinkConnector, LinkEvent, Provisioner,
@@ -40,9 +43,9 @@ pub use mux::{MuxError, ServiceMux};
 pub use server::ControlServer;
 pub use service::{CallContext, EventStream, NoService, Service};
 pub use supervised::{
-    connector, connector_with_attempt, Backoff, Connector, DurableEnd, DurableOpts,
-    DurableSubscription, LinkState, ProvisionError, ProvisionReason, Supervised, SupervisedConfig,
-    SupervisedOptions, SupervisorHooks,
+    connector, connector_reporting, connector_with_attempt, Backoff, Connector, DurableEnd,
+    DurableOpts, DurableSubscription, LinkState, ProvisionError, ProvisionReason, Supervised,
+    SupervisedConfig, SupervisedOptions, SupervisorHooks,
 };
 #[cfg(windows)]
 pub use transport::NamedPipeListener;

@@ -14,6 +14,7 @@ use tokio::task::AbortHandle;
 
 use wasit_diag::Ident;
 
+use crate::attempt::Attempt;
 use crate::client::{ClientOptions, ControlClient, Diagnostics, TransportFacts};
 use crate::diag;
 use crate::error::ConnectError;
@@ -47,6 +48,12 @@ pub enum CommandFailureKind {
     /// The host answered with something that is not the helper's protocol (a shell banner, an
     /// error page, …).
     UnexpectedOutput,
+    /// The remote program the link runs (the helper, e.g. `marsad-agent bridge`) was started
+    /// and then ended by itself, with a status that is its own and nothing else the classifier
+    /// recognises, before the handshake completed: running the same command again cannot help.
+    /// Only decided where the transport's exit-status contract says the status is the remote
+    /// program's ([`TransportKind::remote_status`]).
+    HelperFailed,
     Other,
 }
 
@@ -66,6 +73,7 @@ impl CommandFailureKind {
             CommandFailureKind::UnsupportedPlatform => "unsupported_platform",
             CommandFailureKind::HelperMissing => "helper_missing",
             CommandFailureKind::UnexpectedOutput => "unexpected_output",
+            CommandFailureKind::HelperFailed => "helper_failed",
             CommandFailureKind::Other => "other",
         }
     }
@@ -91,6 +99,7 @@ impl CommandFailureKind {
                 | CommandFailureKind::UnsupportedPlatform
                 | CommandFailureKind::HelperMissing
                 | CommandFailureKind::UnexpectedOutput
+                | CommandFailureKind::HelperFailed
         )
     }
 
@@ -189,6 +198,72 @@ pub fn classify_command_failure(exit_code: Option<i32>, stderr: &str) -> Command
     CommandFailureKind::Other
 }
 
+/// The program that carries a link, as far as the meaning of its exit status goes. Decided from
+/// the program's file name ([`TransportKind::of_program`]); the one place that says what each
+/// transport's status means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportKind {
+    /// `ssh`: exits with the remote command's own status, or with 255 when ssh itself failed
+    /// (ssh(1), "EXIT STATUS").
+    Ssh,
+    /// `wsl.exe`: forwards the Linux program's status, but also exits with its own statuses
+    /// (1 and HRESULT-derived values) for its own failures, whose messages are localised.
+    /// Nothing here separates the two for sure and this could not be verified (no Windows
+    /// available), so a status of `wsl.exe` is never taken to be the remote program's.
+    Wsl,
+    /// Any other command: its exit-status contract is unknown, so is never taken to be the
+    /// remote program's.
+    Other,
+}
+
+/// ssh's own failure status (see [`TransportKind::Ssh`]).
+const SSH_OWN_FAILURE: i32 = 255;
+
+impl TransportKind {
+    /// The kind of transport `program` (the first element of a command's argv, a bare name or
+    /// a path with `/` or `\` separators, with or without `.exe`) is.
+    pub fn of_program(program: &str) -> TransportKind {
+        let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        let name = name.to_ascii_lowercase();
+        match name.strip_suffix(".exe").unwrap_or(&name) {
+            "ssh" => TransportKind::Ssh,
+            "wsl" => TransportKind::Wsl,
+            _ => TransportKind::Other,
+        }
+    }
+
+    /// Whether exit status `code` of this transport is, by the transport's contract, the status
+    /// of the remote program it ran (and not of the transport itself).
+    pub fn remote_status(self, code: i32) -> bool {
+        match self {
+            TransportKind::Ssh => (1..SSH_OWN_FAILURE).contains(&code),
+            // Not verified, see the variants.
+            TransportKind::Wsl | TransportKind::Other => false,
+        }
+    }
+}
+
+/// Classify the end of the transport command of a link whose handshake did not complete, the
+/// remote program having been handed the connection. As [`classify_command_failure`] (what the
+/// words say), and additionally [`CommandFailureKind::HelperFailed`] when nothing is recognised
+/// but the child ended with a status that is the remote program's own
+/// ([`TransportKind::remote_status`]). A signal, a clean exit, a status that is the
+/// transport's own and any transport whose contract is unknown stay what the words make of
+/// them (usually [`CommandFailureKind::Other`]: retried). Pure.
+pub fn classify_helper_exit(
+    transport: TransportKind,
+    exit: Option<ExitInfo>,
+    stderr: &str,
+) -> CommandFailureKind {
+    let code = exit.and_then(|e| e.code);
+    let kind = classify_command_failure(code, stderr);
+    if kind == CommandFailureKind::Other && code.is_some_and(|c| transport.remote_status(c)) {
+        CommandFailureKind::HelperFailed
+    } else {
+        kind
+    }
+}
+
 /// How to start the transport command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
@@ -205,12 +280,13 @@ pub struct CommandSpec {
 }
 
 /// The link attempt a transport command belongs to (see [`CommandSpec::trace`]): the link's
-/// diagnostics label and the attempt number the supervisor passed to the connector, so the
-/// transport's records join the supervisor's on `(link, n)`.
+/// diagnostics label and the attempt the supervisor passed to the connector, so the
+/// transport's records join the supervisor's on `(link, n)` and, should the supervisor end the
+/// attempt, what the transport had said is known to it ([`Attempt`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportTrace {
     pub link: Ident,
-    pub attempt: u64,
+    pub attempt: Attempt,
 }
 
 fn default_stderr_limit() -> usize {
@@ -231,9 +307,13 @@ impl CommandSpec {
         }
     }
 
-    /// Records this command's spawn and exit as belonging to attempt `attempt` of `link`.
-    pub fn traced(mut self, link: Ident, attempt: u64) -> Self {
-        self.trace = Some(TransportTrace { link, attempt });
+    /// Records this command's spawn and exit as belonging to `attempt` of `link`, and makes
+    /// the command known to the attempt (what it says, if the attempt is cut short).
+    pub fn traced(mut self, link: Ident, attempt: &Attempt) -> Self {
+        self.trace = Some(TransportTrace {
+            link,
+            attempt: attempt.clone(),
+        });
         self
     }
 }
@@ -262,11 +342,34 @@ struct Tail {
     seen: u64,
 }
 
+/// A read-only look at a transport child: its exit and its stderr tail. Does not keep the child
+/// alive.
+#[derive(Clone)]
+pub(crate) struct ChildView {
+    exit: watch::Receiver<Option<ExitInfo>>,
+    stderr: Arc<Mutex<Tail>>,
+}
+
+impl ChildView {
+    pub(crate) fn stderr_tail(&self) -> String {
+        let t = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = t.buf.as_slices();
+        let mut v = Vec::with_capacity(a.len() + b.len());
+        v.extend_from_slice(a);
+        v.extend_from_slice(b);
+        wasit_process::decode_console_output(&v).trim().to_owned()
+    }
+
+    pub(crate) fn exit(&self) -> Option<ExitInfo> {
+        *self.exit.borrow()
+    }
+}
+
 /// Owns the transport child. The child is killed when the last handle is dropped.
 pub struct ChildHandle {
     pid: Option<u32>,
-    exit: watch::Receiver<Option<ExitInfo>>,
-    stderr: Arc<Mutex<Tail>>,
+    transport: TransportKind,
+    view: ChildView,
     waiter: AbortHandle,
 }
 
@@ -282,28 +385,75 @@ impl ChildHandle {
         self.pid
     }
 
+    /// The kind of transport this child is (from its program).
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+
     /// The last bytes the child wrote to stderr (UTF-8, or UTF-16LE as `wsl.exe` writes it).
     pub fn stderr_tail(&self) -> String {
-        let t = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
-        let (a, b) = t.buf.as_slices();
-        let mut v = Vec::with_capacity(a.len() + b.len());
-        v.extend_from_slice(a);
-        v.extend_from_slice(b);
-        wasit_process::decode_console_output(&v).trim().to_owned()
+        self.view.stderr_tail()
     }
 
     pub fn exit(&self) -> Option<ExitInfo> {
-        *self.exit.borrow()
+        self.view.exit()
     }
 
     /// Wait at most `max` for the child to exit (stderr fully captured by then).
     pub async fn wait_exit(&self, max: Duration) -> Option<ExitInfo> {
-        let mut rx = self.exit.clone();
+        let mut rx = self.view.exit.clone();
         let res = match tokio::time::timeout(max, rx.wait_for(Option::is_some)).await {
             Ok(Ok(v)) => *v,
-            _ => *self.exit.borrow(),
+            _ => self.view.exit(),
         };
         res
+    }
+
+    /// Explains a failed handshake (the hello exchange over this child's stdio) from the child:
+    /// the one place that does, used by [`CommandTransport::connect`] and by any connector that
+    /// talks to the child before the hello (the product's bootstrap) and then runs the hello
+    /// itself.
+    ///
+    /// A peer that answered (an incompatible protocol, a goodbye) and an error that is not the
+    /// handshake's are returned as they are. Otherwise the child's exit status and stderr tail
+    /// are what the remote side did: when the stream closed the child is about to be reaped
+    /// and is waited for (bounded), after a timeout or garbage it is alive and is not. A
+    /// child that has neither ended nor written anything leaves the handshake's own error.
+    /// Otherwise the result is [`ConnectError::Command`] with the kind
+    /// [`classify_helper_exit`] decides, the child's exit code and a text for the user: the
+    /// stderr tail, or the handshake's error with the exit when stderr is empty, or, for
+    /// [`CommandFailureKind::HelperFailed`], both.
+    pub async fn explain_handshake_failure(&self, e: ConnectError) -> ConnectError {
+        let closed = match &e {
+            ConnectError::ClosedDuringHandshake | ConnectError::Io(_) => true,
+            ConnectError::HandshakeTimeout | ConnectError::Protocol(_) => false,
+            _ => return e,
+        };
+        let exit = if closed {
+            self.wait_exit(CLOSED_EXIT_WAIT).await
+        } else {
+            self.exit()
+        };
+        let stderr = self.stderr_tail();
+        if exit.is_none() && stderr.is_empty() {
+            return e;
+        }
+        let kind = classify_helper_exit(self.transport, exit, &stderr);
+        let ended = match exit {
+            Some(x) => format!("{e}; {x}"),
+            None => e.to_string(),
+        };
+        let text = match (kind == CommandFailureKind::HelperFailed, stderr.is_empty()) {
+            (true, true) => format!("the remote program ended on its own before the handshake completed ({ended})"),
+            (true, false) => format!("the remote program ended on its own before the handshake completed ({ended}): {stderr}"),
+            (false, true) => exit.map_or_else(|| e.to_string(), |x| format!("{e} ({x})")),
+            (false, false) => stderr,
+        };
+        ConnectError::Command {
+            kind,
+            exit_code: exit.and_then(|x| x.code),
+            stderr: text,
+        }
     }
 }
 
@@ -315,6 +465,10 @@ impl Diagnostics for ChildHandle {
         (exit.is_some() || !stderr.is_empty()).then_some(TransportFacts { exit, stderr })
     }
 }
+
+/// How long to wait for a transport child whose stdout closed: it must be about to exit, and
+/// what it wrote to stderr is complete once it has.
+pub const CLOSED_EXIT_WAIT: Duration = Duration::from_secs(5);
 
 /// Spawns transport commands and connects over their stdio.
 pub struct CommandTransport;
@@ -407,17 +561,25 @@ impl CommandTransport {
             }
             let _ = exit_tx.send(Some(info)); // receivers may all be gone
         });
-        let handle = ChildHandle {
-            pid,
+        let view = ChildView {
             exit: exit_rx,
             stderr: tail,
+        };
+        if let Some(t) = &spec.trace {
+            t.attempt.watch(view.clone());
+        }
+        let handle = ChildHandle {
+            pid,
+            transport: TransportKind::of_program(program),
+            view,
             waiter: waiter.abort_handle(),
         };
         Ok((join_duplex(stdout, stdin), handle))
     }
 
     /// Spawn and run the hello exchange. On a transport-level failure the child's exit status
-    /// and stderr are classified into [`ConnectError::Command`].
+    /// and stderr are classified into [`ConnectError::Command`]
+    /// ([`ChildHandle::explain_handshake_failure`]).
     pub async fn connect(
         spec: &CommandSpec,
         opts: ClientOptions,
@@ -426,22 +588,7 @@ impl CommandTransport {
         let child = Arc::new(child);
         match ControlClient::connect(io, opts).await {
             Ok(c) => Ok(c.with_attachment(child.clone()).with_diagnostics(child)),
-            Err(e @ (ConnectError::Incompatible { .. } | ConnectError::Refused(_))) => Err(e),
-            Err(e) => match child.wait_exit(Duration::from_secs(2)).await {
-                Some(exit) => {
-                    let stderr = child.stderr_tail();
-                    Err(ConnectError::Command {
-                        kind: classify_command_failure(exit.code, &stderr),
-                        exit_code: exit.code,
-                        stderr: if stderr.is_empty() {
-                            format!("{e} ({exit})")
-                        } else {
-                            stderr
-                        },
-                    })
-                }
-                None => Err(e),
-            },
+            Err(e) => Err(child.explain_handshake_failure(e).await),
         }
     }
 }
@@ -505,6 +652,7 @@ mod tests {
             K::UnsupportedPlatform,
             K::HelperMissing,
             K::UnexpectedOutput,
+            K::HelperFailed,
         ] {
             assert!(
                 k.is_configuration() && !k.is_transient() && !k.needs_human(),
@@ -512,6 +660,125 @@ mod tests {
             );
         }
         assert!(K::Unreachable.is_transient() && !K::Unreachable.is_configuration());
+    }
+
+    fn exit(code: i32) -> Option<ExitInfo> {
+        Some(ExitInfo {
+            code: Some(code),
+            signal: None,
+        })
+    }
+
+    fn killed(signal: i32) -> Option<ExitInfo> {
+        Some(ExitInfo {
+            code: None,
+            signal: Some(signal),
+        })
+    }
+
+    #[test]
+    fn the_transport_is_known_from_its_program() {
+        for (program, want) in [
+            ("ssh", TransportKind::Ssh),
+            ("/usr/bin/ssh", TransportKind::Ssh),
+            (
+                "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+                TransportKind::Ssh,
+            ),
+            ("SSH.EXE", TransportKind::Ssh),
+            ("wsl", TransportKind::Wsl),
+            ("C:\\Windows\\System32\\wsl.exe", TransportKind::Wsl),
+            ("sshpass", TransportKind::Other),
+            ("my-ssh", TransportKind::Other),
+            ("wasit-control-demo", TransportKind::Other),
+            ("", TransportKind::Other),
+        ] {
+            assert_eq!(TransportKind::of_program(program), want, "{program}");
+        }
+    }
+
+    /// The one table of what an ended transport means when the remote program was handed the
+    /// connection and the handshake did not complete.
+    #[test]
+    fn classifies_the_end_of_a_helper_per_transport() {
+        use TransportKind::{Other as Any, Ssh, Wsl};
+        let cases: &[(TransportKind, Option<ExitInfo>, &str, K)] = &[
+            // ssh: a status of 1..=254 is the remote program's own, so retrying cannot help.
+            (Ssh, exit(1), "", K::HelperFailed),
+            (Ssh, exit(2), "bad argument", K::HelperFailed),
+            (Ssh, exit(101), "thread 'main' panicked", K::HelperFailed),
+            (Ssh, exit(254), "", K::HelperFailed),
+            // ssh's own status, a signal, a clean exit and a child still running: transient.
+            (
+                Ssh,
+                exit(255),
+                "client_loop: send disconnect: Broken pipe",
+                K::Other,
+            ),
+            (Ssh, exit(255), "", K::Other),
+            (Ssh, killed(9), "", K::Other),
+            (Ssh, exit(0), "", K::Other),
+            (Ssh, None, "", K::Other),
+            // What the words recognise keeps its kind, whatever the status.
+            (Ssh, exit(126), "Permission denied", K::PermissionDenied),
+            (Ssh, exit(126), "", K::PermissionDenied),
+            (Ssh, exit(127), "", K::CommandNotFound),
+            (
+                Ssh,
+                exit(1),
+                "sh: 1: marsad-agent: not found",
+                K::CommandNotFound,
+            ),
+            (Ssh, exit(255), "Connection reset by peer", K::Unreachable),
+            (
+                Ssh,
+                exit(255),
+                "Permission denied (publickey).",
+                K::AuthNeeded,
+            ),
+            (
+                Ssh,
+                exit(255),
+                "Host key verification failed.",
+                K::HostKeyUnknown,
+            ),
+            (
+                Ssh,
+                exit(1),
+                "no ed25519 host key is known for h",
+                K::HostKeyUnknown,
+            ),
+            // wsl.exe: its own failures and the program's statuses cannot be told apart (not
+            // verified), so nothing is claimed; the words still classify.
+            (Wsl, exit(1), "bad argument", K::Other),
+            (Wsl, exit(2), "", K::Other),
+            (
+                Wsl,
+                exit(1),
+                "There is no distribution with the supplied name.",
+                K::UnknownDistro,
+            ),
+            (Wsl, exit(126), "", K::PermissionDenied),
+            // Any other command: unknown contract, same.
+            (Any, exit(2), "bad argument", K::Other),
+            (Any, exit(1), "", K::Other),
+            (Any, exit(127), "", K::CommandNotFound),
+        ];
+        for (transport, exit, stderr, want) in cases {
+            assert_eq!(
+                classify_helper_exit(*transport, *exit, stderr),
+                *want,
+                "{transport:?} {exit:?} {stderr:?}"
+            );
+        }
+        // The new kind is a configuration problem: parked, not retried.
+        assert!(K::HelperFailed.is_configuration() && !K::HelperFailed.is_transient());
+        assert!(!K::HelperFailed.needs_human());
+        assert_eq!(K::HelperFailed.code(), "helper_failed");
+        assert_eq!(
+            serde_json::to_string(&K::HelperFailed).unwrap(),
+            "\"helper_failed\""
+        );
     }
 
     #[test]

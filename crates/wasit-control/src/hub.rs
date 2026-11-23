@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use wasit_diag::Ident;
 
+use crate::attempt::Attempt;
 use crate::client::{ClientOptions, ControlClient};
 use crate::command::{CommandSpec, CommandTransport};
 use crate::connection::{ConnConfig, RequestOpts, SubscribeOpts};
@@ -18,8 +19,8 @@ use crate::diag;
 use crate::error::{CallError, ConnectError};
 use crate::service::{CallContext, EventStream, Service};
 use crate::supervised::{
-    connector_with_attempt, LinkState, ProvisionError, ProvisionReason, Supervised,
-    SupervisedConfig, SupervisedOptions, SupervisorHooks,
+    connector_reporting, LinkState, ProvisionError, ProvisionReason, Supervised, SupervisedConfig,
+    SupervisedOptions, SupervisorHooks,
 };
 use crate::wire::{codes, Cursor, Hello, HostId, RpcError};
 
@@ -70,14 +71,16 @@ pub trait Provisioner: Send + Sync + 'static {
 /// Opens one connection to a host. The default is [`CommandConnector`].
 #[async_trait]
 pub trait LinkConnector: Send + Sync + 'static {
-    /// `attempt` is the link's attempt number (1 for the first, +1 per attempt, never reset):
-    /// what the connector records about this attempt carries it, so it joins the
-    /// supervisor's records of the same attempt.
+    /// `attempt` is the link's attempt ([`Attempt::n`]: 1 for the first, +1 per attempt, never
+    /// reset): what the connector records about this attempt carries its number, so it joins
+    /// the supervisor's records of the same attempt. A connector that starts a transport
+    /// command traces it ([`CommandSpec::traced`]) and says which step it has reached
+    /// ([`Attempt::reached`]); the supervisor reports both if it has to end the attempt.
     async fn connect(
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
-        attempt: u64,
+        attempt: Attempt,
     ) -> Result<ControlClient, ConnectError>;
 }
 
@@ -91,9 +94,10 @@ impl LinkConnector for CommandConnector {
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
-        attempt: u64,
+        attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
-        let mut cmd = CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), attempt);
+        let mut cmd =
+            CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), &attempt);
         cmd.env = spec.env.clone();
         CommandTransport::connect(&cmd, opts).await
     }
@@ -293,7 +297,7 @@ impl Hub {
             config: self.inner.cfg.conn.clone(),
         };
         let spec2 = spec.clone();
-        let conn = connector_with_attempt(move |attempt| {
+        let conn = connector_reporting(move |attempt| {
             let c = link_connector.clone();
             let spec = spec2.clone();
             let opts = opts.clone();

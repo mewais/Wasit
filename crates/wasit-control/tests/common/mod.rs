@@ -130,3 +130,12 @@ pub fn scratch_dir(name: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&base).unwrap();
     base
 }
+
+/// The demo binary under the file name of a transport program (`ssh`, `wsl.exe`), in a fresh
+/// directory: what a transport's exit status means is decided from its program's file name.
+#[cfg(unix)]
+pub fn demo_named(name: &str) -> String {
+    let path = scratch_dir("named").join(name);
+    std::os::unix::fs::symlink(demo_bin(), &path).unwrap();
+    path.display().to_string()
+}

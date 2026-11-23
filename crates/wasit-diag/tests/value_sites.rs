@@ -22,11 +22,13 @@ const PATTERNS: &[&str] = &[
 /// Files allowed to contain them. Later steps add here, e.g. the `DiagText::new` sites of
 /// design §4.3.
 ///
-/// `wasit-control/src/diag.rs` makes `DiagText::new(Origin::Transport, …)` in two places, both
+/// `wasit-control/src/diag.rs` makes `DiagText::new(Origin::Transport, …)` in three places, all
 /// text of a link and never of a session: the text that goes with a link state (a transport
 /// command's stderr tail, a parked link's reason, why provisioning was needed, a last error
 /// whose peer-written parts were replaced by their codes first, see `connect_why` and
-/// `close_why`) and the stderr tail of a closed link's transport child.
+/// `close_why`), the stderr tail of a closed link's transport child, and the text of a failed
+/// transport command in `ConnectDiag::of` (the reason the user is shown, for a connector that
+/// records its own failure).
 ///
 /// * `wasit-control/src/diag.rs` also registers `TraceId` (`diag_value!`: it renders as an
 ///   `Ident`, so it can be a field of a record and of a trail entry).

@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 use wasit_control::demo::DemoService;
 use wasit_control::{
-    codes, connector, CallError, ClientOptions, CommandFailureKind, ConnectError, ControlClient,
-    ControlServer, DurableOpts, Hello, HostId, HostSpec, Hub, HubConfig, HubError, LinkConnector,
-    LinkEvent, LinkState, ProvisionError, ProvisionReason, Provisioner, RequestOpts,
+    codes, connector, Attempt, CallError, ClientOptions, CommandFailureKind, ConnectError,
+    ControlClient, ControlServer, DurableOpts, Hello, HostId, HostSpec, Hub, HubConfig, HubError,
+    LinkConnector, LinkEvent, LinkState, ProvisionError, ProvisionReason, Provisioner, RequestOpts,
     RoutingService, Service, SubscribeOpts, Supervised, SupervisedConfig, SupervisedOptions,
     TraceId,
 };
@@ -47,7 +47,7 @@ impl LinkConnector for MemConnector {
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
-        _attempt: u64,
+        _attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
         self.attempts.send_modify(|n| *n += 1);
         let scripted = self

@@ -12,8 +12,8 @@ use common::*;
 use serde_json::Value;
 use wasit_control::demo::DemoService;
 use wasit_control::{
-    CallError, ClientOptions, ConnectError, ControlClient, ControlServer, Hello, HostId, HostSpec,
-    Hub, HubConfig, LinkConnector, LinkState, RoutingService, Service, Uplink,
+    Attempt, CallError, ClientOptions, ConnectError, ControlClient, ControlServer, Hello, HostId,
+    HostSpec, Hub, HubConfig, LinkConnector, LinkState, RoutingService, Service, Uplink,
 };
 
 const D: Duration = Duration::from_secs(10);
@@ -29,7 +29,7 @@ impl LinkConnector for MemConnector {
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
-        _attempt: u64,
+        _attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
         let server = self.targets.lock().unwrap().get(&spec.id).cloned();
         match server {

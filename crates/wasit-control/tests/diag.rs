@@ -19,12 +19,12 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use wasit_control::demo::DemoService;
 use wasit_control::{
-    codes, connector_with_attempt, Backoff, CallError, ClientOptions, CloseReason,
-    CommandFailureKind, ConnConfig, ConnectError, ControlClient, ControlServer, Cursor,
-    EventStream, Hello, HostId, HostSpec, Hub, HubConfig, LinkConnector, LinkState,
-    ProtocolVersion, ProvisionError, ProvisionReason, RequestOpts, RoutingService, RpcError,
-    Service, SubscribeOpts, Supervised, SupervisedConfig, SupervisedOptions, SupervisorHooks,
-    TraceId,
+    codes, connector_reporting, connector_with_attempt, Attempt, Backoff, CallError, ClientOptions,
+    CloseReason, CommandFailureKind, CommandSpec, CommandTransport, ConnConfig, ConnectError,
+    ControlClient, ControlServer, Cursor, EventStream, Hello, HostId, HostSpec, Hub, HubConfig,
+    LinkConnector, LinkState, ProtocolVersion, ProvisionError, ProvisionReason, RequestOpts,
+    RoutingService, RpcError, Service, SubscribeOpts, Supervised, SupervisedConfig,
+    SupervisedOptions, SupervisorHooks, TraceId,
 };
 use wasit_diag::{Code, Ident, SinkConfig};
 
@@ -47,12 +47,21 @@ fn dir() -> &'static PathBuf {
 }
 
 /// Every record written so far (what was emitted before this call is in it).
+///
+/// The file is shared by every test of this binary, and the writer may be in the middle of a
+/// record that another test emitted after the flush: a last line without its newline is not a
+/// record yet and is not read.
 fn all() -> Vec<Value> {
     let dir = dir();
     assert!(wasit_diag::flush(BOUND), "the sink did not flush");
     // The writer creates the file with the first record.
-    std::fs::read_to_string(dir.join(FILE))
-        .unwrap_or_default()
+    let bytes = std::fs::read(dir.join(FILE)).unwrap_or_default();
+    let complete = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(&[][..], |end| &bytes[..end]);
+    std::str::from_utf8(complete)
+        .expect("complete lines are UTF-8")
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
         .filter(|v| v.get("diag_file").is_none())
@@ -361,6 +370,13 @@ async fn every_classified_failure_is_recorded_with_its_outcome_state_and_code() 
             "permission_denied",
         ),
         case(
+            "helper_failed",
+            command(CommandFailureKind::HelperFailed, "the helper refused"),
+            "park",
+            "failed",
+            "helper_failed",
+        ),
+        case(
             "unreachable",
             command(
                 CommandFailureKind::Unreachable,
@@ -488,6 +504,71 @@ async fn a_connect_that_does_not_finish_is_recorded_as_a_timeout() {
     assert_eq!(end["error"]["code"], "timeout");
     assert_eq!(end["error"]["text"], "connect timed out");
     assert!(end["ms"].as_u64().unwrap() >= 30);
+    // A connector that reported nothing leaves nothing to add.
+    assert!(
+        matches!(&s, LinkState::Reconnecting { last_error, .. } if last_error == "connect timed out"),
+        "{s:?}"
+    );
+}
+
+/// The supervisor drops the connector's future when its bound runs out, so the connector says as
+/// it goes where it is (`Attempt::reached`) and starts its transport traced to the attempt: the
+/// link state then says where the attempt was and what the transport had said, not only that it
+/// timed out.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_connect_that_times_out_says_where_it_was_and_what_the_transport_said() {
+    dir();
+    let config = SupervisedConfig {
+        connect_timeout: Duration::from_secs(1),
+        ..slow()
+    };
+    let label = "hosts:t-timeout-evidence";
+    let (opts, mut states) = States::options(label, config, None);
+    let link = opts.diag.clone().unwrap();
+    let sup = Supervised::spawn(
+        connector_reporting(move |attempt| {
+            let link = link.clone();
+            async move {
+                // A transport that says something and then waits for input for ever.
+                let spec = CommandSpec::new([
+                    "sh",
+                    "-c",
+                    &format!("echo 'kex: {SECRET} stuck at the banner' >&2; exec cat"),
+                ])
+                .traced(link, &attempt);
+                let (_io, _child) = CommandTransport::spawn(&spec)?;
+                attempt.reached("waiting for the host's report");
+                std::future::pending::<Result<ControlClient, ConnectError>>().await
+            }
+        }),
+        opts,
+    );
+    let s = states.settled().await;
+    sup.stop().await;
+    let LinkState::Reconnecting { last_error, .. } = &s else {
+        panic!("{s:?}");
+    };
+    assert!(
+        last_error.starts_with("connect timed out while waiting for the host's report"),
+        "{last_error}"
+    );
+    assert!(last_error.contains("stuck at the banner"), "{last_error}");
+    let r = of_link(label);
+    let end = one(&r, "link.attempt_end");
+    assert_eq!(
+        (end["outcome"].as_str(), end["error"]["code"].as_str()),
+        (Some("backoff"), Some("timeout"))
+    );
+    // The same words go with the state in the records, with the registered secret masked.
+    let st = find(&r, "link.state")[0];
+    let t = st["error"].as_str().unwrap();
+    assert!(
+        t.contains("while waiting for the host's report") && t.contains("stuck at the banner"),
+        "{t}"
+    );
+    assert!(t.contains("••••") && !t.contains(SECRET), "{t}");
+    no_secret(&r);
 }
 
 #[tokio::test]
@@ -877,6 +958,108 @@ async fn a_transport_that_exits_with_stderr_is_recorded_with_its_exit_and_scrubb
     );
 }
 
+/// A connector like the product's bootstrap: it starts the transport itself, would talk to the
+/// child before the hello, runs the hello itself and explains a failed hello with the child.
+struct OwnConnector;
+
+#[async_trait]
+impl LinkConnector for OwnConnector {
+    async fn connect(
+        &self,
+        spec: &HostSpec,
+        opts: ClientOptions,
+        attempt: Attempt,
+    ) -> Result<ControlClient, ConnectError> {
+        let cmd = CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), &attempt);
+        let (io, child) = CommandTransport::spawn(&cmd)?;
+        attempt.reached("saying hello");
+        match ControlClient::connect(io, opts).await {
+            Ok(c) => Ok(c),
+            Err(e) => Err(child.explain_handshake_failure(e).await),
+        }
+    }
+}
+
+/// The remote program ended by itself with a status that is its own: the link is parked, with
+/// the program's words, and recorded as such, whether the transport is run by the hub's own
+/// connector or by a custom one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_helper_that_ends_by_itself_parks_the_link_with_its_exit_and_scrubbed_words() {
+    dir();
+    let own: Arc<dyn LinkConnector> = Arc::new(OwnConnector);
+    let stock: Arc<dyn LinkConnector> = Arc::new(wasit_control::CommandConnector);
+    let mut states = Vec::new();
+    for (which, connector) in [("stock", stock), ("own", own)] {
+        let host = format!("diag-helper-{which}");
+        let mut c = HubConfig::new(Hello::new("b1", "diag-hub-h", "hub"));
+        c.supervise = slow();
+        let h = Hub::new(c, connector, None);
+        h.add_link(HostSpec::new(
+            host.as_str(),
+            [
+                demo_named("ssh"),
+                "fail".into(),
+                format!("runtime dir: {SECRET} is not writable"),
+                "--code".into(),
+                "2".into(),
+            ],
+        ))
+        .unwrap();
+        let state = link_state(&h, &host, |s| matches!(s, LinkState::Failed { .. })).await;
+        h.shutdown().await;
+        let LinkState::Failed { reason, problem } = &state else {
+            panic!("{state:?}");
+        };
+        assert_eq!(*problem, Some(CommandFailureKind::HelperFailed), "{which}");
+        assert!(reason.contains("is not writable"), "{reason}");
+        assert!(reason.contains("exit code 2"), "{reason}");
+
+        let r = of_link(&format!("hosts:{host}"));
+        // One attempt, not a loop.
+        assert_eq!(find(&r, "link.attempt_begin").len(), 1, "{r:#?}");
+        let end = one(&r, "link.attempt_end");
+        assert_eq!(
+            (end["outcome"].as_str(), end["error"]["code"].as_str()),
+            (Some("park"), Some("helper_failed")),
+            "{which}"
+        );
+        assert_eq!(one(&r, "transport.exited")["code"], 2);
+        let st = find(&r, "link.state");
+        assert_eq!(st[0]["to"], "failed");
+        let t = st[0]["error"].as_str().unwrap();
+        assert!(t.starts_with("helper_failed: "), "{t}");
+        assert!(
+            t.contains("is not writable") && t.contains("exit code 2"),
+            "{t}"
+        );
+        assert!(t.contains("••••") && !t.contains(SECRET), "{t}");
+        no_secret(&r);
+        states.push(state);
+    }
+    // The same state from the same failure, however the transport was started.
+    assert_eq!(states[0], states[1]);
+
+    // ssh's own failure is not the helper's: retried, as before.
+    let host = "diag-helper-255";
+    let h = hub("diag-hub-h2");
+    h.add_link(HostSpec::new(
+        host,
+        [
+            demo_named("ssh"),
+            "fail".into(),
+            "client_loop: send disconnect: Broken pipe".into(),
+            "--code".into(),
+            "255".into(),
+        ],
+    ))
+    .unwrap();
+    link_state(&h, host, |s| matches!(s, LinkState::Reconnecting { .. })).await;
+    h.shutdown().await;
+    let r = of_link(&format!("hosts:{host}"));
+    assert_eq!(one(&r, "link.attempt_end")["outcome"], "backoff");
+}
+
 #[tokio::test]
 async fn an_established_transport_that_dies_records_its_exit_and_scrubbed_stderr_tail() {
     dir();
@@ -932,9 +1115,12 @@ impl LinkConnector for Numbered {
         &self,
         spec: &HostSpec,
         _opts: ClientOptions,
-        attempt: u64,
+        attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
-        self.0.lock().unwrap().push((spec.id.to_string(), attempt));
+        self.0
+            .lock()
+            .unwrap()
+            .push((spec.id.to_string(), attempt.n()));
         Err(ConnectError::Io("refused".into()))
     }
 }
@@ -1158,7 +1344,7 @@ impl LinkConnector for Mem {
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
-        _attempt: u64,
+        _attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
         let server = self
             .0

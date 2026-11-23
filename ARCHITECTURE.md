@@ -266,6 +266,19 @@ One protocol for GUI↔daemon, daemon↔daemon and (later) phone↔daemon.
 - Windows hosts are reached with the same mechanism via OpenSSH for Windows; WSL distros are
   hosts reached via `wsl.exe -d <distro> -- marsad-agent bridge`. The transport is "a command
   whose stdio is the link" — ssh, wsl and (later) anything else are just different commands.
+- `wasit-control` owns everything about such a link that is not product-specific: starting the
+  command, why a connect failed (`classify_command_failure` for what the words say,
+  `classify_helper_exit` for what the end of the command means per transport: for `ssh` a status
+  of 1..=254 is the remote program's own, so a helper that ended by itself with nothing
+  recognisable is `HelperFailed` and parks the link; `wsl.exe` and any other command have no
+  verified status contract and stay retryable), the state machine and its records. A product
+  connector that talks to the child before the hello (a bootstrap) still starts the child with
+  `CommandTransport::spawn`, runs `ControlClient::connect` itself, explains a failed hello with
+  `ChildHandle::explain_handshake_failure` (the same code `CommandTransport::connect` uses),
+  records its failure with `ConnectDiag::of`, and tells the supervisor where it is
+  (`Attempt::reached`, and `CommandSpec::traced(link, &attempt)` for the transport): when the
+  connect bound runs out and the connector's future is dropped, the link state carries that
+  step and the transport's stderr tail so far.
 
 ### 4.2 On-disk layout (per machine)
 

@@ -308,7 +308,7 @@ pub(crate) fn transport_spawned(
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     emit(ControlEvent::TransportSpawned {
         link: trace.link.clone(),
-        n: trace.attempt,
+        n: trace.attempt.n(),
         program: Code::new(&name),
         argc: count(argc),
         pid,
@@ -318,7 +318,7 @@ pub(crate) fn transport_spawned(
 pub(crate) fn transport_exited(trace: &TransportTrace, exit: &ExitInfo, stderr_bytes: u64) {
     emit(ControlEvent::TransportExited {
         link: trace.link.clone(),
-        n: trace.attempt,
+        n: trace.attempt.n(),
         code: exit.code,
         signal: exit.signal,
         stderr_bytes: Bytes(stderr_bytes),
@@ -345,6 +345,41 @@ pub(crate) fn connect_error(e: &ConnectError) -> ErrorInfo {
         ConnectError::Protocol(m) => ErrorInfo::foreign(Code::st("protocol"), m),
         ConnectError::Command { kind, stderr, .. } => {
             ErrorInfo::foreign(Code::st(kind.code()), stderr)
+        }
+    }
+}
+
+/// A failed connect attempt as the pieces of a record, for a connector that records its own
+/// failure (the product's bootstrap): the one mapping from a [`ConnectError`] to its diagnostics
+/// representation. A failure of the transport command keeps the classifier's word (`kind`), the
+/// child's exit status and the text the user is shown (`stderr`, scrubbed and bounded); any
+/// other failure its code, and its text where the text is ours (`error`, see [`connect_error`]).
+pub struct ConnectDiag {
+    pub kind: Option<Code>,
+    pub exit: Option<i32>,
+    pub stderr: Option<DiagText>,
+    pub error: Option<ErrorInfo>,
+}
+
+impl ConnectDiag {
+    pub fn of(e: &ConnectError) -> ConnectDiag {
+        match e {
+            ConnectError::Command {
+                kind,
+                exit_code,
+                stderr,
+            } => ConnectDiag {
+                kind: Some(Code::st(kind.code())),
+                exit: *exit_code,
+                stderr: Some(DiagText::new(Origin::Transport, stderr)),
+                error: None,
+            },
+            other => ConnectDiag {
+                kind: None,
+                exit: None,
+                stderr: None,
+                error: Some(connect_error(other)),
+            },
         }
     }
 }
@@ -851,6 +886,7 @@ mod tests {
             K::UnsupportedPlatform,
             K::HelperMissing,
             K::UnexpectedOutput,
+            K::HelperFailed,
             K::Other,
         ] {
             assert_eq!(serde_json::to_value(k).unwrap(), k.code());
@@ -897,6 +933,49 @@ mod tests {
                 ms: Ms(1),
             });
             assert!(!v.to_string().contains("SECRET"), "{v}");
+        }
+    }
+
+    /// The one mapping from a connect error to the pieces of a record: a failure of the
+    /// transport command as kind, exit and (scrubbed) text, every other failure as its error.
+    #[test]
+    fn a_connect_error_maps_to_its_record_pieces_in_one_place() {
+        let command = ConnectError::Command {
+            kind: crate::CommandFailureKind::HelperFailed,
+            exit_code: Some(2),
+            stderr: "helper said no".into(),
+        };
+        let d = ConnectDiag::of(&command);
+        assert_eq!(d.kind, Some(Code::st("helper_failed")));
+        assert_eq!(d.exit, Some(2));
+        assert_eq!(d.stderr.as_ref().unwrap().as_str(), "helper said no");
+        assert!(d.error.is_none());
+        for e in [
+            ConnectError::Incompatible {
+                ours: ProtocolVersion { major: 1, minor: 0 },
+                theirs: ProtocolVersion { major: 2, minor: 0 },
+            },
+            ConnectError::Refused(RpcError::new("shutting_down", "SECRET-PEER-TEXT")),
+            ConnectError::HandshakeTimeout,
+            ConnectError::ClosedDuringHandshake,
+            ConnectError::Protocol("SECRET-FRAME-TEXT".into()),
+            ConnectError::Io("broken pipe".into()),
+            ConnectError::Spawn("ssh: no such file".into()),
+            ConnectError::Timeout,
+        ] {
+            let d = ConnectDiag::of(&e);
+            assert!(d.kind.is_none() && d.exit.is_none() && d.stderr.is_none());
+            let record = |error: Option<ErrorInfo>| {
+                line_of(&ControlEvent::AttemptEnd {
+                    link: link(),
+                    n: 1,
+                    outcome: AttemptOutcome::Backoff,
+                    error,
+                    ms: Ms(1),
+                })["error"]
+                    .clone()
+            };
+            assert_eq!(record(d.error), record(Some(connect_error(&e))), "{e:?}");
         }
     }
 }
