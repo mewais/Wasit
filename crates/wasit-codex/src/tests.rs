@@ -524,6 +524,38 @@ fn sessions_parser() {
 }
 
 #[test]
+fn windows_paths_list_the_same_sessions() {
+    let head: Vec<String> = vec![
+        r#"{"type":"session_meta","payload":{"id":"01a1ebcf-0528-7cd2-a32d-e89e91b6a844","cwd":"C:\\Users\\me\\p"}}"#.into(),
+        r#"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"hello"}]}}"#.into(),
+    ];
+    let name = "rollout-2026-11-17T23-19-35-01a1ebcf-0528-7cd2-a32d-e89e91b6a844.jsonl";
+    let sessions = |path: String| {
+        let out = ProbeOutput::Files {
+            files: vec![wasit_core::FileHead {
+                path,
+                modified_ms: 9,
+                head: head.clone(),
+                matching_lines: Some(3),
+            }],
+        };
+        match parse_sessions(&out).unwrap() {
+            Discovered::Sessions(s) => s,
+            d => panic!("{d:?}"),
+        }
+    };
+    let posix = sessions(format!("/h/.codex/sessions/2026/11/17/{name}"));
+    let windows = sessions(format!(r"C:\Users\me\.codex\sessions\2026\11\17\{name}"));
+    assert_eq!(posix.len(), 1);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].id, "01a1ebcf-0528-7cd2-a32d-e89e91b6a844");
+    assert_eq!(windows[0].id, posix[0].id);
+    assert_eq!(windows[0].project, posix[0].project);
+    assert_eq!(windows[0].title, "hello");
+    assert_eq!(windows[0].message_count, Some(3));
+}
+
+#[test]
 fn determinism_same_inputs_same_outputs() {
     let run = || {
         let mut p = CodexProtocol::new();

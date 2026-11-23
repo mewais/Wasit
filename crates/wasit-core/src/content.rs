@@ -393,12 +393,10 @@ pub fn file_uri_path(uri: &str) -> Option<String> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(h) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
-                out.push(h);
-                i += 3;
-                continue;
-            }
+        if let Some(h) = percent_escape(&bytes[i..]) {
+            out.push(h);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -410,6 +408,25 @@ pub fn file_uri_path(uri: &str) -> Option<String> {
         return Some(p[1..].to_string());
     }
     Some(p)
+}
+
+/// The byte a `%XX` escape at the start of `b` decodes to. Exactly two ASCII hex digits must
+/// follow the `%`; anything else (too few bytes, non-hex, `+`, non-ASCII) is not an escape.
+/// Works on bytes, so it never slices a `str` inside a multi-byte character.
+fn percent_escape(b: &[u8]) -> Option<u8> {
+    let [b'%', hi, lo, ..] = b else {
+        return None;
+    };
+    Some((hex_digit(*hi)? << 4) | hex_digit(*lo)?)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// A `file://` URI for an absolute path.
@@ -505,6 +522,53 @@ mod tests {
             file_uri_path(&path_file_uri("/a b/c#1")).as_deref(),
             Some("/a b/c#1")
         );
+    }
+
+    #[test]
+    fn malformed_escapes_never_panic_and_stay_literal() {
+        // A `%` not followed by two ASCII hex digits is kept as a literal byte.
+        for (uri, want) in [
+            ("file:///a%é", "/a%é"),
+            ("file:///%aé", "/%aé"),
+            ("file:///%é1", "/%é1"),
+            ("file:///x%", "/x%"),
+            ("file:///x%2", "/x%2"),
+            ("file:///%+5", "/%+5"),
+            ("file:///%-1", "/%-1"),
+        ] {
+            assert_eq!(file_uri_path(uri).as_deref(), Some(want), "{uri}");
+        }
+    }
+
+    #[test]
+    fn percent_escapes_decode_exactly_two_hex_digits() {
+        assert_eq!(file_uri_path("file:///a%20b").as_deref(), Some("/a b"));
+        // The last escape of the URI decodes too.
+        assert_eq!(file_uri_path("file:///a%20").as_deref(), Some("/a "));
+        assert_eq!(
+            file_uri_path("file:///a%2fb%2Fc").as_deref(),
+            Some("/a/b/c")
+        );
+        assert_eq!(
+            file_uri_path("file:///a%2Fb%2fc").as_deref(),
+            Some("/a/b/c")
+        );
+        assert_eq!(file_uri_path("file:///caf%C3%A9").as_deref(), Some("/café"));
+    }
+
+    #[test]
+    fn base_name_takes_the_last_component_of_either_separator() {
+        assert_eq!(base_name("/a/b/c.jsonl"), "c.jsonl");
+        assert_eq!(
+            base_name(r"C:\Users\me\.claude\projects\x\abc.jsonl"),
+            "abc.jsonl"
+        );
+        assert_eq!(base_name(r"/mixed/dir\file.jsonl"), "file.jsonl");
+        assert_eq!(base_name(r"C:\mixed/dir\file.jsonl"), "file.jsonl");
+        assert_eq!(base_name("/a/b/dir/"), "dir");
+        assert_eq!(base_name(r"C:\a\dir\"), "dir");
+        assert_eq!(base_name("bare.jsonl"), "bare.jsonl");
+        assert_eq!(base_name(""), "");
     }
 
     #[test]

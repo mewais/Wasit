@@ -739,6 +739,39 @@ fn discovery_parsers() {
 }
 
 #[test]
+fn windows_paths_list_the_same_sessions() {
+    let uuid = "0b7c2b3e-1111-4222-8333-944445555666";
+    let line = r#"{"type":"user","cwd":"C:\\Users\\me\\p","message":{"role":"user","content":[{"type":"text","text":"fix it"}]}}"#;
+    let sessions = |path: String| {
+        let out = ProbeOutput::Files {
+            files: vec![wasit_core::FileHead {
+                path,
+                modified_ms: 5,
+                head: vec![line.into()],
+                matching_lines: Some(7),
+            }],
+        };
+        match parse_sessions(&out).unwrap() {
+            Discovered::Sessions(s) => s,
+            d => panic!("{d:?}"),
+        }
+    };
+    let posix = sessions(format!("/h/.claude/projects/-p/{uuid}.jsonl"));
+    let windows = sessions(format!(
+        r"C:\Users\me\.claude\projects\C--Users-me-p\{uuid}.jsonl"
+    ));
+    assert_eq!(posix.len(), 1);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].id, uuid);
+    assert_eq!(windows[0].id, posix[0].id);
+    assert_eq!(windows[0].project, posix[0].project);
+    assert_eq!(windows[0].title, "fix it");
+    assert_eq!(windows[0].message_count, Some(7));
+    // A subagent transcript is skipped in the Windows form too.
+    assert!(sessions(r"C:\Users\me\.claude\projects\C--p\agent-x.jsonl".into()).is_empty());
+}
+
+#[test]
 fn determinism_same_inputs_same_outputs() {
     let run = || {
         let mut p = ClaudeProtocol::new();
