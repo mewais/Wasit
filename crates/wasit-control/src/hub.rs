@@ -3,21 +3,23 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
+use wasit_diag::Ident;
 
 use crate::client::{ClientOptions, ControlClient};
 use crate::command::{CommandSpec, CommandTransport};
 use crate::connection::{ConnConfig, RequestOpts, SubscribeOpts};
-use crate::error::ConnectError;
+use crate::diag;
+use crate::error::{CallError, ConnectError};
 use crate::service::{CallContext, EventStream, Service};
 use crate::supervised::{
-    connector, LinkState, ProvisionError, ProvisionReason, Supervised, SupervisedConfig,
-    SupervisedOptions, SupervisorHooks,
+    connector_with_attempt, LinkState, ProvisionError, ProvisionReason, Supervised,
+    SupervisedConfig, SupervisedOptions, SupervisorHooks,
 };
 use crate::wire::{codes, Cursor, Hello, HostId, RpcError};
 
@@ -50,6 +52,14 @@ impl HostSpec {
     }
 }
 
+impl HostSpec {
+    /// The label of this host's link in diagnostics (`hosts:<id>`); transports started for it
+    /// are traced under it ([`CommandSpec::traced`]).
+    pub fn diag_link(&self) -> Ident {
+        diag::host_link(&self.id)
+    }
+}
+
 /// Installs/updates the helper on a host. Implemented by the product (copy over ssh etc.).
 #[async_trait]
 pub trait Provisioner: Send + Sync + 'static {
@@ -60,10 +70,14 @@ pub trait Provisioner: Send + Sync + 'static {
 /// Opens one connection to a host. The default is [`CommandConnector`].
 #[async_trait]
 pub trait LinkConnector: Send + Sync + 'static {
+    /// `attempt` is the link's attempt number (1 for the first, +1 per attempt, never reset):
+    /// what the connector records about this attempt carries it, so it joins the
+    /// supervisor's records of the same attempt.
     async fn connect(
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
+        attempt: u64,
     ) -> Result<ControlClient, ConnectError>;
 }
 
@@ -77,8 +91,9 @@ impl LinkConnector for CommandConnector {
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
+        attempt: u64,
     ) -> Result<ControlClient, ConnectError> {
-        let mut cmd = CommandSpec::new(spec.connect_argv.clone());
+        let mut cmd = CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), attempt);
         cmd.env = spec.env.clone();
         CommandTransport::connect(&cmd, opts).await
     }
@@ -278,11 +293,11 @@ impl Hub {
             config: self.inner.cfg.conn.clone(),
         };
         let spec2 = spec.clone();
-        let conn = connector(move || {
+        let conn = connector_with_attempt(move |attempt| {
             let c = link_connector.clone();
             let spec = spec2.clone();
             let opts = opts.clone();
-            async move { c.connect(&spec, opts).await }
+            async move { c.connect(&spec, opts, attempt).await }
         });
         let hooks = HubHooks {
             spec: spec.clone(),
@@ -300,6 +315,7 @@ impl Hub {
                 config: self.inner.cfg.supervise.clone(),
                 hooks: Some(Arc::new(hooks)),
                 on_state: Some(on_state),
+                diag: Some(spec.diag_link()),
             },
         );
         links.insert(spec.id.clone(), LinkEntry { spec, sup });
@@ -437,10 +453,28 @@ impl RoutingService {
     }
 }
 
+/// The error a forwarded request returns. A failure of the forwarding itself (the link is gone,
+/// the deadline passed) is also handed to `record`; the remote service answering with an error
+/// is not a forwarding failure.
+fn forwarded_error(e: CallError, record: impl FnOnce(&str)) -> RpcError {
+    let forwarding_failed = !matches!(e, CallError::Rpc(_));
+    let rpc = e.into_rpc();
+    if forwarding_failed {
+        record(&rpc.code);
+    }
+    rpc
+}
+
 #[async_trait]
 impl Service for RoutingService {
     async fn call(&self, ctx: CallContext, method: &str, params: Value) -> Result<Value, RpcError> {
-        match self.hub.route(&ctx.host, ctx.hops)? {
+        let started = Instant::now();
+        let routed = self.hub.route(&ctx.host, ctx.hops).inspect_err(|e| {
+            if let Some(host) = &ctx.host {
+                diag::forward_failed(method, host, &e.code, started);
+            }
+        })?;
+        match routed {
             None => self.local.call(ctx, method, params).await,
             Some(link) => {
                 let opts = RequestOpts {
@@ -448,9 +482,13 @@ impl Service for RoutingService {
                     hops: ctx.hops + 1,
                     deadline: self.hub.inner.cfg.forward_timeout,
                 };
-                link.call(method, params, opts)
-                    .await
-                    .map_err(|e| e.into_rpc())
+                link.call(method, params, opts).await.map_err(|e| {
+                    forwarded_error(e, |code| {
+                        if let Some(host) = &ctx.host {
+                            diag::forward_failed(method, host, code, started);
+                        }
+                    })
+                })
             }
         }
     }
@@ -462,7 +500,13 @@ impl Service for RoutingService {
         params: Value,
         from: Option<Cursor>,
     ) -> Result<EventStream, RpcError> {
-        match self.hub.route(&ctx.host, ctx.hops)? {
+        let started = Instant::now();
+        let routed = self.hub.route(&ctx.host, ctx.hops).inspect_err(|e| {
+            if let Some(host) = &ctx.host {
+                diag::forward_subscribe_failed(topic, host, &e.code, started);
+            }
+        })?;
+        match routed {
             None => self.local.subscribe(ctx, topic, params, from).await,
             Some(link) => {
                 let mut opts = SubscribeOpts::new(self.hub.inner.cfg.forward_timeout)
@@ -470,10 +514,13 @@ impl Service for RoutingService {
                     .from(from);
                 opts.host = ctx.host.clone();
                 opts.hops = ctx.hops + 1;
-                let sub = link
-                    .subscribe_with(topic, opts)
-                    .await
-                    .map_err(|e| e.into_rpc())?;
+                let sub = link.subscribe_with(topic, opts).await.map_err(|e| {
+                    forwarded_error(e, |code| {
+                        if let Some(host) = &ctx.host {
+                            diag::forward_subscribe_failed(topic, host, code, started);
+                        }
+                    })
+                })?;
                 Ok(sub.into_event_stream())
             }
         }

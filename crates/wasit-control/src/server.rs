@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::connection::{ConnConfig, Connection};
+use crate::diag;
 use crate::error::{ConnClose, ConnectError};
 use crate::service::Service;
 use crate::transport::{BoxDuplex, Listener};
@@ -20,6 +21,9 @@ struct ServerInner {
     service: Arc<dyn Service>,
     hello: Hello,
     cfg: ConnConfig,
+    /// Serves peers inside this process only: its connections are not recorded as accepted or
+    /// closed (see [`ControlServer::in_process`]).
+    in_process: bool,
     conns: Mutex<HashMap<u64, Connection>>,
     /// Bumped whenever a connection is added or removed.
     conn_changes: watch::Sender<u64>,
@@ -35,11 +39,23 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn new(service: Arc<dyn Service>, hello: Hello, cfg: ConnConfig) -> Self {
+        Self::build(service, hello, cfg, false)
+    }
+
+    /// A server for peers inside this process (a loopback link to itself): like [`Self::new`],
+    /// but connections to it are not recorded in diagnostics as accepted or closed (a failed
+    /// handshake still is).
+    pub fn in_process(service: Arc<dyn Service>, hello: Hello, cfg: ConnConfig) -> Self {
+        Self::build(service, hello, cfg, true)
+    }
+
+    fn build(service: Arc<dyn Service>, hello: Hello, cfg: ConnConfig, in_process: bool) -> Self {
         ControlServer {
             inner: Arc::new(ServerInner {
                 service,
                 hello,
                 cfg,
+                in_process,
                 conns: Mutex::new(HashMap::new()),
                 conn_changes: watch::channel(0).0,
                 shutdown: CancellationToken::new(),
@@ -150,10 +166,14 @@ async fn run_connection(inner: Arc<ServerInner>, io: BoxDuplex) -> Result<ConnCl
     let conn = match conn {
         Ok(c) => c,
         Err(e) => {
-            tracing::debug!(error = %e, "incoming connection failed handshake");
+            diag::handshake_failed(&e);
             return Err(e);
         }
     };
+    let accepted = Instant::now();
+    if !inner.in_process {
+        diag::conn_accepted(conn.remote_hello());
+    }
     let id = conn.id();
     inner
         .conns
@@ -174,5 +194,11 @@ async fn run_connection(inner: Arc<ServerInner>, io: BoxDuplex) -> Result<ConnCl
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
     inner.conn_changes.send_modify(|n| *n += 1);
+    // Not when the server itself is shutting down: every connection then closes by our own
+    // goodbye, which the process's shutdown record already says (a record per connection at
+    // exit would also follow it).
+    if !inner.in_process && !inner.shutdown.is_cancelled() {
+        diag::conn_closed(conn.remote_hello(), &reason, accepted);
+    }
     Ok(reason)
 }

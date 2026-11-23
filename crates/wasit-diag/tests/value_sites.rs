@@ -20,11 +20,18 @@ const PATTERNS: &[&str] = &[
 
 /// Files allowed to contain them. Later steps add here, e.g. `wasit-control/src/wire.rs` for
 /// `TraceId` (design S10) and the `DiagText::new` sites of design §4.3.
+///
+/// `wasit-control/src/diag.rs` makes `DiagText::new(Origin::Transport, …)` in two places, both
+/// text of a link and never of a session: the text that goes with a link state (a transport
+/// command's stderr tail, a parked link's reason, why provisioning was needed, a last error
+/// whose peer-written parts were replaced by their codes first, see `connect_why` and
+/// `close_why`) and the stderr tail of a closed link's transport child.
 const ALLOW: &[&str] = &[
     "wasit-diag/src/value.rs",
     "wasit-diag/src/text.rs",
     "wasit-diag/src/macros.rs",
     "wasit-diag/src/panic.rs",
+    "wasit-control/src/diag.rs",
 ];
 
 /// `ErrorInfo::ours(` call sites outside `wasit-diag`: the `Display` of one of our own error
@@ -34,10 +41,17 @@ const OURS: &str = "ErrorInfo::ours(";
 /// Files allowed to call it, and what they pass:
 /// * `wasit-shim/src/diag.rs`: the shim's own `Error` (argument, spawn and lock errors; none
 ///   formats an environment value, see `cli.rs`);
-/// * `wasit-runtime/src/bin/wasit-hostd.rs`: the runtime's `RuntimeError` for a session scan.
+/// * `wasit-runtime/src/bin/wasit-hostd.rs`: the runtime's `RuntimeError` for a session scan;
+/// * `wasit-control/src/diag.rs`: `connect_error`, the `Display` of wasit-control's own
+///   `ConnectError` for the variants whose text is fixed by this crate (a version pair, a
+///   timeout, a closed handshake) or is the OS's reason for a failed read/write/connect or the
+///   transport program we could not start (`Io`, `Spawn`). What a peer, a parser or a
+///   transport's stderr wrote (`Refused`, `Protocol`, `Command`) goes through
+///   `ErrorInfo::foreign`, so only its length and fingerprint are kept.
 const OURS_ALLOW: &[&str] = &[
     "wasit-shim/src/diag.rs",
     "wasit-runtime/src/bin/wasit-hostd.rs",
+    "wasit-control/src/diag.rs",
 ];
 
 #[test]

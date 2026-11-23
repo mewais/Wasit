@@ -11,6 +11,7 @@ ts = ["dep:ts-rs"]
 
 [dependencies]
 wasit-process = { path = "../wasit-process" }
+wasit-diag = { path = "../wasit-diag", default-features = false }
 ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -25,3 +26,6 @@ fastrand = "2"
 [[bin]]
 name = "wasit-control-demo"
 path = "src/bin/wasit-control-demo.rs"
+
+[dev-dependencies]
+tempfile = "3"

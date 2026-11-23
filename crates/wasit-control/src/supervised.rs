@@ -2,7 +2,7 @@
 
 use std::mem::discriminant;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -12,11 +12,13 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use wasit_diag::{ErrorInfo, Ident};
 
 use crate::client::ControlClient;
 use crate::command::CommandFailureKind;
 use crate::connection::{RequestOpts, SubscribeOpts, Subscription};
-use crate::error::{CallError, ConnectError};
+use crate::diag::{self, AttemptOutcome, ProvisionOutcome};
+use crate::error::{CallError, ConnClose, ConnectError};
 use crate::wire::{CloseReason, Cursor, Hello, HostId, ProtocolVersion, RpcError};
 
 /// Exponential backoff with jitter.
@@ -71,6 +73,18 @@ pub enum ProvisionReason {
         ours: ProtocolVersion,
         theirs: ProtocolVersion,
     },
+}
+
+impl ProvisionReason {
+    /// The kind as the word it serializes to (`command_not_found`, `build_mismatch`,
+    /// `incompatible`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            ProvisionReason::CommandNotFound { .. } => "command_not_found",
+            ProvisionReason::BuildMismatch { .. } => "build_mismatch",
+            ProvisionReason::Incompatible { .. } => "incompatible",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -129,6 +143,20 @@ impl LinkState {
     pub fn is_connected(&self) -> bool {
         matches!(self, LinkState::Connected { .. })
     }
+
+    /// The state as the word its `state` tag serializes to (`connecting`, `reconnecting`, …).
+    pub fn code(&self) -> &'static str {
+        match self {
+            LinkState::Connecting => "connecting",
+            LinkState::Provisioning { .. } => "provisioning",
+            LinkState::Connected { .. } => "connected",
+            LinkState::Reconnecting { .. } => "reconnecting",
+            LinkState::AuthNeeded { .. } => "auth_needed",
+            LinkState::Incompatible { .. } => "incompatible",
+            LinkState::Failed { .. } => "failed",
+            LinkState::Stopped => "stopped",
+        }
+    }
 }
 
 /// Policy hooks (the hub uses them to drive provisioning).
@@ -145,17 +173,29 @@ pub trait SupervisorHooks: Send + Sync + 'static {
     }
 }
 
-/// Produces a fresh connection on each call.
+/// Produces a fresh connection on each call. The argument is the attempt number: 1 for the
+/// first call of a link, then +1 per call, never reset (not by a successful connect, not by
+/// `reconnect_now`), so what a connector records can be joined with what the supervisor
+/// records for the same attempt.
 pub type Connector =
-    Arc<dyn Fn() -> BoxFuture<'static, Result<ControlClient, ConnectError>> + Send + Sync>;
+    Arc<dyn Fn(u64) -> BoxFuture<'static, Result<ControlClient, ConnectError>> + Send + Sync>;
 
-/// Build a [`Connector`] from an async closure.
+/// Build a [`Connector`] from an async closure that does not need the attempt number.
 pub fn connector<F, Fut>(f: F) -> Connector
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<ControlClient, ConnectError>> + Send + 'static,
 {
-    Arc::new(move || Box::pin(f()))
+    Arc::new(move |_attempt| Box::pin(f()))
+}
+
+/// Build a [`Connector`] from an async closure that is given the attempt number.
+pub fn connector_with_attempt<F, Fut>(f: F) -> Connector
+where
+    F: Fn(u64) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<ControlClient, ConnectError>> + Send + 'static,
+{
+    Arc::new(move |attempt| Box::pin(f(attempt)))
 }
 
 pub type StateCallback = Arc<dyn Fn(&LinkState) + Send + Sync>;
@@ -191,6 +231,10 @@ pub struct SupervisedOptions {
     /// Called synchronously on every state change (no transition is skipped, unlike a
     /// `watch` observer).
     pub on_state: Option<StateCallback>,
+    /// The link's label in diagnostics (`hosts:<id>` for a hub's links). With it every attempt,
+    /// state change, provisioning run and close of the link is recorded; `None` (an in-process
+    /// loopback) records nothing.
+    pub diag: Option<Ident>,
 }
 
 struct Shared {
@@ -201,14 +245,36 @@ struct Shared {
     task: Mutex<Option<JoinHandle<()>>>,
     backoff: Backoff,
     on_state: Option<StateCallback>,
+    diag: Option<Ident>,
 }
 
 impl Shared {
-    fn set(&self, s: LinkState) {
+    /// Publishes `s`. `why` is the text that goes with it in diagnostics when it is not the
+    /// one `s` carries itself.
+    fn set(&self, s: LinkState, why: Option<&str>) {
+        if let Some(link) = &self.diag {
+            let from = self.state.borrow().clone();
+            if from.code() != s.code() {
+                diag::state(link, &from, &s, why);
+            }
+        }
         if let Some(cb) = &self.on_state {
             cb(&s);
         }
         self.state.send_replace(s);
+    }
+
+    /// Records the end of an attempt; `error` is only built when the link has a label.
+    fn attempt_end(
+        &self,
+        n: u64,
+        started: Instant,
+        outcome: AttemptOutcome,
+        error: impl FnOnce() -> Option<ErrorInfo>,
+    ) {
+        if let Some(link) = &self.diag {
+            diag::attempt_end(link, n, outcome, error(), started);
+        }
     }
 }
 
@@ -238,6 +304,19 @@ enum Next {
     },
 }
 
+impl Next {
+    /// What an attempt that led to this decision is recorded as; `None` for a decision no
+    /// failed attempt leads to.
+    fn outcome(&self) -> Option<AttemptOutcome> {
+        match self {
+            Next::Immediate => None,
+            Next::Backoff => Some(AttemptOutcome::Backoff),
+            Next::Park(_) => Some(AttemptOutcome::Park),
+            Next::Provision { .. } => Some(AttemptOutcome::Provision),
+        }
+    }
+}
+
 impl Supervised {
     pub fn spawn(connector: Connector, opts: SupervisedOptions) -> Supervised {
         let stop = CancellationToken::new();
@@ -249,6 +328,7 @@ impl Supervised {
             task: Mutex::new(None),
             backoff: opts.config.backoff.clone(),
             on_state: opts.on_state.clone(),
+            diag: opts.diag.clone(),
         });
         let task = tokio::spawn(run(shared.clone(), connector, opts.config, opts.hooks));
         *shared.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -368,8 +448,15 @@ async fn run(
     let stop = shared.stop.clone();
     let mut reconnect_rx = shared.reconnect.subscribe();
     let mut attempt: u32 = 0;
+    // Attempts of this link in all, never reset: what the connector and the diagnostics join on.
+    let mut n: u64 = 0;
     let mut provisioned: Option<ProvisionReason> = None;
     let mut last_error = String::new();
+    // `last_error` as diagnostics may show it: the same, except that what a peer or a parser
+    // wrote is replaced by its code (see `diag`).
+    let mut last_why = String::new();
+    // Set when a parked state's own text would show `last_error` as it is.
+    let mut park_why: Option<String> = None;
     let mut bridge_unavailable: u32 = 0;
 
     'outer: loop {
@@ -378,14 +465,23 @@ async fn run(
         }
         // Requests for a reconnect made before this attempt are satisfied by it.
         reconnect_rx.borrow_and_update();
-        shared.set(LinkState::Connecting);
+        shared.set(LinkState::Connecting, None);
+        n += 1;
+        let started = Instant::now();
+        if let Some(link) = &shared.diag {
+            diag::attempt_begin(link, n);
+        }
         let res = tokio::select! {
             _ = stop.cancelled() => break,
-            r = tokio::time::timeout(cfg.connect_timeout, connector()) => r,
+            r = tokio::time::timeout(cfg.connect_timeout, connector(n)) => r,
         };
         let next = match res {
             Err(_) => {
                 last_error = "connect timed out".into();
+                last_why = last_error.clone();
+                shared.attempt_end(n, started, AttemptOutcome::Backoff, || {
+                    Some(diag::connect_error(&ConnectError::Timeout))
+                });
                 Next::Backoff
             }
             Ok(Ok(client)) => {
@@ -395,6 +491,8 @@ async fn run(
                 if let Some(reason) = rejected {
                     client.close();
                     last_error = format!("peer needs provisioning: {reason:?}");
+                    last_why = last_error.clone();
+                    shared.attempt_end(n, started, AttemptOutcome::Provision, || None);
                     let fallback = LinkState::Failed {
                         reason: last_error.clone(),
                         problem: None,
@@ -404,15 +502,20 @@ async fn run(
                     attempt = 0;
                     bridge_unavailable = 0;
                     provisioned = None;
+                    shared.attempt_end(n, started, AttemptOutcome::Connected, || None);
                     // The client first: whoever is told the link is connected may use it
                     // at once (a request routed in between would find no client).
                     shared.client.send_replace(Some(client.clone()));
-                    shared.set(LinkState::Connected {
-                        hello: client.remote_hello().clone(),
-                    });
+                    let connected_at = Instant::now();
+                    shared.set(
+                        LinkState::Connected {
+                            hello: client.remote_hello().clone(),
+                        },
+                        None,
+                    );
                     enum Ev {
                         Stop,
-                        Closed(crate::error::ConnClose),
+                        Closed(ConnClose),
                         Reconnect,
                     }
                     let ev = tokio::select! {
@@ -424,17 +527,43 @@ async fn run(
                     match ev {
                         Ev::Stop => {
                             client.close();
+                            if let Some(link) = &shared.diag {
+                                diag::link_closed(
+                                    link,
+                                    &ConnClose::Local,
+                                    connected_at.elapsed(),
+                                    None,
+                                );
+                            }
                             break 'outer;
                         }
                         Ev::Closed(reason) => {
-                            last_error = match client.diagnostics().await {
-                                Some(d) => format!("{reason} ({d})"),
+                            let facts = client.transport_facts().await;
+                            last_error = match &facts {
+                                Some(f) => format!("{reason} ({})", f.describe()),
                                 None => reason.to_string(),
                             };
+                            last_why = diag::close_why(&reason, facts.as_ref());
+                            if let Some(link) = &shared.diag {
+                                diag::link_closed(
+                                    link,
+                                    &reason,
+                                    connected_at.elapsed(),
+                                    facts.as_ref(),
+                                );
+                            }
                             Next::Backoff
                         }
                         Ev::Reconnect => {
                             client.close();
+                            if let Some(link) = &shared.diag {
+                                diag::link_closed(
+                                    link,
+                                    &ConnClose::Local,
+                                    connected_at.elapsed(),
+                                    None,
+                                );
+                            }
                             Next::Immediate
                         }
                     }
@@ -442,6 +571,7 @@ async fn run(
             }
             Ok(Err(e)) => {
                 last_error = e.to_string();
+                last_why = diag::connect_why(&e);
                 let unavailable = matches!(
                     &e,
                     ConnectError::Refused(r) if r.code == crate::wire::codes::BRIDGE_UNAVAILABLE
@@ -451,7 +581,8 @@ async fn run(
                 } else {
                     0
                 };
-                match e {
+                let error = || Some(diag::connect_error(&e));
+                let next = match &e {
                     ConnectError::Refused(r)
                         if unavailable
                             && bridge_unavailable >= cfg.bridge_unavailable_attempts.max(1) =>
@@ -465,8 +596,14 @@ async fn run(
                         })
                     }
                     ConnectError::Incompatible { ours, theirs } => Next::Provision {
-                        reason: ProvisionReason::Incompatible { ours, theirs },
-                        fallback: LinkState::Incompatible { ours, theirs },
+                        reason: ProvisionReason::Incompatible {
+                            ours: *ours,
+                            theirs: *theirs,
+                        },
+                        fallback: LinkState::Incompatible {
+                            ours: *ours,
+                            theirs: *theirs,
+                        },
                     },
                     ConnectError::Command {
                         kind: CommandFailureKind::CommandNotFound,
@@ -484,8 +621,8 @@ async fn run(
                     // Configuration problems: a timer cannot fix them.
                     ConnectError::Command { kind, stderr, .. } if kind.is_configuration() => {
                         Next::Park(LinkState::Failed {
-                            reason: stderr,
-                            problem: Some(kind),
+                            reason: stderr.clone(),
+                            problem: Some(*kind),
                         })
                     }
                     // The local transport program cannot be started (missing, not
@@ -496,12 +633,16 @@ async fn run(
                     }),
                     ConnectError::Command { kind, stderr, .. } if kind.needs_human() => {
                         Next::Park(LinkState::AuthNeeded {
-                            problem: kind,
-                            detail: stderr,
+                            problem: *kind,
+                            detail: stderr.clone(),
                         })
                     }
                     _ => Next::Backoff,
+                };
+                if let Some(outcome) = next.outcome() {
+                    shared.attempt_end(n, started, outcome, error);
                 }
+                next
             }
         };
 
@@ -511,37 +652,62 @@ async fn run(
                     .as_ref()
                     .is_some_and(|p| discriminant(p) == discriminant(&reason));
                 match &hooks {
-                    _ if already => Next::Park(LinkState::Failed {
-                        reason: format!("still failing after provisioning: {last_error}"),
-                        problem: None,
-                    }),
+                    _ if already => {
+                        park_why = Some(format!("still failing after provisioning: {last_why}"));
+                        Next::Park(LinkState::Failed {
+                            reason: format!("still failing after provisioning: {last_error}"),
+                            problem: None,
+                        })
+                    }
                     None => Next::Park(fallback),
                     Some(h) => {
-                        shared.set(LinkState::Provisioning {
-                            reason: reason.clone(),
-                        });
+                        shared.set(
+                            LinkState::Provisioning {
+                                reason: reason.clone(),
+                            },
+                            Some(&last_why),
+                        );
                         provisioned = Some(reason.clone());
+                        let began = Instant::now();
                         let r = tokio::select! {
                             _ = stop.cancelled() => break,
                             r = tokio::time::timeout(cfg.provision_timeout, h.provision(&reason)) => r,
                         };
+                        let record = |outcome: ProvisionOutcome, error: Option<&ProvisionError>| {
+                            if let Some(link) = &shared.diag {
+                                diag::provision(link, &reason, outcome, error, began);
+                            }
+                        };
                         match r {
                             Err(_) => {
+                                record(ProvisionOutcome::TimedOut, None);
                                 last_error = "provisioning timed out".into();
+                                last_why = last_error.clone();
                                 provisioned = None;
                                 Next::Backoff
                             }
-                            Ok(None) => Next::Park(fallback),
-                            Ok(Some(Ok(()))) => Next::Immediate,
+                            Ok(None) => {
+                                record(ProvisionOutcome::Unavailable, None);
+                                Next::Park(fallback)
+                            }
+                            Ok(Some(Ok(()))) => {
+                                record(ProvisionOutcome::Done, None);
+                                Next::Immediate
+                            }
                             Ok(Some(Err(pe))) if pe.retryable => {
+                                record(ProvisionOutcome::FailedRetryable, Some(&pe));
                                 last_error = format!("provisioning failed: {}", pe.message);
+                                last_why = last_error.clone();
                                 provisioned = None;
                                 Next::Backoff
                             }
-                            Ok(Some(Err(pe))) => Next::Park(LinkState::Failed {
-                                reason: format!("provisioning failed: {}", pe.message),
-                                problem: None,
-                            }),
+                            Ok(Some(Err(pe))) => {
+                                record(ProvisionOutcome::Failed, Some(&pe));
+                                Next::Park(LinkState::Failed {
+                                    reason: format!("provisioning failed: {}", pe.message),
+                                    problem: None,
+                                })
+                            }
                         }
                     }
                 }
@@ -554,11 +720,14 @@ async fn run(
             Next::Backoff => {
                 attempt = attempt.saturating_add(1);
                 let delay = shared.backoff.delay_random(attempt);
-                shared.set(LinkState::Reconnecting {
-                    attempt,
-                    next_at: SystemTime::now() + delay,
-                    last_error: last_error.clone(),
-                });
+                shared.set(
+                    LinkState::Reconnecting {
+                        attempt,
+                        next_at: SystemTime::now() + delay,
+                        last_error: last_error.clone(),
+                    },
+                    Some(&last_why),
+                );
                 tokio::select! {
                     _ = stop.cancelled() => break,
                     _ = tokio::time::sleep(delay) => {}
@@ -566,7 +735,7 @@ async fn run(
                 }
             }
             Next::Park(state) => {
-                shared.set(state);
+                shared.set(state, park_why.take().as_deref());
                 tokio::select! {
                     _ = stop.cancelled() => break,
                     _ = reconnect_rx.changed() => {
@@ -580,7 +749,7 @@ async fn run(
         }
     }
     shared.client.send_replace(None);
-    shared.set(LinkState::Stopped);
+    shared.set(LinkState::Stopped, None);
 }
 
 /// Options of a durable subscription.

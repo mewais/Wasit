@@ -29,6 +29,7 @@ impl LinkConnector for MemConnector {
         &self,
         spec: &HostSpec,
         opts: ClientOptions,
+        _attempt: u64,
     ) -> Result<ControlClient, ConnectError> {
         let server = self.targets.lock().unwrap().get(&spec.id).cloned();
         match server {

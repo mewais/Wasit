@@ -11,6 +11,7 @@ pub mod client;
 pub mod command;
 pub mod connection;
 pub mod demo;
+mod diag;
 pub mod error;
 pub mod hub;
 pub mod mux;
@@ -22,10 +23,10 @@ pub mod uplink;
 pub mod wire;
 
 pub use bridge::{bridge, BridgeError, BridgeOptions};
-pub use client::{ClientOptions, ControlClient, Diagnostics};
+pub use client::{ClientOptions, ControlClient, Diagnostics, TransportFacts};
 pub use command::{
     classify_command_failure, ChildHandle, CommandFailureKind, CommandSpec, CommandTransport,
-    ExitInfo,
+    ExitInfo, TransportTrace,
 };
 pub use connection::{
     ConnConfig, Connection, Negotiated, RequestOpts, SubscribeOpts, Subscription,
@@ -39,9 +40,9 @@ pub use mux::{MuxError, ServiceMux};
 pub use server::ControlServer;
 pub use service::{CallContext, EventStream, NoService, Service};
 pub use supervised::{
-    connector, Backoff, Connector, DurableEnd, DurableOpts, DurableSubscription, LinkState,
-    ProvisionError, ProvisionReason, Supervised, SupervisedConfig, SupervisedOptions,
-    SupervisorHooks,
+    connector, connector_with_attempt, Backoff, Connector, DurableEnd, DurableOpts,
+    DurableSubscription, LinkState, ProvisionError, ProvisionReason, Supervised, SupervisedConfig,
+    SupervisedOptions, SupervisorHooks,
 };
 #[cfg(windows)]
 pub use transport::NamedPipeListener;

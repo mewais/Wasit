@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
+use crate::diag;
 use crate::error::{CallError, ConnClose, ConnectError};
 use crate::service::{CallContext, EventStream, Service};
 use crate::transport::BoxDuplex;
@@ -876,7 +877,7 @@ impl Inner {
             });
             return;
         };
-        let Some(ctx) = self.context(guard, host, hops) else {
+        let Some(ctx) = self.context(guard, host.clone(), hops) else {
             return;
         };
         let inner = self.clone();
@@ -893,11 +894,20 @@ impl Inner {
                     return;
                 }
             };
-            inner.pump_subscription(id, stream, window).await;
+            inner
+                .pump_subscription(id, stream, window, &topic, host.as_ref())
+                .await;
         });
     }
 
-    async fn pump_subscription(self: &Arc<Self>, id: u64, mut stream: EventStream, window: u32) {
+    async fn pump_subscription(
+        self: &Arc<Self>,
+        id: u64,
+        mut stream: EventStream,
+        window: u32,
+        topic: &str,
+        host: Option<&HostId>,
+    ) {
         let sub = SubId(self.next_sub.fetch_add(1, Ordering::Relaxed));
         let token = self.cancel.child_token();
         let credit = (window > 0).then(|| Arc::new(Semaphore::new(window as usize)));
@@ -976,6 +986,10 @@ impl Inner {
                 }
             }
         };
+        // A subscription that ends other than normally is the one thing recorded of it (a
+        // record per event would be a record per frame). Before the stream is dropped: whoever
+        // sees the stream gone finds the record.
+        diag::sub_closed(topic, host, &reason);
         drop(stream);
         lock(&self.served).remove(&sub);
         if let Ok(b) = encode(
@@ -1039,7 +1053,6 @@ async fn writer_task(
     }
     .await;
     if let Err(message) = result {
-        tracing::debug!(conn = inner.id, %message, "connection writer failed");
         inner.close(ConnClose::Io { message });
     }
     inner.writer_done.send_replace(true);
@@ -1102,7 +1115,6 @@ async fn reader_task(
             },
         }
     };
-    tracing::debug!(conn = inner.id, %reason, "connection closed");
     inner.close(reason);
 }
 

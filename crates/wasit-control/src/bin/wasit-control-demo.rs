@@ -72,7 +72,11 @@ struct BinService {
 impl Service for BinService {
     async fn call(&self, ctx: CallContext, method: &str, params: Value) -> Result<Value, RpcError> {
         if method == "crash" {
-            // Simulated crash: no response, no flush.
+            // Simulated crash: no response, no flush. `{"stderr": TEXT}` makes it say TEXT on
+            // stderr first, like a transport that dies with an error message.
+            if let Some(text) = params.get("stderr").and_then(Value::as_str) {
+                eprintln!("{text}");
+            }
             std::process::exit(3);
         }
         if method == "shutdown" {
