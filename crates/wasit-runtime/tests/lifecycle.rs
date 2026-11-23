@@ -619,11 +619,17 @@ async fn a_new_process_that_dies_at_once(driver: &str) {
         r#"{"startup":[{"type":"stderr","text":"boom"},{"type":"exit","code":2}]}"#,
     )
     .unwrap();
-    let e = mgr.command(&id, Command::prompt("two")).await.unwrap_err();
-    assert!(
-        matches!(&e, CommandError::ContinueFailed { reason, .. } if !reason.is_empty()),
-        "{e:?}"
-    );
+    // The prompt is answered, one of two ways that the journal's order decides (the CLI's death
+    // and the runtime's attach are two processes racing; neither order is the product's to
+    // pick): the new process was already gone when the prompt reached its shim, so the continue
+    // failed and says how it ended; or the shim took the prompt first, so it was journaled
+    // into that process's window and is `Queued`, and the process died after. The actor's unit
+    // tests pin each order. Either way the failure shows in the session and nothing stays pending.
+    match mgr.command(&id, Command::prompt("two")).await {
+        Err(CommandError::ContinueFailed { reason, .. }) => assert!(!reason.is_empty()),
+        Ok(CommandOutcome::Queued) => {}
+        other => panic!("{other:?}"),
+    }
     let failed = wait_snapshot(&mgr, &id, "failed", |s| {
         s.generation == 2 && matches!(s.phase, Phase::Failed { .. })
     })
@@ -662,11 +668,14 @@ async fn a_resume_the_agent_refuses_fails_the_continue_with_its_reason() {
     for t in transcripts(d.path(), &native) {
         std::fs::remove_file(t).unwrap();
     }
-    let e = mgr.command(&id, Command::prompt("two")).await.unwrap_err();
-    match &e {
-        CommandError::ContinueFailed { reason, .. } => {
+    // As in `a_new_process_that_dies_at_once`: the agent's refusal and the runtime's attach race,
+    // and the journal's order decides whether the prompt reached the shim before the process
+    // ended (`Queued`; the refusal shows in the session) or not (the continue's failure).
+    match mgr.command(&id, Command::prompt("two")).await {
+        Err(CommandError::ContinueFailed { reason, .. }) => {
             assert!(reason.contains("No conversation found"), "{reason}")
         }
+        Ok(CommandOutcome::Queued) => {}
         other => panic!("{other:?}"),
     }
     let snap = wait_snapshot(&mgr, &id, "failed", |s| {

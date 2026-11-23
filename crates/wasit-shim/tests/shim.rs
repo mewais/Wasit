@@ -39,7 +39,7 @@ async fn echo_roundtrip_and_clean_exit() {
         })
     );
     until_end(&mut s).await;
-    // The lock is released before the endpoint closes.
+    // The endpoint name is released before the lock, and the lock before the connections close.
     assert_eq!(
         probe(d.path()).await.unwrap(),
         ShimState::Exited(ExitInfo {
@@ -48,6 +48,41 @@ async fn echo_roundtrip_and_clean_exit() {
         })
     );
     assert!(!wasit_shim::endpoint_name(d.path()).exists());
+}
+
+/// The lock is the right to the endpoint's name: the next generation of a session binds the same
+/// path the moment the lock is free, so by then the exiting shim must have given the name up
+/// (a removal after the lock is free would take the successor's endpoint). The successor here
+/// waits for the lock on the real signal (a blocking `flock`) and looks at the name the instant
+/// it has it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_endpoint_name_is_gone_by_the_time_the_lock_is_free() {
+    for round in 0..40 {
+        let d = TempDir::new();
+        start_child(d.path(), "cat", &[]).await;
+        assert!(wasit_shim::endpoint_name(d.path()).exists());
+        let lock = d.path().join("shim.lock");
+        let name = wasit_shim::endpoint_name(d.path());
+        let successor = tokio::task::spawn_blocking(move || {
+            let f = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(lock)
+                .unwrap();
+            f.lock().unwrap();
+            name.exists()
+        });
+        let c = ShimClient::connect(d.path()).await.unwrap();
+        let mut s = c.attach(1).await.unwrap();
+        c.close_stdin().await.unwrap();
+        until_exited(&mut s).await;
+        assert!(
+            !successor.await.unwrap(),
+            "round {round}: the lock was free while the old endpoint name still existed"
+        );
+        until_end(&mut s).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
