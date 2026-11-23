@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use wasit_control::TraceId;
 use wasit_core::{
-    AgentEvent, Command, DriverCapabilities, DriverDescriptor, DriverError, Encoded,
+    AgentEvent, Command, DriverCapabilities, DriverDescriptor, DriverError, Encoded, GateReason,
     InputDropReason, InputId, Protocol, ResumeMode, SavesConversation, SpawnSpec, Step,
 };
 use wasit_shim::{Kind, Record};
@@ -351,9 +351,6 @@ pub(crate) struct Core {
 
 /// How many withdrawn external gate ids are remembered for refusing late answers.
 const WITHDRAWN_MEMORY: usize = 256;
-
-/// `GateResolved::reason` of an external gate whose request is gone.
-pub(crate) const WITHDRAWN: &str = "withdrawn";
 
 fn truncate(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
@@ -707,11 +704,16 @@ impl Core {
         self.owed.clear();
         self.close_owed = false;
         // External gates end with the process: their requests are gone.
+        let ended = if self.stop_requested {
+            GateReason::new(GateReason::SESSION_STOPPED)
+        } else {
+            GateReason::new(GateReason::PROCESS_ENDED)
+        };
         for request_id in std::mem::take(&mut self.external) {
             self.remember_withdrawn(request_id.clone());
             let event = AgentEvent::GateResolved {
                 request_id,
-                reason: Some(WITHDRAWN.into()),
+                reason: Some(ended.clone()),
             };
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, rec.t);
@@ -851,9 +853,11 @@ impl Core {
             NoteKind::Runtime(RuntimeNote::RaiseGate { token, gate }) => {
                 self.raise_external(token, *gate, rec.t, em, out)
             }
-            NoteKind::Runtime(RuntimeNote::ResolveGate { token, request_id }) => {
-                self.resolve_external(token, request_id, em, out)
-            }
+            NoteKind::Runtime(RuntimeNote::ResolveGate {
+                token,
+                request_id,
+                reason,
+            }) => self.resolve_external(token, request_id, reason, em, out),
             NoteKind::StdinClosed => self.close_owed = false,
             NoteKind::StdinError(error) => {
                 if self.last_echoed.is_empty() {
@@ -1182,6 +1186,7 @@ impl Core {
         &mut self,
         token: String,
         request_id: String,
+        reason: GateReason,
         em: &mut Emitter,
         out: &mut Output,
     ) {
@@ -1189,7 +1194,7 @@ impl Core {
             self.remember_withdrawn(request_id.clone());
             let event = AgentEvent::GateResolved {
                 request_id,
-                reason: Some(WITHDRAWN.into()),
+                reason: Some(reason),
             };
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, em.t);
@@ -1467,7 +1472,8 @@ impl Core {
                     .retain(|g| g.gate.request_id() != request_id);
                 cause = Some(PhaseCause::GateCleared {
                     request_id: request_id.clone(),
-                    how: if reason.as_deref() == Some(WITHDRAWN) {
+                    // Only an external gate's resolution carries a reason.
+                    how: if reason.is_some() {
                         GateClearing::Withdrawn
                     } else {
                         GateClearing::Resolved
@@ -2031,6 +2037,7 @@ mod tests {
             RuntimeNote::ResolveGate {
                 token: "w1".into(),
                 request_id: "x2".into(),
+                reason: GateReason::new("withdrawn").with_detail("the asking turn ended"),
             }
             .to_value(),
         );
@@ -2039,7 +2046,7 @@ mod tests {
         assert!(out.events.iter().any(|e| matches!(
             &e.kind,
             SessionEventKind::Agent { event: AgentEvent::GateResolved { request_id, reason } }
-                if request_id == "x2" && reason.as_deref() == Some("withdrawn")
+                if request_id == "x2" && reason.as_ref().is_some_and(|r| r.code == "withdrawn")
         )));
         // A late answer is refused (typed), and the id cannot be raised again.
         let out = feed(
@@ -2084,6 +2091,7 @@ mod tests {
             RuntimeNote::ResolveGate {
                 token: "w2".into(),
                 request_id: "x2".into(),
+                reason: GateReason::new("withdrawn"),
             }
             .to_value(),
         );
@@ -2110,7 +2118,7 @@ mod tests {
         assert!(out.events.iter().any(|e| matches!(
             &e.kind,
             SessionEventKind::Agent { event: AgentEvent::GateResolved { request_id, reason } }
-                if request_id == "x3" && reason.as_deref() == Some("withdrawn")
+                if request_id == "x3" && reason.as_ref().is_some_and(|r| r.code == "process_ended")
         )));
         let out = feed(
             &mut live,

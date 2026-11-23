@@ -456,7 +456,7 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
         AgentEvent::GateRequested { gate } => raised(gate),
         AgentEvent::GateResolved { request_id, reason } => TrailEntry::GateResolved {
             request_id: Ident::new(request_id),
-            reason: reason.as_deref().map(Code::new),
+            reason: reason.as_ref().map(|r| Code::new(&r.code)),
         },
         AgentEvent::ModelChanged { model } => TrailEntry::AgentModel {
             model: Ident::new(model),
@@ -890,6 +890,25 @@ mod tests {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// A gate resolution's reason is recorded as its code: the resolver's detail text is never
+    /// part of the trail.
+    #[test]
+    fn a_gate_resolution_keeps_its_code_and_never_its_detail() {
+        let event = AgentEvent::GateResolved {
+            request_id: "g1".into(),
+            reason: Some(wasit_core::GateReason::new("denied").with_detail("SECRET words")),
+        };
+        let entry = project_agent(&event).unwrap();
+        assert_eq!(
+            entry,
+            TrailEntry::GateResolved {
+                request_id: Ident::st("g1"),
+                reason: Some(Code::st("denied")),
+            }
+        );
+        assert!(!serde_json::to_string(&entry).unwrap().contains("SECRET"));
     }
 
     /// Every variant serializes to exactly its declared fields: the declaration, the samples and

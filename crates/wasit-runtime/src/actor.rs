@@ -100,7 +100,10 @@ pub(crate) enum Msg {
 /// An external gate operation.
 pub(crate) enum GateOp {
     Raise(wasit_core::GateRequest),
-    Resolve { request_id: String },
+    Resolve {
+        request_id: String,
+        reason: wasit_core::GateReason,
+    },
 }
 
 impl GateOp {
@@ -1306,9 +1309,10 @@ impl Actor {
                 token: tok.clone(),
                 gate: Box::new(gate),
             },
-            GateOp::Resolve { request_id } => RuntimeNote::ResolveGate {
+            GateOp::Resolve { request_id, reason } => RuntimeNote::ResolveGate {
                 token: tok.clone(),
                 request_id,
+                reason,
             },
         }
         .to_value();

@@ -46,8 +46,9 @@ pub use discovery::{
 };
 pub use event::{
     AgentEvent, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind, GateDecision,
-    GateRequest, InputDropReason, McpServerInfo, ModelInfo, ModelUsage, PlanEntry, QuestionAnswer,
-    QuestionOption, QuestionPrompt, RateLimitInfo, SessionMode, SlashCommandInfo, SpawnGate, Usage,
+    GateReason, GateRequest, InputDropReason, McpServerInfo, ModelInfo, ModelUsage, PlanEntry,
+    QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, SessionMode, SlashCommandInfo,
+    SpawnGate, Usage,
 };
 pub use protocol::{Command, DriverError, Encoded, InputId, OutLine, Protocol, Step};
 pub use spec::{GeneratedFile, ResumeMode, SpawnSpec};

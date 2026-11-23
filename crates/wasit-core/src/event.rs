@@ -10,6 +10,96 @@ use std::collections::{BTreeMap, HashMap};
 use crate::content::ContentPart;
 use crate::protocol::InputId;
 
+// ── Gate resolution reason ───────────────────────────────────────────────────
+
+/// Why an external gate was resolved without an answer: a machine word chosen by whoever
+/// resolved it plus an optional short human-facing detail. The detail is the resolver's text
+/// about its own request; it is not diagnostics material (a trail records only the code).
+///
+/// Serialized as `{"code": ..., "detail": ...}`; a bare string is read as a code with no
+/// detail (journals written before a gate resolution could say why carry `"withdrawn"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub struct GateReason {
+    /// A machine word, `[A-Za-z0-9_.:-]{1,64}` (see [`GateReason::check`]).
+    pub code: String,
+    /// A short sentence for people (see [`GateReason::DETAIL_MAX`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl GateReason {
+    /// The owner took the gate down and did not say why (also what a journal written before a
+    /// resolution could carry a reason holds).
+    pub const WITHDRAWN: &'static str = "withdrawn";
+    /// The runtime resolved the gate because the process generation it was raised on ended.
+    pub const PROCESS_ENDED: &'static str = "process_ended";
+    /// The runtime resolved the gate because the session was asked to stop.
+    pub const SESSION_STOPPED: &'static str = "session_stopped";
+    /// The longest accepted code, in bytes.
+    pub const CODE_MAX: usize = 64;
+    /// The longest accepted detail, in characters.
+    pub const DETAIL_MAX: usize = 400;
+
+    pub fn new(code: impl Into<String>) -> Self {
+        GateReason {
+            code: code.into(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// `Err` with what is wrong when the code is not a machine word or the detail is empty
+    /// or too long. A reason that fails the check is refused, never repaired.
+    pub fn check(&self) -> Result<(), String> {
+        let word = !self.code.is_empty()
+            && self.code.len() <= Self::CODE_MAX
+            && self
+                .code
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'));
+        if !word {
+            return Err(format!(
+                "a gate resolution code is 1-{} characters of [A-Za-z0-9_.:-]",
+                Self::CODE_MAX
+            ));
+        }
+        if let Some(d) = &self.detail {
+            if d.is_empty() || d.chars().count() > Self::DETAIL_MAX {
+                return Err(format!(
+                    "a gate resolution detail is 1-{} characters when present",
+                    Self::DETAIL_MAX
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for GateReason {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Code(String),
+            Full {
+                code: String,
+                #[serde(default)]
+                detail: Option<String>,
+            },
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Code(code) => GateReason { code, detail: None },
+            Repr::Full { code, detail } => GateReason { code, detail },
+        })
+    }
+}
+
 // ── Usage ───────────────────────────────────────────────────────────────────
 
 /// Token and cost breakdown.
@@ -716,13 +806,13 @@ pub enum AgentEvent {
     GateRequested { gate: GateRequest },
 
     /// A pending gate stopped being pending without the human answering it
-    /// (declined by the protocol on interrupt, or resolved by the CLI), or an external gate
-    /// was taken down by its owner or ended with the process (`reason: "withdrawn"`; a late
-    /// answer to it is refused).
+    /// (declined by the protocol on interrupt, or resolved by the CLI: no `reason`), or an
+    /// external gate was taken down by its owner or ended with the process (`reason` says
+    /// why; a late answer to it is refused).
     GateResolved {
         request_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
+        reason: Option<GateReason>,
     },
 
     /// Usage update. claude: per assistant message; codex: cumulative thread

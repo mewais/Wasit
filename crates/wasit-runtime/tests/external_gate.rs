@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use wasit_core::{Command, GateDecision, GateRequest};
+use wasit_core::{AgentEvent, Command, GateDecision, GateReason, GateRequest};
 use wasit_fake_cli::scenario::Scenario;
 use wasit_runtime::wire::{CommandError, SessionEventKind};
 
@@ -100,16 +100,47 @@ async fn external_gate_survives_restart(driver: &str) {
         .await
         .is_err());
 
-    // Raise + withdraw: `gate_resolved` with reason "withdrawn", and a late answer is refused
-    // with a typed error.
+    // Raise + take down: `gate_resolved` carries the resolver's reason code and detail, and a
+    // late answer is refused with a typed error.
     mgr.raise_gate(&id, handoff("h-2")).await.unwrap();
     let snap = wait_phase(&mgr, &id, "needs_you").await;
     let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
-    mgr.resolve_gate(&id, "h-2").await.unwrap();
-    until(&mut s, |e| is_withdrawn(e, "h-2")).await;
+    // A reason that is not a machine word is refused, and nothing is resolved.
+    for bad in [
+        GateReason::new(""),
+        GateReason::new("has space"),
+        GateReason::new("x".repeat(GateReason::CODE_MAX + 1)),
+        GateReason::new("ok").with_detail(""),
+        GateReason::new("ok").with_detail("x".repeat(GateReason::DETAIL_MAX + 1)),
+    ] {
+        assert!(
+            matches!(
+                mgr.resolve_gate(&id, "h-2", bad).await,
+                Err(CommandError::Rejected { .. })
+            ),
+            "a malformed reason must be refused"
+        );
+    }
+    assert_eq!(mgr.snapshot(&id).unwrap().pending_gates.len(), 1);
+    mgr.resolve_gate(
+        &id,
+        "h-2",
+        GateReason::new("turn_ended").with_detail("the asking turn ended"),
+    )
+    .await
+    .unwrap();
+    until(&mut s, |e| {
+        is_resolved(
+            e,
+            "h-2",
+            &GateReason::new("turn_ended").with_detail("the asking turn ended"),
+        )
+    })
+    .await;
     wait_phase(&mgr, &id, "idle").await;
     assert!(matches!(
-        mgr.resolve_gate(&id, "h-2").await,
+        mgr.resolve_gate(&id, "h-2", GateReason::new("withdrawn"))
+            .await,
         Err(CommandError::Rejected { .. })
     ));
     assert_eq!(
@@ -118,13 +149,24 @@ async fn external_gate_survives_restart(driver: &str) {
             request_id: "h-2".into()
         })
     );
+    // A reason without a detail is carried as it is.
+    mgr.raise_gate(&id, handoff("h-2b")).await.unwrap();
+    wait_phase(&mgr, &id, "needs_you").await;
+    mgr.resolve_gate(&id, "h-2b", GateReason::new("denied"))
+        .await
+        .unwrap();
+    wait_phase(&mgr, &id, "idle").await;
 
-    // The gate ends with the process (withdrawn too); raising on a stopped session is refused.
+    // The gate ends with the process, and the runtime says so with its own code; raising on a
+    // stopped session is refused.
     mgr.raise_gate(&id, handoff("h-3")).await.unwrap();
     let snap = wait_phase(&mgr, &id, "needs_you").await;
     let mut s = mgr.subscribe(&id, Some(snap.cursor)).await.unwrap();
     mgr.stop(&id).await.unwrap();
-    until(&mut s, |e| is_withdrawn(e, "h-3")).await;
+    until(&mut s, |e| {
+        is_resolved(e, "h-3", &GateReason::new(GateReason::SESSION_STOPPED))
+    })
+    .await;
     let snap = wait_snapshot(&mgr, &id, "exit", |s| !s.phase.is_live()).await;
     assert!(snap.pending_gates.is_empty());
     assert!(matches!(
@@ -135,12 +177,101 @@ async fn external_gate_survives_restart(driver: &str) {
         mgr.raise_gate(&id, handoff("h-4")).await,
         Err(CommandError::NotRunning { .. })
     ));
+
+    // Replay after a daemon restart gives exactly what the live stream said.
+    let live = resolutions(&mgr, &id).await;
+    assert_eq!(
+        live,
+        vec![
+            (
+                "h-2".to_string(),
+                Some(GateReason::new("turn_ended").with_detail("the asking turn ended"))
+            ),
+            ("h-2b".to_string(), Some(GateReason::new("denied"))),
+            (
+                "h-3".to_string(),
+                Some(GateReason::new(GateReason::SESSION_STOPPED))
+            ),
+        ]
+    );
+    drop(mgr);
+    let mgr = manager(d.path()).await;
+    mgr.adopt_all().await.unwrap();
+    wait_snapshot(&mgr, &id, "replayed", |s| s.loaded).await;
+    assert_eq!(resolutions(&mgr, &id).await, live);
+    drop(mgr);
+
+    // A journal written before a resolution could say why (the `resolve_gate` notes have no
+    // reason) replays as a plain withdrawal; everything else is unchanged.
+    let path = d
+        .path()
+        .join("sessions")
+        .join(id.as_str())
+        .join("journal.ndjson");
+    let mut stripped = 0;
+    let mut out = String::new();
+    for line in std::fs::read_to_string(&path).unwrap().lines() {
+        let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["kind"] == "note" && v["data"]["wasit"] == "resolve_gate" {
+            v["data"].as_object_mut().unwrap().remove("reason").unwrap();
+            stripped += 1;
+        }
+        out.push_str(&format!("{v}\n"));
+    }
+    // h-2, the refused second resolution of it, and h-2b.
+    assert_eq!(stripped, 3, "the journal holds all the resolve_gate notes");
+    std::fs::write(&path, out).unwrap();
+    let mgr = manager(d.path()).await;
+    mgr.adopt_all().await.unwrap();
+    wait_snapshot(&mgr, &id, "replayed old journal", |s| s.loaded).await;
+    assert_eq!(
+        resolutions(&mgr, &id).await,
+        vec![
+            (
+                "h-2".to_string(),
+                Some(GateReason::new(GateReason::WITHDRAWN))
+            ),
+            (
+                "h-2b".to_string(),
+                Some(GateReason::new(GateReason::WITHDRAWN))
+            ),
+            (
+                "h-3".to_string(),
+                Some(GateReason::new(GateReason::SESSION_STOPPED))
+            ),
+        ]
+    );
 }
 
-fn is_withdrawn(e: &wasit_runtime::wire::SessionEvent, rid: &str) -> bool {
+/// Every external gate resolution in the session's history, oldest first (`h-1` was answered,
+/// so it is not one): request id and reason.
+async fn resolutions(
+    mgr: &wasit_runtime::SessionManager,
+    id: &wasit_runtime::wire::SessionId,
+) -> Vec<(String, Option<GateReason>)> {
+    let mut s = mgr.subscribe(id, None).await.unwrap();
+    let seen = until(&mut s, |e| is_resolved_any(e, "h-3")).await;
+    seen.iter()
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::Agent {
+                event: AgentEvent::GateResolved { request_id, reason },
+            } => Some((request_id.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_resolved_any(e: &wasit_runtime::wire::SessionEvent, rid: &str) -> bool {
+    is_agent(
+        e,
+        |a| matches!(a, AgentEvent::GateResolved { request_id, .. } if request_id == rid),
+    )
+}
+
+fn is_resolved(e: &wasit_runtime::wire::SessionEvent, rid: &str, why: &GateReason) -> bool {
     is_agent(e, |a| {
-        matches!(a, wasit_core::AgentEvent::GateResolved { request_id, reason }
-            if request_id == rid && reason.as_deref() == Some("withdrawn"))
+        matches!(a, AgentEvent::GateResolved { request_id, reason }
+            if request_id == rid && reason.as_ref() == Some(why))
     })
 }
 

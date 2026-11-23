@@ -754,12 +754,24 @@ impl SessionManager {
         self.gate_op(id, GateOp::Raise(gate)).await
     }
 
-    /// Withdraw a pending external gate without an answer (emits `gate_resolved`).
-    pub async fn resolve_gate(&self, id: &SessionId, request_id: &str) -> Result<(), CommandError> {
+    /// Take down a pending external gate without an answer (emits `gate_resolved`). `reason`
+    /// is why, from the resolver: a machine word and optionally a short detail, journaled with
+    /// the resolution and carried on the event. A reason that is not well formed
+    /// ([`GateReason::check`]) is refused and nothing is resolved.
+    pub async fn resolve_gate(
+        &self,
+        id: &SessionId,
+        request_id: &str,
+        reason: wasit_core::GateReason,
+    ) -> Result<(), CommandError> {
+        if let Err(reason) = reason.check() {
+            return Err(CommandError::Rejected { reason });
+        }
         self.gate_op(
             id,
             GateOp::Resolve {
                 request_id: request_id.to_string(),
+                reason,
             },
         )
         .await

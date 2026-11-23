@@ -6,9 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 use wasit_control::TraceId;
-use wasit_core::{Command, GateRequest, SpawnSpec};
+use wasit_core::{Command, GateReason, GateRequest, SpawnSpec};
 
 use crate::wire::NoticeCode;
+
+/// What a `resolve_gate` note journaled before resolutions carried a reason means.
+fn withdrawn() -> GateReason {
+    GateReason::new(GateReason::WITHDRAWN)
+}
 
 /// A runtime note. Serialized as `{"wasit": "<kind>", …}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,8 +51,14 @@ pub(crate) enum RuntimeNote {
         token: String,
         gate: Box<GateRequest>,
     },
-    /// An external gate was withdrawn by its owner without an answer.
-    ResolveGate { token: String, request_id: String },
+    /// An external gate was taken down by its owner without an answer, for `reason` (a note
+    /// journaled before resolutions carried one has none: it reads as `withdrawn`).
+    ResolveGate {
+        token: String,
+        request_id: String,
+        #[serde(default = "withdrawn")]
+        reason: GateReason,
+    },
 }
 
 impl RuntimeNote {
@@ -134,6 +145,23 @@ mod tests {
             classify(&old),
             NoteKind::Runtime(RuntimeNote::Command { trace: None, .. })
         ));
+        // A gate resolution journaled before it could say why reads as plainly withdrawn; one
+        // that says why round-trips with its detail.
+        let old_resolve = serde_json::json!({"wasit":"resolve_gate","token":"t","request_id":"r"});
+        assert_eq!(
+            classify(&old_resolve),
+            NoteKind::Runtime(RuntimeNote::ResolveGate {
+                token: "t".into(),
+                request_id: "r".into(),
+                reason: GateReason::new("withdrawn"),
+            })
+        );
+        let resolve = RuntimeNote::ResolveGate {
+            token: "t".into(),
+            request_id: "r".into(),
+            reason: GateReason::new("denied").with_detail("not now"),
+        };
+        assert_eq!(classify(&resolve.to_value()), NoteKind::Runtime(resolve));
         let old_start = serde_json::json!({"wasit":"start","spec":SpawnSpec::default()});
         assert!(matches!(
             classify(&old_start),
