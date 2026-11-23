@@ -1314,6 +1314,7 @@ fn tool_choices(suggestions: &[Value], plan: bool) -> (Vec<GateChoice>, Vec<(Str
         },
     )];
     if !suggestions.is_empty() {
+        let effects: Vec<String> = suggestions.iter().map(describe_suggestion).collect();
         choices.push(
             GateChoice::neutral(
                 "allow_always",
@@ -1324,13 +1325,8 @@ fn tool_choices(suggestions: &[Value], plan: bool) -> (Vec<GateChoice>, Vec<(Str
                 },
                 GateChoiceKind::AllowAlways,
             )
-            .with_description(
-                suggestions
-                    .iter()
-                    .map(describe_suggestion)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ),
+            .with_description(effects.join("; "))
+            .with_effects(effects),
         );
         answers.push((
             "allow_always".to_string(),
