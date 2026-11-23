@@ -779,6 +779,7 @@ fn claude_stores_a_conversation_with_its_first_prompt_and_resume_needs_it() {
         .find(|m| m["type"] == "system" && m["subtype"] == "init")
         .expect("init");
     assert_eq!(init["session_id"], CONVERSATION);
+    assert_eq!(init["model"], "claude-haiku-5-5");
     assert!(transcript(state, cwd, CONVERSATION).is_file());
 
     // Resuming works, also from another directory (claude finds the conversation in whatever
