@@ -100,7 +100,7 @@ pub(crate) enum Msg {
 
 /// An external gate operation.
 pub(crate) enum GateOp {
-    Raise(wasit_core::GateRequest),
+    Raise(wasit_core::GateRequest, Option<wasit_core::TurnBinding>),
     Resolve {
         request_id: String,
         reason: wasit_core::GateReason,
@@ -111,7 +111,7 @@ impl GateOp {
     /// What the operation is called in the records about it.
     fn name(&self) -> &'static str {
         match self {
-            GateOp::Raise(_) => "raise_gate",
+            GateOp::Raise(..) => "raise_gate",
             GateOp::Resolve { .. } => "resolve_gate",
         }
     }
@@ -1348,9 +1348,10 @@ impl Actor {
         }
         let tok = token();
         let data = match op {
-            GateOp::Raise(gate) => RuntimeNote::RaiseGate {
+            GateOp::Raise(gate, binding) => RuntimeNote::RaiseGate {
                 token: tok.clone(),
                 gate: Box::new(gate),
+                binding,
             },
             GateOp::Resolve { request_id, reason } => RuntimeNote::ResolveGate {
                 token: tok.clone(),

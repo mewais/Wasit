@@ -300,6 +300,60 @@ starts a turn by itself.
   `StopTask{task_id}` stops one task (`capabilities.stop_task`; an id that is not running is
   refused, the CLI would answer success to anything).
 
+### 3.7 External gates
+
+A session can carry gates that the agent CLI did not raise: requests for the human made by code
+around it (Wasl's handoff and spawn gates, Marsad's `ask_user` question). They are raised with
+`SessionManager::raise_gate` (journaled as a `raise_gate` note, shown as `gate_requested` and in
+`pending_gates` like a CLI gate), answered through the normal command path (an `input` event the
+owner watches for; nothing is written to the CLI), taken down by their owner with `resolve_gate`
+(a `GateReason{code, detail?}`), and ended by the runtime with the process generation
+(`process_ended`, or `session_stopped` when a stop was requested). The session's reducer
+(`Core`) is the one owner of all of this; whoever raised a gate only *observes* `gate_resolved`.
+
+**A gate bound to a turn.** A request that exists because a turn is waiting for it (an agent's
+tool call blocked on a human) must not outlive that turn. Raise it with
+`raise_gate_for_turn(id, gate, TurnBinding)`; the binding is journaled in the note, and `Core`
+resolves the gate itself, in the same step that interrupts or ends the turn, so the order is
+a property of the journal and replays identically. Nothing watches events to do it. Rules:
+
+- *Which turn:* the turn open when the raise note is applied (journal order, not when the caller
+  looked). Every bound gate therefore belongs to the turn open now; a gate is never bound to a
+  later turn.
+- *What ends the binding.* `TurnBinding::Interrupt` ends with an **applied interrupt** of the
+  turn only; a turn that ends normally leaves the gate pending and it then belongs to the session
+  (a handoff outlives the delegating turn). `TurnBinding::Turn` also ends when the turn ends
+  without an answer. An interrupt is *applied* when its `input` is accepted (`Sent`) while a turn
+  is open, which is before the CLI confirms; the gates go at that moment and the confirmation
+  adds nothing. If the CLI ends the turn normally anyway (the race), the gate was still the
+  interrupted turn's: it was resolved by the interrupt and is not resolved again. A turn the CLI
+  reports as interrupted that no applied interrupt preceded resolves its gates as interrupted
+  when it completes.
+- *Raised in the window* between an applied interrupt and the turn's completion: the turn is as
+  good as over, so the gate is resolved at once with `turn_interrupted`, in the raising record,
+  right behind its `gate_requested`.
+- *Raised with no turn open* (between turns, while only background work runs, before the first
+  turn): the gate belongs to the session, whatever the binding. There is no turn to follow, and
+  refusing would make a request that is legitimate outside a turn (a handoff raised between
+  turns) impossible. The residual race: a request whose own turn ended before the raise is
+  applied finds no turn (and is the session's); one whose turn was already replaced by the next
+  is bound to that next turn. Both are the owner's to settle by its own means (cancel, caller
+  gone, deadline), as before.
+- *Reasons* are runtime-owned codes, next to `process_ended` and `session_stopped`:
+  `turn_interrupted` and `turn_ended` (`GateReason::TURN_INTERRUPTED` / `TURN_ENDED`). The
+  *detail* is the raiser's own wording, supplied in the binding (`TurnBinding::check` refuses a
+  malformed one before anything is journaled) and carried on the event. Wasl's `EndCode` uses the
+  same two words with the same meaning: it maps the runtime's code to its own ending and never
+  redefines it.
+- *Order guaranteed.* Interrupt: `input{interrupt}` → `gate_resolved{turn_interrupted}` (one per
+  bound gate, in raise order, the same record) → the driver's own events → `turn_completed`
+  (`was_interrupted`). Turn end: `gate_resolved{turn_ended}` → `turn_completed`, in the
+  completing record. A session never reports a finished turn with one of its bound gates
+  pending. A gate answered or resolved by its owner first is not resolved again.
+- *Without a binding* (`raise_gate`) the gate belongs to the session and lives until it is
+  answered, resolved by its owner, or the process ends. A `raise_gate` note journaled before
+  bindings existed has no `binding` and replays as one.
+
 ## 4. Control protocol (`wasit-control`)
 
 One protocol for GUI↔daemon, daemon↔daemon and (later) phone↔daemon.

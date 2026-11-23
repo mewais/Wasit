@@ -752,7 +752,27 @@ impl SessionManager {
         id: &SessionId,
         gate: wasit_core::GateRequest,
     ) -> Result<(), CommandError> {
-        self.gate_op(id, GateOp::Raise(gate)).await
+        self.gate_op(id, GateOp::Raise(gate, None)).await
+    }
+
+    /// [`SessionManager::raise_gate`] for a request that belongs to the turn open when the
+    /// raise is applied (an agent's tool call waiting for a human): the session itself resolves
+    /// the gate, in the step that interrupts or ends that turn, ordered before the turn's own
+    /// completion, with [`GateReason::TURN_INTERRUPTED`](wasit_core::GateReason::TURN_INTERRUPTED)
+    /// or `TURN_ENDED` and the details of `binding`; the owner only observes `gate_resolved`.
+    /// See [`TurnBinding`](wasit_core::TurnBinding) and ARCHITECTURE.md (external gates) for
+    /// the exact rules, including a raise with no turn open. A `binding` whose details are not
+    /// well formed ([`TurnBinding::check`](wasit_core::TurnBinding::check)) is refused.
+    pub async fn raise_gate_for_turn(
+        &self,
+        id: &SessionId,
+        gate: wasit_core::GateRequest,
+        binding: wasit_core::TurnBinding,
+    ) -> Result<(), CommandError> {
+        if let Err(reason) = binding.check() {
+            return Err(CommandError::Rejected { reason });
+        }
+        self.gate_op(id, GateOp::Raise(gate, Some(binding))).await
     }
 
     /// Take down a pending external gate without an answer (emits `gate_resolved`). `reason`

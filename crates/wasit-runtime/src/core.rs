@@ -36,7 +36,7 @@
 //! commands journaled in that window, are buffered and applied right after `start` — in live
 //! operation and in replay alike.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use wasit_control::TraceId;
@@ -44,6 +44,7 @@ use wasit_core::tasks::{self, BackgroundChange};
 use wasit_core::{
     AgentEvent, Command, DriverCapabilities, DriverDescriptor, DriverError, Encoded, GateReason,
     InputDropReason, InputId, Protocol, ResumeMode, SavesConversation, Scope, SpawnSpec, Step,
+    TurnBinding,
 };
 use wasit_shim::{Kind, Record};
 
@@ -312,6 +313,13 @@ impl Emitter {
     }
 }
 
+/// How a turn's gates are being taken down ([`Core::end_turn_gates`]).
+#[derive(Clone, Copy)]
+enum TurnEnd {
+    Interrupted,
+    Ended,
+}
+
 /// See the module docs.
 pub(crate) struct Core {
     desc: Arc<dyn DriverDescriptor>,
@@ -343,10 +351,14 @@ pub(crate) struct Core {
     /// An `activity_while_idle` anomaly was reported since the last phase change.
     anomaly_reported: bool,
     stderr_tail: VecDeque<String>,
-    /// Request ids of pending gates raised from outside the CLI protocol (see
-    /// [`RuntimeNote::RaiseGate`]). They survive turn ends, are answered without the protocol,
-    /// and end with the process generation.
-    external: BTreeSet<String>,
+    /// Pending gates raised from outside the CLI protocol (see [`RuntimeNote::RaiseGate`]), by
+    /// request id, with the binding to the open turn that still applies to them. They are
+    /// answered without the protocol and end with the process generation; a gate with a binding
+    /// also ends with its turn ([`Core::end_turn_gates`]), one without lives on across turns.
+    /// Invariant: every bound gate belongs to the turn open now.
+    external: BTreeMap<String, Option<TurnBinding>>,
+    /// An interrupt was applied to the turn open now (the CLI has not ended it yet).
+    interrupt_applied: bool,
     /// Request ids of external gates that were withdrawn or ended with their process (newest
     /// last, bounded): a late answer to one is refused as [`CommandStatus::Withdrawn`].
     withdrawn: VecDeque<String>,
@@ -511,7 +523,8 @@ impl Core {
             causes: Vec::new(),
             anomaly_reported: false,
             stderr_tail: VecDeque::new(),
-            external: BTreeSet::new(),
+            external: BTreeMap::new(),
+            interrupt_applied: false,
             withdrawn: VecDeque::new(),
         }
     }
@@ -802,15 +815,9 @@ impl Core {
         } else {
             GateReason::new(GateReason::PROCESS_ENDED)
         };
-        for request_id in std::mem::take(&mut self.external) {
-            self.remember_withdrawn(request_id.clone());
-            let event = AgentEvent::GateResolved {
-                request_id,
-                reason: Some(ended.clone()),
-            };
-            let cursor = em.next_cursor();
-            self.reduce(&event, cursor, rec.t);
-            em.push(SessionEventKind::Agent { event });
+        let pending: Vec<String> = self.external.keys().cloned().collect();
+        for request_id in pending {
+            self.withdraw_external(request_id, ended.clone(), rec.t, em);
         }
         self.clear_live_state(rec.t);
         self.snap.exit = Some(ExitSummary {
@@ -943,9 +950,11 @@ impl Core {
                     });
                 }
             }
-            NoteKind::Runtime(RuntimeNote::RaiseGate { token, gate }) => {
-                self.raise_external(token, *gate, rec.t, em, out)
-            }
+            NoteKind::Runtime(RuntimeNote::RaiseGate {
+                token,
+                gate,
+                binding,
+            }) => self.raise_external(token, *gate, binding, rec.t, em, out),
             NoteKind::Runtime(RuntimeNote::ResolveGate {
                 token,
                 request_id,
@@ -1103,6 +1112,7 @@ impl Core {
                 None,
             ),
         };
+        let interrupts = status == CommandStatus::Sent && matches!(command, Command::Interrupt);
         let accepted = matches!(status, CommandStatus::Sent | CommandStatus::Queued);
         if accepted {
             match &command {
@@ -1142,6 +1152,13 @@ impl Core {
         if let Some(token) = token {
             out.resolved.push((token, status));
         }
+        // The gates of the turn being interrupted go right behind the interrupt itself and
+        // before anything the driver reports about it (it may confirm only later, or end the
+        // turn normally in a race: either way the gates were the interrupted turn's).
+        if interrupts && self.snap.turn.is_some() {
+            self.interrupt_applied = true;
+            self.end_turn_gates(TurnEnd::Interrupted, em.t, em);
+        }
         if let Some(step) = step {
             self.step(step, Some(input), em, out);
         }
@@ -1153,7 +1170,7 @@ impl Core {
     pub(crate) fn answers_withdrawn(&self, command: &Command) -> Option<String> {
         match command {
             Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. }
-                if !self.external.contains(request_id)
+                if !self.external.contains_key(request_id)
                     && self.withdrawn.iter().any(|w| w == request_id) =>
             {
                 Some(request_id.clone())
@@ -1174,7 +1191,7 @@ impl Core {
     fn answers_external(&self, command: &Command) -> bool {
         match command {
             Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. } => {
-                self.external.contains(request_id)
+                self.external.contains_key(request_id)
             }
             _ => false,
         }
@@ -1241,6 +1258,7 @@ impl Core {
         &mut self,
         token: String,
         gate: wasit_core::GateRequest,
+        binding: Option<TurnBinding>,
         t: u64,
         em: &mut Emitter,
         out: &mut Output,
@@ -1265,11 +1283,14 @@ impl Core {
                 reason: format!("a gate with request id {rid:?} is already pending"),
             }
         } else {
-            self.external.insert(rid);
+            self.external.insert(rid.clone(), None);
             let event = AgentEvent::GateRequested { gate };
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, t);
             em.push(SessionEventKind::Agent { event });
+            if let Some(binding) = binding {
+                self.bind_to_turn(rid, binding, t, em);
+            }
             CommandStatus::Sent
         };
         out.resolved.push((token, status));
@@ -1283,15 +1304,8 @@ impl Core {
         em: &mut Emitter,
         out: &mut Output,
     ) {
-        let status = if self.external.remove(&request_id) {
-            self.remember_withdrawn(request_id.clone());
-            let event = AgentEvent::GateResolved {
-                request_id,
-                reason: Some(reason),
-            };
-            let cursor = em.next_cursor();
-            self.reduce(&event, cursor, em.t);
-            em.push(SessionEventKind::Agent { event });
+        let status = if self.external.contains_key(&request_id) {
+            self.withdraw_external(request_id, reason, em.t, em);
             CommandStatus::Sent
         } else {
             CommandStatus::Rejected {
@@ -1299,6 +1313,77 @@ impl Core {
             }
         };
         out.resolved.push((token, status));
+    }
+
+    /// Take the external gate `request_id` down with `reason`: the one place a gate is resolved
+    /// without an answer (its owner asked, the process ended, its turn was interrupted or
+    /// ended). Remembered, so a late answer is refused.
+    fn withdraw_external(
+        &mut self,
+        request_id: String,
+        reason: GateReason,
+        t: u64,
+        em: &mut Emitter,
+    ) {
+        self.external.remove(&request_id);
+        self.remember_withdrawn(request_id.clone());
+        let event = AgentEvent::GateResolved {
+            request_id,
+            reason: Some(reason),
+        };
+        let cursor = em.next_cursor();
+        self.reduce(&event, cursor, t);
+        em.push(SessionEventKind::Agent { event });
+    }
+
+    /// Tie the gate just raised to the turn open now ([`TurnBinding`]):
+    ///
+    /// * a turn is open and no interrupt was applied to it: the gate is bound to it;
+    /// * a turn is open and was interrupted already (the CLI has not ended it yet): the turn
+    ///   is as good as over, so the gate is resolved at once with `turn_interrupted`;
+    /// * no turn is open: the gate belongs to the session (a request raised outside any turn:
+    ///   between turns, while only background work runs, before the first turn; there is no
+    ///   turn to follow).
+    ///
+    /// The resolution is part of the raising record, right behind `gate_requested`.
+    fn bind_to_turn(&mut self, rid: String, binding: TurnBinding, t: u64, em: &mut Emitter) {
+        if self.snap.turn.is_some() {
+            if self.interrupt_applied {
+                self.withdraw_external(rid, binding.interrupted_reason(), t, em);
+            } else {
+                self.external.insert(rid, Some(binding));
+            }
+        }
+    }
+
+    /// The open turn is over (`Ended`) or being interrupted (`Interrupted`): resolve the gates
+    /// bound to it, in the order they were raised, with the runtime's own reasons. A bound
+    /// gate that survives this (an interrupt-only binding at a normal end) becomes the
+    /// session's. Always runs *before* the event that ends the turn is published, so a gate
+    /// is never left pending behind a finished turn.
+    fn end_turn_gates(&mut self, how: TurnEnd, t: u64, em: &mut Emitter) {
+        let bound: Vec<(String, TurnBinding)> = self
+            .snap
+            .pending_gates
+            .iter()
+            .filter_map(|g| {
+                let rid = g.gate.request_id();
+                let binding = self.external.get(rid)?.clone()?;
+                Some((rid.to_string(), binding))
+            })
+            .collect();
+        for (rid, binding) in bound {
+            let reason = match how {
+                TurnEnd::Interrupted => Some(binding.interrupted_reason()),
+                TurnEnd::Ended => binding.ended_reason(),
+            };
+            match reason {
+                Some(reason) => self.withdraw_external(rid, reason, t, em),
+                None => {
+                    self.external.insert(rid, None);
+                }
+            }
+        }
     }
 
     fn note_prompt(&mut self, input: InputId, text: String) {
@@ -1380,6 +1465,17 @@ impl Core {
                     inputs.push(*input);
                 }
                 AgentEvent::InputDropped { input, .. } => self.queued.retain(|q| q != input),
+                AgentEvent::TurnCompleted {
+                    was_interrupted, ..
+                } => self.end_turn_gates(
+                    if *was_interrupted {
+                        TurnEnd::Interrupted
+                    } else {
+                        TurnEnd::Ended
+                    },
+                    em.t,
+                    em,
+                ),
                 _ => {}
             }
             let cursor = em.next_cursor();
@@ -1490,6 +1586,7 @@ impl Core {
                 trigger,
             } => {
                 saved = Some(TurnStarted);
+                self.interrupt_applied = false;
                 let prompt = input.and_then(|i| take_text(&mut self.prompt_texts, i));
                 s.turn = Some(TurnInfo {
                     started_at_ms: t,
@@ -1517,10 +1614,11 @@ impl Core {
                 origin,
             } => {
                 s.turn = None;
+                self.interrupt_applied = false;
                 // CLI gates end with the turn; external gates are owned by someone else.
                 let external = &self.external;
                 s.pending_gates
-                    .retain(|g| external.contains(g.gate.request_id()));
+                    .retain(|g| external.contains_key(g.gate.request_id()));
                 s.turns_completed += 1;
                 if *usage != Default::default() {
                     s.usage = usage.clone();
@@ -1622,7 +1720,7 @@ impl Core {
                 });
                 cause = Some(PhaseCause::GateRaised {
                     request_id: gate.request_id().to_string(),
-                    external: self.external.contains(gate.request_id()),
+                    external: self.external.contains_key(gate.request_id()),
                 });
             }
             AgentEvent::GateResolved { request_id, reason } => {
@@ -1706,7 +1804,8 @@ impl Core {
     fn clear_live_state(&mut self, t: u64) {
         self.snap.turn = None;
         self.snap.pending_gates.clear();
-        for request_id in std::mem::take(&mut self.external) {
+        self.interrupt_applied = false;
+        for request_id in std::mem::take(&mut self.external).into_keys() {
             self.remember_withdrawn(request_id);
         }
         tasks::end_all(&mut self.snap.tasks, t);
@@ -2089,6 +2188,7 @@ mod tests {
             RuntimeNote::RaiseGate {
                 token: "r1".into(),
                 gate: Box::new(gate),
+                binding: None,
             }
             .to_value(),
         );
@@ -2134,6 +2234,7 @@ mod tests {
             RuntimeNote::RaiseGate {
                 token: "r0".into(),
                 gate: Box::new(handoff("x0")),
+                binding: None,
             }
             .to_value(),
         );
@@ -2163,6 +2264,7 @@ mod tests {
             RuntimeNote::RaiseGate {
                 token: "r1".into(),
                 gate: Box::new(handoff("x1")),
+                binding: None,
             }
             .to_value(),
         );
@@ -2177,6 +2279,7 @@ mod tests {
             RuntimeNote::RaiseGate {
                 token: "r2".into(),
                 gate: Box::new(handoff("x1")),
+                binding: None,
             }
             .to_value(),
         );
@@ -2223,6 +2326,7 @@ mod tests {
             RuntimeNote::RaiseGate {
                 token: "r3".into(),
                 gate: Box::new(handoff("x2")),
+                binding: None,
             }
             .to_value(),
         );
@@ -2276,6 +2380,7 @@ mod tests {
             RuntimeNote::RaiseGate {
                 token: "r5".into(),
                 gate: Box::new(handoff("x2")),
+                binding: None,
             }
             .to_value(),
         );
@@ -2300,6 +2405,7 @@ mod tests {
             RuntimeNote::RaiseGate {
                 token: "r4".into(),
                 gate: Box::new(handoff("x3")),
+                binding: None,
             }
             .to_value(),
         );
@@ -2339,6 +2445,336 @@ mod tests {
         }
         assert_eq!(revents, events);
         assert_eq!(replay.snapshot(), live.snapshot());
+    }
+
+    // ── external gates bound to a turn ──────────────────────────────────────
+
+    fn question_gate(rid: &str) -> wasit_core::GateRequest {
+        wasit_core::GateRequest::Handoff {
+            request_id: rid.into(),
+            task_id: "t1".into(),
+            from: "h/a".into(),
+            to: "h/b".into(),
+            mode: "consult".into(),
+            instruction: "look".into(),
+            details: serde_json::Value::Null,
+            choices: vec![wasit_core::GateChoice::agent(
+                "allow",
+                "Allow",
+                wasit_core::GateChoiceKind::AllowOnce,
+            )],
+        }
+    }
+
+    fn raise(sim: &mut Sim, rid: &str, binding: Option<TurnBinding>) -> CommandStatus {
+        let out = sim.note(RuntimeNote::RaiseGate {
+            token: format!("raise-{rid}"),
+            gate: Box::new(question_gate(rid)),
+            binding,
+        });
+        out.resolved[0].1.clone()
+    }
+
+    /// Both endings, with the details the raiser words.
+    fn whole_turn() -> TurnBinding {
+        TurnBinding::Turn {
+            interrupted: Some("the user interrupted the turn".into()),
+            ended: Some("the turn ended before an answer".into()),
+        }
+    }
+
+    /// The order of what matters about gates and the turn: interrupts, gate raises and
+    /// resolutions (with their reason code and detail) and turn completions.
+    fn gate_trace(sim: &Sim) -> Vec<String> {
+        sim.events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Input {
+                    command: Command::Interrupt,
+                    ..
+                } => Some("interrupt".to_string()),
+                SessionEventKind::Agent {
+                    event: AgentEvent::GateRequested { gate },
+                } => Some(format!("requested:{}", gate.request_id())),
+                SessionEventKind::Agent {
+                    event: AgentEvent::GateResolved { request_id, reason },
+                } => Some(match reason {
+                    Some(r) => format!(
+                        "resolved:{request_id}:{}:{}",
+                        r.code,
+                        r.detail.as_deref().unwrap_or("-")
+                    ),
+                    None => format!("resolved:{request_id}"),
+                }),
+                SessionEventKind::Agent {
+                    event:
+                        AgentEvent::TurnCompleted {
+                            was_interrupted, ..
+                        },
+                } => Some(format!("turn_completed:{was_interrupted}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A session in the middle of a turn that the CLI started for `"go"`.
+    fn sim_in_a_turn() -> Sim {
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        sim.command(Command::prompt("go"));
+        sim.cli_starts_turn_for_the_last_prompt();
+        assert!(sim.core.snapshot().turn.is_some());
+        sim
+    }
+
+    const RESULT_INTERRUPTED: &str =
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}"#;
+
+    /// The interrupt resolves the turn's gate in its own step: right behind the `input` event
+    /// of the interrupt, before anything the CLI says about it and before the turn completes.
+    #[test]
+    fn an_interrupt_resolves_the_gates_of_the_turn_before_it_completes() {
+        let mut sim = sim_in_a_turn();
+        assert_eq!(
+            raise(&mut sim, "g1", Some(whole_turn())),
+            CommandStatus::Sent
+        );
+        assert_eq!(
+            raise(&mut sim, "g2", Some(whole_turn())),
+            CommandStatus::Sent
+        );
+        assert_eq!(sim.core.snapshot().pending_gates.len(), 2);
+        let (_, out) = sim.command(Command::Interrupt);
+        // The same step: the interrupt, then both gates in the order they were raised, then
+        // what the driver wrote for the interrupt; the gates are gone from the snapshot while
+        // the turn is still open.
+        let kinds: Vec<String> = out.events.iter().map(|e| short(&e.kind)).collect();
+        assert!(kinds[0].starts_with("input"), "{kinds:?}");
+        assert_eq!(kinds[1], "gate_resolved", "{kinds:?}");
+        assert_eq!(kinds[2], "gate_resolved", "{kinds:?}");
+        assert!(sim.core.snapshot().pending_gates.is_empty());
+        assert!(sim.core.snapshot().turn.is_some());
+        sim.feed(Kind::Out, json!(RESULT_INTERRUPTED));
+        let why = "the user interrupted the turn";
+        assert_eq!(
+            gate_trace(&sim),
+            [
+                "requested:g1".to_string(),
+                "requested:g2".into(),
+                "interrupt".into(),
+                format!("resolved:g1:turn_interrupted:{why}"),
+                format!("resolved:g2:turn_interrupted:{why}"),
+                "turn_completed:true".into(),
+            ]
+        );
+        // The gate is withdrawn: a late answer is refused as such.
+        let (_, out) = sim.command(Command::AnswerGate {
+            request_id: "g1".into(),
+            decision: GateDecision::choose("allow"),
+        });
+        assert!(matches!(
+            out.events.last().map(|e| &e.kind),
+            Some(SessionEventKind::Input {
+                status: CommandStatus::Withdrawn { .. },
+                ..
+            })
+        ));
+        sim.assert_replay_exact();
+    }
+
+    /// A turn that ends normally takes its gate with it, resolved right before the completion.
+    #[test]
+    fn a_turn_ending_without_an_answer_resolves_its_gates_right_before_it_completes() {
+        let mut sim = sim_in_a_turn();
+        raise(&mut sim, "g1", Some(whole_turn()));
+        let out = sim.feed(Kind::Out, json!(RESULT_OK));
+        assert_eq!(
+            gate_trace(&sim),
+            [
+                "requested:g1".to_string(),
+                "resolved:g1:turn_ended:the turn ended before an answer".into(),
+                "turn_completed:false".into(),
+            ]
+        );
+        // One record, in this order, with nothing pending when the turn is reported over.
+        let kinds: Vec<String> = out.events.iter().map(|e| short(&e.kind)).collect();
+        let at = |n: &str| kinds.iter().position(|k| k == n).unwrap();
+        assert!(at("gate_resolved") < at("turn_completed"), "{kinds:?}");
+        assert!(sim.core.snapshot().pending_gates.is_empty());
+        assert_eq!(sim.core.snapshot().phase, Phase::Idle);
+        sim.assert_replay_exact();
+    }
+
+    /// An interrupt that the CLI answers with a normal result (it ended the turn first): the
+    /// gate was the interrupted turn's and says so, once.
+    #[test]
+    fn an_interrupt_that_loses_the_race_to_a_normal_end_still_resolved_the_gate_as_interrupted() {
+        let mut sim = sim_in_a_turn();
+        raise(&mut sim, "g1", Some(whole_turn()));
+        sim.command(Command::Interrupt);
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        let trace = gate_trace(&sim);
+        assert_eq!(
+            trace.iter().filter(|t| t.starts_with("resolved")).count(),
+            1
+        );
+        assert!(trace[2].contains("turn_interrupted"), "{trace:?}");
+        assert_eq!(trace[3], "turn_completed:false");
+        sim.assert_replay_exact();
+    }
+
+    /// Without a binding a gate belongs to the session: turns end and are interrupted around it.
+    #[test]
+    fn a_session_gate_is_untouched_by_turn_ends_and_interrupts() {
+        let mut sim = sim_in_a_turn();
+        assert_eq!(raise(&mut sim, "s1", None), CommandStatus::Sent);
+        sim.command(Command::Interrupt);
+        sim.feed(Kind::Out, json!(RESULT_INTERRUPTED));
+        sim.command(Command::prompt("again"));
+        sim.cli_starts_turn_for_the_last_prompt();
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        assert_eq!(sim.core.snapshot().pending_gates.len(), 1);
+        assert_eq!(sim.core.snapshot().phase, Phase::NeedsYou);
+        assert!(gate_trace(&sim).iter().all(|t| !t.starts_with("resolved")));
+        sim.assert_replay_exact();
+    }
+
+    /// An interrupt-only binding follows an interrupt of its turn but not a normal end, after
+    /// which the gate belongs to the session (a later turn's interrupt leaves it).
+    #[test]
+    fn an_interrupt_binding_survives_a_normal_end_and_then_belongs_to_the_session() {
+        let only_interrupt = || TurnBinding::Interrupt {
+            detail: Some("interrupted".into()),
+        };
+        let mut sim = sim_in_a_turn();
+        raise(&mut sim, "h1", Some(only_interrupt()));
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        assert_eq!(sim.core.snapshot().pending_gates.len(), 1);
+        sim.command(Command::prompt("next"));
+        sim.cli_starts_turn_for_the_last_prompt();
+        sim.command(Command::Interrupt);
+        sim.feed(Kind::Out, json!(RESULT_INTERRUPTED));
+        assert_eq!(
+            sim.core.snapshot().pending_gates.len(),
+            1,
+            "now the session's"
+        );
+        // Another one, bound to the turn that is interrupted: resolved by it.
+        let mut sim = sim_in_a_turn();
+        raise(&mut sim, "h2", Some(only_interrupt()));
+        sim.command(Command::Interrupt);
+        sim.feed(Kind::Out, json!(RESULT_INTERRUPTED));
+        assert_eq!(
+            gate_trace(&sim),
+            [
+                "requested:h2".to_string(),
+                "interrupt".into(),
+                "resolved:h2:turn_interrupted:interrupted".into(),
+                "turn_completed:true".into(),
+            ]
+        );
+        sim.assert_replay_exact();
+    }
+
+    /// Raised with no turn open, a gate belongs to the session whatever its binding: there is no
+    /// turn to follow, and the next turns neither end nor interrupt it.
+    #[test]
+    fn a_gate_raised_with_no_turn_open_belongs_to_the_session() {
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        assert!(sim.core.snapshot().turn.is_none());
+        assert_eq!(
+            raise(&mut sim, "n1", Some(whole_turn())),
+            CommandStatus::Sent
+        );
+        assert_eq!(
+            raise(
+                &mut sim,
+                "n2",
+                Some(TurnBinding::Interrupt { detail: None })
+            ),
+            CommandStatus::Sent
+        );
+        assert_eq!(
+            gate_trace(&sim),
+            ["requested:n1".to_string(), "requested:n2".into()]
+        );
+        // Turns come and go (one interrupted) around them.
+        sim.command(Command::prompt("go"));
+        sim.cli_starts_turn_for_the_last_prompt();
+        sim.command(Command::Interrupt);
+        sim.feed(Kind::Out, json!(RESULT_INTERRUPTED));
+        sim.command(Command::prompt("again"));
+        sim.cli_starts_turn_for_the_last_prompt();
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        assert_eq!(sim.core.snapshot().pending_gates.len(), 2);
+        assert!(gate_trace(&sim).iter().all(|t| !t.starts_with("resolved")));
+        sim.assert_replay_exact();
+    }
+
+    /// Raised after the interrupt was applied but before the CLI ended the turn: the turn is
+    /// as good as over, so the gate is resolved as interrupted in the raising record.
+    #[test]
+    fn a_gate_raised_on_a_turn_already_interrupted_is_resolved_as_interrupted() {
+        let mut sim = sim_in_a_turn();
+        sim.command(Command::Interrupt);
+        assert_eq!(
+            raise(&mut sim, "g1", Some(whole_turn())),
+            CommandStatus::Sent
+        );
+        assert!(sim.core.snapshot().pending_gates.is_empty());
+        sim.feed(Kind::Out, json!(RESULT_INTERRUPTED));
+        // A turn after it is a new turn: its gates are its own.
+        sim.command(Command::prompt("again"));
+        sim.cli_starts_turn_for_the_last_prompt();
+        assert_eq!(
+            raise(&mut sim, "g2", Some(whole_turn())),
+            CommandStatus::Sent
+        );
+        assert_eq!(sim.core.snapshot().pending_gates.len(), 1);
+        assert_eq!(
+            gate_trace(&sim),
+            [
+                "interrupt".to_string(),
+                "requested:g1".into(),
+                "resolved:g1:turn_interrupted:the user interrupted the turn".into(),
+                "turn_completed:true".into(),
+                "requested:g2".into(),
+            ]
+        );
+        sim.assert_replay_exact();
+    }
+
+    /// An answer wins over the turn's end: the answered gate is not resolved again.
+    #[test]
+    fn an_answered_gate_is_not_resolved_by_the_end_of_its_turn() {
+        let mut sim = sim_in_a_turn();
+        raise(&mut sim, "g1", Some(whole_turn()));
+        sim.command(Command::AnswerGate {
+            request_id: "g1".into(),
+            decision: GateDecision::choose("allow"),
+        });
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        assert!(gate_trace(&sim).iter().all(|t| !t.starts_with("resolved")));
+        sim.assert_replay_exact();
+    }
+
+    /// The process ending still resolves a bound gate with the runtime's process reasons.
+    #[test]
+    fn the_end_of_the_process_resolves_a_bound_gate_with_its_own_reason() {
+        let mut sim = sim_in_a_turn();
+        raise(&mut sim, "g1", Some(whole_turn()));
+        sim.feed(Kind::Exited, json!({"code": 1}));
+        assert_eq!(
+            gate_trace(&sim),
+            [
+                "requested:g1".to_string(),
+                "resolved:g1:process_ended:-".into()
+            ]
+        );
+        sim.assert_replay_exact();
     }
 
     #[test]

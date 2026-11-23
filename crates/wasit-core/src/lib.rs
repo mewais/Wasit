@@ -49,7 +49,7 @@ pub use event::{
     AgentEvent, BackgroundTask, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind,
     GateDecision, GateReason, GateRequest, InputDropReason, McpServerInfo, ModelInfo, ModelUsage,
     PlanEntry, QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, Scope, SessionMode,
-    SlashCommandInfo, SpawnGate, TaskUsage, TurnOrigin, TurnTrigger, Usage,
+    SlashCommandInfo, SpawnGate, TaskUsage, TurnBinding, TurnOrigin, TurnTrigger, Usage,
 };
 pub use protocol::{Command, DriverError, Encoded, InputId, OutLine, Protocol, Step};
 pub use spec::{GeneratedFile, ResumeMode, SpawnSpec};
