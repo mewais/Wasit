@@ -1,0 +1,7 @@
+[{"wait":"turn_completed"},
+ {"wait":"turn_started","contains":"\"agent\""},
+ {"wait":"tool_call_started"},
+ {"cmd":{"command":"interrupt"}},
+ {"wait":"turn_completed"},
+ {"cmd":{"command":"prompt","text":"Reply with just the word AFTER."}},
+ {"wait":"turn_completed"}]

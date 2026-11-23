@@ -89,7 +89,24 @@ Steps (`{"type": "<name>", …}`):
 | `hang` | | stop answering anything (stdin is drained until EOF) |
 | `garbage` | `line?` | one malformed stdout line |
 | `stderr` | `text` | write to stderr |
+| `background` | `kind` (`local_agent` \| `local_bash`), `description`, `subagent_type?`, `command?`, `after_ms`, `steps`, `status?`, `summary?`, `then`, `on_stop` | claude persona: start a task in the background, as the real CLI does (see below) |
 | `mcp_call` | `server`, `tool`, `arguments`, `save_as?` | claude persona: start the stdio MCP server `server` from `--mcp-config`, call `tool`, show it as a tool call `mcp__<server>__<tool>`; `save_as` keeps the result (JSON when it parses) for `{{name.path.0.x}}` placeholders in later `say` texts and `mcp_call` arguments |
+
+Background tasks (claude persona, modelled on claude 2.1.293: `reference/claude/background_bash`,
+`background_agent`, `stop_task`, `agent_turn_interrupt`, `agent_turn_prompt`): a `background` step prints
+the spawning tool call, `background_tasks_changed`, `task_started` (`is_backgrounded`) and the call's
+result, and the turn goes on and ends. The task runs for `after_ms` while the session is idle: a
+`local_agent` streams its own `steps` (assistant / user lines tagged `parent_tool_use_id`, `agent_id`,
+`subagent_type`, `task_description`, with `task_progress` after each of its tool calls); then
+`task_updated`, `task_notification`, `background_tasks_changed` and — when `then` is not empty — a turn
+the agent starts by itself: `system/init`, no lifecycle frame, `then`'s steps, a `result` whose `origin`
+is `{kind:"task-notification", producer:"session-task", runId}`. `stop_task {task_id}` ends the task
+(`task_updated` killed, `task_notification` stopped, the new list, then the answer `{}`; any other id is
+answered `{}` too, a missing one is refused); stopping a `local_agent` makes the agent run `on_stop`
+as its own turn, stopping a `local_bash` starts none (both recorded). An `interrupt` while only tasks
+run is answered and stops nothing. A prompt with a `uuid` read during a turn the agent started by itself
+is taken into it at the next step boundary (`started`, then `completed` right before the `result`, which
+lists it); one read during a turn of the client's waits for the next turn as before.
 
 Protocol-level requests are answered without scenario help: initialize, session/thread creation,
 load/resume/fork/close/list, set mode / model / config option, interrupt / cancel (turn ends as
@@ -145,8 +162,10 @@ exist.
 
 `reference/<persona>/*.jsonl` are real exchanges recorded from claude 2.1.326, opencode 1.19.6,
 kilo 7.8.27 and codex-cli 0.169.1 (see `reference/record/README.md` for how);
-`reference/claude/lifecycle.jsonl` is from claude 2.1.293 (sanitized: home path, MCP server and
-skill names). The claude persona reports the lifecycle of a user message that carries a `uuid`
+`reference/claude/lifecycle.jsonl`, `background_bash.jsonl`, `background_agent.jsonl`, `stop_task.jsonl`,
+`agent_turn_interrupt.jsonl` and `agent_turn_prompt.jsonl` are from claude 2.1.293 (sanitized: home path,
+MCP server, skill and plugin names; recorded with `wasit-smoke --record`, scripts and the sanitizer in
+`reference/record/background`; the same data is `wasit-claude/tests/fixtures/*.ndjson`). The claude persona reports the lifecycle of a user message that carries a `uuid`
 the way that recording shows: `command_lifecycle` `queued` when the line is read, `started`
 before the turn's `system/init`, `completed` / `cancelled` (interrupted) after its `result`,
 whose `user_message_uuids` lists it; `cancel_async_message` removes a still-queued message
@@ -173,10 +192,14 @@ opencode/kilo persona lists only the scenario's sessions, not the stored ones; J
 codex reasoning items, ACP `plan` updates (real opencode reports todos as a `todowrite` tool call,
 the ACP spec shape is emitted here) and claude `ExitPlanMode` were not captured from the real
 CLIs and follow the protocol specs; claude `rate_limit_event` and codex `warning` /
-`account/rateLimits/updated` / `thread/readState/changed` noise is not emitted; claude's
-`system/init` is printed once, not at the start of every turn; a claude message read during a
-turn waits for the next turn, while the real CLI may also take it into the running turn at its
-next model call (`started` mid-turn, one `result` listing both); the lifecycle state after a
+`account/rateLimits/updated` / `thread/readState/changed` noise is not emitted; a claude
+message read during a turn of the client's waits for the next turn, while the real CLI may also take
+it into the running turn at its next model call (`started` mid-turn, one `result` listing both; the
+fake does that only in a turn the agent started itself); tasks end only while the session is idle (a
+task that comes due during a turn is ended after it, where the real CLI absorbs the notification into
+the running turn); the real CLI sometimes starts two turns of its own after one subagent (a `peer`
+hand-back with the subagent's report in `origin.body`, then the task notification), the fake one;
+claude `system/session_state_changed` (an opt-in of the CLI) is not emitted; the lifecycle state after a
 failed turn was not recorded (`completed` is sent); codex `turn/steer`: only the accepted shape, the
 two errors above and the fold-in at turn end were recorded (a real steer is folded in at the next model
 call, a turn with tool calls may take it earlier), a steer is accepted only while the scenario's turn

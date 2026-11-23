@@ -40,9 +40,10 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use wasit_control::TraceId;
+use wasit_core::tasks::{self, BackgroundChange};
 use wasit_core::{
     AgentEvent, Command, DriverCapabilities, DriverDescriptor, DriverError, Encoded,
-    InputDropReason, InputId, Protocol, ResumeMode, SavesConversation, SpawnSpec, Step,
+    InputDropReason, InputId, Protocol, ResumeMode, SavesConversation, Scope, SpawnSpec, Step,
 };
 use wasit_shim::{Kind, Record};
 
@@ -226,6 +227,8 @@ pub(crate) fn blank_snapshot(
         live_usage: None,
         context_pct: None,
         subagents: Vec::new(),
+        tasks: Vec::new(),
+        background_running: 0,
         plan: Vec::new(),
         last_activity_ms: meta.created_at_ms,
         exit: None,
@@ -377,7 +380,9 @@ fn take_text(texts: &mut VecDeque<(InputId, String)>, input: InputId) -> Option<
 
 /// The event type of agent activity (output that means the agent is working).
 fn activity(e: &AgentEvent) -> Option<&'static str> {
-    Some(match e {
+    // A subagent's activity is activity too: it is the phase (`working` while its task runs)
+    // that says whether it is explained.
+    Some(match e.unscoped().1 {
         AgentEvent::AssistantDelta { .. } => "assistant_delta",
         AgentEvent::AssistantContent { .. } => "assistant_content",
         AgentEvent::ThinkingDelta { .. } => "thinking_delta",
@@ -386,6 +391,94 @@ fn activity(e: &AgentEvent) -> Option<&'static str> {
         AgentEvent::ToolCallFinished { .. } => "tool_call_finished",
         _ => return None,
     })
+}
+
+/// The ids of the tasks running in the background.
+fn running_background_ids(tasks: &[wasit_core::TaskInfo]) -> Vec<String> {
+    tasks
+        .iter()
+        .filter(|t| t.running && t.background)
+        .map(|t| t.task_id.clone())
+        .collect()
+}
+
+fn push_subagent(
+    subagents: &mut Vec<SubagentInfo>,
+    call_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    model: &Option<String>,
+    t: u64,
+) {
+    subagents.push(SubagentInfo {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        model: model.clone(),
+        description: input
+            .get("description")
+            .and_then(|d| d.as_str())
+            .map(|d| truncate(d, TITLE_CHARS))
+            .unwrap_or_default(),
+        started_at_ms: t,
+        running: true,
+        ok: None,
+        task_id: None,
+        agent_id: None,
+        subagent_type: input
+            .get("subagent_type")
+            .and_then(|d| d.as_str())
+            .map(str::to_string),
+        status: None,
+        ended_at_ms: None,
+        tool_calls: 0,
+        last_tool: None,
+        usage: None,
+    });
+    if subagents.len() > MAX_SUBAGENTS {
+        if let Some(i) = subagents.iter().position(|a| !a.running) {
+            subagents.remove(i);
+        } else {
+            subagents.remove(0);
+        }
+    }
+}
+
+/// The tool call that started subagent `call_id` returned. For a subagent the agent reports a
+/// task for, that is not its end (a backgrounded one returns at once): the task's end is.
+fn finish_subagent_call(subagents: &mut [SubagentInfo], call_id: &str, ok: bool, t: u64) {
+    if let Some(a) = subagents.iter_mut().find(|a| a.call_id == call_id) {
+        if a.task_id.is_none() {
+            a.running = false;
+            a.ok = Some(ok);
+            a.ended_at_ms = Some(t);
+        }
+    }
+}
+
+/// Make every subagent show what the agent's task for it says: the link is the spawning call
+/// (`TaskInfo::call_id`), and the task is the authority for whether it runs.
+fn sync_subagents(subagents: &mut [SubagentInfo], tasks: &[wasit_core::TaskInfo]) {
+    for a in subagents.iter_mut() {
+        let task = match &a.task_id {
+            Some(id) => tasks.iter().find(|t| &t.task_id == id),
+            None => tasks
+                .iter()
+                .find(|t| t.call_id.as_deref() == Some(a.call_id.as_str())),
+        };
+        let Some(task) = task else { continue };
+        a.task_id = Some(task.task_id.clone());
+        a.running = task.running;
+        a.status.clone_from(&task.status);
+        a.ok = if task.running { None } else { task.ok };
+        a.ended_at_ms = task.ended_at_ms;
+        if task.subagent_type.is_some() {
+            a.subagent_type.clone_from(&task.subagent_type);
+        }
+        if task.last_tool.is_some() {
+            a.last_tool.clone_from(&task.last_tool);
+        }
+        a.usage = task.usage;
+    }
 }
 
 impl Core {
@@ -588,7 +681,7 @@ impl Core {
             kinds.push(SessionEventKind::Agent { event });
         }
         self.lost = Some(reason.to_string());
-        self.clear_live_state();
+        self.clear_live_state(self.snap.last_activity_ms);
         let slot = synthetic_cursor(self.last_seq);
         let t = self.snap.last_activity_ms;
         let phase = self.compute_phase();
@@ -635,7 +728,7 @@ impl Core {
         self.lost = None;
         self.exit_phase = None;
         self.prompt_texts.clear();
-        self.clear_live_state();
+        self.clear_live_state(rec.t);
         self.snap.generation += 1;
         self.causes.push(PhaseCause::Spawned {
             generation: self.snap.generation,
@@ -717,7 +810,7 @@ impl Core {
             self.reduce(&event, cursor, rec.t);
             em.push(SessionEventKind::Agent { event });
         }
-        self.clear_live_state();
+        self.clear_live_state(rec.t);
         self.snap.exit = Some(ExitSummary {
             code: info.code,
             signal: info.signal,
@@ -1312,7 +1405,47 @@ impl Core {
         }
     }
 
+    /// What an event of a subagent's own conversation does to the session: it is never part of
+    /// the session's turn (no tool counts, no current tool, no usage meters); it counts toward
+    /// the subagent it belongs to.
+    fn reduce_scoped(&mut self, scope: &Scope, event: &AgentEvent, t: u64) {
+        let s = &mut self.snap;
+        let known =
+            |subs: &mut Vec<SubagentInfo>| subs.iter().position(|a| a.call_id == scope.call_id);
+        if let Some(i) = known(&mut s.subagents) {
+            if s.subagents[i].agent_id.is_none() {
+                s.subagents[i].agent_id.clone_from(&scope.agent_id);
+            }
+        }
+        match event {
+            AgentEvent::ToolCallStarted {
+                name,
+                call_id,
+                input,
+                is_subagent,
+                subagent_model,
+            } => {
+                if let Some(i) = known(&mut s.subagents) {
+                    s.subagents[i].tool_calls += 1;
+                    s.subagents[i].last_tool = Some(name.clone());
+                }
+                if *is_subagent {
+                    push_subagent(&mut s.subagents, call_id, name, input, subagent_model, t);
+                    sync_subagents(&mut s.subagents, &s.tasks);
+                }
+            }
+            AgentEvent::ToolCallFinished { call_id, ok, .. } => {
+                finish_subagent_call(&mut s.subagents, call_id, *ok, t);
+            }
+            _ => {}
+        }
+    }
+
     fn reduce(&mut self, event: &AgentEvent, cursor: u64, t: u64) {
+        if let AgentEvent::Scoped { scope, event } = event {
+            self.reduce_scoped(scope, event, t);
+            return;
+        }
         let s = &mut self.snap;
         let mut cause = None;
         let mut saved: Option<SavedFact> = None;
@@ -1349,19 +1482,25 @@ impl Core {
             AgentEvent::TurnStarted {
                 native_turn_id,
                 input,
+                trigger,
             } => {
                 saved = Some(TurnStarted);
                 let prompt = input.and_then(|i| take_text(&mut self.prompt_texts, i));
                 s.turn = Some(TurnInfo {
                     started_at_ms: t,
                     native_turn_id: native_turn_id.clone(),
+                    input: *input,
+                    trigger: *trigger,
                     prompt,
                     tool_calls: 0,
                     last_tool: None,
                     current_tool: None,
                     current_call: None,
                 });
-                cause = Some(PhaseCause::TurnStarted { input: *input });
+                cause = Some(PhaseCause::TurnStarted {
+                    input: *input,
+                    trigger: *trigger,
+                });
             }
             AgentEvent::TurnCompleted {
                 end_reason,
@@ -1370,6 +1509,7 @@ impl Core {
                 usage,
                 per_model,
                 reply,
+                origin,
             } => {
                 s.turn = None;
                 // CLI gates end with the turn; external gates are owned by someone else.
@@ -1386,15 +1526,25 @@ impl Core {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                 }
+                // Work that is not in the background cannot outlive its turn; background tasks
+                // go on (that is what makes the session `working` without a turn).
+                tasks::end_foreground(&mut s.tasks, t);
                 for a in s.subagents.iter_mut().filter(|a| a.running) {
-                    a.running = false;
+                    if a.task_id.is_none() {
+                        // An agent that reports no task for it: the turn's end is the only end.
+                        a.running = false;
+                        a.ended_at_ms = Some(t);
+                    }
                 }
+                sync_subagents(&mut s.subagents, &s.tasks);
+                s.background_running = tasks::background_running(&s.tasks);
                 s.last_turn = Some(TurnOutcome {
                     ended_at_ms: t,
                     end_reason: *end_reason,
                     was_interrupted: *was_interrupted,
                     num_turns: *num_turns,
                     reply: reply.as_deref().map(|r| truncate(r, REPLY_CHARS)),
+                    origin: origin.clone(),
                 });
                 cause = Some(PhaseCause::TurnCompleted {
                     end_reason: *end_reason,
@@ -1415,26 +1565,8 @@ impl Core {
                     turn.current_call = Some(call_id.clone());
                 }
                 if *is_subagent {
-                    s.subagents.push(SubagentInfo {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        model: subagent_model.clone(),
-                        description: input
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .map(|d| truncate(d, TITLE_CHARS))
-                            .unwrap_or_default(),
-                        started_at_ms: t,
-                        running: true,
-                        ok: None,
-                    });
-                    if s.subagents.len() > MAX_SUBAGENTS {
-                        if let Some(i) = s.subagents.iter().position(|a| !a.running) {
-                            s.subagents.remove(i);
-                        } else {
-                            s.subagents.remove(0);
-                        }
-                    }
+                    push_subagent(&mut s.subagents, call_id, name, input, subagent_model, t);
+                    sync_subagents(&mut s.subagents, &s.tasks);
                 }
             }
             AgentEvent::ToolCallFinished { call_id, ok, .. } => {
@@ -1444,11 +1576,37 @@ impl Core {
                         turn.current_call = None;
                     }
                 }
-                if let Some(a) = s.subagents.iter_mut().find(|a| &a.call_id == call_id) {
-                    a.running = false;
-                    a.ok = Some(*ok);
-                }
+                finish_subagent_call(&mut s.subagents, call_id, *ok, t);
             }
+            AgentEvent::TaskStarted { .. }
+            | AgentEvent::TaskProgress { .. }
+            | AgentEvent::TaskUpdated { .. }
+            | AgentEvent::TaskEnded { .. }
+            | AgentEvent::BackgroundTasksChanged { .. } => {
+                let before = running_background_ids(&s.tasks);
+                let change = tasks::apply(&mut s.tasks, event, t);
+                let after = running_background_ids(&s.tasks);
+                sync_subagents(&mut s.subagents, &s.tasks);
+                s.background_running = after.len() as u32;
+                cause =
+                    match change {
+                        BackgroundChange::Started => after
+                            .iter()
+                            .find(|id| !before.contains(id))
+                            .map(|id| PhaseCause::TaskStarted {
+                                task_id: id.clone(),
+                            }),
+                        BackgroundChange::Ended => before
+                            .iter()
+                            .find(|id| !after.contains(id))
+                            .map(|id| PhaseCause::TaskEnded {
+                                task_id: id.clone(),
+                            }),
+                        BackgroundChange::None => None,
+                    };
+            }
+            // Handled before the match: see `reduce_scoped`.
+            AgentEvent::Scoped { .. } => {}
             AgentEvent::GateRequested { gate } => {
                 s.pending_gates
                     .retain(|g| g.gate.request_id() != gate.request_id());
@@ -1539,15 +1697,18 @@ impl Core {
         }
     }
 
-    fn clear_live_state(&mut self) {
+    fn clear_live_state(&mut self, t: u64) {
         self.snap.turn = None;
         self.snap.pending_gates.clear();
         for request_id in std::mem::take(&mut self.external) {
             self.remember_withdrawn(request_id);
         }
+        tasks::end_all(&mut self.snap.tasks, t);
         for a in self.snap.subagents.iter_mut().filter(|a| a.running) {
             a.running = false;
+            a.ended_at_ms = Some(t);
         }
+        self.snap.background_running = 0;
     }
 
     fn compute_phase(&self) -> Phase {
@@ -1569,12 +1730,32 @@ impl Core {
                     Phase::NeedsYou
                 } else if !self.handshake_done {
                     Phase::Starting
-                } else if self.snap.turn.is_some() {
+                } else if self.snap.turn.is_some() || self.snap.background_running > 0 {
                     Phase::Working
                 } else {
                     Phase::Idle
                 }
             }
+        }
+    }
+
+    /// A subagent's line (it names the call that spawned the subagent) is accounted for when the
+    /// session knows that subagent, running or just ended: the agent flushes the last lines of a
+    /// task right after its end frames. A line of a subagent nobody told us about is not.
+    fn explained_by_a_known_subagent(&self, event: &AgentEvent) -> bool {
+        match event.unscoped().0 {
+            Some(scope) => {
+                self.snap
+                    .subagents
+                    .iter()
+                    .any(|a| a.call_id == scope.call_id)
+                    || self
+                        .snap
+                        .tasks
+                        .iter()
+                        .any(|t| t.call_id.as_deref() == Some(scope.call_id.as_str()))
+            }
+            None => false,
         }
     }
 
@@ -1586,12 +1767,14 @@ impl Core {
             Phase::Idle => matches!(
                 c,
                 PhaseCause::TurnCompleted { .. }
+                    | PhaseCause::TaskEnded { .. }
                     | PhaseCause::GateCleared { .. }
                     | PhaseCause::HandshakeDone
             ),
             Phase::Working => matches!(
                 c,
                 PhaseCause::TurnStarted { .. }
+                    | PhaseCause::TaskStarted { .. }
                     | PhaseCause::GateCleared { .. }
                     | PhaseCause::HandshakeDone
             ),
@@ -1626,7 +1809,9 @@ impl Core {
             )
         {
             let first = em.events.iter().find_map(|e| match &e.kind {
-                SessionEventKind::Agent { event } => activity(event),
+                SessionEventKind::Agent { event } => {
+                    activity(event).filter(|_| !self.explained_by_a_known_subagent(event))
+                }
                 _ => None,
             });
             if let Some(first) = first {
@@ -1656,7 +1841,7 @@ impl Core {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wasit_core::GateDecision;
+    use wasit_core::{GateDecision, TurnTrigger};
 
     fn meta() -> SessionMeta {
         SessionMeta {
@@ -1785,8 +1970,19 @@ mod tests {
         feed(&mut live, &mut j, Kind::Out, json!(INIT_OK));
         assert_eq!(
             live.snapshot().phase,
+            Phase::Idle,
+            "the first prompt went out, but no turn runs until the CLI says so"
+        );
+        feed(
+            &mut live,
+            &mut j,
+            Kind::Out,
+            json!(r#"{"type":"system","subtype":"init","session_id":"s1","model":"haiku"}"#),
+        );
+        assert_eq!(
+            live.snapshot().phase,
             Phase::Working,
-            "first prompt went out"
+            "the CLI started the turn"
         );
         feed(
             &mut live,
@@ -2222,6 +2418,15 @@ mod tests {
     const RESULT_OK: &str =
         r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#;
 
+    /// `system/init`, printed at the start of every turn.
+    const TURN_INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s1","model":"haiku","cwd":"/w","tools":[],"mcp_servers":[],"slash_commands":[],"permissionMode":"default","claude_code_version":"2.1.293"}"#;
+
+    fn lifecycle_line(uuid: &str, state: &str) -> String {
+        json!({"type":"command_lifecycle","command_uuid":uuid,"state":state,
+               "uuid":"e9cc3bf9-5691-43dc-9491-cf9459579ef0","session_id":"s1"})
+        .to_string()
+    }
+
     /// Drives a core like the live actor (records in, the shim's `in` echo for writes when
     /// asked), keeping the journal so a replay can be compared.
     struct Sim {
@@ -2312,6 +2517,28 @@ mod tests {
         fn kinds(&self) -> Vec<String> {
             self.events.iter().map(|e| short(&e.kind)).collect()
         }
+
+        /// The `uuid` of the latest user message the shim wrote.
+        fn last_uuid(&self) -> String {
+            self.j
+                .recs
+                .iter()
+                .rev()
+                .filter(|r| r.kind == Kind::In)
+                .filter_map(|r| serde_json::from_str::<serde_json::Value>(r.text()?).ok())
+                .find(|v| v["type"] == "user")
+                .and_then(|v| v["uuid"].as_str().map(str::to_string))
+                .expect("a user message with a uuid was written")
+        }
+
+        /// The CLI takes the latest written prompt in and starts its turn: what the real
+        /// CLI prints (`queued`, `started`, then `system/init`).
+        fn cli_starts_turn_for_the_last_prompt(&mut self) {
+            let uuid = self.last_uuid();
+            self.feed(Kind::Out, json!(lifecycle_line(&uuid, "queued")));
+            self.feed(Kind::Out, json!(lifecycle_line(&uuid, "started")));
+            self.feed(Kind::Out, json!(TURN_INIT));
+        }
     }
 
     /// A compact name of an event, with the input it is about.
@@ -2391,11 +2618,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} in {k:?}"))
         };
         assert!(at("input:2") < at("input_sent:2"));
-        assert!(at("input_sent:2") < at("turn_started:2"));
-        assert!(at("turn_started:2") < at("written:2"));
+        assert!(at("input_sent:2") < at("written:2"));
+        assert!(!k.iter().any(|x| x.starts_with("turn_started")), "{k:?}");
+        assert_eq!(sim.core.snapshot().phase, Phase::Idle);
+        // The CLI takes it in and starts the turn for it: acknowledged, then the turn.
+        sim.cli_starts_turn_for_the_last_prompt();
+        let k = sim.kinds();
+        let at = |name: &str| {
+            k.iter()
+                .position(|x| x == name)
+                .unwrap_or_else(|| panic!("{name} in {k:?}"))
+        };
+        assert!(at("written:2") < at("input_acknowledged:2"));
+        assert!(at("input_acknowledged:2") < at("turn_started:2"));
         assert_eq!(k.iter().filter(|x| x.starts_with("input:")).count(), 1);
         let snap = sim.core.snapshot();
-        assert_eq!(snap.turn.as_ref().unwrap().prompt.as_deref(), Some("hello"));
+        assert_eq!(snap.phase, Phase::Working);
+        let turn = snap.turn.as_ref().unwrap();
+        assert_eq!(turn.prompt.as_deref(), Some("hello"));
+        assert_eq!(turn.input, Some(InputId(2)));
+        assert_eq!(turn.trigger, TurnTrigger::Input);
         assert_eq!(snap.title.as_deref(), Some("hello"));
         sim.feed(Kind::Out, json!(RESULT_OK));
         assert_eq!(sim.core.snapshot().phase, Phase::Idle);
@@ -2482,6 +2724,7 @@ mod tests {
                     r#"{"message":{"content":[{"text":"hello","type":"text"}],"role":"user"},"type":"user"}"#
                 ),
             ),
+            (Kind::Out, json!(TURN_INIT)),
             (Kind::Out, json!(RESULT_OK)),
         ];
         let mut sim = Sim::new();
@@ -2499,14 +2742,46 @@ mod tests {
                 "models_updated",
                 "modes_updated",
                 "input_sent:2",
-                "turn_started:2",
                 "phase",
                 "written:2",
+                // That build wrote no message ids: the turn is the CLI's `system/init`, and
+                // which input it ran for is not reported.
+                "session_init",
+                "turn_started",
+                "phase",
                 "turn_completed",
                 "phase"
             ]
             .map(|s| s.to_string())
         );
+        let turn = sim
+            .events
+            .iter()
+            .find_map(|e| match &e.kind {
+                SessionEventKind::Agent {
+                    event: AgentEvent::TurnStarted { input, trigger, .. },
+                } => Some((*input, *trigger)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(turn, (None, TurnTrigger::Unreported));
+        sim.assert_replay_exact();
+    }
+
+    /// The same journal where the CLI never printed `system/init` (a result with no start): the
+    /// turn is still one turn, never an end without a start.
+    #[test]
+    fn a_result_without_a_reported_start_still_gets_its_start() {
+        let mut sim = Sim::new();
+        sim.start(Some("hello"));
+        sim.feed(Kind::Out, json!(INIT_OK));
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        let k = sim.kinds();
+        let start = k.iter().position(|x| x == "turn_started").unwrap();
+        let end = k.iter().position(|x| x == "turn_completed").unwrap();
+        assert!(start < end, "{k:?}");
+        assert_eq!(sim.core.snapshot().phase, Phase::Idle);
+        assert_eq!(sim.core.snapshot().turns_completed, 1);
         sim.assert_replay_exact();
     }
 
@@ -2644,6 +2919,7 @@ mod tests {
         sim.start(None);
         sim.feed(Kind::Out, json!(INIT_OK));
         let (a, _) = sim.command(Command::prompt("A"));
+        sim.cli_starts_turn_for_the_last_prompt();
         let (b, out) = sim.command(Command::prompt("B"));
         assert!(out.writes.is_empty(), "B waits behind A's turn");
         let (c, _) = sim.command(Command::prompt("C"));
@@ -2653,6 +2929,7 @@ mod tests {
             json!(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}"#),
         );
         let (d, _) = sim.command(Command::prompt("D"));
+        sim.cli_starts_turn_for_the_last_prompt();
         let k = sim.kinds();
         for dropped in [b, c] {
             assert!(k.contains(&format!("input_dropped:{dropped}")), "{k:?}");
@@ -2673,6 +2950,7 @@ mod tests {
         sim.start(None);
         sim.feed(Kind::Out, json!(INIT_OK));
         let (go, _) = sim.command(Command::prompt("go"));
+        sim.cli_starts_turn_for_the_last_prompt();
         sim.feed(
             Kind::Out,
             json!(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#),
@@ -2690,7 +2968,10 @@ mod tests {
                 ("idle".to_string(), PhaseCause::HandshakeDone),
                 (
                     "working".into(),
-                    PhaseCause::TurnStarted { input: Some(go) }
+                    PhaseCause::TurnStarted {
+                        input: Some(go),
+                        trigger: TurnTrigger::Input,
+                    }
                 ),
                 (
                     "needs_you".into(),
@@ -2762,6 +3043,7 @@ mod tests {
         );
         // A turn of ours, then idle again: a new period.
         sim.command(Command::prompt("go"));
+        sim.cli_starts_turn_for_the_last_prompt();
         sim.feed(
             Kind::Out,
             json!(r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#),
@@ -3021,23 +3303,31 @@ mod tests {
     }
 
     /// An agent that opens a thread (and reports its id) but writes nothing until the first turn
-    /// cannot resume it before then, and cannot start it again under its id either.
+    /// cannot resume it before then, and cannot start it again under its id either. (codex: it
+    /// reports the thread at `thread/start`, and its turns with `turn/started`.)
     #[test]
     fn a_conversation_the_agent_has_not_saved_cannot_be_continued_until_a_turn_ran() {
-        let desc: Arc<dyn DriverDescriptor> = Arc::new(Variant {
-            inner: wasit_claude::descriptor(),
-            resume: true,
-            saves: SavesConversation::OnFirstTurn,
-        });
+        let desc = wasit_codex::descriptor();
+        assert_eq!(desc.saves_conversation(), SavesConversation::OnFirstTurn);
         let mut sim = Sim::of(desc, meta_with(Conversation::Unknown));
+        let handshake = |sim: &mut Sim| {
+            sim.feed(Kind::Out, json!(r#"{"id":1,"result":{}}"#));
+            sim.feed(Kind::Out, json!(r#"{"id":2,"result":{"data":[]}}"#));
+            sim.feed(
+                Kind::Out,
+                json!(format!(
+                    r#"{{"id":3,"result":{{"thread":{{"id":"{U}"}},"model":"m","cwd":"/w"}}}}"#
+                )),
+            );
+        };
         sim.feed(Kind::Spawned, json!({"pid": 7}));
         sim.note(RuntimeNote::Start {
             spec: Box::new(SpawnSpec::default()),
             trace: None,
         });
-        sim.feed(Kind::Out, json!(INIT_OK));
+        handshake(&mut sim);
         // The agent reports the thread's id; nothing is stored yet.
-        sim.feed(Kind::Out, json!(init_line(U)));
+        assert_eq!(sim.snap().native_session_id.as_deref(), Some(U));
         sim.note(RuntimeNote::Stop { token: "s".into() });
         sim.feed(Kind::Exited, json!({"code": 0}));
         assert_eq!(sim.snap().native_session_id.as_deref(), Some(U));
@@ -3053,9 +3343,14 @@ mod tests {
             spec: Box::new(SpawnSpec::default()),
             trace: None,
         });
-        sim.feed(Kind::Out, json!(INIT_OK));
+        handshake(&mut sim);
         sim.command(Command::prompt("go"));
-        sim.feed(Kind::Out, json!(init_line(U)));
+        sim.feed(
+            Kind::Out,
+            json!(format!(
+                r#"{{"method":"turn/started","params":{{"threadId":"{U}","turn":{{"id":"u1"}}}}}}"#
+            )),
+        );
         sim.note(RuntimeNote::Stop { token: "s2".into() });
         sim.feed(Kind::Exited, json!({"code": 0}));
         assert!(sim.snap().continuable, "{:?}", sim.snap().not_continuable);
@@ -3191,5 +3486,400 @@ mod tests {
             "{kinds:?}"
         );
         sim.assert_replay_exact();
+    }
+
+    // ── background work, turns the CLI starts itself, subagents (real recordings) ──────────
+
+    /// Replay a recording of the claude driver (`wasit-claude/tests/fixtures`) through the core
+    /// the way the live actor runs it: the shim echoes every line the protocol writes, the
+    /// recording's commands are journaled as notes.
+    fn sim_of_fixture(name: &str) -> Sim {
+        let path = format!(
+            "{}/../wasit-claude/tests/fixtures/{name}.ndjson",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let records = wasit_core::transcript::parse(&text).unwrap();
+        let mut sim = Sim::new();
+        for r in records {
+            match r {
+                wasit_core::transcript::Record::Start(spec) => {
+                    sim.feed(Kind::Spawned, json!({"pid": 7, "argv": ["claude"]}));
+                    sim.note(RuntimeNote::Start { spec, trace: None });
+                }
+                wasit_core::transcript::Record::Out(line) => {
+                    sim.feed(Kind::Out, json!(line));
+                }
+                wasit_core::transcript::Record::Cmd(cmd) => {
+                    sim.command(cmd);
+                }
+                // The shim echoes what the protocol writes; the recording's copies are not
+                // journaled twice.
+                wasit_core::transcript::Record::In(_)
+                | wasit_core::transcript::Record::CloseStdin => {}
+            }
+        }
+        sim
+    }
+
+    fn anomalies(sim: &Sim) -> Vec<(AnomalyKind, String)> {
+        sim.events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Anomaly { anomaly, first } => Some((*anomaly, first.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The snapshot after every event of a journal: what the session said it was doing, between
+    /// any two lines the CLI printed.
+    fn phase_after_each_record(name: &str) -> Vec<(String, Phase, u32, bool)> {
+        let path = format!(
+            "{}/../wasit-claude/tests/fixtures/{name}.ndjson",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let records = wasit_core::transcript::parse(&text).unwrap();
+        let mut sim = Sim::new();
+        let mut out = Vec::new();
+        for r in records {
+            let line = match r {
+                wasit_core::transcript::Record::Start(spec) => {
+                    sim.feed(Kind::Spawned, json!({"pid": 7, "argv": ["claude"]}));
+                    sim.note(RuntimeNote::Start { spec, trace: None });
+                    continue;
+                }
+                wasit_core::transcript::Record::Out(line) => line,
+                wasit_core::transcript::Record::Cmd(cmd) => {
+                    sim.command(cmd);
+                    continue;
+                }
+                _ => continue,
+            };
+            sim.feed(Kind::Out, json!(line.clone()));
+            let ty = serde_json::from_str::<serde_json::Value>(&line)
+                .map(|v| {
+                    format!(
+                        "{}/{}",
+                        v["type"].as_str().unwrap_or(""),
+                        v["subtype"].as_str().unwrap_or("")
+                    )
+                })
+                .unwrap_or_default();
+            let snap = sim.core.snapshot();
+            out.push((
+                ty,
+                snap.phase.clone(),
+                snap.background_running,
+                snap.turn.is_some(),
+            ));
+        }
+        out
+    }
+
+    /// The owner's report: the session read `idle` while the agent was still working. With
+    /// background work in the model the phase is `working` from the first `task_started` to the
+    /// end of the task, with or without a turn; between the turn that started it and the turn
+    /// the CLI starts when it ends, the session is working with no turn.
+    #[test]
+    fn a_session_is_never_idle_while_a_background_task_runs() {
+        for name in ["background-bash", "background-agent", "stop-task"] {
+            let states = phase_after_each_record(name);
+            let mut saw_background_without_turn = false;
+            for (ty, phase, running, turn) in &states {
+                if *running > 0 {
+                    assert_eq!(*phase, Phase::Working, "{name}: after {ty}");
+                    saw_background_without_turn |= !turn;
+                }
+            }
+            assert!(
+                saw_background_without_turn,
+                "{name}: the recording has a stretch of background work with no turn"
+            );
+        }
+    }
+
+    /// Activity that a running background task explains is no anomaly; the same activity with
+    /// nothing running (a stale subagent line, a top-level call out of nowhere) still is.
+    #[test]
+    fn no_anomaly_for_attributed_activity_and_one_for_the_rest() {
+        for name in [
+            "background-bash",
+            "background-agent",
+            "stop-task",
+            "agent-turn-interrupt",
+            "agent-turn-prompt",
+            "basic",
+            "gates",
+            "interrupt",
+        ] {
+            let sim = sim_of_fixture(name);
+            assert_eq!(anomalies(&sim), [], "{name}");
+        }
+        // A line of a subagent the session knows (its task just ended: the CLI flushes its last
+        // lines after the end frames) is accounted for; one of a subagent nobody told us about,
+        // and a top-level line with nothing running, are not.
+        let mut sim = sim_of_fixture("background-agent");
+        assert_eq!(sim.core.snapshot().phase, Phase::Idle);
+        let scoped_line = |call: &str| {
+            json!(format!(
+                r#"{{"type":"assistant","parent_tool_use_id":"{call}","agent_id":"x","message":{{"id":"late","content":[{{"type":"text","text":"late"}}]}}}}"#
+            ))
+        };
+        let call = sim.core.snapshot().subagents[0].call_id.clone();
+        sim.feed(Kind::Out, scoped_line(&call));
+        assert_eq!(anomalies(&sim), []);
+        sim.feed(Kind::Out, scoped_line("toolu_unknown"));
+        assert_eq!(
+            anomalies(&sim),
+            [(
+                AnomalyKind::ActivityWhileIdle,
+                "assistant_delta".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_snapshot_keeps_tasks_and_subagents_until_their_tasks_end() {
+        let name = "background-agent";
+        let states = phase_after_each_record(name);
+        // After the parent's first `result` the subagent still runs.
+        let first_result = states
+            .iter()
+            .position(|(ty, ..)| ty == "result/success")
+            .unwrap();
+        assert_eq!(states[first_result].1, Phase::Working);
+        assert_eq!(states[first_result].2, 1);
+        assert!(
+            !states[first_result].3,
+            "no turn is open: the work is the subagent's"
+        );
+        let sim = sim_of_fixture(name);
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.phase, Phase::Idle);
+        assert_eq!(snap.background_running, 0);
+        assert_eq!(snap.subagents.len(), 1);
+        let sub = &snap.subagents[0];
+        assert!(!sub.running);
+        assert_eq!(sub.ok, Some(true));
+        assert_eq!(sub.status.as_deref(), Some("completed"));
+        assert_eq!(sub.subagent_type.as_deref(), Some("general-purpose"));
+        assert!(sub.task_id.is_some() && sub.agent_id.is_some() && sub.ended_at_ms.is_some());
+        assert!(sub.tool_calls >= 1, "its own tool calls count for it");
+        assert!(sub.usage.is_some_and(|u| u.tool_uses >= 1));
+        assert_eq!(snap.tasks.len(), 1);
+        assert_eq!(snap.tasks[0].task_id, sub.task_id.clone().unwrap());
+        // The session's own turn counters never took the subagent's tool calls: one `Agent` call.
+        assert_eq!(
+            snap.turns_completed as usize,
+            sim.kinds()
+                .iter()
+                .filter(|k| *k == "turn_completed")
+                .count()
+        );
+        // The agent's own turns after the task are labelled so.
+        let last = snap.last_turn.as_ref().unwrap();
+        assert_eq!(
+            last.origin.as_ref().map(|o| o.kind.as_str()),
+            Some("task-notification")
+        );
+        sim.assert_replay_exact();
+    }
+
+    #[test]
+    fn a_turn_the_agent_started_says_so_in_the_snapshot_and_the_phase_cause() {
+        let sim = sim_of_fixture("background-bash");
+        // (Message ids of a recording are derived from its own input ids, not this journal's:
+        // which turns are ours is the driver's replay test; here, that a turn nobody asked for
+        // is `working` with no input.)
+        let agent_turn = phases(&sim)
+            .into_iter()
+            .rev()
+            .find(|(_, c)| matches!(c, PhaseCause::TurnStarted { input: None, .. }));
+        assert_eq!(agent_turn.map(|(p, _)| p).as_deref(), Some("working"));
+        // The background task started, then ended: both are phase causes.
+        let causes: Vec<PhaseCause> = phases(&sim).into_iter().map(|(_, c)| c).collect();
+        assert!(
+            causes
+                .iter()
+                .any(|c| matches!(c, PhaseCause::TaskEnded { .. })),
+            "{causes:?}"
+        );
+        sim.assert_replay_exact();
+    }
+
+    /// Stopping a task and interrupting the agent's own turn, end to end through the core.
+    #[test]
+    fn stopping_tasks_and_interrupting_a_turn_the_agent_started_replay_exactly() {
+        for name in [
+            "stop-task",
+            "agent-turn-interrupt",
+            "agent-turn-prompt",
+            "background-bash",
+        ] {
+            let sim = sim_of_fixture(name);
+            sim.assert_replay_exact();
+        }
+        let sim = sim_of_fixture("agent-turn-interrupt");
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.phase, Phase::Idle);
+        assert_eq!(snap.turns_completed, 3);
+        // The agent's cancelled turn is in the record of what ended; the last turn was ours.
+        let ends: Vec<_> = sim
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Agent {
+                    event:
+                        AgentEvent::TurnCompleted {
+                            end_reason,
+                            was_interrupted,
+                            origin,
+                            ..
+                        },
+                } => Some((*end_reason, *was_interrupted, origin.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                (None, false, false),
+                (Some(wasit_core::EndReason::Cancelled), true, true),
+                (None, false, false)
+            ]
+        );
+    }
+
+    /// A subagent's transcript and the session's own are filters of one stream; their union is the
+    /// stream, and a subagent's lines are not in the session's.
+    #[test]
+    fn history_scopes_split_one_stream() {
+        use crate::wire::HistoryScope;
+        let sim = sim_of_fixture("background-agent");
+        let call = sim.core.snapshot().subagents[0].call_id.clone();
+        let sub = HistoryScope::Subagent {
+            call_id: call.clone(),
+        };
+        let in_main: Vec<_> = sim
+            .events
+            .iter()
+            .filter(|e| HistoryScope::Main.admits(e))
+            .collect();
+        let in_sub: Vec<_> = sim.events.iter().filter(|e| sub.admits(e)).collect();
+        assert!(!in_sub.is_empty());
+        for e in &in_sub {
+            assert!(
+                !HistoryScope::Main.admits(e)
+                    || matches!(
+                        &e.kind,
+                        SessionEventKind::Agent {
+                            event: AgentEvent::TaskStarted { .. } | AgentEvent::TaskEnded { .. }
+                        }
+                    )
+            );
+        }
+        // Scoped lines are in the subagent's transcript and never in the session's.
+        for e in &sim.events {
+            if let SessionEventKind::Agent {
+                event: AgentEvent::Scoped { scope, .. },
+            } = &e.kind
+            {
+                assert!(!HistoryScope::Main.admits(e));
+                assert_eq!(sub.admits(e), scope.call_id == call);
+                assert!(HistoryScope::All.admits(e));
+            }
+        }
+        // The session's own conversation is intact: its tool call, its text, its turns.
+        let main_kinds: Vec<String> = in_main.iter().map(|e| short(&e.kind)).collect();
+        assert!(main_kinds.iter().any(|k| k == "tool_call_started"));
+        assert!(
+            main_kinds
+                .iter()
+                .filter(|k| *k == "turn_started" || k.starts_with("turn_started"))
+                .count()
+                >= 2
+        );
+        // Another call's transcript is empty.
+        let other = HistoryScope::Subagent {
+            call_id: "toolu_nope".into(),
+        };
+        assert_eq!(sim.events.iter().filter(|e| other.admits(e)).count(), 0);
+        // The wire shape of the filter.
+        assert_eq!(
+            serde_json::to_value(&sub).unwrap(),
+            json!({"kind":"subagent","call_id": call})
+        );
+        assert_eq!(
+            serde_json::from_value::<HistoryScope>(json!({"kind":"main"})).unwrap(),
+            HistoryScope::Main
+        );
+    }
+
+    /// A process that ends takes its running tasks with it: nothing is left `running`.
+    #[test]
+    fn the_end_of_the_process_ends_every_task() {
+        let mut sim = sim_of_fixture("background-agent");
+        // A new task that never reports its end, then the process exits.
+        sim.feed(Kind::Out, json!(r#"{"type":"system","subtype":"task_started","task_id":"zz","tool_use_id":"toolu_z","description":"d","is_backgrounded":true,"task_type":"local_bash"}"#));
+        assert_eq!(sim.core.snapshot().phase, Phase::Working);
+        assert_eq!(sim.core.snapshot().background_running, 1);
+        sim.feed(Kind::Exited, json!({"code": 0}));
+        let snap = sim.core.snapshot();
+        assert!(matches!(
+            snap.phase,
+            Phase::Exited { .. } | Phase::Failed { .. }
+        ));
+        assert_eq!(snap.background_running, 0);
+        assert!(snap.tasks.iter().all(|t| !t.running));
+        assert!(snap.subagents.iter().all(|s| !s.running));
+        sim.assert_replay_exact();
+    }
+
+    /// Journals the previous build wrote (the recordings are such streams: the same lines, the
+    /// same writes) replay through the new core without trouble: exactly, with every turn started
+    /// before it ends, nothing running at the end and no anomaly. What they cannot say (which
+    /// input a turn was for, when the CLI printed no message lifecycle) stays unsaid.
+    #[test]
+    fn journals_of_the_previous_build_replay_to_a_truthful_state() {
+        for name in [
+            "basic",
+            "gates",
+            "interrupt",
+            "mode",
+            "resume",
+            "continue",
+            "claude-image-prompt",
+            "claude-read-image",
+            "lifecycle",
+        ] {
+            let sim = sim_of_fixture(name);
+            sim.assert_replay_exact();
+            let mut open = false;
+            for e in &sim.events {
+                match &e.kind {
+                    SessionEventKind::Agent {
+                        event: AgentEvent::TurnStarted { .. },
+                    } => {
+                        assert!(!open, "{name}: a turn started inside a turn");
+                        open = true;
+                    }
+                    SessionEventKind::Agent {
+                        event: AgentEvent::TurnCompleted { .. },
+                    } => {
+                        assert!(open, "{name}: a turn ended without a start");
+                        open = false;
+                    }
+                    _ => {}
+                }
+            }
+            let snap = sim.core.snapshot();
+            assert!(!open && snap.turn.is_none(), "{name}");
+            assert_eq!(snap.background_running, 0, "{name}");
+            assert!(snap.tasks.is_empty(), "{name}");
+            assert_eq!(anomalies(&sim), [], "{name}");
+            assert!(snap.turns_completed >= 1, "{name}");
+        }
     }
 }

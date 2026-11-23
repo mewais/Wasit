@@ -1,0 +1,9 @@
+[{"wait":"turn_completed"},
+ {"cmd":{"command":"stop_task","task_id":"@running"}},
+ {"wait":"task_ended"},
+ {"cmd":{"command":"prompt","text":"Use the Agent tool exactly once with run_in_background set to true, subagent_type general-purpose, description probe, instruction: run the Bash command `sleep 40; echo hi` and report its output in one word. Then reply with just the word STARTED and end your turn. When you are later told the agent finished or was stopped, reply with just the word FINISHED."}},
+ {"wait":"turn_completed"},
+ {"wait":"task_progress"},
+ {"cmd":{"command":"stop_task","task_id":"@running"}},
+ {"wait":"task_ended"},
+ {"wait":"turn_completed"}]

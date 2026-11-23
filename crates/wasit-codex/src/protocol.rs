@@ -339,6 +339,11 @@ impl CodexProtocol {
                 }
                 step.write.push(encode_user_input_answer(&gate, &answer));
             }
+            Command::StopTask { .. } => {
+                return Err(DriverError::Unsupported {
+                    operation: "stop_task".into(),
+                })
+            }
             Command::Interrupt => return Ok(self.interrupt()),
             Command::SetModel { model } => {
                 let line = self.request(
@@ -596,6 +601,7 @@ impl CodexProtocol {
                     usage: self.total_usage.clone(),
                     per_model: HashMap::new(),
                     reply: Some(message),
+                    origin: None,
                 });
                 step.extend(self.drain());
                 step
@@ -675,10 +681,10 @@ impl CodexProtocol {
             "turn/started" => {
                 let turn = params.get("turn").and_then(|t| opt_s(t, "id"));
                 let starting = self.starting.take();
-                let mut step = events(vec![AgentEvent::TurnStarted {
-                    native_turn_id: turn.clone(),
-                    input: starting.map(|s| s.input),
-                }]);
+                let mut step = events(vec![AgentEvent::turn_started(
+                    turn.clone(),
+                    starting.map(|s| s.input),
+                )]);
                 // The notification came before the `turn/start` result: it says the same.
                 if let Some(Starting {
                     input,
@@ -871,6 +877,7 @@ impl CodexProtocol {
             usage: self.total_usage.clone(),
             per_model: HashMap::new(),
             reply,
+            origin: None,
         });
         step.extend(self.drain());
         step

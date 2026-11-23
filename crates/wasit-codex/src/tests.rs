@@ -123,10 +123,7 @@ fn turn_lifecycle_usage_and_reply() {
         .events;
     assert_eq!(
         ev,
-        vec![AgentEvent::TurnStarted {
-            native_turn_id: Some("u1".into()),
-            input: Some(PROMPT_ID)
-        }]
+        vec![AgentEvent::turn_started(Some("u1".into()), Some(PROMPT_ID))]
     );
     let ev = p
         .on_line(
@@ -777,10 +774,7 @@ fn drained_commands_report_input_sent() {
         .events;
     assert_eq!(
         ev[0],
-        AgentEvent::TurnStarted {
-            native_turn_id: Some("u1".into()),
-            input: Some(InputId(2))
-        }
+        AgentEvent::turn_started(Some("u1".into()), Some(InputId(2)))
     );
 }
 
@@ -845,10 +839,10 @@ fn turn_start_is_acknowledged_by_its_result_and_not_again_by_the_notification() 
     let step = p.on_line(TURN_STARTED_U1);
     assert_eq!(
         step.events,
-        vec![AgentEvent::TurnStarted {
-            native_turn_id: Some("u1".into()),
-            input: Some(InputId(20))
-        }]
+        vec![AgentEvent::turn_started(
+            Some("u1".into()),
+            Some(InputId(20))
+        )]
     );
     // The turn runs and ends: no further acknowledgement for the input.
     let step = p.on_line(
@@ -866,10 +860,7 @@ fn turn_start_is_acknowledged_by_the_notification_when_it_comes_first() {
     assert_eq!(
         step.events,
         vec![
-            AgentEvent::TurnStarted {
-                native_turn_id: Some("u1".into()),
-                input: Some(InputId(21))
-            },
+            AgentEvent::turn_started(Some("u1".into()), Some(InputId(21))),
             AgentEvent::InputAcknowledged {
                 input: InputId(21),
                 steered: false
@@ -961,10 +952,10 @@ fn a_prompt_queued_for_the_turn_id_is_sent_as_a_steer_and_acknowledged_as_one() 
     let step = p.on_line(TURN_STARTED_U1);
     assert_eq!(
         step.events,
-        vec![AgentEvent::TurnStarted {
-            native_turn_id: Some("u1".into()),
-            input: Some(InputId(50))
-        }]
+        vec![AgentEvent::turn_started(
+            Some("u1".into()),
+            Some(InputId(50))
+        )]
     );
 }
 

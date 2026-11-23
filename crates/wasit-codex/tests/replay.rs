@@ -339,6 +339,7 @@ fn steered_prompt_is_acknowledged_as_steered() {
             AgentEvent::TurnStarted {
                 native_turn_id,
                 input,
+                ..
             } => Some((native_turn_id.clone().unwrap(), *input)),
             _ => None,
         })

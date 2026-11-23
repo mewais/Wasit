@@ -41,8 +41,8 @@ use crate::note::RuntimeNote;
 use crate::store::{self, SessionFile};
 use crate::stream::Subscriber;
 use crate::wire::{
-    CommandError, CommandOutcome, HistoryPage, NotContinuable, Phase, RuntimeError, SessionEvent,
-    SessionId, SessionSnapshot, TrailPage,
+    CommandError, CommandOutcome, HistoryPage, HistoryScope, NotContinuable, Phase, RuntimeError,
+    SessionEvent, SessionId, SessionSnapshot, TrailPage,
 };
 
 /// Bound on commands awaiting their journal round trip, and on messages deferred while the
@@ -87,6 +87,7 @@ pub(crate) enum Msg {
     History {
         before: Option<u64>,
         limit: usize,
+        scope: HistoryScope,
         reply: oneshot::Sender<Local<HistoryPage>>,
     },
     /// The same window of the session's trail.
@@ -970,12 +971,13 @@ impl Actor {
             Msg::History {
                 before,
                 limit,
+                scope,
                 reply,
             } => {
                 let r = if self.loading {
                     Local::Replay
                 } else {
-                    self.history(before, limit)
+                    self.history(before, limit, &scope)
                 };
                 let _ = reply.send(r); // requester may have given up
             }
@@ -1075,6 +1077,7 @@ impl Actor {
             Command::SetModel { .. } => !caps.set_model,
             Command::SetMode { .. } => !caps.set_mode,
             Command::RunSlash { .. } => !caps.slash_commands,
+            Command::StopTask { .. } => !caps.stop_task,
             _ => false,
         };
         if unsupported {
@@ -1468,11 +1471,17 @@ impl Actor {
         }
     }
 
-    fn history(&self, before: Option<u64>, limit: usize) -> Local<HistoryPage> {
+    fn history(
+        &self,
+        before: Option<u64>,
+        limit: usize,
+        scope: &HistoryScope,
+    ) -> Local<HistoryPage> {
         let below: Vec<&SessionEvent> = self
             .ring
             .iter()
             .filter(|e| before.is_none_or(|b| e.cursor < b))
+            .filter(|e| scope.admits(e))
             .collect();
         match last_window(below, limit, self.evicted_max.is_none()) {
             Some((events, has_more)) => Local::Page(HistoryPage {

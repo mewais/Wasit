@@ -6,13 +6,20 @@
 //!   are reported as [`AgentEvent::Unknown`]. The `initialize` response
 //!   carries the slash commands, the model catalog and the current
 //!   permission mode.
-//! - `system/init` is printed at the start of EVERY turn; only the first one
-//!   becomes [`AgentEvent::SessionInit`], later ones only report a model
-//!   change.
+//! - `system/init` is printed at the start of EVERY turn, whoever started it; the first one
+//!   becomes [`AgentEvent::SessionInit`], later ones only report a model change. Each is
+//!   [`AgentEvent::TurnStarted`], and the turn ends at its `result`: the turn edges are the CLI's
+//!   own, never inferred from what this protocol writes. The CLI starts turns by itself (verified
+//!   on 2.1.293): when a background task ends it prints `system/init` … `result` for the
+//!   notification, with an `origin` on the `result`. Which input a turn runs for is known only
+//!   from the lifecycle `started` frame (below) that precedes its `system/init`; a turn with no
+//!   such frame is the agent's own, and a CLI that reports no lifecycle leaves the input unknown
+//!   (`TurnTrigger::Unreported`): a turn is never attributed to a prompt on a guess.
 //! - A user message is `{"type":"user","message":{"role":"user","content":[…]}}`.
 //!   A message whose text starts with `/name` runs that slash command / skill.
 //!   Claude merges user messages written while a turn is starting into one
-//!   turn, so this protocol holds prompts while a turn runs and sends the next
+//!   turn, so this protocol holds prompts while a turn runs (the CLI's turn, whoever
+//!   started it) or while the previous prompt has not started, and sends the next
 //!   one after the `result` line (one prompt = one turn).
 //! - Tool permission gates arrive as `control_request {subtype:"can_use_tool"}`
 //!   (also `AskUserQuestion` / `ExitPlanMode` by tool name) or
@@ -32,7 +39,17 @@
 //!   sends uuids only when the runtime gave it a session id to derive them from,
 //!   acknowledges only on those frames, and asks for cancellations only after
 //!   the CLI has shown it reports lifecycles. A CLI that reports nothing leaves
-//!   its prompts "written, not acknowledged".
+//!   its prompts "written, not acknowledged". A `started` that arrives while a turn is already
+//!   open (or another input is about to start it) joined that turn: the acknowledgement says
+//!   `steered`.
+//! - Subagents (`Agent` / `Task` tool) and shell commands run as *tasks*. The CLI backgrounds
+//!   them even when told to wait: the tool result returns at once, the parent's turn ends, and
+//!   the work continues, reported by `system` frames `task_started`, `task_progress`,
+//!   `task_updated`, `task_notification` (the end) and `background_tasks_changed` (the
+//!   complete list of background tasks). Every line of a subagent's own conversation carries
+//!   `parent_tool_use_id` (the spawning call), `agent_id`, `subagent_type`: those events are
+//!   [`AgentEvent::Scoped`]. `interrupt` does not stop background tasks (verified); the control
+//!   request `stop_task {task_id}` does (an unknown id answers success and does nothing).
 //! - `set_model` / `set_permission_mode` control requests switch model / mode;
 //!   errors come back as `control_response {subtype:"error"}`.
 
@@ -42,10 +59,11 @@ use serde_json::{json, Value};
 use wasit_core::content::{path_reference_text, COMMON_IMAGE_MIMES};
 use wasit_core::wire::{opt_s, s, u};
 use wasit_core::{
-    AgentEvent, Attachment, ChoiceText, Command, CompactionInfo, ContentPart, DriverError, Encoded,
-    EndReason, GateChoice, GateChoiceKind, GateRequest, InputDropReason, InputId, McpServerInfo,
-    MediaSource, ModelInfo, ModelUsage, OutLine, Protocol, QuestionAnswer, QuestionOption,
-    QuestionPrompt, RateLimitInfo, SlashCommandInfo, SpawnSpec, Step, Usage,
+    AgentEvent, Attachment, BackgroundTask, ChoiceText, Command, CompactionInfo, ContentPart,
+    DriverError, Encoded, EndReason, GateChoice, GateChoiceKind, GateRequest, InputDropReason,
+    InputId, McpServerInfo, MediaSource, ModelInfo, ModelUsage, OutLine, Protocol, QuestionAnswer,
+    QuestionOption, QuestionPrompt, RateLimitInfo, Scope, SlashCommandInfo, SpawnSpec, Step,
+    TaskInfo, TaskUsage, TurnOrigin, TurnTrigger, Usage,
 };
 
 /// What a pending gate needs to encode its answer.
@@ -98,6 +116,10 @@ struct Written {
     cancel_requested: bool,
 }
 
+/// What the CLI lists in `system/init` `capabilities` when it reports `command_lifecycle`
+/// frames for the user messages that carry a `uuid`.
+const LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
+
 /// How many written messages are remembered for the CLI's lifecycle reports.
 const MAX_WRITTEN: usize = 256;
 
@@ -123,10 +145,18 @@ pub struct ClaudeProtocol {
     outstanding: HashMap<String, (&'static str, Option<InputId>)>,
     /// Commands waiting for the handshake or for the running turn to end.
     queue: VecDeque<(InputId, Command)>,
-    /// A turn is running (prompt written, `result` not seen).
-    busy: bool,
-    /// The input whose prompt started the running turn.
-    turn_input: Option<InputId>,
+    /// A turn is running: `system/init` seen, `result` not (whoever started the turn).
+    turn_open: bool,
+    /// The input whose lifecycle `started` frame came and whose turn's `system/init` has not:
+    /// the turn that starts next runs for it.
+    started: Option<InputId>,
+    /// A prompt was written and the CLI has said nothing about it yet (no lifecycle frame, no
+    /// `system/init`, no `result` since): a turn may be starting for it. Cleared by whatever the
+    /// CLI reports next.
+    unobserved_write: bool,
+    /// The tasks the CLI runs (the one reduction of the task events, [`wasit_core::tasks`]):
+    /// which are running decides what `Interrupt` and `StopTask` do.
+    tasks: Vec<TaskInfo>,
     /// Seed of the message uuids (from `SpawnSpec::session_id`); `None`: messages carry no
     /// uuid (a spec from before session ids: the lines stay what they always were).
     uuid_seed: Option<u64>,
@@ -134,6 +164,10 @@ pub struct ClaudeProtocol {
     written: VecDeque<Written>,
     /// The CLI has reported a `command_lifecycle` in this process.
     lifecycle_seen: bool,
+    /// The CLI said at `system/init` that it reports message lifecycles
+    /// (`capabilities` holds [`LIFECYCLE_CAPABILITY`]): a turn that no `started` frame preceded
+    /// is its own, even before the first frame was seen.
+    lifecycle_capable: bool,
     /// We sent `interrupt` during the running turn.
     interrupt_sent: bool,
     session_init_sent: bool,
@@ -159,11 +193,14 @@ impl ClaudeProtocol {
             init_request_id: String::new(),
             outstanding: HashMap::new(),
             queue: VecDeque::new(),
-            busy: false,
-            turn_input: None,
+            turn_open: false,
+            started: None,
+            unobserved_write: false,
+            tasks: Vec::new(),
             uuid_seed: None,
             written: VecDeque::new(),
             lifecycle_seen: false,
+            lifecycle_capable: false,
             interrupt_sent: false,
             session_init_sent: false,
             model: None,
@@ -209,10 +246,25 @@ impl ClaudeProtocol {
             ),
             Phase::Ready => {
                 matches!(cmd, Command::Prompt { .. } | Command::RunSlash { .. })
-                    && (self.busy || !self.queue.is_empty())
+                    && (self.prompt_blocked() || !self.queue.is_empty())
             }
             Phase::Closed => false,
         }
+    }
+
+    /// A prompt written now would start a second turn, or merge into one that is running or
+    /// starting: wait. The CLI's turn counts whoever started it; so does a prompt of ours the
+    /// CLI has queued, or that it has not yet said anything about.
+    fn prompt_blocked(&self) -> bool {
+        self.turn_open
+            || self.started.is_some()
+            || self.unobserved_write
+            || self.written.iter().any(|w| w.cli == CliState::Queued)
+    }
+
+    /// A turn is running or about to run: what an `interrupt` has to stop.
+    fn turn_running(&self) -> bool {
+        self.turn_open || self.started.is_some() || (!self.lifecycle_seen && self.unobserved_write)
     }
 
     fn encode_now(&mut self, input: InputId, cmd: Command) -> Result<Step, DriverError> {
@@ -295,6 +347,19 @@ impl ClaudeProtocol {
                 }
             }
             Command::Interrupt => Ok(self.interrupt()),
+            Command::StopTask { task_id } => {
+                if !self.tasks.iter().any(|t| t.running && t.task_id == task_id) {
+                    // The CLI answers success to any id and does nothing: say so here.
+                    return Err(DriverError::NotFound {
+                        detail: format!("no running task {task_id}"),
+                    });
+                }
+                let line = self.stop_task_line(&task_id);
+                Ok(Step {
+                    write: vec![line],
+                    ..Step::default()
+                })
+            }
             Command::SetModel { model } => {
                 let line = self
                     .control_request("set_model", json!({"subtype": "set_model", "model": model}));
@@ -329,9 +394,8 @@ impl ClaudeProtocol {
     }
 
     fn write_prompt(&mut self, input: InputId, text: &str, attachments: &[Attachment]) -> Step {
-        self.busy = true;
-        self.interrupt_sent = false;
-        self.turn_input = Some(input);
+        // The turn starts when the CLI says so (`system/init`), not when this line is written.
+        self.unobserved_write = true;
         let uuid = self.uuid_seed.map(|seed| message_uuid(seed, input));
         let line = user_message(text, attachments, uuid.as_deref());
         if let Some(uuid) = uuid {
@@ -347,12 +411,8 @@ impl ClaudeProtocol {
             }
         }
         Step {
-            events: vec![AgentEvent::TurnStarted {
-                native_turn_id: None,
-                input: Some(input),
-            }],
             write: vec![line],
-            close_stdin: false,
+            ..Step::default()
         }
     }
 
@@ -368,8 +428,9 @@ impl ClaudeProtocol {
             .collect()
     }
 
-    /// The CLI reported that it took the message at `pos` in.
-    fn acknowledge(&mut self, pos: usize) -> Vec<AgentEvent> {
+    /// The CLI reported that it took the message at `pos` in; `steered`: into a turn that was
+    /// already running (or about to run for another input) instead of a turn of its own.
+    fn acknowledge(&mut self, pos: usize, steered: bool) -> Vec<AgentEvent> {
         let w = &mut self.written[pos];
         if w.acknowledged {
             return vec![];
@@ -377,7 +438,7 @@ impl ClaudeProtocol {
         w.acknowledged = true;
         vec![AgentEvent::InputAcknowledged {
             input: w.input,
-            steered: false,
+            steered,
         }]
     }
 
@@ -387,6 +448,10 @@ impl ClaudeProtocol {
         let Some(w) = self.written.remove(pos) else {
             return Step::default();
         };
+        if self.started == Some(w.input) {
+            // Its turn will not start for it.
+            self.started = None;
+        }
         if w.cli == CliState::Started || w.acknowledged {
             // It ran and was interrupted; the turn's `result` says so.
             return Step::default();
@@ -397,20 +462,8 @@ impl ClaudeProtocol {
             InputDropReason::Refused
         };
         let mut step = events(vec![dropped(w.input, reason)]);
-        if self.busy && self.turn_input == Some(w.input) {
-            // Our turn was this message, and it will never run: no `result` will end it.
-            self.busy = false;
-            self.turn_input = None;
-            step.events.push(AgentEvent::TurnCompleted {
-                end_reason: Some(EndReason::Cancelled),
-                was_interrupted: true,
-                num_turns: 0,
-                usage: Usage::default(),
-                per_model: HashMap::new(),
-                reply: None,
-            });
-            step.extend(self.drain());
-        }
+        // It was holding the later prompts back.
+        step.extend(self.drain());
         step
     }
 
@@ -420,6 +473,8 @@ impl ClaudeProtocol {
             return events(vec![AgentEvent::Unknown { raw: v }]);
         };
         self.lifecycle_seen = true;
+        // The CLI is reporting on its own now.
+        self.unobserved_write = false;
         match s(&v, "state") {
             "queued" => {
                 let w = &mut self.written[pos];
@@ -429,12 +484,23 @@ impl ClaudeProtocol {
                 Step::default()
             }
             "started" => {
+                let input = self.written[pos].input;
                 self.written[pos].cli = CliState::Started;
-                events(self.acknowledge(pos))
+                // A turn is open, or another input is about to start the next one: this one
+                // joins it. Otherwise its turn is the next `system/init`.
+                let steered = self.turn_open || self.started.is_some();
+                if !steered {
+                    self.started = Some(input);
+                }
+                events(self.acknowledge(pos, steered))
             }
             "completed" => {
-                let step = events(self.acknowledge(pos));
-                self.written.remove(pos);
+                let step = events(self.acknowledge(pos, false));
+                if let Some(w) = self.written.remove(pos) {
+                    if self.started == Some(w.input) {
+                        self.started = None;
+                    }
+                }
                 step
             }
             "cancelled" => self.cancelled(pos),
@@ -453,9 +519,19 @@ impl ClaudeProtocol {
         Ok(self.gates.remove(pos).1)
     }
 
-    /// Interrupt: drop prompts that never started, decline pending gates, ask
-    /// claude to drop the messages it holds but has not started, then ask it to
-    /// stop the turn.
+    /// The `stop_task` request for `task_id`.
+    fn stop_task_line(&mut self, task_id: &str) -> OutLine {
+        self.control_request(
+            "stop_task",
+            json!({"subtype": "stop_task", "task_id": task_id}),
+        )
+    }
+
+    /// Interrupt: drop prompts that never started, decline pending gates, ask claude to drop
+    /// the messages it holds but has not started, then stop what runs: the turn when one is
+    /// running (a turn the CLI started by itself too; background tasks are left alone, as the
+    /// CLI's own interrupt does), else the background tasks (`interrupt` does not stop them;
+    /// `stop_task` does).
     fn interrupt(&mut self) -> Step {
         let mut step = events(self.drop_queued_prompts(InputDropReason::Interrupted));
         for (id, kind) in std::mem::take(&mut self.gates) {
@@ -493,10 +569,23 @@ impl ClaudeProtocol {
                 step.write.push(line);
             }
         }
-        if self.busy && !self.interrupt_sent {
-            self.interrupt_sent = true;
-            let line = self.control_request("interrupt", json!({"subtype": "interrupt"}));
-            step.write.push(line);
+        if self.turn_running() {
+            if !self.interrupt_sent {
+                self.interrupt_sent = true;
+                let line = self.control_request("interrupt", json!({"subtype": "interrupt"}));
+                step.write.push(line);
+            }
+        } else {
+            let running: Vec<String> = self
+                .tasks
+                .iter()
+                .filter(|t| t.running && t.background)
+                .map(|t| t.task_id.clone())
+                .collect();
+            for id in running {
+                let line = self.stop_task_line(&id);
+                step.write.push(line);
+            }
         }
         step
     }
@@ -506,7 +595,7 @@ impl ClaudeProtocol {
         let mut step = Step::default();
         while let Some((_, cmd)) = self.queue.front() {
             let is_prompt = matches!(cmd, Command::Prompt { .. } | Command::RunSlash { .. });
-            if self.phase != Phase::Ready || (is_prompt && self.busy) {
+            if self.phase != Phase::Ready || (is_prompt && self.prompt_blocked()) {
                 break;
             }
             let (input, cmd) = self.queue.pop_front().expect("front exists");
@@ -591,6 +680,19 @@ impl ClaudeProtocol {
                 Some(pos) if payload.get("cancelled").and_then(Value::as_bool) == Some(true) => {
                     self.cancelled(pos)
                 }
+                // Too late to cancel: its turn is the one the interrupt was meant to stop.
+                _ if payload.get("cancelled").and_then(Value::as_bool) == Some(false)
+                    && self.turn_running()
+                    && !self.interrupt_sent =>
+                {
+                    self.interrupt_sent = true;
+                    Step {
+                        write: vec![
+                            self.control_request("interrupt", json!({"subtype": "interrupt"}))
+                        ],
+                        ..Step::default()
+                    }
+                }
                 _ => Step::default(),
             };
         }
@@ -645,21 +747,18 @@ impl ClaudeProtocol {
 
     fn on_system(&mut self, v: Value) -> Vec<AgentEvent> {
         match s(&v, "subtype") {
-            "init" => {
-                let model = opt_s(&v, "model");
-                if self.session_init_sent {
-                    if model.is_some() && model != self.model {
-                        self.model = model.clone();
-                        return vec![AgentEvent::ModelChanged {
-                            model: model.unwrap_or_default(),
-                        }];
-                    }
-                    return vec![];
+            "init" => self.on_init(&v),
+            "task_started"
+            | "task_progress"
+            | "task_updated"
+            | "task_notification"
+            | "background_tasks_changed" => match task_event(&v) {
+                Some(event) => {
+                    wasit_core::tasks::apply(&mut self.tasks, &event, 0);
+                    vec![event]
                 }
-                self.session_init_sent = true;
-                self.model = model.clone();
-                vec![session_init(&v)]
-            }
+                None => vec![AgentEvent::Unknown { raw: v }],
+            },
             "status" => match opt_s(&v, "permissionMode") {
                 Some(mode) => vec![AgentEvent::ModesUpdated {
                     available_modes: vec![],
@@ -683,11 +782,59 @@ impl ClaudeProtocol {
         }
     }
 
+    /// `system/init`: a turn starts. The first one also identifies the session; later ones
+    /// report a model change.
+    fn on_init(&mut self, v: &Value) -> Vec<AgentEvent> {
+        let model = opt_s(v, "model");
+        let mut out = Vec::new();
+        if self.session_init_sent {
+            if model.is_some() && model != self.model {
+                self.model = model.clone();
+                out.push(AgentEvent::ModelChanged {
+                    model: model.unwrap_or_default(),
+                });
+            }
+        } else {
+            self.session_init_sent = true;
+            self.model = model.clone();
+            out.push(session_init(v));
+        }
+        if v.get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|c| c.iter().any(|c| c.as_str() == Some(LIFECYCLE_CAPABILITY)))
+        {
+            self.lifecycle_capable = true;
+        }
+        // Whatever the CLI had not said about our write, it has begun working since.
+        self.unobserved_write = false;
+        if !self.turn_open {
+            self.turn_open = true;
+            // The input whose `started` frame came just before: the turn is for it. When the
+            // CLI reports lifecycles for our messages (it said so, or already did) and no such
+            // frame came, the turn is the agent's own; otherwise the driver cannot tell, and
+            // says so rather than guess.
+            let reports =
+                (self.lifecycle_seen || self.lifecycle_capable) && self.uuid_seed.is_some();
+            let (input, trigger) = match self.started.take() {
+                Some(input) => (Some(input), TurnTrigger::Input),
+                None if reports => (None, TurnTrigger::Agent),
+                None => (None, TurnTrigger::Unreported),
+            };
+            out.push(AgentEvent::TurnStarted {
+                native_turn_id: None,
+                input,
+                trigger,
+            });
+        }
+        out
+    }
+
     fn on_assistant(&mut self, v: &Value) -> Vec<AgentEvent> {
         let Some(msg) = v.get("message") else {
             return vec![AgentEvent::Unknown { raw: v.clone() }];
         };
         let message_id = opt_s(msg, "id");
+        let scope = scope_of(v);
         let mut out = Vec::new();
         for block in msg
             .get("content")
@@ -699,19 +846,25 @@ impl ClaudeProtocol {
                 "text" => {
                     let text = s(block, "text");
                     if !text.is_empty() {
-                        out.push(AgentEvent::AssistantDelta {
-                            text: text.to_string(),
-                            message_id: message_id.clone(),
-                        });
+                        out.push(
+                            AgentEvent::AssistantDelta {
+                                text: text.to_string(),
+                                message_id: message_id.clone(),
+                            }
+                            .scoped(scope.clone()),
+                        );
                     }
                 }
                 "thinking" => {
                     let text = s(block, "thinking");
                     if !text.is_empty() {
-                        out.push(AgentEvent::ThinkingDelta {
-                            text: text.to_string(),
-                            message_id: message_id.clone(),
-                        });
+                        out.push(
+                            AgentEvent::ThinkingDelta {
+                                text: text.to_string(),
+                                message_id: message_id.clone(),
+                            }
+                            .scoped(scope.clone()),
+                        );
                     }
                 }
                 "tool_use" => {
@@ -725,13 +878,16 @@ impl ClaudeProtocol {
                     } else {
                         None
                     };
-                    out.push(AgentEvent::ToolCallStarted {
-                        name,
-                        call_id,
-                        input,
-                        is_subagent,
-                        subagent_model,
-                    });
+                    out.push(
+                        AgentEvent::ToolCallStarted {
+                            name,
+                            call_id,
+                            input,
+                            is_subagent,
+                            subagent_model,
+                        }
+                        .scoped(scope.clone()),
+                    );
                 }
                 _ => {}
             }
@@ -742,12 +898,18 @@ impl ClaudeProtocol {
             if message_id.is_none() || message_id != self.last_usage_message {
                 self.last_usage_message = message_id;
                 let usage = parse_usage(usage);
-                let context_pct = self.context_window.filter(|w| *w > 0).map(|w| {
-                    let used =
-                        usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens;
-                    (used as f64 * 100.0 / w as f64) as f32
-                });
-                out.push(AgentEvent::UsageUpdate { usage, context_pct });
+                // The context window fill is the session's own conversation's; a subagent's
+                // messages have a context of their own.
+                let context_pct = self
+                    .context_window
+                    .filter(|w| *w > 0 && scope.is_none())
+                    .map(|w| {
+                        let used = usage.input_tokens
+                            + usage.cache_read_tokens
+                            + usage.cache_creation_tokens;
+                        (used as f64 * 100.0 / w as f64) as f32
+                    });
+                out.push(AgentEvent::UsageUpdate { usage, context_pct }.scoped(scope.clone()));
             }
         }
         out
@@ -755,6 +917,7 @@ impl ClaudeProtocol {
 
     fn on_user(&mut self, v: &Value) -> Vec<AgentEvent> {
         let mut out = Vec::new();
+        let scope = scope_of(v);
         let content = v
             .get("message")
             .and_then(|m| m.get("content"))
@@ -769,22 +932,25 @@ impl ClaudeProtocol {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(claude_part).collect())
                     .unwrap_or_default();
-                out.push(AgentEvent::ToolCallFinished {
-                    call_id,
-                    name,
-                    ok: !block
-                        .get("is_error")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    result: block.get("content").cloned(),
-                    parts,
-                });
+                out.push(
+                    AgentEvent::ToolCallFinished {
+                        call_id,
+                        name,
+                        ok: !block
+                            .get("is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        result: block.get("content").cloned(),
+                        parts,
+                    }
+                    .scoped(scope.clone()),
+                );
             } else if let Some(p) = claude_part(block) {
                 user_parts.push(p);
             }
         }
         if !user_parts.is_empty() {
-            out.push(AgentEvent::UserContent { parts: user_parts });
+            out.push(AgentEvent::UserContent { parts: user_parts }.scoped(scope));
         }
         out
     }
@@ -850,13 +1016,25 @@ impl ClaudeProtocol {
             .filter_map(Value::as_str)
         {
             if let Some(pos) = self.written.iter().position(|w| w.uuid == uuid) {
-                acks.extend(self.acknowledge(pos));
+                acks.extend(self.acknowledge(pos, false));
             }
         }
-        self.busy = false;
-        self.turn_input = None;
-        self.interrupt_sent = false;
         let mut step = events(acks);
+        if !self.turn_open {
+            // The CLI ended a turn whose start it did not report: still one turn, never an end
+            // without a start.
+            step.events.push(AgentEvent::TurnStarted {
+                native_turn_id: None,
+                input: None,
+                trigger: TurnTrigger::Unreported,
+            });
+        }
+        self.turn_open = false;
+        self.started = None;
+        self.unobserved_write = false;
+        self.interrupt_sent = false;
+        // What does not run in the background cannot outlive its turn.
+        wasit_core::tasks::end_foreground(&mut self.tasks, 0);
         step.events.push(AgentEvent::TurnCompleted {
             end_reason,
             was_interrupted: interrupted,
@@ -864,6 +1042,7 @@ impl ClaudeProtocol {
             usage,
             per_model,
             reply,
+            origin: turn_origin(v),
         });
         step.extend(self.drain());
         step
@@ -1297,6 +1476,98 @@ fn parse_usage(v: &Value) -> Usage {
         cache_creation_tokens: u(v, "cache_creation_input_tokens"),
         cost_usd: 0.0,
     }
+}
+
+/// The subagent a line belongs to: lines of a subagent's own conversation carry the spawning
+/// call's id as `parent_tool_use_id` (and the subagent's own as `agent_id`).
+fn scope_of(v: &Value) -> Option<Scope> {
+    Some(Scope {
+        call_id: opt_s(v, "parent_tool_use_id").filter(|c| !c.is_empty())?,
+        agent_id: opt_s(v, "agent_id").filter(|c| !c.is_empty()),
+    })
+}
+
+/// `result.origin`: why the CLI ran a turn it started by itself, as it says.
+fn turn_origin(v: &Value) -> Option<TurnOrigin> {
+    let o = v.get("origin").filter(|o| o.is_object())?;
+    Some(TurnOrigin {
+        kind: opt_s(o, "kind")?,
+        producer: opt_s(o, "producer"),
+        run_id: opt_s(o, "runId"),
+    })
+}
+
+fn task_usage(v: &Value) -> Option<TaskUsage> {
+    let u = v.get("usage").filter(|u| u.is_object())?;
+    Some(TaskUsage {
+        total_tokens: wasit_core::wire::u(u, "total_tokens"),
+        tool_uses: wasit_core::wire::u(u, "tool_uses"),
+        duration_ms: wasit_core::wire::u(u, "duration_ms"),
+    })
+}
+
+/// The event of a `system` task frame; `None` when it names no task.
+fn task_event(v: &Value) -> Option<AgentEvent> {
+    let subtype = s(v, "subtype");
+    if subtype == "background_tasks_changed" {
+        let tasks = v
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| {
+                        Some(BackgroundTask {
+                            task_id: opt_s(t, "task_id")?,
+                            kind: s(t, "task_type").to_string(),
+                            description: s(t, "description").to_string(),
+                            subagent_type: opt_s(t, "subagent_type"),
+                            run_id: opt_s(t, "run_id"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Some(AgentEvent::BackgroundTasksChanged { tasks });
+    }
+    let task_id = opt_s(v, "task_id")?;
+    let call_id = opt_s(v, "tool_use_id").filter(|c| !c.is_empty());
+    Some(match subtype {
+        "task_started" => AgentEvent::TaskStarted {
+            task_id,
+            kind: s(v, "task_type").to_string(),
+            call_id,
+            description: s(v, "description").to_string(),
+            subagent_type: opt_s(v, "subagent_type"),
+            background: v
+                .get("is_backgrounded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            run_id: opt_s(v, "run_id"),
+        },
+        "task_progress" => AgentEvent::TaskProgress {
+            task_id,
+            call_id,
+            description: s(v, "description").to_string(),
+            last_tool: opt_s(v, "last_tool_name"),
+            usage: task_usage(v),
+        },
+        "task_updated" => AgentEvent::TaskUpdated {
+            task_id,
+            status: v.get("patch").and_then(|p| opt_s(p, "status")),
+        },
+        "task_notification" => {
+            let status = s(v, "status").to_string();
+            AgentEvent::TaskEnded {
+                task_id,
+                call_id,
+                ok: status == "completed",
+                status,
+                summary: opt_s(v, "summary"),
+                usage: task_usage(v),
+            }
+        }
+        _ => return None,
+    })
 }
 
 // ── wire encoders ─────────────────────────────────────────────────────────────

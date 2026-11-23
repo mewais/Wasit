@@ -80,6 +80,7 @@ impl DriverDescriptor for CodexDescriptor {
             continue_latest: true,
             streaming_output: true,
             prompt_while_busy: BusyPrompt::Steered,
+            stop_task: false,
         }
     }
 

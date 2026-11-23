@@ -15,7 +15,8 @@
 //! `i` interrupt; `m MODEL`; `mode ID`; `/name args` slash command; anything
 //! else is a prompt; `.quit` or EOF shuts the session down.
 //!
-//! Script steps: `{"cmd": <Command JSON>}`, `{"wait": "<event type>",
+//! Script steps: `{"cmd": <Command JSON>}` (`"task_id": "@running"` names the latest task the
+//! agent started), `{"wait": "<event type>",
 //! "contains": "<substring>"?}`, `{"approve": true}` / `{"deny": true}` /
 //! `{"always": true}` (latest gate), `{"answer": "<label>"}` (latest question
 //! gate).

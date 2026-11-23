@@ -136,6 +136,7 @@ impl DriverDescriptor for AcpDescriptor {
             continue_latest: true,
             streaming_output: true,
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
+            stop_task: false,
         }
     }
 

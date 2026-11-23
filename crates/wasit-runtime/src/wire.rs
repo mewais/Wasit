@@ -51,7 +51,8 @@ use wasit_control::TraceId;
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
     GateRequest, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput, ResumableSession,
-    SessionMode, SlashCommandInfo, Unsupported, Usage,
+    SessionMode, SlashCommandInfo, TaskInfo, TaskUsage, TurnOrigin, TurnTrigger, Unsupported,
+    Usage,
 };
 
 /// Method names.
@@ -179,9 +180,12 @@ impl std::fmt::Display for SessionId {
 pub enum Phase {
     /// The process is spawned but its handshake has not completed.
     Starting,
-    /// Ready, no turn running, nothing pending.
+    /// Ready: no turn running, no background task running, nothing pending.
     Idle,
-    /// A turn is running.
+    /// The agent is working: a turn is running (`snapshot.turn`), or no turn is open but a task
+    /// runs in the background (`snapshot.background_running > 0`, `snapshot.turn` is `None`).
+    /// It is never `Idle` while either is true; a client that treats `Working` as "busy" is
+    /// right in both cases.
     Working,
     /// At least one gate waits for a human.
     NeedsYou,
@@ -243,6 +247,12 @@ pub struct TurnInfo {
     pub started_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_turn_id: Option<String>,
+    /// The input the turn runs for, when the agent said so (see `trigger`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<InputId>,
+    /// What started the turn: one of our inputs, the agent itself, or the driver cannot tell.
+    #[serde(default)]
+    pub trigger: TurnTrigger,
     /// The prompt that started it, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
@@ -270,6 +280,9 @@ pub struct TurnOutcome {
     /// Final reply / error text, truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
+    /// Why the agent ran the turn when it started it by itself and said why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TurnOrigin>,
 }
 
 /// A subagent started by a tool call.
@@ -284,9 +297,33 @@ pub struct SubagentInfo {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     pub started_at_ms: u64,
+    /// From its start until the agent says its task ended (a backgrounded subagent keeps
+    /// running after the tool call that started it returned and after the turn ended); for an
+    /// agent that reports no tasks, until the tool call returned or the turn ended.
     pub running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// The agent's task for it ([`TaskInfo::task_id`]; what `Command::StopTask` takes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// The subagent's own id, from the lines it produced (`Scope::agent_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    /// The agent's status word for how its task ended (`completed`, `failed`, `stopped`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    /// Tool calls the subagent made (events scoped to it).
+    #[serde(default)]
+    pub tool_calls: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool: Option<String>,
+    /// What the agent says the task used (not part of the session's own `usage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TaskUsage>,
 }
 
 /// How the process of the latest generation ended.
@@ -409,6 +446,13 @@ pub struct SessionSnapshot {
     pub context_pct: Option<f32>,
     #[serde(default)]
     pub subagents: Vec<SubagentInfo>,
+    /// The tasks the agent runs or ran (subagents, shell commands), newest last, bounded.
+    #[serde(default)]
+    pub tasks: Vec<TaskInfo>,
+    /// How many tasks run in the background right now. While it is above zero the phase is
+    /// `working`, with or without a `turn`.
+    #[serde(default)]
+    pub background_running: u32,
     #[serde(default)]
     pub plan: Vec<PlanEntry>,
     /// Journal time of the last CLI output or user input (ms since the Unix epoch).
@@ -494,11 +538,17 @@ pub enum PhaseCause {
     Spawned { generation: u32 },
     /// The CLI completed its handshake.
     HandshakeDone,
-    /// A turn started (for this input, when it is one of ours).
+    /// A turn started (for this input, when it is one of ours; `trigger` says what started it).
     TurnStarted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<InputId>,
+        #[serde(default)]
+        trigger: TurnTrigger,
     },
+    /// A background task started running (the agent works in the background).
+    TaskStarted { task_id: String },
+    /// A background task stopped running.
+    TaskEnded { task_id: String },
     /// A turn ended.
     TurnCompleted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -818,6 +868,49 @@ pub struct HistoryRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<u64>,
     pub limit: u32,
+    /// Which events: everything (default), the session's own transcript, or one subagent's.
+    #[serde(default, skip_serializing_if = "HistoryScope::is_all")]
+    pub scope: HistoryScope,
+}
+
+/// Which events a history page holds. The cursors are the same whatever the scope (a scoped page
+/// is the filter of the full stream), so `before` pages a subagent's transcript exactly like the
+/// session's, and `has_more` says whether older events *of that scope* exist.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryScope {
+    /// Every event (what the history API always returned).
+    #[default]
+    All,
+    /// The session's own transcript: every event except the `scoped` ones of subagents.
+    Main,
+    /// One subagent's transcript: the `scoped` events of the tool call that spawned it
+    /// ([`SubagentInfo::call_id`]) and the start and end of its task.
+    Subagent { call_id: String },
+}
+
+impl HistoryScope {
+    pub fn is_all(&self) -> bool {
+        matches!(self, HistoryScope::All)
+    }
+
+    /// Whether `event` belongs to this scope.
+    pub fn admits(&self, event: &SessionEvent) -> bool {
+        let SessionEventKind::Agent { event: agent } = &event.kind else {
+            return !matches!(self, HistoryScope::Subagent { .. });
+        };
+        match self {
+            HistoryScope::All => true,
+            HistoryScope::Main => !matches!(agent, AgentEvent::Scoped { .. }),
+            HistoryScope::Subagent { call_id } => match agent {
+                AgentEvent::Scoped { scope, .. } => scope.call_id == *call_id,
+                AgentEvent::TaskStarted { call_id: c, .. }
+                | AgentEvent::TaskEnded { call_id: c, .. } => c.as_deref() == Some(call_id),
+                _ => false,
+            },
+        }
+    }
 }
 
 /// Result of `session.history`, oldest first.

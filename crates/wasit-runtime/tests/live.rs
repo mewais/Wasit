@@ -97,6 +97,159 @@ async fn live_turn(driver: &str, model: Option<&str>, env: Vec<(String, String)>
     assert_eq!(a, before);
 }
 
+/// The owner's report against the real CLI: a prompt that makes claude start a background
+/// subagent. The session must never read `idle` between the start of the background task and the
+/// CLI's report that it ended; the subagent's tool calls are attributed to the call that spawned
+/// it (and not part of the session's own conversation); the subagent runs until its task ended;
+/// and the final state is `idle` with nothing running.
+#[tokio::test]
+#[ignore = "live: needs an authenticated claude CLI"]
+async fn live_claude_background_subagent() {
+    require("claude");
+    let d = TempDir::new();
+    let work = d.path().join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let mgr = live_manager(d.path()).await;
+    let mut req = CreateSession::new("claude");
+    req.cwd = Some(work.to_string_lossy().into_owned());
+    req.model = Some("haiku".into());
+    let id = mgr.create(req).await.unwrap().id;
+    wait_snapshot_within(&mgr, &id, "idle", LIVE, |s| s.phase == Phase::Idle).await;
+    mgr.command(
+        &id,
+        Command::prompt(
+            "Use the Agent tool exactly once with run_in_background set to true, subagent_type \
+             general-purpose, description probe, instruction: run the Bash command `echo hi` and \
+             report its output in one word. Then reply with just the word STARTED and end your \
+             turn. When you are later told the agent finished, reply with just the word OK.",
+        ),
+    )
+    .await
+    .unwrap();
+    // Everything the CLI does for this prompt, to the moment the agent's own turn(s) ended.
+    let end = wait_snapshot_within(
+        &mgr,
+        &id,
+        "the background work done and the session idle",
+        LIVE,
+        |s| {
+            s.phase == Phase::Idle
+                && s.turns_completed >= 2
+                && !s.tasks.is_empty()
+                && s.tasks.iter().all(|t| !t.running)
+        },
+    )
+    .await;
+    let all = mgr.history(&id, None, 5000).await.unwrap().events;
+    let agent_events: Vec<&AgentEvent> = all
+        .iter()
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::Agent { event } => Some(event),
+            _ => None,
+        })
+        .collect();
+    eprintln!(
+        "[claude] {} events; tasks {:?}; subagents {:?}; turns {}",
+        all.len(),
+        end.tasks
+            .iter()
+            .map(|t| (&t.kind, t.background, &t.status))
+            .collect::<Vec<_>>(),
+        end.subagents
+            .iter()
+            .map(|s| (&s.subagent_type, s.tool_calls, s.running, s.ok))
+            .collect::<Vec<_>>(),
+        end.turns_completed
+    );
+    // The CLI backgrounded it, as asked.
+    let started = all
+        .iter()
+        .position(|e| {
+            matches!(
+                &e.kind,
+                SessionEventKind::Agent {
+                    event: AgentEvent::TaskStarted {
+                        background: true,
+                        ..
+                    }
+                }
+            )
+        })
+        .expect("the CLI started a background task");
+    let ended = all
+        .iter()
+        .position(|e| {
+            matches!(
+                &e.kind,
+                SessionEventKind::Agent {
+                    event: AgentEvent::TaskEnded { .. }
+                }
+            )
+        })
+        .expect("the CLI reported the task ended");
+    assert!(started < ended);
+    // Never idle between the task's start and the CLI's report that it ended — although the turn
+    // that started it ended long before.
+    let first_turn_end = all.iter().position(is_turn_completed).unwrap();
+    assert!(
+        started < first_turn_end && first_turn_end < ended,
+        "the turn ended while the task ran"
+    );
+    for e in &all[started..ended] {
+        assert!(
+            !is_phase(e, "idle"),
+            "idle while the background task ran: {e:?}"
+        );
+    }
+    // The subagent's own tool calls are scoped to the call that spawned it.
+    let spawn = agent_events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallStarted {
+                call_id,
+                is_subagent: true,
+                ..
+            } => Some(call_id.clone()),
+            _ => None,
+        })
+        .expect("the Agent call");
+    let scoped: Vec<&AgentEvent> = agent_events
+        .iter()
+        .copied()
+        .filter(|e| matches!(e, AgentEvent::Scoped { .. }))
+        .collect();
+    assert!(!scoped.is_empty(), "the subagent's lines were attributed");
+    assert!(scoped
+        .iter()
+        .all(|e| matches!(e, AgentEvent::Scoped { scope, .. } if scope.call_id == spawn)));
+    assert!(scoped.iter().any(|e| matches!(e, AgentEvent::Scoped { event, .. } if matches!(&**event, AgentEvent::ToolCallStarted { .. }))));
+    // The session's own transcript has none of them.
+    let main = mgr
+        .history_scoped(&id, None, 5000, wasit_runtime::wire::HistoryScope::Main)
+        .await
+        .unwrap();
+    assert!(!main
+        .events
+        .iter()
+        .any(|e| is_agent(e, |a| matches!(a, AgentEvent::Scoped { .. }))));
+    // The subagent ran until the agent said its task ended; the final state is idle, nothing running.
+    assert_eq!(end.phase, Phase::Idle);
+    assert_eq!(end.background_running, 0);
+    assert_eq!(end.subagents.len(), 1);
+    assert!(
+        !end.subagents[0].running && end.subagents[0].ok == Some(true),
+        "{:?}",
+        end.subagents[0]
+    );
+    assert!(end.subagents[0].tool_calls >= 1);
+    assert!(
+        !all.iter()
+            .any(|e| matches!(&e.kind, SessionEventKind::Anomaly { .. })),
+        "an activity the model could not explain was reported"
+    );
+    stop(&mgr, &id).await;
+}
+
 async fn stop(mgr: &SessionManager, id: &SessionId) -> SessionSnapshot {
     mgr.stop(id).await.unwrap();
     let snap = wait_snapshot_within(mgr, id, "exit", LIVE, |s| !s.phase.is_live()).await;

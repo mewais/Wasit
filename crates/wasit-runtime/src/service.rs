@@ -255,7 +255,7 @@ impl Service for RuntimeService {
             }
             methods::SESSION_HISTORY => {
                 let r: HistoryRequest = params(p)?;
-                ok(m.history(&r.id, r.before, r.limit as usize)
+                ok(m.history_scoped(&r.id, r.before, r.limit as usize, r.scope)
                     .await
                     .map_err(runtime_err)?)
             }

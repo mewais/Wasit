@@ -159,7 +159,8 @@ replay-from-cursor, and a continuously reduced `SessionSnapshot` (phase, pending
 usage/cost/context, model/mode, subagents, last activity, exit). Rules:
 
 - Phase is derived only from facts: journal says the process exited ⇒ `Exited{code}` (shown as
-  Done/Failed), shim gone without an exit record ⇒ `Lost`; never "working" for a dead process.
+  Done/Failed), shim gone without an exit record ⇒ `Lost`; never "working" for a dead process;
+  `Working` while a turn is open or a background task runs (§3.6).
 - Pending gates are part of reduced state, so they survive daemon restart via replay.
 - Transcript = the journal. Backfill = replay from cursor. No separate transcript store, no
   1 MiB caps; paging by cursor.
@@ -241,6 +242,59 @@ to processes started afterwards (a continued session keeps its stored command); 
 detected again when the result changed. `host.environment.test` applies again (setup re-run)
 and returns the report plus the settled inventory. Secret variables are never reported: texts
 are scrubbed of their values and `EnvVar`'s `Debug` hides them.
+
+### 3.6 Turns, background work and subagents
+
+What the session says it is doing is what the agent says it is doing, never what we infer from
+what we wrote. Verified against claude 2.1.293 (recordings in `wasit-claude/tests/fixtures`,
+`wasit-fake-cli/reference/claude`): the CLI backgrounds subagents and shell commands even when told
+to wait, the tool result returns at once, the turn ends, the work goes on, and when it ends the CLI
+starts a turn by itself.
+
+- **A turn is the agent's.** `TurnStarted` and `TurnCompleted` are the agent's own edges, whoever
+  started the turn (claude: `system/init` … `result`; codex: `turn/started`/`turn/completed`; ACP:
+  the prompt request). A `TurnCompleted` never arrives without its `TurnStarted`. `TurnStarted.input`
+  names the input only on the agent's own report (claude: the `command_lifecycle started` frame
+  that comes just before `system/init`), `trigger` says why: `input`, `agent` (the agent started it
+  itself, e.g. after a background task ended; `TurnCompleted.origin` then says why, in its words) or
+  `unreported` (the driver cannot tell: a CLI that reports no message lifecycle — never a guess, so
+  a turn is never attributed to the wrong prompt). An input a turn joined is acknowledged
+  `steered`.
+- **One prompt, one turn.** The claude driver writes a prompt only when no turn is open (the CLI's
+  own turn counts), none is starting, and the CLI holds none of ours queued; others wait in the
+  driver's queue and `Interrupt` drops them. (No timeouts: the CLI's own `started` / `result`
+  release them.)
+- **Background work is state.** The agent's tasks (`TaskStarted`/`TaskProgress`/`TaskUpdated`/
+  `TaskEnded`, and `BackgroundTasksChanged`, the agent's own list of what runs in the background:
+  the authority) are folded by one function, `wasit_core::tasks::apply`, used by the runtime's
+  reducer (`snapshot.tasks`, `snapshot.background_running`) and by every consumer that follows the
+  events itself (Wasl). **`Phase::Working` ⇔ a turn is open or a background task runs; `Idle` only
+  when neither.** There is no separate phase: a client that treats `working` as busy is right in
+  both cases, and `snapshot.turn == None` says only background work remains. The phase cause is
+  `TurnStarted{input, trigger}`, `TaskStarted` or `TaskEnded`. The agent gives no notice before it
+  starts the turn that answers a finished task (it starts one for a finished subagent or command,
+  none for a command that was stopped), so for the instant between the task's end frames and that
+  turn (10–100 ms in the recordings) the phase honestly reads `idle`: a consumer that must not act
+  in that instant keys on events (a turn that completes with no task running), never on a phase
+  it read.
+- **Subagents are attributed.** A line the CLI tags as a subagent's own conversation is
+  `AgentEvent::Scoped{scope:{call_id, agent_id}, event}` (`call_id`: the tool call that spawned
+  it). A consumer that knows nothing of scopes shows no subagent text in the session's
+  conversation. `snapshot.subagents[*].running` holds from the start until the agent says the task
+  ended (not until the spawning tool call returned); activity of a subagent the session knows is
+  accounted for, so `Anomaly{ActivityWhileIdle}` only reports what nothing explains. Usage is what
+  the CLI reports: the session's `usage` is its cumulative total (subagents included); a subagent's
+  messages never feed the session's `live_usage` / `context_pct`; `TaskInfo.usage` is the task's.
+- **Transcripts are filters of one stream.** `session.history {id, before, limit, scope}` takes
+  `scope`: `{"kind":"all"}` (default, everything), `{"kind":"main"}` (the session's own transcript:
+  every event except the scoped ones) or `{"kind":"subagent","call_id":…}` (that subagent's
+  conversation and the start and end of its task). Cursors are those of the full stream, `before`
+  pages exactly as without a scope, `limit`/`has_more` count events of the scope. There is no
+  second store.
+- **Stopping.** `Interrupt` stops the turn that runs (also one the agent started itself); when no
+  turn runs but background tasks do, it stops them (the CLI's own `interrupt` does not).
+  `StopTask{task_id}` stops one task (`capabilities.stop_task`; an id that is not running is
+  refused, the CLI would answer success to anything).
 
 ## 4. Control protocol (`wasit-control`)
 
@@ -351,7 +405,11 @@ A home directory may be shared by several machines (NFS and similar). Marsad's l
   journaled by the node; results are structured (`status`, `summary`, `artifacts`, `usage`).
   Fan-out never serialises: no lock is held across a delegation.
 - **Delivery:** a task for a session is a turn submitted to that session's actor with a
-  provenance header; progress events stream back to the task; completion = the turn's result.
+  provenance header (it waits for the session to be `idle`); progress events stream back to the
+  task; completion = the result of the turn that ran the input (matched by `TurnStarted.input`, or
+  by `InputAcknowledged{steered}` when it joined a running turn) — and, when the receiver still
+  works in the background at that turn's end, the turn that ends the work (§3.6). Cancelling a
+  task whose receiver only waits for background work stops that work.
 - **Handoff gates:** raised by the *sender's* node as a gate on the sending session (kind
   `Handoff`), so they surface through the same pipeline as any tool permission, for every CLI,
   with no dependence on MCP elicitation. Policy per edge: `ask` (default) / `always_allow` /

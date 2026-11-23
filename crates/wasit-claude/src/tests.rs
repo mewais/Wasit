@@ -2,8 +2,11 @@ use super::*;
 use serde_json::json;
 use wasit_core::{
     AgentEvent, Command, Encoded, EndReason, GateDecision, GateRequest, InputId, McpServerConfig,
-    McpTransport, PluginRef, QuestionAnswer, SkillRef, Step,
+    McpTransport, PluginRef, QuestionAnswer, SkillRef, Step, TurnTrigger,
 };
+
+/// `system/init`, printed at the start of every turn.
+const TURN_INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s1","model":"m","cwd":"/p","tools":[],"mcp_servers":[],"permissionMode":"default","claude_code_version":"2.1.293","slash_commands":[]}"#;
 
 fn ready() -> (ClaudeProtocol, Step) {
     let mut p = ClaudeProtocol::new();
@@ -65,16 +68,13 @@ fn start_writes_initialize_and_the_first_prompt_waits_for_the_handshake() {
     assert_eq!(step.write.len(), 1);
     assert!(step.write[0].0.contains(r#""text":"hi""#));
     assert!(!step.write[0].0.contains("uuid"), "no session id, no uuid");
+    // Writing the prompt is not the turn: the turn starts when the CLI says so.
     assert_eq!(
         step.events,
-        vec![
-            AgentEvent::InputSent { input: InputId(2) },
-            AgentEvent::TurnStarted {
-                native_turn_id: None,
-                input: Some(InputId(2))
-            }
-        ]
+        vec![AgentEvent::InputSent { input: InputId(2) }]
     );
+    // The second prompt waits for the first one's turn to start, run and end.
+    p.on_line(TURN_INIT);
     let step = p.on_line(
         r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#,
     );
@@ -410,6 +410,7 @@ fn unsupported_control_request_gets_error_reply() {
 fn interrupt_declines_gates_then_interrupts_and_marks_cancel() {
     let (mut p, _) = ready();
     sent(p.encode(InputId(111), Command::prompt("go")));
+    p.on_line(TURN_INIT);
     p.on_line(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"x"}}}"#);
     let step = sent(p.encode(InputId(112), Command::Interrupt));
     let w = writes(&step);
@@ -449,6 +450,7 @@ fn interrupt_declines_gates_then_interrupts_and_marks_cancel() {
 #[test]
 fn result_variants_and_cumulative_usage() {
     let (mut p, _) = ready();
+    p.on_line(TURN_INIT);
     let ev = p
         .on_line(r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":9}"#)
         .events;
@@ -459,10 +461,12 @@ fn result_variants_and_cumulative_usage() {
             ..
         }
     ));
+    p.on_line(TURN_INIT);
     let ev = p.on_line(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["boom"]}"#).events;
     assert!(
         matches!(&ev[0], AgentEvent::TurnCompleted { end_reason: Some(EndReason::ExecutionError), reply: Some(r), .. } if r == "boom")
     );
+    p.on_line(TURN_INIT);
     let ev = p.on_line(r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"hi","total_cost_usd":0.5,"modelUsage":{"a":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":3,"cacheCreationInputTokens":4,"costUSD":0.2},"b":{"inputTokens":10,"outputTokens":20,"costUSD":0.3}}}"#).events;
     match &ev[0] {
         AgentEvent::TurnCompleted {
@@ -540,6 +544,7 @@ fn slash_command_is_a_user_message() {
         writes(&step)[0]["message"]["content"][0]["text"],
         "/context"
     );
+    p.on_line(TURN_INIT);
     let step = p.on_line(r#"{"type":"result","subtype":"success","is_error":false}"#);
     assert!(step.write.is_empty());
     let step = sent(p.encode(
@@ -1081,7 +1086,11 @@ fn message_uuids_are_deterministic_per_session_and_input() {
 fn two_queued_prompts_then_interrupt_are_dropped_and_never_start() {
     let mut p = ready_with_ids();
     let first = sent(p.encode(InputId(10), Command::prompt("long")));
-    assert_eq!(turn_starts(&first.events), vec![Some(InputId(10))]);
+    assert!(
+        turn_starts(&first.events).is_empty(),
+        "the CLI starts the turn"
+    );
+    p.on_line(TURN_INIT);
     assert_eq!(
         p.encode(InputId(11), Command::prompt("second")).unwrap(),
         Encoded::Queued
@@ -1098,7 +1107,7 @@ fn two_queued_prompts_then_interrupt_are_dropped_and_never_start() {
             (InputId(12), wasit_core::InputDropReason::Interrupted)
         ]
     );
-    // No lifecycle seen yet: no cancellation is asked for, only the interrupt.
+    // No lifecycle seen: no cancellation is asked for, only the interrupt.
     let w = writes(&step);
     assert_eq!(w.len(), 1);
     assert_eq!(w[0]["request"]["subtype"], "interrupt");
@@ -1199,12 +1208,13 @@ fn acknowledgement_comes_from_the_message_lifecycle_only() {
             "{l} acknowledged: {ev:?}"
         );
     }
+    // The `system/init` above opened a turn of the CLI's own: the message joined it.
     let ev = p.on_line(&lifecycle(&uuid, "started")).events;
     assert_eq!(
         ev,
         vec![AgentEvent::InputAcknowledged {
             input: InputId(5),
-            steered: false
+            steered: true
         }]
     );
     // Once.
@@ -1219,6 +1229,7 @@ fn acknowledgement_comes_from_the_message_lifecycle_only() {
 fn a_result_listing_the_message_acknowledges_it_without_lifecycle_frames() {
     let mut p = ready_with_ids();
     let uuid = uuid_of(&sent(p.encode(InputId(5), Command::prompt("go"))));
+    p.on_line(TURN_INIT);
     let ev = p
         .on_line(&format!(
             r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"user_message_uuids":["{uuid}"]}}"#
@@ -1259,9 +1270,9 @@ fn without_lifecycle_reports_nothing_is_acknowledged() {
     assert_eq!(w[0]["request"]["subtype"], "interrupt");
 }
 
-/// A message the CLI has read but not started (it sits in the CLI's own queue, e.g. behind a
-/// turn the CLI started by itself) is cancelled before the interrupt; the CLI's `cancelled`
-/// report drops it, and our turn for it — which will never produce a `result` — ends.
+/// A message the CLI has read but not started (it sits in the CLI's own queue, behind a turn the
+/// CLI started by itself) is cancelled before the interrupt; the CLI's `cancelled` report drops
+/// it. No turn of ours ends with it: the turn that runs is the CLI's own, and its `result` ends it.
 #[test]
 fn interrupt_cancels_a_message_waiting_in_the_clis_queue() {
     let mut p = ready_with_ids();
@@ -1269,11 +1280,21 @@ fn interrupt_cancels_a_message_waiting_in_the_clis_queue() {
     let u1 = uuid_of(&sent(p.encode(InputId(5), Command::prompt("one"))));
     p.on_line(&lifecycle(&u1, "queued"));
     p.on_line(&lifecycle(&u1, "started"));
+    p.on_line(TURN_INIT);
     p.on_line(RESULT_OK);
     p.on_line(&lifecycle(&u1, "completed"));
-    // The next one is read but not started.
+    // The next one is read, and then the CLI starts a turn of its own before this one.
     let u2 = uuid_of(&sent(p.encode(InputId(6), Command::prompt("two"))));
     p.on_line(&lifecycle(&u2, "queued"));
+    let ev = p.on_line(TURN_INIT).events;
+    assert!(matches!(
+        ev[..],
+        [AgentEvent::TurnStarted {
+            input: None,
+            trigger: TurnTrigger::Agent,
+            ..
+        }]
+    ));
     let step = sent(p.encode(InputId(7), Command::Interrupt));
     let w = writes(&step);
     assert_eq!(w.len(), 2, "{w:?}");
@@ -1281,7 +1302,7 @@ fn interrupt_cancels_a_message_waiting_in_the_clis_queue() {
     assert_eq!(w[0]["request"]["message_uuid"], u2.as_str());
     assert_eq!(w[1]["request"]["subtype"], "interrupt");
     let cancel_id = w[0]["request_id"].as_str().unwrap().to_string();
-    // A prompt sent meanwhile waits behind our (still open) turn.
+    // A prompt sent meanwhile waits behind the CLI's turn.
     assert_eq!(
         p.encode(InputId(8), Command::prompt("three")).unwrap(),
         Encoded::Queued
@@ -1292,33 +1313,68 @@ fn interrupt_cancels_a_message_waiting_in_the_clis_queue() {
         drops(&step.events),
         vec![(InputId(6), wasit_core::InputDropReason::Interrupted)]
     );
-    assert!(matches!(
-        step.events[1],
-        AgentEvent::TurnCompleted {
-            end_reason: Some(EndReason::Cancelled),
-            was_interrupted: true,
-            ..
-        }
-    ));
-    assert_eq!(turn_starts(&step.events), vec![Some(InputId(8))]);
+    assert_eq!(
+        step.events.len(),
+        1,
+        "no turn of ours ends: {:?}",
+        step.events
+    );
+    assert!(step.write.is_empty(), "the CLI's turn is still open");
     let ev = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{cancel_id}","response":{{"cancelled":true}}}}}}"#)).events;
     assert!(ev.is_empty(), "dropped once: {ev:?}");
+    // The CLI's turn ends (interrupted); the held prompt goes out.
+    let step = p.on_line(
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"origin":{"kind":"task-notification","producer":"session-task","runId":"r1"}}"#,
+    );
+    assert!(matches!(
+        &step.events[..],
+        [
+            AgentEvent::TurnCompleted {
+                end_reason: Some(EndReason::Cancelled),
+                was_interrupted: true,
+                origin: Some(wasit_core::TurnOrigin { kind, .. }),
+                ..
+            },
+            AgentEvent::InputSent { input: InputId(8) }
+        ] if kind == "task-notification"
+    ));
+    assert_eq!(writes(&step).len(), 1);
 }
 
-/// Asked too late: the message had started (`cancelled:false`); it runs, is acknowledged, and
-/// its interrupted turn ends with the `result`.
+/// Asked too late: the message had started (`cancelled:false`); it runs, is acknowledged, and the
+/// interrupt that was meant for its turn goes out then; its interrupted turn ends with the
+/// `result`.
 #[test]
-fn a_cancel_that_comes_too_late_changes_nothing() {
+fn a_cancel_that_comes_too_late_interrupts_the_turn_that_started() {
     let mut p = ready_with_ids();
     let u1 = uuid_of(&sent(p.encode(InputId(5), Command::prompt("one"))));
     p.on_line(&lifecycle(&u1, "queued"));
     let w = writes(&sent(p.encode(InputId(6), Command::Interrupt)));
+    assert_eq!(
+        w.len(),
+        1,
+        "nothing runs yet: only the cancellation is asked for"
+    );
     assert_eq!(w[0]["request"]["subtype"], "cancel_async_message");
     let cancel_id = w[0]["request_id"].as_str().unwrap().to_string();
     let ev = p.on_line(&lifecycle(&u1, "started")).events;
-    assert!(matches!(ev[..], [AgentEvent::InputAcknowledged { .. }]));
-    let ev = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{cancel_id}","response":{{"cancelled":false}}}}}}"#)).events;
-    assert!(ev.is_empty());
+    assert!(matches!(
+        ev[..],
+        [AgentEvent::InputAcknowledged { steered: false, .. }]
+    ));
+    let step = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{cancel_id}","response":{{"cancelled":false}}}}}}"#));
+    assert!(step.events.is_empty());
+    assert_eq!(writes(&step)[0]["request"]["subtype"], "interrupt");
+    let ev = p.on_line(TURN_INIT).events;
+    assert!(matches!(ev[0], AgentEvent::SessionInit { .. }));
+    assert!(matches!(
+        ev[1..],
+        [AgentEvent::TurnStarted {
+            input: Some(InputId(5)),
+            trigger: TurnTrigger::Input,
+            ..
+        }]
+    ));
     let ev = p
         .on_line(
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}"#,
@@ -1345,5 +1401,385 @@ fn a_cancel_the_cli_refuses_is_reported() {
     let ev = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{cancel_id}","error":"unknown subtype"}}}}"#)).events;
     assert!(
         matches!(&ev[..], [AgentEvent::CommandRejected { command, .. }] if command == "interrupt")
+    );
+}
+
+// ── turns come from the CLI; background work; subagents (frame shapes of claude 2.1.293) ──
+
+/// `system/init` of a CLI that says it reports message lifecycles.
+const TURN_INIT_CAPABLE: &str = r#"{"type":"system","subtype":"init","session_id":"s1","model":"m","cwd":"/p","tools":[],"mcp_servers":[],"permissionMode":"default","claude_code_version":"2.1.293","slash_commands":[],"capabilities":["interrupt_receipt_v1","msg_lifecycle_v1"]}"#;
+
+const TASK_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"a1","run_id":"r1","tool_use_id":"toolu_A","description":"probe","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"p"}"#;
+const TASKS_LISTED: &str = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","run_id":"r1","task_type":"local_agent","subagent_type":"general-purpose","description":"probe"}]}"#;
+const TASKS_EMPTY: &str = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+const TASK_ENDED: &str = r#"{"type":"system","subtype":"task_notification","task_id":"a1","run_id":"r1","tool_use_id":"toolu_A","status":"completed","output_file":"/o","summary":"hi","usage":{"total_tokens":60846,"tool_uses":1,"duration_ms":2533}}"#;
+
+fn first_turn_start(events: &[AgentEvent]) -> Option<(Option<InputId>, TurnTrigger)> {
+    events.iter().find_map(|e| match e {
+        AgentEvent::TurnStarted { input, trigger, .. } => Some((*input, *trigger)),
+        _ => None,
+    })
+}
+
+/// The turn starts at `system/init`; which input it runs for is known only from the lifecycle
+/// `started` frame that came just before. Three CLIs: one that reports lifecycles for our messages
+/// (the turn is attributed; a turn with no `started` frame is the agent's own), one that said it
+/// does but has not shown a frame yet (the agent's own turn), one that reports nothing (the
+/// driver cannot tell and does not guess).
+#[test]
+fn a_turn_is_attributed_only_on_the_clis_own_report() {
+    // Reports lifecycles.
+    let mut p = ready_with_ids();
+    let uuid = uuid_of(&sent(p.encode(InputId(5), Command::prompt("go"))));
+    p.on_line(&lifecycle(&uuid, "queued"));
+    p.on_line(&lifecycle(&uuid, "started"));
+    let ev = p.on_line(TURN_INIT).events;
+    assert_eq!(
+        first_turn_start(&ev),
+        Some((Some(InputId(5)), TurnTrigger::Input))
+    );
+    p.on_line(RESULT_OK);
+    p.on_line(&lifecycle(&uuid, "completed"));
+    // The next turn has no `started` frame before it: the CLI's own.
+    let ev = p.on_line(TURN_INIT).events;
+    assert_eq!(first_turn_start(&ev), Some((None, TurnTrigger::Agent)));
+
+    // Said it reports (`capabilities`), no frame seen yet: the first turn of a session is ours,
+    // but a turn the CLI starts for a message of ours it has not reported is still the agent's.
+    let mut p = ready_with_ids();
+    let ev = p.on_line(TURN_INIT_CAPABLE).events;
+    assert_eq!(first_turn_start(&ev), Some((None, TurnTrigger::Agent)));
+
+    // Reports nothing: our prompt, then `system/init`: whose turn it is cannot be told.
+    let (mut p, _) = ready();
+    sent(p.encode(InputId(5), Command::prompt("go")));
+    let ev = p.on_line(TURN_INIT).events;
+    assert_eq!(first_turn_start(&ev), Some((None, TurnTrigger::Unreported)));
+    // The same for a CLI that lists the capability while the messages carry no uuid (no session
+    // id was given): there is nothing it could report about.
+    let (mut p, _) = ready();
+    sent(p.encode(InputId(5), Command::prompt("go")));
+    let ev = p.on_line(TURN_INIT_CAPABLE).events;
+    assert_eq!(first_turn_start(&ev), Some((None, TurnTrigger::Unreported)));
+}
+
+/// A result with no `system/init` before it (a CLI that did not print one): the turn still has a
+/// start, marked as unreported.
+#[test]
+fn a_turn_end_is_never_reported_without_its_start() {
+    let (mut p, _) = ready();
+    let ev = p.on_line(RESULT_OK).events;
+    assert!(matches!(
+        ev[..],
+        [
+            AgentEvent::TurnStarted {
+                input: None,
+                trigger: TurnTrigger::Unreported,
+                ..
+            },
+            AgentEvent::TurnCompleted { .. }
+        ]
+    ));
+}
+
+/// A message the CLI takes into a turn that is already running joined it: acknowledged as
+/// steered, and it starts no turn of its own. (The race: our prompt was written just before the
+/// CLI began a turn by itself; it printed `queued`, then `system/init` for its own turn, and took
+/// the message in at the next model call, as recorded with 2.1.293.)
+#[test]
+fn a_message_taken_into_a_turn_the_cli_started_is_acknowledged_as_steered() {
+    let mut p = ready_with_ids();
+    let u1 = uuid_of(&sent(p.encode(InputId(5), Command::prompt("one"))));
+    p.on_line(&lifecycle(&u1, "queued"));
+    let ev = p.on_line(TURN_INIT).events;
+    assert_eq!(first_turn_start(&ev), Some((None, TurnTrigger::Agent)));
+    // The CLI's turn goes on; our message is still waiting in its queue: nothing else is
+    // written meanwhile.
+    assert_eq!(
+        p.encode(InputId(6), Command::prompt("two")).unwrap(),
+        Encoded::Queued
+    );
+    let ev = p.on_line(&lifecycle(&u1, "started")).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::InputAcknowledged {
+            input: InputId(5),
+            steered: true
+        }]
+    );
+    // It starts no turn of its own: the CLI's turn ends once, listing the message.
+    p.on_line(&lifecycle(&u1, "completed"));
+    let step = p.on_line(&format!(
+        r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":2,"user_message_uuids":["{u1}"],"origin":{{"kind":"task-notification","producer":"session-task","runId":"r1"}}}}"#
+    ));
+    assert!(matches!(
+        &step.events[..],
+        [
+            AgentEvent::TurnCompleted {
+                origin: Some(_),
+                ..
+            },
+            AgentEvent::InputSent { input: InputId(6) }
+        ]
+    ));
+}
+
+/// A prompt written while the CLI is in a turn of its own is held until that turn's `result`,
+/// like one behind our own turn; and a prompt the CLI has queued (read, not started: it is
+/// waiting behind a turn the CLI began first) holds the next ones back too, so no two of our
+/// prompts are ever merged into one turn.
+#[test]
+fn prompts_wait_for_the_clis_turn_and_for_the_prompt_the_cli_has_queued() {
+    let mut p = ready_with_ids();
+    let u1 = uuid_of(&sent(p.encode(InputId(5), Command::prompt("one"))));
+    p.on_line(&lifecycle(&u1, "queued"));
+    p.on_line(&lifecycle(&u1, "started"));
+    p.on_line(TURN_INIT);
+    p.on_line(RESULT_OK);
+    p.on_line(&lifecycle(&u1, "completed"));
+    // The CLI begins a turn of its own: a prompt waits for it.
+    p.on_line(TURN_INIT);
+    assert_eq!(
+        p.encode(InputId(6), Command::prompt("two")).unwrap(),
+        Encoded::Queued
+    );
+    // Its turn ends: the prompt goes out.
+    let step = p.on_line(RESULT_OK);
+    let u2 = uuid_of(&step);
+    assert_eq!(
+        step.events.last(),
+        Some(&AgentEvent::InputSent { input: InputId(6) })
+    );
+    // The CLI reads it but is busy with another turn of its own (`queued`, no `started`): the
+    // next prompt keeps waiting although no turn of the CLI is open right now.
+    p.on_line(&lifecycle(&u2, "queued"));
+    assert_eq!(
+        p.encode(InputId(7), Command::prompt("three")).unwrap(),
+        Encoded::Queued
+    );
+    p.on_line(&lifecycle(&u2, "started"));
+    p.on_line(TURN_INIT);
+    let step = p.on_line(RESULT_OK);
+    assert_eq!(
+        step.events.last(),
+        Some(&AgentEvent::InputSent { input: InputId(7) })
+    );
+}
+
+/// Real frames of a background subagent (E4): the task is running from `task_started` until
+/// `task_notification`, whatever happens to the tool call that spawned it.
+#[test]
+fn task_frames_become_task_events() {
+    let (mut p, _) = ready();
+    let ev = p.on_line(TASKS_LISTED).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::BackgroundTasksChanged {
+            tasks: vec![wasit_core::BackgroundTask {
+                task_id: "a1".into(),
+                kind: "local_agent".into(),
+                description: "probe".into(),
+                subagent_type: Some("general-purpose".into()),
+                run_id: Some("r1".into()),
+            }]
+        }]
+    );
+    let ev = p.on_line(TASK_STARTED).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::TaskStarted {
+            task_id: "a1".into(),
+            kind: "local_agent".into(),
+            call_id: Some("toolu_A".into()),
+            description: "probe".into(),
+            subagent_type: Some("general-purpose".into()),
+            background: true,
+            run_id: Some("r1".into()),
+        }]
+    );
+    let ev = p.on_line(r#"{"type":"system","subtype":"task_progress","task_id":"a1","run_id":"r1","tool_use_id":"toolu_A","description":"Running Echo","subagent_type":"general-purpose","usage":{"total_tokens":59844,"tool_uses":1,"duration_ms":1111},"last_tool_name":"Bash"}"#).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::TaskProgress {
+            task_id: "a1".into(),
+            call_id: Some("toolu_A".into()),
+            description: "Running Echo".into(),
+            last_tool: Some("Bash".into()),
+            usage: Some(wasit_core::TaskUsage {
+                total_tokens: 59844,
+                tool_uses: 1,
+                duration_ms: 1111
+            }),
+        }]
+    );
+    let ev = p.on_line(r#"{"type":"system","subtype":"task_updated","task_id":"a1","run_id":"r1","patch":{"status":"completed","end_time":1795391266906}}"#).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::TaskUpdated {
+            task_id: "a1".into(),
+            status: Some("completed".into())
+        }]
+    );
+    let ev = p.on_line(TASK_ENDED).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::TaskEnded {
+            task_id: "a1".into(),
+            call_id: Some("toolu_A".into()),
+            status: "completed".into(),
+            ok: true,
+            summary: Some("hi".into()),
+            usage: Some(wasit_core::TaskUsage {
+                total_tokens: 60846,
+                tool_uses: 1,
+                duration_ms: 2533
+            }),
+        }]
+    );
+    // A stopped or failed task did not succeed.
+    let ev = p
+        .on_line(&TASK_ENDED.replace("completed", "stopped"))
+        .events;
+    assert!(
+        matches!(&ev[0], AgentEvent::TaskEnded { ok: false, status, .. } if status == "stopped")
+    );
+    // A frame that names no task stays an unrecognised line.
+    let ev = p
+        .on_line(r#"{"type":"system","subtype":"task_started"}"#)
+        .events;
+    assert!(matches!(ev[0], AgentEvent::Unknown { .. }));
+}
+
+/// Every line the CLI tags with `parent_tool_use_id` is the subagent's own conversation.
+#[test]
+fn a_subagents_lines_are_scoped_to_it() {
+    let (mut p, _) = ready();
+    let scope = || wasit_core::Scope {
+        call_id: "toolu_A".into(),
+        agent_id: Some("a1".into()),
+    };
+    // Text, thinking and a tool call of the subagent, with its usage.
+    let ev = p.on_line(r#"{"type":"assistant","parent_tool_use_id":"toolu_A","agent_id":"a1","subagent_type":"general-purpose","task_description":"probe","message":{"id":"m1","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"hi"},{"type":"tool_use","id":"toolu_B","name":"Bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":3,"output_tokens":2}}}"#).events;
+    assert_eq!(ev.len(), 4);
+    for e in &ev {
+        match e {
+            AgentEvent::Scoped { scope: s, .. } => assert_eq!(*s, scope()),
+            other => panic!("not scoped: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        &ev[0],
+        AgentEvent::Scoped { event, .. } if matches!(&**event, AgentEvent::ThinkingDelta { text, .. } if text == "hmm")
+    ));
+    assert!(matches!(
+        &ev[1],
+        AgentEvent::Scoped { event, .. } if matches!(&**event, AgentEvent::AssistantDelta { text, .. } if text == "hi")
+    ));
+    assert!(matches!(
+        &ev[2],
+        AgentEvent::Scoped { event, .. } if matches!(&**event, AgentEvent::ToolCallStarted { name, .. } if name == "Bash")
+    ));
+    assert!(matches!(
+        &ev[3],
+        AgentEvent::Scoped { event, .. } if matches!(&**event, AgentEvent::UsageUpdate { context_pct: None, .. })
+    ));
+    // Its tool result, and a result a subagent's own text line is not mistaken for.
+    let ev = p.on_line(r#"{"type":"user","parent_tool_use_id":"toolu_A","agent_id":"a1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_B","content":"hi"}]}}"#).events;
+    assert!(matches!(
+        &ev[0],
+        AgentEvent::Scoped { scope: s, event } if *s == scope() && matches!(&**event, AgentEvent::ToolCallFinished { call_id, name, ok: true, .. } if call_id == "toolu_B" && name == "Bash")
+    ));
+    // The session's own lines (`parent_tool_use_id` null) stay unscoped.
+    let ev = p.on_line(r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"m2","content":[{"type":"text","text":"mine"}]}}"#).events;
+    assert!(matches!(&ev[0], AgentEvent::AssistantDelta { text, .. } if text == "mine"));
+    // The agent's id is optional: the spawning call alone scopes a line.
+    let ev = p.on_line(r#"{"type":"assistant","parent_tool_use_id":"toolu_A","message":{"id":"m3","content":[{"type":"text","text":"x"}]}}"#).events;
+    assert!(matches!(
+        &ev[0],
+        AgentEvent::Scoped { scope: wasit_core::Scope { call_id, agent_id: None }, .. } if call_id == "toolu_A"
+    ));
+}
+
+/// What `interrupt` stops: the turn that runs (a turn the CLI started by itself too), else the
+/// background tasks, which `interrupt` itself does not stop; `StopTask` stops one.
+#[test]
+fn interrupt_stops_the_turn_or_else_the_background_tasks_and_stop_task_one_task() {
+    let mut p = ready_with_ids();
+    p.on_line(TASKS_LISTED);
+    p.on_line(TASK_STARTED);
+    // No turn: the background task is what runs.
+    let w = writes(&sent(p.encode(InputId(8), Command::Interrupt)));
+    assert_eq!(w.len(), 1);
+    assert_eq!(
+        w[0]["request"],
+        json!({"subtype":"stop_task","task_id":"a1"})
+    );
+    // A turn the CLI started by itself: interrupt stops the turn only.
+    p.on_line(TURN_INIT);
+    let w = writes(&sent(p.encode(InputId(9), Command::Interrupt)));
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0]["request"]["subtype"], "interrupt");
+    let ev = p
+        .on_line(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"origin":{"kind":"task-notification","producer":"session-task","runId":"r1"}}"#)
+        .events;
+    assert!(matches!(
+        ev[..],
+        [AgentEvent::TurnCompleted {
+            end_reason: Some(EndReason::Cancelled),
+            was_interrupted: true,
+            ..
+        }]
+    ));
+    // One task by id: the CLI answers success to any id, so an unknown one is refused here.
+    let w = writes(&sent(p.encode(
+        InputId(10),
+        Command::StopTask {
+            task_id: "a1".into(),
+        },
+    )));
+    assert_eq!(
+        w[0]["request"],
+        json!({"subtype":"stop_task","task_id":"a1"})
+    );
+    assert!(matches!(
+        p.encode(
+            InputId(11),
+            Command::StopTask {
+                task_id: "nosuch".into()
+            }
+        ),
+        Err(wasit_core::DriverError::NotFound { .. })
+    ));
+    // Once the agent reports it ended, it is no longer there to stop or interrupt.
+    p.on_line(TASK_ENDED);
+    p.on_line(TASKS_EMPTY);
+    assert!(matches!(
+        p.encode(
+            InputId(12),
+            Command::StopTask {
+                task_id: "a1".into()
+            }
+        ),
+        Err(wasit_core::DriverError::NotFound { .. })
+    ));
+    assert!(sent(p.encode(InputId(13), Command::Interrupt))
+        .write
+        .is_empty());
+}
+
+#[test]
+fn a_stop_the_cli_refuses_is_reported() {
+    let mut p = ready_with_ids();
+    p.on_line(TASK_STARTED);
+    let w = writes(&sent(p.encode(
+        InputId(5),
+        Command::StopTask {
+            task_id: "a1".into(),
+        },
+    )));
+    let id = w[0]["request_id"].as_str().unwrap().to_string();
+    let ev = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{id}","error":"stop_task: task_id must be a string"}}}}"#)).events;
+    assert!(
+        matches!(&ev[..], [AgentEvent::CommandRejected { command, .. }] if command == "stop_task")
     );
 }
