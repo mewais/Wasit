@@ -282,6 +282,16 @@ pub struct McpCallStep {
     pub save_as: Option<String>,
 }
 
+/// A prompt the CLI refuses outright instead of running it (see [`Scenario::refuse`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Refusal {
+    /// Regex on the prompt text.
+    pub when: String,
+    /// The error the CLI answers with.
+    pub message: String,
+}
+
 /// One turn script.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -314,6 +324,11 @@ pub struct Scenario {
     pub startup: Vec<Step>,
     /// Reply for prompts no turn matches is `<echo_prefix><prompt>` (default `echo: `).
     pub echo_prefix: Option<String>,
+    /// Prompts the CLI refuses with an error instead of running them: the codex persona answers
+    /// the `turn/start` or `turn/steer` that carries a matching text with a JSON-RPC error
+    /// (the way it does for a thread it does not know or a turn that is not running) and
+    /// runs nothing. Other personas ignore this; use a `fail` step for their turn errors.
+    pub refuse: Vec<Refusal>,
 }
 
 impl Scenario {
@@ -395,6 +410,15 @@ impl ScenarioBuilder {
     }
     pub fn echo_prefix(mut self, p: impl Into<String>) -> Self {
         self.scenario.echo_prefix = Some(p.into());
+        self
+    }
+    /// Refuse prompts whose text matches the regex `when` with `message` (see
+    /// [`Scenario::refuse`]).
+    pub fn refuse(mut self, when: impl Into<String>, message: impl Into<String>) -> Self {
+        self.scenario.refuse.push(Refusal {
+            when: when.into(),
+            message: message.into(),
+        });
         self
     }
     /// Append a turn (anything convertible with `Into<Turn>`: a [`Turn`] or a [`TurnBuilder`]).

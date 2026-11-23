@@ -13,6 +13,10 @@ kilo 7.8.27, codex-cli 0.169.1). They are kept for reproducibility, not run by `
   for `ASKUSER`, a slow stream for `SLOW`, an HTTP 400 for `FAILME`, and for a message with an
   `input_image` a reply naming its MIME type and size; requests are appended to
   `$FAKE_RESPONSES_LOG`, default `/tmp/fake-responses.log`).
+* `codex/steer.jsonl` (not in `codex.mjs`): codex-cli 0.161.0 (the version installed on the recording
+  machine), same fake Responses server, port changed. A raw JSON-RPC client: `turn/start` `SLOW please`,
+  after the first delta a `turn/steer` with a wrong `expectedTurnId`, one with the right one, and after
+  `turn/completed` one more. The host name and installation id were replaced by hand.
 * `trim.py` shortens long lists (models, commands, tools) so the recordings stay small.
 
 Run from this directory with `REF_DIR=..` set.

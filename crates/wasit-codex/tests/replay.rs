@@ -4,8 +4,8 @@
 
 use serde_json::Value;
 use wasit_codex::CodexProtocol;
-use wasit_core::transcript::{parse, replay, Record, Replay};
-use wasit_core::{AgentEvent, EndReason, ResumeMode};
+use wasit_core::transcript::{input_id, parse, replay, Record, Replay};
+use wasit_core::{AgentEvent, Command, EndReason, InputId, ResumeMode};
 
 fn load(name: &str) -> Vec<Record> {
     let path = format!(
@@ -235,4 +235,136 @@ fn resume_and_continue() {
         .expect("thread/list");
     assert_eq!(m[list + 1], "thread/resume");
     assert_eq!(turns(&r).len(), 1);
+}
+
+/// The inputs a transcript sends the CLI: the start record's first prompt, then each prompt command.
+fn prompt_inputs(records: &[Record]) -> Vec<InputId> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| match r {
+            Record::Start(spec) => spec.first_prompt.is_some(),
+            Record::Cmd(Command::Prompt { .. }) => true,
+            _ => false,
+        })
+        .map(|(i, _)| input_id(i))
+        .collect()
+}
+
+fn acks(r: &Replay) -> Vec<(InputId, bool)> {
+    r.events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputAcknowledged { input, steered } => Some((*input, *steered)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// New with the acknowledgements: in every recording (codex-cli 0.169.1) each prompt written as
+/// a `turn/start` is acknowledged exactly once, on its result (which precedes `turn/started`
+/// in all of them), as a turn of its own, and no prompt is dropped.
+#[test]
+fn every_prompt_is_acknowledged_once() {
+    for name in ["basic", "gates", "interrupt", "mode", "resume", "continue"] {
+        let r = run(name);
+        let expected: Vec<(InputId, bool)> = prompt_inputs(&load(name))
+            .into_iter()
+            .map(|i| (i, false))
+            .collect();
+        assert!(!expected.is_empty(), "{name}");
+        assert_eq!(acks(&r), expected, "{name}");
+        assert!(
+            !r.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::InputDropped { .. })),
+            "{name}"
+        );
+        // The acknowledgement names the input the turn it opens names.
+        let started: Vec<InputId> = r
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnStarted { input, .. } => *input,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            expected.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            "{name}"
+        );
+        // Result first, then the notification, so the acknowledgement comes before `TurnStarted`.
+        for (input, _) in &expected {
+            let ack = r
+                .events
+                .iter()
+                .position(
+                    |e| matches!(e, AgentEvent::InputAcknowledged { input: i, .. } if i == input),
+                )
+                .unwrap();
+            let turn = r
+                .events
+                .iter()
+                .position(
+                    |e| matches!(e, AgentEvent::TurnStarted { input: Some(i), .. } if i == input),
+                )
+                .unwrap();
+            assert!(ack < turn, "{name}");
+        }
+    }
+}
+
+/// Recorded with codex-cli 0.161.0 against the scripted fake Responses server
+/// (`SLOW please`, then a prompt while the turn streams): `turn/steer` is answered
+/// `{"turnId": <the running turn>}`, codex folds the text into the same turn (a `userMessage`
+/// item, a second model call) and the one turn ends. Only the host name and installation id in
+/// the `remoteControl/status/changed` line were replaced.
+#[test]
+fn steered_prompt_is_acknowledged_as_steered() {
+    let records = load("steer");
+    let first = input_id(0);
+    let steered = records
+        .iter()
+        .position(|r| matches!(r, Record::Cmd(Command::Prompt { .. })))
+        .map(input_id)
+        .unwrap();
+    let r = run("steer");
+    // The first prompt opened the turn; the second joined it.
+    assert_eq!(acks(&r), vec![(first, false), (steered, true)]);
+    let started: Vec<_> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnStarted {
+                native_turn_id,
+                input,
+            } => Some((native_turn_id.clone().unwrap(), *input)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "a steered prompt starts no turn: {started:?}"
+    );
+    assert_eq!(started[0].1, Some(first));
+    let steer = r
+        .written
+        .iter()
+        .map(|l| json(l))
+        .find(|v| v["method"] == "turn/steer")
+        .expect("turn/steer written");
+    assert_eq!(steer["params"]["expectedTurnId"], started[0].0.as_str());
+    assert_eq!(steer["params"]["input"][0]["text"], "steer me please");
+    assert!(!r.events.iter().any(|e| matches!(
+        e,
+        AgentEvent::InputDropped { .. } | AgentEvent::CommandRejected { .. }
+    )));
+    // One turn ends, with the reply to the steered text.
+    assert_eq!(turns(&r).len(), 1);
+    assert!(r.events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnCompleted { reply: Some(t), .. } if t == "Hello from fake: steer me please"
+    )));
 }

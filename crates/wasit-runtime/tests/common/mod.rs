@@ -62,6 +62,31 @@ impl Drop for TempDir {
     }
 }
 
+/// A real login-shell binary for the tests that need one. Looked for (first `names` entry
+/// first) in the directories of `WASIT_TEST_SHELL_DIR` (a PATH-style list: for a machine
+/// without root, packages unpacked with `dpkg-deb -x`, e.g. `apt-get download tcsh csh fish
+/// zsh`), then in `/usr/bin` and `/bin` (where CI installs them). A shell that is not found
+/// fails the test; it is never skipped.
+pub fn real_shell(names: &[&str]) -> PathBuf {
+    let extra: Vec<PathBuf> = std::env::var_os("WASIT_TEST_SHELL_DIR")
+        .map(|v| std::env::split_paths(&v).collect())
+        .unwrap_or_default();
+    let dirs = extra
+        .into_iter()
+        .chain(["/usr/bin", "/bin"].map(PathBuf::from))
+        .collect::<Vec<_>>();
+    names
+        .iter()
+        .find_map(|n| dirs.iter().map(|d| d.join(n)).find(|p| p.exists()))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is not installed (CI installs it: apt-get install fish tcsh csh zsh; without \
+                 root unpack the packages and set WASIT_TEST_SHELL_DIR to the directory of binaries)",
+                names.join(" / ")
+            )
+        })
+}
+
 /// Kill a process outright (`kill -9` / `taskkill /F`); a missing process is fine.
 pub fn kill_pid(pid: u64) {
     #[cfg(unix)]

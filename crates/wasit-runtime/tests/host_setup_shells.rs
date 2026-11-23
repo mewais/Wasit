@@ -1,10 +1,13 @@
-//! Capture and setup commands with real fish, tcsh, csh and zsh login shells (installed by CI;
-//! a missing shell fails the test, it is never skipped silently). Each shell gets its own HOME
-//! with startup files: fish and zsh define a `module` function in interactive shells only (the
-//! setup runs in that shell, so it exists); tcsh/csh set variables in `.tcshrc`/`.cshrc` and
-//! `.login` (both captured; setup lines are POSIX and run with `/bin/sh`). Per shell: success
-//! with non-ASCII output, a failing last command, a syntax error (nothing runs), `exit`.
-//! One test function: the base environment is process-wide.
+//! Capture and setup commands with real fish, tcsh, csh (bsd-csh) and zsh login shells
+//! (installed by CI; a missing shell fails the test, it is never skipped silently; without root,
+//! unpack the packages and name the directory of binaries in `WASIT_TEST_SHELL_DIR`). Each shell
+//! gets its own HOME with startup files: fish and zsh define a `module` function in interactive
+//! shells only (the setup runs in that shell, so it exists); tcsh/csh define a `module` alias in
+//! `.tcshrc`/`.cshrc` and variables and another alias in `.login` (the setup is csh and runs in
+//! that shell, from a private file). Per shell: success with non-ASCII output, a failing last
+//! command, a syntax error, `exit`; for csh also: control structures, runtime errors (tcsh and
+//! csh differ), the file's mode and removal, secrets, the deadline. One test function: the base
+//! environment is process-wide.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -21,20 +24,11 @@ fn exe(p: &Path, text: &str) {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn real(name: &str) -> PathBuf {
-    ["/usr/bin", "/bin"]
-        .iter()
-        .map(|d| Path::new(d).join(name))
-        .find(|p| p.exists())
-        .unwrap_or_else(|| {
-            panic!("{name} is not installed (CI installs it: apt-get install {name})")
-        })
-}
-
-/// `<dir>/<name>/bin/<name>`: runs the real shell with HOME = `<dir>/<name>/home` and no
-/// `XDG_CONFIG_HOME`/`ZDOTDIR` (CI runners set XDG_CONFIG_HOME, where fish would look instead);
-/// the file name is what the environment stage recognises the shell by. Returns (shell, home).
-fn shell(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+/// `<dir>/<name>/bin/<name>`: runs the real shell (the first of `real_names` that is installed)
+/// with HOME = `<dir>/<name>/home` and no `XDG_CONFIG_HOME`/`ZDOTDIR` (CI runners set
+/// XDG_CONFIG_HOME, where fish would look instead); the file name is what the environment stage
+/// recognises the shell by. Returns (shell, home).
+fn shell_of(dir: &Path, name: &str, real_names: &[&str]) -> (PathBuf, PathBuf) {
     let home = dir.join(name).join("home");
     let bin = dir.join(name).join("bin");
     std::fs::create_dir_all(&home).unwrap();
@@ -45,10 +39,14 @@ fn shell(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
         &format!(
             "#!/bin/sh\nHOME='{}'; export HOME\nunset XDG_CONFIG_HOME ZDOTDIR\nexec '{}' \"$@\"\n",
             home.display(),
-            real(name).display()
+            real_shell(real_names).display()
         ),
     );
     (s, home)
+}
+
+fn shell(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    shell_of(dir, name, &[name])
 }
 
 fn modules(dir: &Path) -> PathBuf {
@@ -148,8 +146,27 @@ async fn exercise(name: &str, sh: &Path, lines: Lines, setup_shell: &str, dir: &
     assert_eq!(s.exit_code, Some(3), "{name}: {s:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fish_tcsh_csh_and_zsh_login_shells() {
+/// The body is one long future (a debug build's frames for it do not fit the 2 MB of a test
+/// thread), so it runs on a thread with a larger stack.
+#[test]
+fn fish_tcsh_csh_and_zsh_login_shells() {
+    let t = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(all_shells())
+        })
+        .unwrap();
+    if let Err(e) = t.join() {
+        std::panic::resume_unwind(e);
+    }
+}
+
+async fn all_shells() {
     let d = TempDir::new();
     let m = modules(d.path());
     let md = m.display();
@@ -237,58 +254,310 @@ async fn fish_tcsh_csh_and_zsh_login_shells() {
     )
     .await;
 
-    // tcsh and csh: `-l` cannot be combined with `-c`; both rc and login files are captured.
-    // Setup lines are POSIX (run with /bin/sh in the captured environment).
-    for name in ["tcsh", "csh"] {
-        let (sh, home) = shell(d.path(), name);
-        let rc = if name == "tcsh" { ".tcshrc" } else { ".cshrc" };
-        std::fs::write(
-            home.join(rc),
-            format!("setenv RC_VAR {name}-rc\nset path = ( '{md}/rc-bin' $path )\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            home.join(".login"),
-            format!("echo {name}-login-noise\nsetenv LOGIN_VAR {name}-login\n"),
-        )
-        .unwrap();
-        let c = capture(&CaptureOptions {
-            shell: Some(sh.clone()),
-            ..CaptureOptions::default()
+    // tcsh, csh and bsd-csh (the Debian name of the real csh): `-l` cannot be combined with
+    // `-c`; rc and login files are captured and the setup is csh, run by that shell.
+    Box::pin(csh_family(d.path(), "tcsh", &["tcsh"], true)).await;
+    Box::pin(csh_family(d.path(), "csh", &["bsd-csh"], false)).await;
+    Box::pin(csh_family(d.path(), "bsd-csh", &["bsd-csh"], false)).await;
+
+    // A login shell that is not POSIX, csh or fish (here a wrapper named like xonsh around bash,
+    // which takes the same command line): captured like a POSIX shell, setup run by /bin/sh.
+    let (xonsh, _) = shell_of(d.path(), "xonsh", &["bash"]);
+    let env = HostEnv::new(CaptureOptions {
+        shell: Some(xonsh),
+        ..CaptureOptions::default()
+    });
+    env.refresh().await;
+    let s = setup(&env, "FROM_SETUP='a b'; export FROM_SETUP", "foreign").await;
+    assert!(s.ok && s.applied, "{s:?}");
+    assert!(s.shell.starts_with("/bin/sh"), "{s:?}");
+    assert_eq!(var("FROM_SETUP").as_deref(), Some("a b"));
+}
+
+const SECRET: &str = "s3cret-c5h-4d2a";
+
+/// The lines every csh-family case below runs; `modcmd` is a POSIX script, as Environment
+/// Modules' csh `module` alias is (`eval "`modulecmd csh ...`"`).
+fn csh_home(home: &Path, rc: &str, name: &str, md: &Path) {
+    let md = md.display();
+    let modcmd = format!(
+        "#!/bin/sh\nif [ \"$1\" = load ] && [ -d '{md}'/\"$2\" ]; then\n  \
+         echo \"setenv PATH '{md}'/$2/bin:\\$PATH; echo loaded $2\"\nelse\n  \
+         echo \"sh -c 'echo module: $2 not found >&2; exit 1'\"\nfi\n"
+    );
+    exe(&Path::new(&format!("{md}")).join("modcmd"), &modcmd);
+    std::fs::write(
+        home.join(rc),
+        format!(
+            "setenv RC_VAR {name}-rc\nset path = ( '{md}/rc-bin' $path )\n\
+             alias module 'eval \"`{md}/modcmd \\!*`\"'\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".login"),
+        format!(
+            "echo {name}-login-noise\nsetenv LOGIN_VAR {name}-login\nsetenv SITE_TOKEN {SECRET}\n\
+             alias fromlogin 'echo login-alias-works'\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn files_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("setup-"))
+                .collect()
         })
-        .await;
-        assert_eq!(
-            c.report.source,
-            EnvSource::LoginShell,
-            "{name}: {:?}",
-            c.report
-        );
-        let get = |k: &str| c.vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        assert_eq!(get("RC_VAR"), Some(format!("{name}-rc")), "{name}");
-        assert_eq!(get("LOGIN_VAR"), Some(format!("{name}-login")), "{name}");
+        .unwrap_or_default()
+}
+
+/// One csh-family shell: `wrapper` is the file name the shell is recognised by, `tcsh` whether the
+/// real binary is tcsh (csh's behaviour differs: no pre-check, a runtime error ends the shell).
+async fn csh_family(dir: &Path, wrapper: &str, real_names: &[&str], tcsh: bool) {
+    let name = wrapper;
+    let m = modules(dir);
+    let md = m.display();
+    let (sh, home) = shell_of(dir, wrapper, real_names);
+    let rc = if tcsh { ".tcshrc" } else { ".cshrc" };
+    csh_home(&home, rc, name, &m);
+    // bsd-csh uses the default private directory (the machine's runtime directory for `wasit`),
+    // the others one of their own.
+    let default_dir = wrapper == "bsd-csh";
+    let scratch = if default_dir {
+        wasit_runtime::machine::runtime_dir("wasit", None).unwrap()
+    } else {
+        dir.join(format!("{name}-run"))
+    };
+    let opts = CaptureOptions {
+        shell: Some(sh.clone()),
+        scratch_dir: (!default_dir).then(|| scratch.clone()),
+        ..CaptureOptions::default()
+    };
+    let c = capture(&opts).await;
+    assert_eq!(
+        c.report.source,
+        EnvSource::LoginShell,
+        "{name}: {:?}",
+        c.report
+    );
+    let get = |k: &str| c.vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    assert_eq!(get("RC_VAR"), Some(format!("{name}-rc")), "{name}");
+    assert_eq!(get("LOGIN_VAR"), Some(format!("{name}-login")), "{name}");
+    assert!(
+        get("PATH")
+            .unwrap_or_default()
+            .starts_with(&format!("{md}/rc-bin:")),
+        "{name}: {:?}",
+        get("PATH")
+    );
+
+    let env = HostEnv::new(opts.clone());
+    env.refresh().await;
+    let tools = format!("{md}/tools/bin");
+    let gone = |what: &str| {
         assert!(
-            get("PATH")
-                .unwrap_or_default()
-                .starts_with(&format!("{md}/rc-bin:")),
-            "{name}: {:?}",
-            get("PATH")
-        );
-        let marker = d.path().join(format!("{name}-ran"));
-        exercise(
-            name,
-            &sh,
-            Lines {
-                ok: format!(
-                    "PATH='{md}/tools/bin':$PATH; export PATH\nexport FROM_SETUP='a b'\n\
-                     test \"$RC_VAR:$LOGIN_VAR\" = '{name}-rc:{name}-login' && echo 'héllo ✓'"
-                ),
-                failing: "export X=1\nfalse",
-                syntax: format!("touch '{}'\nif true; then\n  echo never", marker.display()),
-                exit: "echo bye\nexit 3",
-            },
-            "/bin/sh",
-            d.path(),
+            files_in(&scratch).is_empty(),
+            "{name}: the setup file is left after {what}: {:?}",
+            files_in(&scratch)
+        )
+    };
+
+    // Success: the rc's alias (`module`), the login file's alias and variables, `setenv`, `if`,
+    // `foreach`, non-ASCII output, the file private while it runs; the environment is taken.
+    let ok = "module load tools\nsetenv FROM_SETUP \"a b\"\nfromlogin\n\
+              if ( \"$RC_VAR\" == \"RCRC\" && \"$LOGIN_VAR\" == \"LOGINLOGIN\" ) then\n  echo 'héllo ✓'\nelse\n  \
+              echo wrong-startup\nendif\n\
+              set acc = ''\nforeach d ( one two )\n  set acc = \"$acc$d\"\nend\n\
+              setenv FROM_LOOP $acc\n\
+              set f = \"$__WASIT_SETUP_FILE\"\n\
+              echo mode=`stat -c %a \"$f\"` dir=`stat -c %a \"$f:h\"`"
+        .replace("RCRC", &format!("{name}-rc"))
+    .replace("LOGINLOGIN", &format!("{name}-login"));
+    let s = setup(&env, &ok, &format!("{name}-ok")).await;
+    assert!(s.ok && s.applied, "{name}: {s:?}");
+    assert_eq!(s.exit_code, Some(0), "{name}: {s:?}");
+    assert_eq!(s.shell, sh.display().to_string(), "{name}: {s:?}");
+    assert!(s.error.is_none(), "{name}: {s:?}");
+    for want in [
+        "loaded tools",
+        "login-alias-works",
+        "héllo ✓",
+        "mode=600 dir=700",
+    ] {
+        assert!(s.output.contains(want), "{name}: {want}: {s:?}");
+    }
+    assert!(!s.output.contains("noise"), "{name}: {s:?}");
+    assert_eq!(var("FROM_SETUP").as_deref(), Some("a b"), "{name}");
+    assert_eq!(var("FROM_LOOP").as_deref(), Some("onetwo"), "{name}");
+    assert_eq!(first_path(), tools, "{name}");
+    for internal in ["__WASIT_SETUP_FILE", "__WASIT_SETUP_DONE", "__WASIT_SETUP"] {
+        assert_eq!(var(internal), None, "{name}: {internal} leaked");
+    }
+    gone("success");
+    // The environment reaches a process started through the runtime's process helper.
+    let out = wasit_process::command("/bin/sh")
+        .args(["-c", "echo \"$FROM_SETUP|$FROM_LOOP|$RC_VAR\""])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("a b|onetwo|{name}-rc"),
+        "{name}"
+    );
+
+    // A failing last command: reported with its status; its environment is taken.
+    let s = setup(
+        &env,
+        "setenv AFTER_FAIL 1\nmodule load nope",
+        &format!("{name}-fail"),
+    )
+    .await;
+    assert!(!s.ok && s.applied, "{name}: {s:?}");
+    assert_eq!(s.exit_code, Some(1), "{name}: {s:?}");
+    let e = s.error.as_deref().unwrap_or_default();
+    assert!(
+        e.starts_with("the last command exited with status 1"),
+        "{name}: {s:?}"
+    );
+    assert!(e.contains("cannot check commands without running"), "{s:?}");
+    assert!(s.output.contains("module: nope not found"), "{s:?}");
+    assert_eq!(var("AFTER_FAIL").as_deref(), Some("1"), "{name}");
+    assert_eq!(
+        var("FROM_SETUP"),
+        None,
+        "{name}: the previous setup is gone"
+    );
+    gone("a failing command");
+
+    // A runtime error in the middle (tcsh stops the file and goes on; csh ends the shell): either
+    // way the commands did not finish, nothing after it ran and the login environment is kept.
+    let s = setup(
+        &env,
+        "setenv HALF 1\necho $nosuchvariable\nsetenv AFTER_ERROR 1",
+        &format!("{name}-undefined"),
+    )
+    .await;
+    assert!(!s.ok && !s.applied, "{name}: {s:?}");
+    assert_eq!(s.exit_code, Some(1), "{name}: {s:?}");
+    let e = s.error.as_deref().unwrap_or_default();
+    let stopped = if tcsh {
+        "stopped before their end"
+    } else {
+        "ended the shell"
+    };
+    assert!(e.contains(stopped), "{name}: {s:?}");
+    assert!(e.contains("cannot check commands without running"), "{s:?}");
+    assert!(s.output.contains("Undefined variable"), "{name}: {s:?}");
+    assert_eq!(var("HALF"), None, "{name}: the login environment is kept");
+    assert_eq!(var("AFTER_ERROR"), None, "{name}");
+    assert_eq!(var("RC_VAR").as_deref(), Some(&*format!("{name}-rc")));
+    gone("a runtime error");
+
+    // `exit` returns from the file: the commands did not finish.
+    let s = setup(
+        &env,
+        "setenv HALF 1\necho bye\nexit 3\nsetenv AFTER_EXIT 1",
+        &format!("{name}-exit"),
+    )
+    .await;
+    assert!(!s.ok && !s.applied, "{name}: {s:?}");
+    assert_eq!(s.exit_code, Some(3), "{name}: {s:?}");
+    assert!(
+        s.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stopped before their end"),
+        "{name}: {s:?}"
+    );
+    assert_eq!(var("HALF"), None, "{name}");
+    assert_eq!(var("AFTER_EXIT"), None, "{name}");
+    gone("exit");
+
+    // A block that is never closed, whose condition is false, swallows the rest of the file: it
+    // does not look finished. (With a true condition csh/tcsh run the block's lines as they come
+    // and end quietly at the end of the file: they report no error and neither do we.)
+    let s = setup(
+        &env,
+        "echo opened\nif ( 0 ) then\n  setenv UNCLOSED 1",
+        &format!("{name}-open"),
+    )
+    .await;
+    assert!(!s.ok && !s.applied, "{name}: {s:?}");
+    assert!(
+        s.error.as_deref().unwrap_or_default().contains(stopped),
+        "{name}: {s:?}"
+    );
+    assert_eq!(var("UNCLOSED"), None, "{name}");
+    gone("an open block");
+
+    // A syntax error. tcsh reads the file first (`-n`, lexical errors only): nothing runs. csh
+    // has no such check, so what comes before the error runs, and the report says so.
+    let marker = dir.join(format!("{name}-ran"));
+    let s = setup(
+        &env,
+        &format!("touch '{}'\necho \"unterminated", marker.display()),
+        &format!("{name}-syntax"),
+    )
+    .await;
+    assert!(!s.ok && !s.applied, "{name}: {s:?}");
+    assert!(!s.output.is_empty(), "{name}: the shell's message: {s:?}");
+    let e = s.error.as_deref().unwrap_or_default();
+    if tcsh {
+        assert!(e.contains("nothing was run"), "{name}: {s:?}");
+        assert!(s.shell.ends_with(" -n"), "{name}: {s:?}");
+        assert!(!marker.exists(), "{name}: a line ran despite the check");
+    } else {
+        assert!(!e.contains("nothing was run"), "{name}: {s:?}");
+        assert!(e.contains("cannot check commands without running"), "{s:?}");
+        assert!(marker.exists(), "{name}: the line before the error ran");
+    }
+    assert_eq!(var("FROM_SETUP"), None, "{name}: the login environment");
+    gone("a syntax error");
+
+    // A secret the setup prints is scrubbed from the report; it is in the process environment
+    // (set by the variables, after the setup).
+    let mut config = cfg("echo \"token $SITE_TOKEN\"\nsetenv FROM_SETUP 1");
+    config.vars = vec![wasit_runtime::wire::EnvVar {
+        name: "API_TOKEN".into(),
+        value: SECRET.into(),
+        secret: true,
+    }];
+    let (r, _) = env.configure(config, format!("{name}-secret"), false).await;
+    let s = r.setup.clone().expect("a setup report");
+    assert!(s.ok && s.applied, "{name}: {s:?}");
+    assert!(s.output.contains("token ••••"), "{name}: {s:?}");
+    assert!(!format!("{r:?}").contains(SECRET), "{name}: {r:?}");
+    assert_eq!(var("API_TOKEN").as_deref(), Some(SECRET), "{name}");
+    assert_eq!(var("FROM_SETUP").as_deref(), Some("1"), "{name}");
+    gone("the secret setup");
+
+    // The deadline: the whole group is killed, the login environment is kept, the file is gone.
+    let quick = HostEnv::new(CaptureOptions {
+        setup_deadline: std::time::Duration::from_millis(1500),
+        ..opts
+    });
+    quick.refresh().await;
+    let (r, _) = quick
+        .configure(
+            cfg("setenv HUNG 1\nsleep 60"),
+            format!("{name}-hang"),
+            false,
         )
         .await;
-    }
+    let s = r.setup.expect("a setup report");
+    assert!(!s.ok && !s.applied, "{name}: {s:?}");
+    assert!(
+        s.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not finish within 1.5 s"),
+        "{name}: {s:?}"
+    );
+    assert_eq!(var("HUNG"), None, "{name}");
+    gone("the deadline");
 }

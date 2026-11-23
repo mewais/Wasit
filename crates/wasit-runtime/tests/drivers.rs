@@ -785,3 +785,279 @@ async fn claude_prompt_is_acknowledged_by_the_cli() {
         1
     );
 }
+
+fn input_events(
+    events: &[wasit_runtime::wire::SessionEvent],
+    f: impl Fn(&AgentEvent) -> bool,
+) -> usize {
+    events.iter().filter(|e| is_agent(e, &f)).count()
+}
+
+/// codex and the ACP agents (opencode, kilo) acknowledge a prompt on the CLI's own reaction:
+/// codex's `turn/start` result, ACP's first update of the agent working on it. Once, after the
+/// prompt was written, before the turn ends.
+async fn prompt_is_acknowledged(driver: &str) {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let sc = Scenario::builder()
+        .turn(Turn::builder().say("hi"))
+        .turn(Turn::builder().say("again"))
+        .build();
+    let id = create_idle(&mgr, d.path(), driver, &sc).await;
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    for text in ["hello", "second"] {
+        mgr.command(&id, Command::prompt(text)).await.unwrap();
+        let events = until(&mut s, is_turn_completed).await;
+        let (at, input) = prompt_input(&events, text);
+        let pos = |f: &dyn Fn(&SessionEventKind) -> bool| {
+            events
+                .iter()
+                .position(|e| f(&e.kind))
+                .unwrap_or_else(|| panic!("{events:#?}"))
+        };
+        let written =
+            pos(&|k| matches!(k, SessionEventKind::Written { input: i, .. } if *i == input));
+        let acked = pos(
+            &|k| matches!(k, SessionEventKind::Agent { event: AgentEvent::InputAcknowledged { input: i, steered: false } } if *i == input),
+        );
+        let ended = pos(&|k| {
+            matches!(
+                k,
+                SessionEventKind::Agent {
+                    event: AgentEvent::TurnCompleted { .. }
+                }
+            )
+        });
+        assert!(
+            at < written && written < acked && acked < ended,
+            "{events:#?}"
+        );
+        assert_eq!(
+            input_events(&events, |a| matches!(
+                a,
+                AgentEvent::InputAcknowledged { .. }
+            )),
+            1,
+            "{events:#?}"
+        );
+        assert_eq!(
+            input_events(&events, |a| matches!(a, AgentEvent::InputDropped { .. })),
+            0,
+            "{events:#?}"
+        );
+        wait_phase(&mgr, &id, "idle").await;
+    }
+}
+
+#[tokio::test]
+async fn codex_prompt_is_acknowledged_by_the_cli() {
+    prompt_is_acknowledged("codex").await
+}
+#[tokio::test]
+async fn opencode_prompt_is_acknowledged_by_the_cli() {
+    prompt_is_acknowledged("opencode").await
+}
+#[tokio::test]
+async fn kilo_prompt_is_acknowledged_by_the_cli() {
+    prompt_is_acknowledged("kilo").await
+}
+
+/// The fake codex running a turn that waits: `prompt("long")`, up to its first output.
+async fn codex_running_turn(
+    sc: &Scenario,
+) -> (
+    TempDir,
+    wasit_runtime::SessionManager,
+    wasit_runtime::wire::SessionId,
+    wasit_runtime::SessionEventStream,
+) {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let id = create_idle(&mgr, d.path(), "codex", sc).await;
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    mgr.command(&id, Command::prompt("long")).await.unwrap();
+    until(&mut s, |e| {
+        is_agent(e, |a| matches!(a, AgentEvent::AssistantDelta { .. }))
+    })
+    .await;
+    (d, mgr, id, s)
+}
+
+/// A codex prompt sent during a running turn is steered into it: acknowledged as steered when
+/// the CLI answers `turn/steer`, with no turn of its own.
+#[tokio::test]
+async fn codex_steered_prompt_is_acknowledged_as_steered() {
+    let sc = Scenario::builder()
+        .turn(Turn::builder().say("working").wait_for_interrupt())
+        .build();
+    let (_d, mgr, id, mut s) = codex_running_turn(&sc).await;
+    let out = mgr.command(&id, Command::prompt("later")).await.unwrap();
+    assert_eq!(out, CommandOutcome::Sent);
+    let events = until(&mut s, |e| {
+        is_agent(e, |a| matches!(a, AgentEvent::InputAcknowledged { .. }))
+    })
+    .await;
+    let (_, later) = prompt_input(&events, "later");
+    assert!(
+        events.iter().any(|e| is_agent(
+            e,
+            |a| matches!(a, AgentEvent::InputAcknowledged { input: i, steered: true } if *i == later)
+        )),
+        "{events:#?}"
+    );
+    assert!(!events.iter().any(|e| is_agent(e, |a| matches!(
+        a,
+        AgentEvent::TurnStarted { input: Some(i), .. } if *i == later
+    ))));
+    // Still the one turn: an interrupt ends it, with nothing more said about the steered prompt.
+    mgr.command(&id, Command::Interrupt).await.unwrap();
+    let events = until(&mut s, is_turn_completed).await;
+    assert_eq!(
+        input_events(&events, |a| matches!(
+            a,
+            AgentEvent::InputAcknowledged { .. } | AgentEvent::InputDropped { .. }
+        )),
+        0,
+        "{events:#?}"
+    );
+    wait_phase(&mgr, &id, "idle").await;
+}
+
+/// A `turn/steer` the CLI refuses is reported dropped with the CLI's error; the running turn is
+/// untouched and the prompt is not started as a turn behind its back.
+#[tokio::test]
+async fn codex_refused_steer_is_reported_dropped() {
+    let sc = Scenario::builder()
+        .refuse("^refuse me", "this turn cannot take input")
+        .turn(Turn::builder().say("working").wait_for_interrupt())
+        .turn(Turn::builder().say("next"))
+        .build();
+    let (_d, mgr, id, mut s) = codex_running_turn(&sc).await;
+    let out = mgr
+        .command(&id, Command::prompt("refuse me"))
+        .await
+        .unwrap();
+    assert_eq!(out, CommandOutcome::Sent);
+    let events = until(&mut s, |e| {
+        is_agent(e, |a| matches!(a, AgentEvent::InputDropped { .. }))
+    })
+    .await;
+    let (_, refused) = prompt_input(&events, "refuse me");
+    let dropped = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            SessionEventKind::Agent {
+                event:
+                    AgentEvent::InputDropped {
+                        input,
+                        reason,
+                        error,
+                    },
+            } => Some((*input, *reason, error.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        dropped,
+        (
+            refused,
+            wasit_core::InputDropReason::Refused,
+            Some("this turn cannot take input".into())
+        )
+    );
+    assert!(!events.iter().any(|e| is_agent(
+        e,
+        |a| matches!(a, AgentEvent::InputAcknowledged { input: i, .. } if *i == refused)
+    )));
+    // The turn runs on until it is interrupted; no turn was started for the refused prompt.
+    mgr.command(&id, Command::Interrupt).await.unwrap();
+    let events = until(&mut s, is_turn_completed).await;
+    assert!(!events.iter().any(|e| is_agent(e, |a| matches!(
+        a,
+        AgentEvent::TurnStarted { input: Some(i), .. } if *i == refused
+    ))));
+    wait_phase(&mgr, &id, "idle").await;
+    assert_eq!(mgr.snapshot(&id).unwrap().turns_completed, 1);
+}
+
+/// A prompt the CLI refuses outright (codex: the `turn/start` is answered with an error; the
+/// ACP agents: the `session/prompt` is, with no work done) is reported dropped with the CLI's
+/// error, the turn it never ran ends as an error, and the session takes the next prompt.
+async fn refused_prompt(driver: &str) {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let sc = Scenario::builder()
+        .refuse("^refuse me", "You need to sign in to use this model.")
+        .turn(Turn::when("^refuse me").fail("You need to sign in to use this model."))
+        .turn(Turn::builder().say("fine"))
+        .build();
+    let id = create_idle(&mgr, d.path(), driver, &sc).await;
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    mgr.command(&id, Command::prompt("refuse me"))
+        .await
+        .unwrap();
+    let events = until(&mut s, is_turn_completed).await;
+    let (_, refused) = prompt_input(&events, "refuse me");
+    let dropped: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::Agent {
+                event:
+                    AgentEvent::InputDropped {
+                        input,
+                        reason,
+                        error,
+                    },
+            } => Some((*input, *reason, error.clone().unwrap_or_default())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dropped.len(), 1, "{events:#?}");
+    assert_eq!(
+        (dropped[0].0, dropped[0].1),
+        (refused, wasit_core::InputDropReason::Refused)
+    );
+    assert!(
+        dropped[0]
+            .2
+            .contains("You need to sign in to use this model."),
+        "{dropped:?}"
+    );
+    assert_eq!(
+        input_events(&events, |a| matches!(
+            a,
+            AgentEvent::InputAcknowledged { .. }
+        )),
+        0,
+        "{events:#?}"
+    );
+    assert!(events.iter().any(|e| is_agent(e, |a| matches!(
+        a,
+        AgentEvent::TurnCompleted {
+            end_reason: Some(wasit_core::EndReason::ExecutionError),
+            ..
+        }
+    ))));
+    // The session carries on, and the next prompt is acknowledged as usual.
+    wait_phase(&mgr, &id, "idle").await;
+    mgr.command(&id, Command::prompt("go on")).await.unwrap();
+    let events = until(&mut s, is_turn_completed).await;
+    let (_, next) = prompt_input(&events, "go on");
+    assert!(events.iter().any(|e| is_agent(
+        e,
+        |a| matches!(a, AgentEvent::InputAcknowledged { input: i, steered: false } if *i == next)
+    )));
+}
+
+#[tokio::test]
+async fn codex_refused_prompt_is_reported_dropped() {
+    refused_prompt("codex").await
+}
+#[tokio::test]
+async fn opencode_refused_prompt_is_reported_dropped() {
+    refused_prompt("opencode").await
+}
+#[tokio::test]
+async fn kilo_refused_prompt_is_reported_dropped() {
+    refused_prompt("kilo").await
+}

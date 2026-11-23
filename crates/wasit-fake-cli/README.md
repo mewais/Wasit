@@ -61,6 +61,7 @@ scenario.write_to(dir.join("scenario.json"))?;
   "sessions": [{"id": "ses_old", "title": "…", "cwd": "/w",        // exist before start: list / load / resume
                 "history": [{"role": "user", "text": "…"}, {"role": "assistant", "text": "…"}]}],
   "echo_prefix": "echo: ",
+  "refuse": [{"when": "regex on the prompt", "message": "…"}],     // codex: turn/start and turn/steer carrying a matching text get this error
   "turns": [ {"when": "regex on prompt (optional)", "steps": [ … ]} ],
   "startup": [ … ]              // steps run before any input: stderr / garbage / hang / exit
 }
@@ -91,6 +92,12 @@ Steps (`{"type": "<name>", …}`):
 Protocol-level requests are answered without scenario help: initialize, session/thread creation,
 load/resume/fork/close/list, set mode / model / config option, interrupt / cancel (turn ends as
 interrupted), permission responses (continue the tool, or deny it). Closing stdin ends the process.
+The codex persona also answers `turn/steer` as codex-cli 0.161.0 does (`reference/codex/steer.jsonl`):
+`{"turnId"}` while a turn runs and `expectedTurnId` names it, otherwise the real errors (`no active
+turn to steer`, `expected active turn id … but found …`), or the scenario's `refuse` error; an
+accepted prompt is folded in when the turn ends (a `userMessage` item, then a reply `<echo_prefix><text>`
+in the same turn; an interrupted or failed turn drops it). The engine reads input only while a turn
+waits (`sleep_ms`, `wait_for_interrupt`, a gate), so a steer is seen only then.
 
 Discovery commands (opencode / kilo persona): `--version`, `models [provider] [--verbose]`,
 `session list [--format json]`, answered from `models` / `sessions`. `--version` also works for
@@ -112,6 +119,11 @@ large static objects (claude `system/init` and the initialize reply, codex threa
 `initialize`) straight from those recordings, and `tests/reference.rs` replays the client side of
 every recording against the fake and compares message structure (keys and JSON kinds, not values).
 
+`reference/codex/steer.jsonl` is from codex-cli 0.161.0, the version installed where it was recorded
+(the rest of `reference/codex` is 0.169.1); only the host name and installation id in the
+`remoteControl/status/changed` line were replaced, and `tests/reference.rs` compares just the
+`turn/steer` replies of it.
+
 Known gaps: JSON key order is alphabetical, not the real CLI's order; codex `fileChange` items,
 codex reasoning items, ACP `plan` updates (real opencode reports todos as a `todowrite` tool call,
 the ACP spec shape is emitted here) and claude `ExitPlanMode` were not captured from the real
@@ -120,6 +132,11 @@ CLIs and follow the protocol specs; claude `rate_limit_event` and codex `warning
 `system/init` is printed once, not at the start of every turn; a claude message read during a
 turn waits for the next turn, while the real CLI may also take it into the running turn at its
 next model call (`started` mid-turn, one `result` listing both); the lifecycle state after a
-failed turn was not recorded (`completed` is sent); `session/load`
+failed turn was not recorded (`completed` is sent); codex `turn/steer`: only the accepted shape, the
+two errors above and the fold-in at turn end were recorded (a real steer is folded in at the next model
+call, a turn with tool calls may take it earlier), a steer is accepted only while the scenario's turn
+waits, and `refuse` is the fake's own knob for the refusals a real CLI gives for reasons no recording
+shows (a vanished thread, a rejected input); the ACP persona refuses a prompt only through a `fail` step
+(usage update, then the error: kilo 7.8.8 / 7.8.27 without credentials, `reference/kilo/error.jsonl`); `session/load`
 history replay and codex `thread/resume` history are simplified; kilo's `effort` config option is
 not advertised.

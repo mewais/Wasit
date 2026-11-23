@@ -450,7 +450,7 @@ pub fn mcp_overrides(server: &McpServerConfig) -> Result<Vec<String>, String> {
 pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
     let mut sessions = Vec::new();
     for f in listed_files(out)? {
-        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let name = wasit_core::content::base_name(&f.path);
         let Some(stem) = name
             .strip_prefix("rollout-")
             .and_then(|s| s.strip_suffix(".jsonl"))

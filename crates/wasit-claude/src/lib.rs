@@ -627,7 +627,7 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
     let files = listed_files(out)?;
     let mut sessions = Vec::new();
     for f in files {
-        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let name = wasit_core::content::base_name(&f.path);
         let Some(id) = name.strip_suffix(".jsonl") else {
             continue;
         };

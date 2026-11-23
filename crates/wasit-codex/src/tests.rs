@@ -524,6 +524,38 @@ fn sessions_parser() {
 }
 
 #[test]
+fn windows_paths_list_the_same_sessions() {
+    let head: Vec<String> = vec![
+        r#"{"type":"session_meta","payload":{"id":"01a1ebcf-0528-7cd2-a32d-e89e91b6a844","cwd":"C:\\Users\\me\\p"}}"#.into(),
+        r#"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"hello"}]}}"#.into(),
+    ];
+    let name = "rollout-2026-11-17T23-19-35-01a1ebcf-0528-7cd2-a32d-e89e91b6a844.jsonl";
+    let sessions = |path: String| {
+        let out = ProbeOutput::Files {
+            files: vec![wasit_core::FileHead {
+                path,
+                modified_ms: 9,
+                head: head.clone(),
+                matching_lines: Some(3),
+            }],
+        };
+        match parse_sessions(&out).unwrap() {
+            Discovered::Sessions(s) => s,
+            d => panic!("{d:?}"),
+        }
+    };
+    let posix = sessions(format!("/h/.codex/sessions/2026/11/17/{name}"));
+    let windows = sessions(format!(r"C:\Users\me\.codex\sessions\2026\11\17\{name}"));
+    assert_eq!(posix.len(), 1);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].id, "01a1ebcf-0528-7cd2-a32d-e89e91b6a844");
+    assert_eq!(windows[0].id, posix[0].id);
+    assert_eq!(windows[0].project, posix[0].project);
+    assert_eq!(windows[0].title, "hello");
+    assert_eq!(windows[0].message_count, Some(3));
+}
+
+#[test]
 fn determinism_same_inputs_same_outputs() {
     let run = || {
         let mut p = CodexProtocol::new();
@@ -750,4 +782,305 @@ fn drained_commands_report_input_sent() {
             input: Some(InputId(2))
         }
     );
+}
+
+// ── acknowledgement and refusal of prompts ──────────────────────────────────
+
+fn acks(events: &[AgentEvent]) -> Vec<(InputId, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputAcknowledged { input, steered } => Some((*input, *steered)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn refusals(events: &[AgentEvent]) -> Vec<(InputId, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputDropped {
+                input,
+                reason: InputDropReason::Refused,
+                error,
+            } => Some((
+                *input,
+                error.clone().expect("a refusal carries the CLI's error"),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn id_of(step: &Step, method: &str) -> u64 {
+    w(step)
+        .iter()
+        .find(|l| l["method"] == method)
+        .unwrap_or_else(|| panic!("no {method} written"))["id"]
+        .as_u64()
+        .unwrap()
+}
+
+fn result_line(id: u64, result: &str) -> String {
+    format!(r#"{{"id":{id},"result":{result}}}"#)
+}
+
+const TURN_STARTED_U1: &str =
+    r#"{"method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1"}}}"#;
+
+#[test]
+fn turn_start_is_acknowledged_by_its_result_and_not_again_by_the_notification() {
+    // The order both recorded CLIs (0.169.1, 0.161.0) use: result, then `turn/started`.
+    let mut p = ready();
+    let start = sent(p.encode(InputId(20), Command::prompt("go")));
+    let id = id_of(&start, "turn/start");
+    // Nothing is acknowledged by writing the line.
+    assert!(acks(&start.events).is_empty());
+    let step = p.on_line(&result_line(
+        id,
+        r#"{"turn":{"id":"u1","status":"inProgress"}}"#,
+    ));
+    assert_eq!(acks(&step.events), vec![(InputId(20), false)]);
+    let step = p.on_line(TURN_STARTED_U1);
+    assert_eq!(
+        step.events,
+        vec![AgentEvent::TurnStarted {
+            native_turn_id: Some("u1".into()),
+            input: Some(InputId(20))
+        }]
+    );
+    // The turn runs and ends: no further acknowledgement for the input.
+    let step = p.on_line(
+        r#"{"method":"turn/completed","params":{"turn":{"id":"u1","status":"completed","items":[]}}}"#,
+    );
+    assert!(acks(&step.events).is_empty());
+}
+
+#[test]
+fn turn_start_is_acknowledged_by_the_notification_when_it_comes_first() {
+    let mut p = ready();
+    let start = sent(p.encode(InputId(21), Command::prompt("go")));
+    let id = id_of(&start, "turn/start");
+    let step = p.on_line(TURN_STARTED_U1);
+    assert_eq!(
+        step.events,
+        vec![
+            AgentEvent::TurnStarted {
+                native_turn_id: Some("u1".into()),
+                input: Some(InputId(21))
+            },
+            AgentEvent::InputAcknowledged {
+                input: InputId(21),
+                steered: false
+            }
+        ]
+    );
+    // The late result says the same thing: no second acknowledgement.
+    let step = p.on_line(&result_line(id, r#"{"turn":{"id":"u1"}}"#));
+    assert!(step.events.is_empty() && step.write.is_empty(), "{step:?}");
+}
+
+#[test]
+fn each_turn_start_is_acknowledged_once_for_its_own_input() {
+    let mut p = ready();
+    let mut all = Vec::new();
+    for (n, turn) in [(30u64, "u1"), (31, "u2")] {
+        let start = sent(p.encode(InputId(n), Command::prompt("go")));
+        let id = id_of(&start, "turn/start");
+        all.extend(acks(
+            &p.on_line(&result_line(
+                id,
+                &format!(r#"{{"turn":{{"id":"{turn}"}}}}"#),
+            ))
+            .events,
+        ));
+        let started = format!(
+            r#"{{"method":"turn/started","params":{{"threadId":"t1","turn":{{"id":"{turn}"}}}}}}"#
+        );
+        all.extend(acks(&p.on_line(&started).events));
+        let done = format!(
+            r#"{{"method":"turn/completed","params":{{"turn":{{"id":"{turn}","status":"completed","items":[]}}}}}}"#
+        );
+        all.extend(acks(&p.on_line(&done).events));
+    }
+    assert_eq!(all, vec![(InputId(30), false), (InputId(31), false)]);
+}
+
+#[test]
+fn a_steered_prompt_is_acknowledged_as_steered_and_starts_no_turn() {
+    let mut p = ready();
+    let start = sent(p.encode(InputId(40), Command::prompt("a")));
+    let start_id = id_of(&start, "turn/start");
+    p.on_line(&result_line(start_id, r#"{"turn":{"id":"u1"}}"#));
+    p.on_line(TURN_STARTED_U1);
+    // A prompt during the running turn is steered.
+    let steer = sent(p.encode(InputId(41), Command::prompt("b")));
+    let steer_id = id_of(&steer, "turn/steer");
+    assert_eq!(w(&steer)[0]["params"]["expectedTurnId"], "u1");
+    assert!(acks(&steer.events).is_empty());
+    // The shape codex-cli 0.161.0 answers with (wasit-codex/tests/fixtures/steer.ndjson).
+    let step = p.on_line(&result_line(steer_id, r#"{"turnId":"u1"}"#));
+    assert_eq!(
+        step.events,
+        vec![AgentEvent::InputAcknowledged {
+            input: InputId(41),
+            steered: true
+        }]
+    );
+    assert!(step.write.is_empty());
+    // It never gets a `TurnStarted` of its own: the turn that ends is the first prompt's.
+    let step = p.on_line(
+        r#"{"method":"turn/completed","params":{"turn":{"id":"u1","status":"completed","items":[]}}}"#,
+    );
+    assert!(!step
+        .events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnStarted { .. })));
+}
+
+#[test]
+fn a_prompt_queued_for_the_turn_id_is_sent_as_a_steer_and_acknowledged_as_one() {
+    let mut p = ready();
+    let start = sent(p.encode(InputId(50), Command::prompt("a")));
+    let start_id = id_of(&start, "turn/start");
+    // The turn id is not known yet: the second prompt waits.
+    assert_eq!(
+        p.encode(InputId(51), Command::prompt("b")).unwrap(),
+        Encoded::Queued
+    );
+    let step = p.on_line(&result_line(start_id, r#"{"turn":{"id":"u1"}}"#));
+    assert_eq!(acks(&step.events), vec![(InputId(50), false)]);
+    assert!(step
+        .events
+        .contains(&AgentEvent::InputSent { input: InputId(51) }));
+    let steer_id = id_of(&step, "turn/steer");
+    let step = p.on_line(&result_line(steer_id, r#"{"turnId":"u1"}"#));
+    assert_eq!(acks(&step.events), vec![(InputId(51), true)]);
+    // `turn/started` then names the first prompt only.
+    let step = p.on_line(TURN_STARTED_U1);
+    assert_eq!(
+        step.events,
+        vec![AgentEvent::TurnStarted {
+            native_turn_id: Some("u1".into()),
+            input: Some(InputId(50))
+        }]
+    );
+}
+
+#[test]
+fn a_refused_steer_is_reported_dropped_and_not_sent_again() {
+    let mut p = ready();
+    let start = sent(p.encode(InputId(60), Command::prompt("a")));
+    let start_id = id_of(&start, "turn/start");
+    p.on_line(&result_line(start_id, r#"{"turn":{"id":"u1"}}"#));
+    p.on_line(TURN_STARTED_U1);
+    let steer = sent(p.encode(InputId(61), Command::prompt("b")));
+    let steer_id = id_of(&steer, "turn/steer");
+    // The error codex-cli 0.161.0 answers a steer with when the turn is gone or another one runs.
+    let step = p.on_line(&format!(
+        r#"{{"error":{{"code":-32600,"message":"no active turn to steer"}},"id":{steer_id}}}"#
+    ));
+    assert_eq!(
+        step.events,
+        vec![AgentEvent::InputDropped {
+            input: InputId(61),
+            reason: InputDropReason::Refused,
+            error: Some("no active turn to steer".into())
+        }]
+    );
+    // Not silently re-sent as a turn, and not also a bare `CommandRejected`.
+    assert!(step.write.is_empty());
+    assert!(acks(&step.events).is_empty());
+    // The running turn is untouched: it completes as usual.
+    let step = p.on_line(
+        r#"{"method":"turn/completed","params":{"turn":{"id":"u1","status":"completed","items":[]}}}"#,
+    );
+    assert!(matches!(
+        &step.events[0],
+        AgentEvent::TurnCompleted {
+            end_reason: None,
+            ..
+        }
+    ));
+    assert!(step.write.is_empty());
+}
+
+#[test]
+fn a_refused_turn_start_is_reported_dropped_and_ends_the_turn() {
+    let mut p = ready();
+    let start = sent(p.encode(InputId(70), Command::prompt("a")));
+    let start_id = id_of(&start, "turn/start");
+    // A prompt waiting behind it goes out as its own turn once this one is gone.
+    assert_eq!(
+        p.encode(InputId(71), Command::prompt("b")).unwrap(),
+        Encoded::Queued
+    );
+    // The error shape of reference/codex/lifecycle.jsonl (codex-cli 0.169.1).
+    let step = p.on_line(&format!(
+        r#"{{"error":{{"code":-32600,"message":"thread not found: t1"}},"id":{start_id}}}"#
+    ));
+    assert_eq!(
+        refusals(&step.events),
+        vec![(InputId(70), "thread not found: t1".to_string())]
+    );
+    assert!(acks(&step.events).is_empty());
+    // The turn that never started ends, as before.
+    assert!(step.events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnCompleted {
+            end_reason: Some(EndReason::ExecutionError),
+            reply: Some(r),
+            ..
+        } if r == "thread not found: t1"
+    )));
+    // The queued prompt follows, as a turn of its own, naming itself.
+    assert!(step
+        .events
+        .contains(&AgentEvent::InputSent { input: InputId(71) }));
+    let next_start = id_of(&step, "turn/start");
+    let step = p.on_line(&result_line(next_start, r#"{"turn":{"id":"u2"}}"#));
+    assert_eq!(acks(&step.events), vec![(InputId(71), false)]);
+}
+
+#[test]
+fn an_error_after_the_turn_was_announced_is_not_a_refusal() {
+    let mut p = ready();
+    let start = sent(p.encode(InputId(80), Command::prompt("a")));
+    let start_id = id_of(&start, "turn/start");
+    p.on_line(TURN_STARTED_U1);
+    let step = p.on_line(&format!(
+        r#"{{"error":{{"code":-32603,"message":"late"}},"id":{start_id}}}"#
+    ));
+    assert!(refusals(&step.events).is_empty(), "{:?}", step.events);
+}
+
+#[test]
+fn queued_prompts_dropped_by_an_interrupt_are_never_acknowledged() {
+    let mut p = ready();
+    let start = sent(p.encode(InputId(90), Command::prompt("go")));
+    let start_id = id_of(&start, "turn/start");
+    p.encode(InputId(91), Command::prompt("a")).unwrap();
+    p.encode(InputId(92), Command::prompt("b")).unwrap();
+    let step = sent(p.encode(InputId(93), Command::Interrupt));
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(91), InputDropReason::Interrupted),
+            (InputId(92), InputDropReason::Interrupted)
+        ]
+    );
+    // What the CLI reports afterwards concerns the written prompt only.
+    let mut after = p
+        .on_line(&result_line(start_id, r#"{"turn":{"id":"u1"}}"#))
+        .events;
+    after.extend(p.on_line(TURN_STARTED_U1).events);
+    after.extend(
+        p.on_line(
+            r#"{"method":"turn/completed","params":{"turn":{"id":"u1","status":"interrupted","items":[]}}}"#,
+        )
+        .events,
+    );
+    assert_eq!(acks(&after), vec![(InputId(90), false)]);
+    assert!(drops(&after).is_empty());
 }
