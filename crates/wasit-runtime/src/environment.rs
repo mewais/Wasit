@@ -137,6 +137,13 @@ impl HostEnv {
         self.commands.clone()
     }
 
+    /// Registers the secrets of the configuration in effect again. The scrubber forgets its least
+    /// recently registered value beyond its capacity, so what must stay known is registered
+    /// again as sessions are created (a cold path).
+    pub(crate) fn register_secrets(&self) {
+        crate::scrub::host_secrets(&self.stage().config);
+    }
+
     fn stage(&self) -> std::sync::MutexGuard<'_, Stage> {
         // Fields are replaced whole; a poisoned stage is still consistent.
         self.stage.lock().unwrap_or_else(|e| e.into_inner())
@@ -172,6 +179,9 @@ impl HostEnv {
         revision: String,
         again: bool,
     ) -> (HostEnvironment, bool) {
+        // First: the secrets are known before the stage stores, applies or captures anything,
+        // so no text it records (a setup's output, a note) can hold one.
+        crate::scrub::host_secrets(&config);
         let _g = self.running.lock().await;
         let captured = {
             let mut guard = self.stage();

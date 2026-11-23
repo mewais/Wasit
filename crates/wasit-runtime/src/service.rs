@@ -36,15 +36,15 @@ pub struct RuntimeService {
     env: Option<crate::environment::HostEnv>,
 }
 
-fn params<T: DeserializeOwned>(v: Value) -> Result<T, RpcError> {
+pub(crate) fn params<T: DeserializeOwned>(v: Value) -> Result<T, RpcError> {
     serde_json::from_value(v).map_err(|e| RpcError::invalid_params(e.to_string()))
 }
 
-fn ok<T: Serialize>(v: T) -> Result<Value, RpcError> {
+pub(crate) fn ok<T: Serialize>(v: T) -> Result<Value, RpcError> {
     serde_json::to_value(v).map_err(|e| RpcError::internal(format!("cannot encode result: {e}")))
 }
 
-fn runtime_err(e: RuntimeError) -> RpcError {
+pub(crate) fn runtime_err(e: RuntimeError) -> RpcError {
     let data = serde_json::to_value(&e).ok();
     let mut r = RpcError::new(e.code(), e.to_string());
     r.data = data;
@@ -210,6 +210,9 @@ impl Service for RuntimeService {
             methods::SESSIONS_LIST => ok(SessionList { sessions: m.list() }),
             methods::SESSIONS_CREATE => {
                 let r: CreateSession = params(p)?;
+                if let Some(env) = &self.env {
+                    env.register_secrets();
+                }
                 ok(m.create_traced(r, ctx.trace).await.map_err(runtime_err)?)
             }
             methods::SESSIONS_CONTINUE => {

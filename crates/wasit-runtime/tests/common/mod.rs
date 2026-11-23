@@ -203,6 +203,33 @@ pub fn client(data: &Path) -> wasit_runtime::RuntimeClient {
     )
 }
 
+/// A client of `service` over an in-process connection (no daemon process): for tests that
+/// need the service's process to be the test's own (the global diagnostics sink and scrubber).
+pub fn loopback(
+    service: std::sync::Arc<dyn wasit_control::Service>,
+) -> wasit_runtime::RuntimeClient {
+    use wasit_control::{
+        connector, ClientOptions, ConnConfig, ControlClient, ControlServer, Hello, Supervised,
+        SupervisedOptions,
+    };
+    let server = ControlServer::in_process(
+        service,
+        Hello::new("test", "loop", "daemon"),
+        ConnConfig::default(),
+    );
+    let hello = Hello::new("test", "gui-test", "gui");
+    let conn = connector(move || {
+        let server = server.clone();
+        let hello = hello.clone();
+        async move {
+            let (a, b) = tokio::io::duplex(1 << 16);
+            drop(server.serve_connection(Box::new(a)));
+            ControlClient::connect(Box::new(b), ClientOptions::new(hello)).await
+        }
+    });
+    wasit_runtime::RuntimeClient::new(Supervised::spawn(conn, SupervisedOptions::default()))
+}
+
 pub fn timeouts() -> Timeouts {
     Timeouts {
         handshake: Duration::from_secs(20),

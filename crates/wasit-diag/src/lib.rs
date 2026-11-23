@@ -255,6 +255,11 @@ pub fn read(source: &str, gen: u64, offset: u64, max: usize) -> std::io::Result<
     }
 }
 
+/// See [`Sink::boot`]; `None` without a sink.
+pub fn boot() -> Option<String> {
+    SINK.get().map(|s| s.boot().to_owned())
+}
+
 /// See [`Sink::stats`].
 pub fn stats() -> Option<Stats> {
     SINK.get().map(Sink::stats)

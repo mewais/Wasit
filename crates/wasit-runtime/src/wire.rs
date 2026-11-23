@@ -28,6 +28,8 @@
 //! | [`methods::SESSION_ATTACHMENT_PUT`] | [`crate::media::AttachmentPut`] | [`crate::media::AttachmentPutReply`] |
 //! | [`methods::SESSION_FILE_READ`] | [`crate::media::FileReadRequest`] | [`crate::media::FileChunk`] |
 //! | [`methods::SESSION_FILES_STAT`] | [`crate::media::FilesStatRequest`] | [`crate::media::FilesStatReply`] |
+//! | [`methods::DIAG_SOURCES`] | — | [`DiagSources`] (served by [`crate::DiagService`], routes [`DIAG_ROUTES`]) |
+//! | [`methods::DIAG_READ`] | [`DiagReadRequest`] | [`DiagChunk`] (served by [`crate::DiagService`]) |
 //!
 //! Errors are `RpcError`s whose `code` is one of [`codes`]; command failures carry a
 //! [`CommandError`] and other failures a [`RuntimeError`] as `data`.
@@ -40,6 +42,7 @@
 //! | `session.events:<id>` ([`topics::session_events`]) | [`SessionEvent`] | [`SessionEvent::cursor`] as a decimal `u64`; stable across daemon restarts |
 //! | `session.trail:<id>` ([`topics::session_trail`]) | [`TrailItem`] | the cursor of the [`SessionEvent`] it was projected from, as a decimal `u64`: the same cursors as `session.events:<id>`, stable across daemon restarts |
 //! | [`topics::DRIVERS_INVENTORY`] | [`InventoryReply`] | `"<epoch>.<n>"`; every event is a full inventory |
+//! | [`topics::DIAG_TAIL`] (params [`DiagTailParams`]; served by [`crate::DiagService`]) | [`DiagTailEvent`] | `"<boot>.<seq>"` of the process's diagnostics sink; an unknown or expired cursor restarts with [`DiagTailEvent::Reset`] |
 
 use std::collections::BTreeMap;
 
@@ -73,12 +76,15 @@ pub mod methods {
     pub const SESSION_ATTACHMENT_PUT: &str = "session.attachment.put";
     pub const SESSION_FILE_READ: &str = "session.file.read";
     pub const SESSION_FILES_STAT: &str = "session.files.stat";
+    pub const DIAG_SOURCES: &str = "diag.sources";
+    pub const DIAG_READ: &str = "diag.read";
 }
 
 /// Topic names.
 pub mod topics {
     pub const HOST_SESSIONS: &str = "host.sessions";
     pub const DRIVERS_INVENTORY: &str = "drivers.inventory";
+    pub const DIAG_TAIL: &str = "diag.tail";
     /// Prefix of the per-session event topic.
     pub const SESSION_EVENTS_PREFIX: &str = "session.events:";
     /// Prefix of the per-session trail topic (the content-free projection of the events).
@@ -108,6 +114,10 @@ pub const ROUTES: &[&str] = &[
     "sessions.",
     "session.",
 ];
+
+/// The routes [`crate::DiagService`] serves (its own constant: a daemon mounts that service
+/// next to [`crate::RuntimeService`], and a hub routes these by `host` like [`ROUTES`]).
+pub const DIAG_ROUTES: &[&str] = &["diag."];
 
 /// Error codes (in addition to `wasit_control::codes`).
 pub mod codes {
@@ -1116,6 +1126,118 @@ pub enum HostEvent {
     Upsert { session: Box<SessionSnapshot> },
     /// A session was deleted.
     Removed { id: SessionId },
+}
+
+// ── Diagnostics ─────────────────────────────────────────────────────────────
+
+/// Result of `diag.sources`: the diagnostics files this process wrote (named as the sink names
+/// them: `daemon`, `aux`, …) and, for each session it knows with a shim log, `shim:<session id>`.
+/// Generations are oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DiagSources {
+    /// This host's wall clock (ms since the Unix epoch) when it answered: the reader measures the
+    /// round trip and so the offset between the clocks; no time in a file is ever rewritten.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub now_ms: u64,
+    /// The process's boot id (`b` of its records).
+    pub boot: String,
+    pub sources: Vec<DiagSource>,
+}
+
+/// One source of [`DiagSources`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DiagSource {
+    pub name: String,
+    pub gens: Vec<DiagGen>,
+}
+
+/// One file of a source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DiagGen {
+    /// The generation number in the file's header; it stays with the file when it is rotated.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub gen: u64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub bytes: u64,
+    /// The `t` of the first and last record of the file, when it has records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+    pub first_t: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+    pub last_t: Option<u64>,
+}
+
+/// Largest `max_bytes` of `diag.read` (2 MiB of NDJSON, escaped once more as a JSON string, is
+/// far below the control protocol's frame limit).
+pub const DIAG_READ_MAX: u32 = 2 << 20;
+
+/// `diag.read`: at most `max_bytes` (1 ..= [`DIAG_READ_MAX`]) of whole lines of generation
+/// `gen` of `source`, from `offset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DiagReadRequest {
+    /// A name from `diag.sources`; nothing else is accepted.
+    pub source: String,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub gen: u64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub offset: u64,
+    pub max_bytes: u32,
+}
+
+/// Result of `diag.read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DiagChunk {
+    /// Complete lines, each ending in `\n`; a trailing partial line is left for the next read.
+    pub data: String,
+    /// The offset to read from next.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub next: u64,
+    /// `next` was the end of the file when it was read.
+    pub eof: bool,
+    /// The generation no longer exists (rotated away): nothing was read.
+    pub gone: bool,
+}
+
+/// Params of the `diag.tail` topic; a record must match every filter given. Most records carry
+/// none of these keys: a filter on one of them excludes them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DiagTailParams {
+    /// Records whose `host` field is this host (a daemon's own records name a host only when
+    /// they are about one: a hub's link records, a host's own start record). Which host a
+    /// request is served by is the request's `host`, not this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Records about this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    /// Records of any of these traces (at most [`DIAG_TAIL_TRACES`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub traces: Vec<TraceId>,
+    /// Records whose event name starts with this (`rpc.`, `session.`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ev_prefix: Option<String>,
+}
+
+/// Most trace ids one `diag.tail` subscription filters on.
+pub const DIAG_TAIL_TRACES: usize = 64;
+
+/// Payload of the `diag.tail` topic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiagTailEvent {
+    /// What the process's ring holds that matches (oldest first; the newest that fit a bounded
+    /// size): the first event of a fresh subscription, or after an unknown or expired cursor.
+    Reset { records: Vec<String> },
+    /// One record, as the NDJSON line the file gets (without its newline).
+    Record { line: String },
 }
 
 // ── Discovery ───────────────────────────────────────────────────────────────

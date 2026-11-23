@@ -15,9 +15,10 @@ use wasit_core::{Command, DriverId};
 
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandOutcome, CommandReply, CommandRequest,
-    CreateSession, CreateSessionReply, HistoryPage, HistoryRequest, HostEvent, HostInfo,
-    InventoryReply, InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent,
-    SessionId, SessionList, SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
+    CreateSession, CreateSessionReply, DiagChunk, DiagReadRequest, DiagSources, DiagTailEvent,
+    DiagTailParams, HistoryPage, HistoryRequest, HostEvent, HostInfo, InventoryReply,
+    InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent, SessionId,
+    SessionList, SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
 };
 
 /// A failed client call.
@@ -403,6 +404,44 @@ impl RuntimeClient {
             },
         )
         .await
+    }
+
+    /// `diag.sources`: the host's diagnostics files and each session's shim log.
+    pub async fn diag_sources(&self) -> Result<DiagSources, ClientError> {
+        self.call(methods::DIAG_SOURCES, ()).await
+    }
+
+    /// `diag.read`: at most `max_bytes` of whole lines of generation `gen` of `source` from
+    /// `offset`.
+    pub async fn diag_read(
+        &self,
+        source: &str,
+        gen: u64,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<DiagChunk, ClientError> {
+        self.call(
+            methods::DIAG_READ,
+            DiagReadRequest {
+                source: source.to_owned(),
+                gen,
+                offset,
+                max_bytes,
+            },
+        )
+        .await
+    }
+
+    /// The host's diagnostics records matching `params`: a `Reset` of what its ring holds, then
+    /// every later record. `from` is a cursor of an earlier run of this subscription (`<boot>.<seq>`).
+    /// Open it only while something shows it.
+    pub fn subscribe_diag_tail(
+        &self,
+        params: &DiagTailParams,
+        from: Option<Cursor>,
+    ) -> TypedSubscription<DiagTailEvent> {
+        let params = serde_json::to_value(params).unwrap_or_default();
+        self.durable(topics::DIAG_TAIL.into(), params, from)
     }
 
     /// A session's events strictly after `from` (from the beginning when `None`).
