@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bounds::{clip, limits};
 use crate::config::{ConfigItem, ConfigItemKind, ConfigSource};
 use crate::event::{AgentEvent, ModelInfo, SessionMode};
 use crate::spec::SpawnSpec;
@@ -72,15 +73,17 @@ pub enum ProbeAction {
         spec: Box<SpawnSpec>,
         until: DiscoveryKind,
     },
-    /// List files ending in `suffix` under `dir` (recursively when asked),
-    /// newest first, at most `max_files`, with the first `head_lines` lines
-    /// of each. With a non-empty `count_containing`, also count the lines of each file that
+    /// List files ending in `suffix` under `dir` (recursively when asked, at most `max_depth`
+    /// levels of folders down when given: `Some(1)` = in `dir` and in the folders directly
+    /// in it), newest first, at most `max_files` (the runtime reports how many more there were),
+    /// with the first `head_lines` lines of each. With a non-empty `count_containing`, also count the lines of each file that
     /// contain any of those substrings ([`FileHead::matching_lines`]; e.g. a transcript's
     /// message records).
     ListFiles {
         dir: String,
         suffix: String,
         recursive: bool,
+        max_depth: Option<usize>,
         max_files: usize,
         head_lines: usize,
         count_containing: Vec<String>,
@@ -393,16 +396,23 @@ pub fn skills_from_listing(
         let fm = front_matter(&f.head);
         out.push(ConfigItem {
             kind: ConfigItemKind::Skill,
-            name: fm
-                .get("name")
-                .filter(|n| !n.is_empty())
-                .cloned()
-                .unwrap_or_else(|| dir.to_string()),
+            name: clip(
+                fm.get("name")
+                    .filter(|n| !n.is_empty())
+                    .map(String::as_str)
+                    .unwrap_or(dir),
+                limits::NAME_CHARS,
+            ),
             source: ConfigSource {
                 scope: scope_of(&f.path),
                 path: Some(f.path.clone()),
             },
-            description: fm.get("description").cloned().unwrap_or_default(),
+            description: clip(
+                fm.get("description")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                limits::DESCRIPTION_CHARS,
+            ),
             enabled: true,
             mcp: None,
             path: Some(f.path.clone()),
@@ -423,16 +433,23 @@ pub fn markdown_items(files: &[FileHead], kind: ConfigItemKind, scope: &str) -> 
             let fm = front_matter(&f.head);
             Some(ConfigItem {
                 kind,
-                name: fm
-                    .get("name")
-                    .filter(|n| !n.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| stem.to_string()),
+                name: clip(
+                    fm.get("name")
+                        .filter(|n| !n.is_empty())
+                        .map(String::as_str)
+                        .unwrap_or(stem),
+                    limits::NAME_CHARS,
+                ),
                 source: ConfigSource {
                     scope: scope.to_string(),
                     path: Some(f.path.clone()),
                 },
-                description: fm.get("description").cloned().unwrap_or_default(),
+                description: clip(
+                    fm.get("description")
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                    limits::DESCRIPTION_CHARS,
+                ),
                 enabled: true,
                 mcp: None,
                 path: Some(f.path.clone()),
@@ -449,6 +466,7 @@ pub fn config_listing(dir: String, suffix: &str, recursive: bool) -> ProbeAction
         dir,
         suffix: suffix.to_string(),
         recursive,
+        max_depth: None,
         max_files: 500,
         head_lines: 24,
         count_containing: vec![],

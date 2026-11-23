@@ -1242,3 +1242,24 @@ fn replayed_usage_and_plan_are_not_shown() {
         assert!(p.on_line(&replayed(body)).events.is_empty(), "{body}");
     }
 }
+
+/// A session list whose titles are megabytes long lists titles of at most `TITLE_CHARS`
+/// characters ending with the cut marker. (Synthetic text only.)
+#[test]
+fn a_huge_session_title_is_bounded() {
+    use wasit_core::{limits, CUT};
+    let list = json!([
+        {"id":"ses_1","title":"ü".repeat(1024 * 1024),"updated":5,"directory":"/p"},
+        {"id":"ses_2","title":"short","updated":4,"directory":"/p"},
+    ]);
+    let out = ProbeOutput::Exec {
+        exit_code: Some(0),
+        stdout: list.to_string(),
+    };
+    let Discovered::Sessions(s) = parse_sessions(&out).unwrap() else {
+        panic!("not sessions");
+    };
+    assert_eq!(s[0].title.chars().count(), limits::TITLE_CHARS);
+    assert!(s[0].title.ends_with(CUT));
+    assert_eq!(s[1].title, "short");
+}

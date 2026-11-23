@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use wasit_core::{
-    exec_stdout, modes_from_handshake, parse_version_line, AgentConfig, BusyPrompt, ConfigItem,
-    ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
-    DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, GeneratedFile,
-    HistoryDelivery, McpServerConfig, McpTransport, ModelInfo, ProbeAction, ProbeOutput,
-    PromptInput, Protocol, ResumableSession, SpawnSpec, Unsupported,
+    clip, exec_stdout, limits, modes_from_handshake, parse_version_line, AgentConfig, BusyPrompt,
+    ConfigItem, ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext,
+    DiscoveryKind, DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput,
+    GeneratedFile, HistoryDelivery, McpServerConfig, McpTransport, ModelInfo, ProbeAction,
+    ProbeOutput, PromptInput, Protocol, ResumableSession, SpawnSpec, Unsupported,
 };
 
 pub use protocol::{config_models, config_modes, AcpProtocol};
@@ -634,12 +634,11 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
                     project: e
                         .get("directory")
                         .and_then(Value::as_str)
-                        .map(str::to_string),
-                    title: e
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                        .map(|p| clip(p, limits::PATH_CHARS)),
+                    title: clip(
+                        e.get("title").and_then(Value::as_str).unwrap_or_default(),
+                        limits::TITLE_CHARS,
+                    ),
                     modified_ms: e.get("updated").and_then(Value::as_u64).unwrap_or(0),
                     // `session list` reports no message count (opencode 1.19.6, kilo 7.8.27).
                     message_count: None,

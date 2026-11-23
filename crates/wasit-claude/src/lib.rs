@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use wasit_core::{
-    config_listing, exec_stdout, listed_files, markdown_items, models_from_handshake,
+    clip, config_listing, exec_stdout, limits, listed_files, markdown_items, models_from_handshake,
     parse_version_line, read_file, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem,
     ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
     DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, HistoryDelivery,
@@ -234,6 +234,9 @@ impl DriverDescriptor for ClaudeDescriptor {
                 kind: DiscoveryKind::Sessions,
                 action: ProbeAction::ListFiles {
                     recursive: ctx.project.is_none(),
+                    // `projects/<project>/<id>.jsonl`; deeper are a conversation's subagents'
+                    // transcripts, which are not conversations (and would fill the listing).
+                    max_depth: Some(1),
                     dir,
                     suffix: ".jsonl".into(),
                     max_files: 200,
@@ -727,7 +730,10 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
                 continue;
             }
             if project.is_none() {
-                project = v.get("cwd").and_then(Value::as_str).map(str::to_string);
+                project = v
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(|p| clip(p, limits::PATH_CHARS));
             }
             if title.is_empty() {
                 title = first_text(v.get("message").and_then(|m| m.get("content")));
@@ -747,16 +753,18 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
     Ok(Discovered::Sessions(sessions))
 }
 
+/// The text of a user message (its first text block), as a title: at most
+/// [`limits::TITLE_CHARS`], cut with a marker. A first prompt can be a pasted file.
 fn first_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
+    let text = match content {
+        Some(Value::String(s)) => s.as_str(),
         Some(Value::Array(blocks)) => blocks
             .iter()
             .find_map(|b| b.get("text").and_then(Value::as_str))
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
-    }
+            .unwrap_or_default(),
+        _ => "",
+    };
+    clip(text, limits::TITLE_CHARS)
 }
 
 #[cfg(test)]

@@ -16,12 +16,12 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use wasit_core::{
-    config_listing, exec_stdout, listed_files, models_from_handshake, modes_from_handshake,
-    parse_named_version, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem, ConfigItemKind,
-    ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
-    DriverCapabilities, DriverDescriptor, DriverId, FileInput, HistoryDelivery, McpServerConfig,
-    McpTransport, ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession,
-    SavesConversation, SpawnSpec, Unsupported,
+    clip, config_listing, exec_stdout, limits, listed_files, models_from_handshake,
+    modes_from_handshake, parse_named_version, skills_from_listing, AgentConfig, BusyPrompt,
+    ConfigItem, ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext,
+    DiscoveryKind, DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput,
+    HistoryDelivery, McpServerConfig, McpTransport, ProbeAction, ProbeOutput, PromptInput,
+    Protocol, ResumableSession, SavesConversation, SpawnSpec, Unsupported,
 };
 
 pub use protocol::{CodexProtocol, SKILL_ROOTS_OPTION};
@@ -128,6 +128,7 @@ impl DriverDescriptor for CodexDescriptor {
                 dir: format!("{home}/sessions"),
                 suffix: ".jsonl".into(),
                 recursive: true,
+                max_depth: None,
                 max_files: 2000,
                 head_lines: 40,
                 count_containing: vec![],
@@ -197,6 +198,7 @@ impl DriverDescriptor for CodexDescriptor {
                     dir: format!("{home}/sessions"),
                     suffix: ".jsonl".into(),
                     recursive: true,
+                    max_depth: None,
                     max_files: 200,
                     head_lines: 40,
                     count_containing: vec![MESSAGE_RECORD.to_string()],
@@ -536,7 +538,7 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
                     project = payload
                         .get("cwd")
                         .and_then(Value::as_str)
-                        .map(str::to_string);
+                        .map(|p| clip(p, limits::PATH_CHARS));
                 }
                 Some("response_item")
                     if title.is_empty()
@@ -549,7 +551,8 @@ pub fn parse_sessions(out: &ProbeOutput) -> Result<Discovered, String> {
                         .unwrap_or_default();
                     // Skip injected context blocks (`<environment_context>` …).
                     if !text.trim_start().starts_with('<') {
-                        title = text.to_string();
+                        // A first prompt can be a pasted file: the title is its start.
+                        title = clip(text, limits::TITLE_CHARS);
                     }
                 }
                 _ => {}

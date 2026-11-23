@@ -120,6 +120,34 @@ wasit_diag::diag_events! {
         /// A blob still being written did not finish in time; the reader stopped waiting.
         #[diag(ev = "blob.wait_timeout", lvl = warn)]
         BlobWaitTimeout { blob: Ident },
+        /// One driver's part of the inventory was built (a discovery refresh ended): its size as
+        /// sent (`bytes`, JSON), the biggest section (`models`, `modes`, `sessions`, `config`,
+        /// `probes` or `other`) and its size, how many items each list holds, and how many it
+        /// leaves out (`not_listed`). The inventory is one event or reply and a frame has a size
+        /// limit: when a peer reports one that was too large, this says which part of which
+        /// driver's was big.
+        #[diag(ev = "inventory.sized", lvl = info)]
+        InventorySized {
+            driver: Ident,
+            bytes: u64,
+            biggest: Code,
+            biggest_bytes: u64,
+            models: u64,
+            modes: u64,
+            sessions: u64,
+            config: u64,
+            not_listed: u64,
+        },
+        /// A driver's part of the inventory was over its size budget even with every list within
+        /// its maximum: `shed` items were left out (counted in `not_listed`) to bring it from
+        /// `bytes` to within `budget`.
+        #[diag(ev = "inventory.shed", lvl = warn)]
+        InventoryShed {
+            driver: Ident,
+            bytes: u64,
+            budget: u64,
+            shed: u64,
+        },
     }
 }
 
@@ -309,6 +337,38 @@ pub(crate) fn blob_wait_timeout(path: &Path) {
         .unwrap_or_default();
     wasit_diag::emit(&RuntimeEvent::BlobWaitTimeout {
         blob: Ident::new(blob),
+    });
+}
+
+/// One driver's part of the inventory was built; see [`RuntimeEvent::InventorySized`].
+pub(crate) fn inventory_sized(
+    driver: &str,
+    bytes: usize,
+    biggest: (&'static str, usize),
+    counts: [usize; 4],
+    not_listed: wasit_core::NotListed,
+) {
+    let [models, modes, sessions, config] = counts.map(|n| n as u64);
+    wasit_diag::emit(&RuntimeEvent::InventorySized {
+        driver: Ident::new(driver),
+        bytes: bytes as u64,
+        biggest: Code::st(biggest.0),
+        biggest_bytes: biggest.1 as u64,
+        models,
+        modes,
+        sessions,
+        config,
+        not_listed: not_listed.sessions + not_listed.config + not_listed.models + not_listed.modes,
+    });
+}
+
+/// A driver's part of the inventory had items left out to fit its budget.
+pub(crate) fn inventory_shed(driver: &str, bytes: usize, budget: usize, shed: u64) {
+    wasit_diag::emit(&RuntimeEvent::InventoryShed {
+        driver: Ident::new(driver),
+        bytes: bytes as u64,
+        budget: budget as u64,
+        shed,
     });
 }
 
@@ -530,6 +590,47 @@ mod tests {
             "blob.wait_timeout",
             "warn",
             &["blob"],
+        );
+        let v = check(
+            RuntimeEvent::InventorySized {
+                driver: Ident::st("claude"),
+                bytes: 90_000,
+                biggest: Code::st("sessions"),
+                biggest_bytes: 60_000,
+                models: 3,
+                modes: 6,
+                sessions: 200,
+                config: 14,
+                not_listed: 0,
+            },
+            "inventory.sized",
+            "info",
+            &[
+                "driver",
+                "bytes",
+                "biggest",
+                "biggest_bytes",
+                "models",
+                "modes",
+                "sessions",
+                "config",
+                "not_listed",
+            ],
+        );
+        assert_eq!(
+            (v["bytes"].as_u64(), v["biggest"].as_str()),
+            (Some(90_000), Some("sessions"))
+        );
+        check(
+            RuntimeEvent::InventoryShed {
+                driver: Ident::st("claude"),
+                bytes: 500_000,
+                budget: 196_608,
+                shed: 40,
+            },
+            "inventory.shed",
+            "warn",
+            &["driver", "bytes", "budget", "shed"],
         );
     }
 }

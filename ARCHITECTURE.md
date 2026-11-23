@@ -127,6 +127,22 @@ binary name, `argv(spec)`, `env(spec)`, capabilities, a `new_protocol()` factory
 hooks (list models, list resumable sessions, version), how the earlier history of a resumed
 conversation is read (§3.8) and a `ConfigRenderer` (§6).
 
+**An inventory is bounded by design.** `drivers.inventory` (reply and topic) is one frame of at
+most 8 MiB, and what is in it comes from the user's data (a conversation's first prompt can be a
+pasted file; a host can have thousands of conversations and skills). So `wasit_core::bounds`
+states a maximum for every free-text field (`limits::*_CHARS`: cut on a character boundary, ending
+with `…`) and for every list (`limits::SESSIONS`, `CONFIG_ITEMS`, `MODELS`, `MODES`, an MCP
+server's entries); drivers apply the text limits where they read the text, and the runtime applies
+`Discovered::bounded` to every probe result whatever the driver did. What a list leaves out is
+counted, never dropped silently: `DriverInventory.not_listed` (also the files a `ListFiles` probe
+found beyond its `max_files`). A driver's whole entry also has a size budget
+(`discovery::ENTRY_BYTES`, 192 KiB: 32 drivers make 6 MiB); if the lists within their maxima still
+exceed it, items are left out from the end of config, sessions, models, modes, and counted. The
+worst case (every list over its maximum, every text over its limit, in the characters JSON writes
+as six bytes) is a unit test (`the_worst_inventory_fits_a_frame`). Each refresh records its entry's
+size and biggest section (`inventory.sized`, `inventory.shed`), so a peer's `frame_too_large` can
+be traced to a section from an export.
+
 ### 3.2 Shim = the only process that owns a CLI
 
 One small process per session, detached from whoever started it (new session/process group on

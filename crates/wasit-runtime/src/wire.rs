@@ -1640,6 +1640,12 @@ pub struct DriverInventory {
     pub modes: Vec<SessionMode>,
     #[serde(default)]
     pub sessions: Vec<ResumableSession>,
+    /// How many items the lists above leave out: more than their maximum
+    /// ([`wasit_core::limits`]), or than fit in an inventory's size budget
+    /// ([`crate::discovery::ENTRY_BYTES`]). `None` = every list is whole. Text that was cut
+    /// ends with [`wasit_core::bounds::CUT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_listed: Option<wasit_core::NotListed>,
     /// What the CLI itself has configured on this host for `project` (MCP servers, skills,
     /// plugins, commands, agents), each with its source.
     #[serde(default)]

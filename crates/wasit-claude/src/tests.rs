@@ -1816,3 +1816,43 @@ fn a_stop_the_cli_refuses_is_reported() {
         matches!(&ev[..], [AgentEvent::CommandRejected { command, .. }] if command == "stop_task")
     );
 }
+
+/// A conversation whose first prompt is megabytes of pasted text is listed with a title of at
+/// most `TITLE_CHARS` characters ending with the cut marker, whichever way claude wrote the
+/// prompt (a string, or a text block), on a character boundary, and its `cwd` is bounded too.
+/// Short titles are untouched. (Synthetic text only.)
+#[test]
+fn a_huge_first_prompt_becomes_a_bounded_title() {
+    use wasit_core::{limits, CUT};
+    // Two-byte characters: a cut inside one would panic or produce invalid text.
+    let huge = "é".repeat(3 * 1024 * 1024);
+    let long_cwd = format!("/p/{}", "d".repeat(100_000));
+    let files: Vec<wasit_core::FileHead> = [
+        json!({"type":"user","cwd":long_cwd,"message":{"role":"user","content":huge}}),
+        json!({"type":"user","cwd":"/p","message":{"role":"user","content":[{"type":"text","text":huge}]}}),
+        json!({"type":"user","cwd":"/p","message":{"role":"user","content":"short"}}),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, line)| wasit_core::FileHead {
+        path: format!("/h/.claude/projects/-p/0b7c2b3e-1111-4222-8333-94444555566{i}.jsonl"),
+        modified_ms: 1,
+        head: vec![line.to_string()],
+        matching_lines: Some(1),
+    })
+    .collect();
+    let Discovered::Sessions(s) = parse_sessions(&ProbeOutput::Files { files }).unwrap() else {
+        panic!("not sessions");
+    };
+    assert_eq!(s.len(), 3);
+    for cut in &s[..2] {
+        assert_eq!(cut.title.chars().count(), limits::TITLE_CHARS);
+        assert!(cut.title.ends_with(CUT));
+        assert!(cut.title.starts_with("éé"));
+    }
+    assert_eq!(s[2].title, "short");
+    let project = s[0].project.as_deref().unwrap();
+    assert_eq!(project.chars().count(), limits::PATH_CHARS);
+    assert!(project.ends_with(CUT));
+    assert_eq!(s[1].project.as_deref(), Some("/p"));
+}

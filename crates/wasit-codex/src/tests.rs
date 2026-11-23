@@ -1358,3 +1358,33 @@ fn a_resumed_thread_without_turns_that_has_a_preview_says_nothing_was_sent() {
     let step = p.on_line(r#"{"id":3,"result":{"thread":{"id":"t2","preview":"","turns":[]}}}"#);
     assert!(step.events.iter().all(|e| e.as_history().is_none()));
 }
+
+/// A rollout whose first prompt is megabytes of pasted text is listed with a title of at most
+/// `TITLE_CHARS` characters ending with the cut marker; a long `cwd` is cut too. (Synthetic
+/// text only.)
+#[test]
+fn a_huge_first_prompt_becomes_a_bounded_title() {
+    use wasit_core::{limits, CUT};
+    let huge = "€".repeat(2 * 1024 * 1024);
+    let meta = json!({"type":"session_meta","payload":{
+        "id":"01a1ebcf-0528-7cd2-a32d-e89e91b6a844","cwd":format!("/p/{}", "d".repeat(100_000))}});
+    let prompt = json!({"type":"response_item","payload":{"role":"user",
+        "content":[{"type":"input_text","text":huge}]}});
+    let out = ProbeOutput::Files {
+        files: vec![wasit_core::FileHead {
+            path: "/h/.codex/sessions/2026/11/17/rollout-2026-11-17T23-19-35-01a1ebcf-0528-7cd2-a32d-e89e91b6a844.jsonl".into(),
+            modified_ms: 9,
+            head: vec![meta.to_string(), prompt.to_string()],
+            matching_lines: Some(2),
+        }],
+    };
+    let Discovered::Sessions(s) = parse_sessions(&out).unwrap() else {
+        panic!("not sessions");
+    };
+    assert_eq!(s[0].title.chars().count(), limits::TITLE_CHARS);
+    assert!(s[0].title.ends_with(CUT) && s[0].title.starts_with("€€"));
+    assert_eq!(
+        s[0].project.as_deref().unwrap().chars().count(),
+        limits::PATH_CHARS
+    );
+}

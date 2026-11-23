@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bounds;
 mod config;
 pub mod content;
 mod descriptor;
@@ -31,6 +32,7 @@ pub mod tasks;
 pub mod transcript;
 pub mod wire;
 
+pub use bounds::{clip, clip_in_place, limits, NotListed, CUT};
 pub use config::{
     AgentConfig, ConfigItem, ConfigItemKind, ConfigItemRef, ConfigRenderer, ConfigSource,
     DisabledItem, McpServerConfig, McpTransport, PluginRef, SkillRef, ToolPolicy, Unsupported,

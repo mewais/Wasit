@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use futures::stream::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
+use wasit_core::{clip_in_place, limits};
 use wasit_core::{
     AgentEvent, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe, DriverDescriptor,
-    DriverId, DriverRegistry, FileHead, ProbeAction, ProbeOutput, SpawnSpec,
+    DriverId, DriverRegistry, FileHead, NotListed, ProbeAction, ProbeOutput, SpawnSpec,
 };
 
 use crate::config::{AgentCommands, DriverOverride, RuntimeConfig};
@@ -281,6 +282,7 @@ impl Discovery {
                     models: Vec::new(),
                     modes: Vec::new(),
                     sessions: Vec::new(),
+                    not_listed: None,
                     config: Vec::new(),
                     project: project.map(str::to_string),
                     refreshing: false,
@@ -327,6 +329,7 @@ impl Discovery {
                 e.models.clear();
                 e.modes.clear();
                 e.sessions.clear();
+                e.not_listed = None;
                 e.config.clear();
             });
             return;
@@ -362,6 +365,7 @@ impl Discovery {
                             .unwrap_or_default();
                         e.modes = global.as_ref().map(|g| g.modes.clone()).unwrap_or_default();
                         e.sessions.clear();
+                        e.not_listed = None;
                         e.config.clear();
                     });
                     return;
@@ -393,10 +397,21 @@ impl Discovery {
         self.finish(&key, |e| {
             e.probes.clear();
             let mut config: Option<Vec<wasit_core::ConfigItem>> = None;
+            let mut not_listed = NotListed::default();
             for (kind, r, took) in results {
                 let duration_ms = took.as_millis() as u64;
                 match r {
-                    Ok(d) => {
+                    Ok((d, omitted)) => {
+                        // Whatever a driver's parser returned, what is reported is within the
+                        // bounds ([`wasit_core::bounds`]); files its listing did not read are
+                        // not listed either.
+                        let (d, mut cut) = d.bounded();
+                        match kind {
+                            DiscoveryKind::Sessions => cut.sessions += omitted,
+                            DiscoveryKind::Config => cut.config += omitted,
+                            _ => {}
+                        }
+                        not_listed.add(cut);
                         match d {
                             Discovered::Version(v) => e.version = Some(v),
                             Discovered::Models(m) => e.models = m,
@@ -423,7 +438,13 @@ impl Discovery {
                 }
             }
             // Several probes contribute config items; a refresh replaces them as a whole.
-            e.config = config.unwrap_or_default();
+            let mut config = config.unwrap_or_default();
+            // Each probe's items are within the maximum; their sum is too.
+            let over = config.len().saturating_sub(limits::CONFIG_ITEMS);
+            config.truncate(limits::CONFIG_ITEMS);
+            not_listed.config += over as u64;
+            e.config = config;
+            e.not_listed = (!not_listed.is_empty()).then_some(not_listed);
             e.refreshed_at_ms = now_ms();
             // A host agent command must answer like the CLI it stands in for.
             e.warning = command.as_ref().and_then(|c| {
@@ -443,6 +464,8 @@ impl Discovery {
             let again = st.again.remove(key);
             if let Some(e) = st.entries.get_mut(key) {
                 f(e);
+                let shed = bound_entry(e);
+                record_sizes(e, &shed);
                 e.refreshing = again;
             }
             again
@@ -455,6 +478,116 @@ impl Discovery {
                 tokio::spawn(async move { this.run_refresh(desc, key).await });
             }
         }
+    }
+}
+
+/// The size budget of one driver's entry in an inventory, as serialized: an inventory is a
+/// single event or reply, so it must fit a frame ([`wasit_control::wire::DEFAULT_MAX_FRAME`],
+/// 8 MiB) whatever the user's data holds. Thirty-two drivers' entries make up at most
+/// 6 MiB of it, so the guarantee holds for a host with up to 32 drivers (the project has four).
+pub const ENTRY_BYTES: usize = 192 * 1024;
+
+/// The entry within its bounds: the text that is not a probe's result (errors, version, paths)
+/// cut ([`limits`]), then, if the entry is still over [`ENTRY_BYTES`] (its lists are each
+/// within their maxima, but their sum need not be), items left out from the end of the config,
+/// then the sessions (the oldest), the models and the modes, until it fits. What is left out is
+/// counted in `not_listed`.
+fn bound_entry(e: &mut DriverInventory) -> Shed {
+    for t in [&mut e.command, &mut e.warning, &mut e.error]
+        .into_iter()
+        .flatten()
+    {
+        clip_in_place(t, limits::ERROR_CHARS);
+    }
+    for t in [&mut e.binary_path, &mut e.project].into_iter().flatten() {
+        clip_in_place(t, limits::PATH_CHARS);
+    }
+    if let Some(v) = &mut e.version {
+        clip_in_place(v, limits::VERSION_CHARS);
+    }
+    clip_in_place(&mut e.display_name, limits::NAME_CHARS);
+    for p in &mut e.probes {
+        if let Some(t) = &mut p.error {
+            clip_in_place(t, limits::ERROR_CHARS);
+        }
+    }
+    let before = serde_json::to_vec(&*e).map(|b| b.len()).unwrap_or(0);
+    let mut over = before.saturating_sub(ENTRY_BYTES);
+    if over == 0 {
+        return Shed { before, items: 0 };
+    }
+    let mut cut = e.not_listed.unwrap_or_default();
+    let was = cut;
+    shed(&mut e.config, &mut cut.config, &mut over);
+    shed(&mut e.sessions, &mut cut.sessions, &mut over);
+    shed(&mut e.models, &mut cut.models, &mut over);
+    shed(&mut e.modes, &mut cut.modes, &mut over);
+    e.not_listed = Some(cut);
+    Shed {
+        before,
+        items: cut.sessions + cut.config + cut.models + cut.modes
+            - (was.sessions + was.config + was.models + was.modes),
+    }
+}
+
+/// What fitting an entry in [`ENTRY_BYTES`] cost: its size before, and how many items it left
+/// out for that (0 = it fit).
+struct Shed {
+    before: usize,
+    items: u64,
+}
+
+/// Records what an entry weighs as it is published and which section is the biggest; a
+/// summary of sizes and counts, never of what the sections hold.
+fn record_sizes(e: &DriverInventory, shed: &Shed) {
+    fn len<T: serde::Serialize>(v: &T) -> usize {
+        serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0)
+    }
+    let sections: [(&'static str, usize); 5] = [
+        ("models", len(&e.models)),
+        ("modes", len(&e.modes)),
+        ("sessions", len(&e.sessions)),
+        ("config", len(&e.config)),
+        ("probes", len(&e.probes)),
+    ];
+    let total = serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0);
+    let (biggest, biggest_bytes) = sections
+        .iter()
+        .copied()
+        .max_by_key(|(_, n)| *n)
+        .unwrap_or(("", 0));
+    // What is not in a list: the identity, the capabilities, the text of an error.
+    let rest = total.saturating_sub(sections.iter().map(|(_, n)| n).sum::<usize>());
+    let (biggest, biggest_bytes) = if rest > biggest_bytes {
+        ("other", rest)
+    } else {
+        (biggest, biggest_bytes)
+    };
+    crate::diag::inventory_sized(
+        &e.driver.0,
+        total,
+        (biggest, biggest_bytes),
+        [
+            e.models.len(),
+            e.modes.len(),
+            e.sessions.len(),
+            e.config.len(),
+        ],
+        e.not_listed.unwrap_or_default(),
+    );
+    if shed.items > 0 {
+        crate::diag::inventory_shed(&e.driver.0, shed.before, ENTRY_BYTES, shed.items);
+    }
+}
+
+/// Remove items from the end of `list` until `over` bytes are gone (or the list is empty).
+fn shed<T: serde::Serialize>(list: &mut Vec<T>, count: &mut u64, over: &mut usize) {
+    while *over > 0 {
+        let Some(last) = list.pop() else { return };
+        // The item and the comma after it.
+        let bytes = serde_json::to_vec(&last).map(|b| b.len() + 1).unwrap_or(1);
+        *over = over.saturating_sub(bytes);
+        *count += 1;
     }
 }
 
@@ -526,7 +659,7 @@ pub(crate) async fn latest_conversation(
     let probe = desc
         .conversations_in_project(&ctx)
         .ok_or_else(|| "the agent cannot list the conversations of a folder".to_string())?;
-    match run_probe(&dcfg, desc, &ov, &probe).await? {
+    match run_probe(&dcfg, desc, &ov, &probe).await?.0 {
         // A conversation with no message in it is not one to continue.
         Discovered::Sessions(list) => Ok(list
             .into_iter()
@@ -591,7 +724,9 @@ async fn run_probe(
     desc: &dyn DriverDescriptor,
     ov: &DriverOverride,
     probe: &DiscoveryProbe,
-) -> Result<Discovered, String> {
+) -> Result<(Discovered, u64), String> {
+    // Files the listing found beyond what it reads.
+    let mut omitted = 0;
     let output = match &probe.action {
         ProbeAction::Exec { argv, env, cwd } => {
             let mut env = env.clone();
@@ -627,14 +762,16 @@ async fn run_probe(
             dir,
             suffix,
             recursive,
+            max_depth,
             max_files,
             head_lines,
             count_containing,
         } => {
-            let (dir, suffix, recursive, max_files, head_lines, count) = (
+            let (dir, suffix, recursive, max_depth, max_files, head_lines, count) = (
                 dir.clone(),
                 suffix.clone(),
                 *recursive,
+                *max_depth,
                 *max_files,
                 *head_lines,
                 count_containing.clone(),
@@ -644,6 +781,7 @@ async fn run_probe(
                     Path::new(&dir),
                     &suffix,
                     recursive,
+                    max_depth,
                     max_files,
                     head_lines,
                     &count,
@@ -660,7 +798,10 @@ async fn run_probe(
                 Ok(Ok(Err(e))) => {
                     return Err(format!("cannot list {}: {e}", dir_display(&probe.action)))
                 }
-                Ok(Ok(Ok(files))) => ProbeOutput::Files { files },
+                Ok(Ok(Ok((files, more)))) => {
+                    omitted = more;
+                    ProbeOutput::Files { files }
+                }
             }
         }
         ProbeAction::ReadFile { path, max_bytes } => {
@@ -676,7 +817,7 @@ async fn run_probe(
             }
         }
     };
-    (probe.parse)(&output)
+    Ok(((probe.parse)(&output)?, omitted))
 }
 
 /// Read at most `max` bytes of `path`; a missing file yields `contents: None`, a larger one
@@ -862,21 +1003,26 @@ fn memfind(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The newest `max_files` files of the listing [`ProbeAction::ListFiles`] describes, and how
+/// many more there were.
 fn list_files(
     dir: &Path,
     suffix: &str,
     recursive: bool,
+    max_depth: Option<usize>,
     max_files: usize,
     head_lines: usize,
     count_containing: &[String],
-) -> std::io::Result<Vec<FileHead>> {
+) -> std::io::Result<(Vec<FileHead>, u64)> {
     let mut found: Vec<(u64, PathBuf)> = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
         let rd = match std::fs::read_dir(&d) {
             Ok(rd) => rd,
             // A CLI that never ran has no session directory yet: nothing to list.
-            Err(e) if d == dir && e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) if d == dir && e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((vec![], 0))
+            }
             Err(e) if d == dir => return Err(e),
             Err(_) => continue,
         };
@@ -884,8 +1030,8 @@ fn list_files(
             let Ok(ft) = ent.file_type() else { continue };
             let p = ent.path();
             if ft.is_dir() {
-                if recursive {
-                    stack.push(p);
+                if recursive && max_depth.is_none_or(|m| depth < m) {
+                    stack.push((p, depth + 1));
                 }
             } else if p.to_string_lossy().ends_with(suffix) {
                 let modified = ent
@@ -900,8 +1046,9 @@ fn list_files(
         }
     }
     found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    let omitted = found.len().saturating_sub(max_files) as u64;
     found.truncate(max_files);
-    Ok(found
+    let files = found
         .into_iter()
         .map(|(modified_ms, p)| {
             let (head, matching_lines) = read_head(&p, head_lines, count_containing);
@@ -912,7 +1059,8 @@ fn list_files(
                 matching_lines,
             }
         })
-        .collect())
+        .collect();
+    Ok((files, omitted))
 }
 
 #[cfg(test)]
@@ -963,5 +1111,231 @@ mod tests {
             wasit_core::ProbeOutput::Exec { stdout, .. } => assert_eq!(stdout, dir),
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+    use crate::default_registry;
+    use wasit_core::{
+        ConfigItem, ConfigItemKind, ConfigSource, McpTransport, ModelInfo, ResumableSession,
+        SessionMode,
+    };
+
+    /// Text that JSON writes as six bytes a character (`\u0001`): the worst a character costs.
+    fn worst(chars: usize) -> String {
+        "\u{1}".repeat(chars)
+    }
+
+    /// Text twice as long as its limit, in the worst characters.
+    fn over(limit: usize) -> String {
+        worst(limit * 2)
+    }
+
+    /// One driver's entry with every list over its maximum and every text over its limit, as a
+    /// probe could return it, made by what the runtime does with probe results. Some of the
+    /// configured items are MCP servers with every part over its limit: the biggest an item
+    /// can be.
+    fn worst_entry(driver: &str) -> DriverInventory {
+        let sessions = (0..limits::SESSIONS + 5)
+            .map(|i| ResumableSession {
+                id: over(limits::ID_CHARS),
+                project: Some(over(limits::PATH_CHARS)),
+                title: over(limits::TITLE_CHARS),
+                modified_ms: u64::MAX - i as u64,
+                message_count: Some(u64::MAX),
+            })
+            .collect();
+        let models = (0..limits::MODELS + 5)
+            .map(|_| ModelInfo {
+                id: over(limits::NAME_CHARS),
+                display_name: over(limits::NAME_CHARS),
+                description: over(limits::DESCRIPTION_CHARS),
+                is_default: true,
+            })
+            .collect();
+        let modes = (0..limits::MODES + 5)
+            .map(|_| SessionMode {
+                id: over(limits::NAME_CHARS),
+                label: over(limits::NAME_CHARS),
+                description: over(limits::DESCRIPTION_CHARS),
+            })
+            .collect();
+        let item = |mcp: bool| ConfigItem {
+            kind: ConfigItemKind::McpServer,
+            name: over(limits::NAME_CHARS),
+            source: ConfigSource {
+                scope: over(limits::SCOPE_CHARS),
+                path: Some(over(limits::PATH_CHARS)),
+            },
+            description: over(limits::DESCRIPTION_CHARS),
+            enabled: true,
+            mcp: mcp.then(|| McpTransport::Stdio {
+                command: over(limits::MCP_TARGET_CHARS),
+                args: (0..limits::MCP_ENTRIES + 5)
+                    .map(|_| over(limits::MCP_VALUE_CHARS))
+                    .collect(),
+                env: (0..limits::MCP_ENTRIES + 5)
+                    .map(|i| {
+                        (
+                            format!("{}{i}", over(limits::MCP_KEY_CHARS)),
+                            over(limits::MCP_VALUE_CHARS),
+                        )
+                    })
+                    .collect(),
+            }),
+            path: Some(over(limits::PATH_CHARS)),
+        };
+        let config = (0..limits::CONFIG_ITEMS + 5).map(|i| item(i < 5)).collect();
+        let mut e = DriverInventory {
+            driver: DriverId::new(driver),
+            display_name: worst(10_000),
+            capabilities: default_registry()
+                .get(&DriverId::new("claude"))
+                .unwrap()
+                .capabilities(),
+            installed: true,
+            command: Some(worst(100_000)),
+            warning: Some(worst(100_000)),
+            binary_path: Some(worst(100_000)),
+            error: Some(worst(100_000)),
+            version: Some(worst(100_000)),
+            models: vec![],
+            modes: vec![],
+            sessions: vec![],
+            not_listed: None,
+            config: vec![],
+            project: Some(worst(100_000)),
+            refreshing: false,
+            probes: [
+                DiscoveryKind::Version,
+                DiscoveryKind::Models,
+                DiscoveryKind::Modes,
+                DiscoveryKind::Sessions,
+                DiscoveryKind::Config,
+                DiscoveryKind::Config,
+                DiscoveryKind::Config,
+                DiscoveryKind::Config,
+                DiscoveryKind::Config,
+                DiscoveryKind::Config,
+                DiscoveryKind::Config,
+                DiscoveryKind::Config,
+            ]
+            .into_iter()
+            .map(|kind| ProbeReport {
+                kind,
+                ok: false,
+                error: Some(worst(100_000)),
+                duration_ms: u64::MAX,
+            })
+            .collect(),
+            refreshed_at_ms: u64::MAX,
+        };
+        let mut cut = NotListed::default();
+        for d in [
+            Discovered::Models(models),
+            Discovered::Modes(modes),
+            Discovered::Sessions(sessions),
+            Discovered::Config(config),
+        ] {
+            let (d, c) = d.bounded();
+            cut.add(c);
+            match d {
+                Discovered::Models(m) => e.models = m,
+                Discovered::Modes(m) => e.modes = m,
+                Discovered::Sessions(s) => e.sessions = s,
+                Discovered::Config(c) => e.config = c,
+                Discovered::Version(_) => unreachable!(),
+            }
+        }
+        e.not_listed = Some(cut);
+        e
+    }
+
+    /// The guarantee that an inventory fits a frame: an entry with every list over its maximum
+    /// and every text over its limit, in the worst characters, is within [`ENTRY_BYTES`] once
+    /// bounded, what it leaves out is counted exactly, and an inventory of 32 such drivers is
+    /// one event that [`wasit_control::wire::encode`] accepts under the frame limit, with the
+    /// margin of what the entries do not use.
+    #[test]
+    fn the_worst_inventory_fits_a_frame() {
+        use wasit_control::wire::{encode, Frame, SubId, DEFAULT_MAX_FRAME};
+
+        let mut e = worst_entry("claude");
+        let (sessions, config, models, modes) = (
+            e.sessions.len() as u64,
+            e.config.len() as u64,
+            e.models.len() as u64,
+            e.modes.len() as u64,
+        );
+        let before = e.not_listed.unwrap();
+        // Five over their maxima before the budget: the lists were capped and said so.
+        assert_eq!(
+            (before.sessions, before.config, before.models, before.modes),
+            (5, 5, 5, 5)
+        );
+        let shed = bound_entry(&mut e);
+        let size = serde_json::to_vec(&e).unwrap().len();
+        assert!(size <= ENTRY_BYTES, "{size} > {ENTRY_BYTES}");
+        assert!(shed.items > 0, "the worst entry needs the budget too");
+        // Nothing is lost silently: listed + not listed is what the lists were capped to.
+        let after = e.not_listed.unwrap();
+        assert_eq!(
+            e.sessions.len() as u64 + after.sessions - before.sessions,
+            sessions
+        );
+        assert_eq!(e.config.len() as u64 + after.config - before.config, config);
+        assert_eq!(e.models.len() as u64 + after.models - before.models, models);
+        assert_eq!(e.modes.len() as u64 + after.modes - before.modes, modes);
+        // The text outside the lists is bounded.
+        for t in [&e.command, &e.warning, &e.error] {
+            assert!(t.as_ref().unwrap().chars().count() <= limits::ERROR_CHARS);
+        }
+        assert!(e.version.as_ref().unwrap().chars().count() <= limits::VERSION_CHARS);
+        assert!(e
+            .probes
+            .iter()
+            .all(|p| p.error.as_ref().unwrap().chars().count() <= limits::ERROR_CHARS));
+
+        // 32 drivers' entries, the largest a host could have, as one event.
+        let drivers: Vec<DriverInventory> = (0..32)
+            .map(|i| DriverInventory {
+                driver: DriverId::new(format!("d{i}")),
+                ..e.clone()
+            })
+            .collect();
+        let payload = serde_json::to_value(InventoryReply { drivers }).unwrap();
+        let frame = Frame::Event {
+            sub: SubId(u64::MAX),
+            cursor: wasit_control::wire::Cursor::new("ffffffffffff.18446744073709551615"),
+            payload,
+        };
+        let bytes = encode(&frame, DEFAULT_MAX_FRAME).expect("the worst inventory fits a frame");
+        assert!(
+            bytes.len() <= DEFAULT_MAX_FRAME * 3 / 4,
+            "{} bytes leave no margin",
+            bytes.len()
+        );
+    }
+
+    /// An entry that fits is left exactly as it is, and says nothing was left out.
+    #[test]
+    fn an_entry_that_fits_is_untouched() {
+        let mut e = worst_entry("claude");
+        e.sessions.truncate(3);
+        e.config.truncate(3);
+        e.models.truncate(3);
+        e.modes.truncate(3);
+        e.sessions.iter_mut().for_each(|s| s.title = "t".into());
+        e.config.clear();
+        e.not_listed = None;
+        let want = serde_json::to_vec(&e).unwrap();
+        let shed = bound_entry(&mut e);
+        // Its own text (errors, paths) is cut, nothing else changes.
+        assert_eq!(shed.items, 0);
+        assert!(e.not_listed.is_none());
+        assert_eq!(e.sessions.len(), 3);
+        assert!(serde_json::to_vec(&e).unwrap().len() < want.len());
     }
 }
