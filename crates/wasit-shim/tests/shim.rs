@@ -598,7 +598,9 @@ async fn torn_final_line_is_truncated_and_seq_continues() {
     }
     assert_eq!(from_file, recs[1..].to_vec());
 
-    // Reusing the directory continues the sequence.
+    // Reusing the directory continues the sequence: the first shim must be gone (lock released).
+    drop(c);
+    assert!(await_pid_exit(h.shim_pid, T).await);
     let last = recs.last().unwrap().seq;
     let h2 = start_child(d.path(), "print", &["y"]).await;
     assert_eq!(h2.spawned_seq, last + 1);
@@ -898,10 +900,15 @@ async fn stderr_is_a_separate_bounded_file() {
         vec![b'x'; 70 * 1024],
     )
     .unwrap();
-    start_child(d.path(), "print", &["x"]).await;
+    let first = start_child(d.path(), "print", &["x"]).await;
     let c = ShimClient::connect(d.path()).await.unwrap();
     let mut s = c.attach(1).await.unwrap();
     until_exited(&mut s).await;
+    // The lock is released only when the shim closes its connections, and the process is gone
+    // after that: wait for both before the directory is reused.
+    until_end(&mut s).await;
+    drop(c);
+    assert!(await_pid_exit(first.shim_pid, T).await);
     assert_eq!(shim_stderr(d.path()), "");
     // Small leftovers stay.
     std::fs::write(d.path().join(wasit_shim::STDERR_FILE), "earlier crash\n").unwrap();
