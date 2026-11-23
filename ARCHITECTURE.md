@@ -68,6 +68,7 @@ resolved copy of Wasit in any build. Local development uses a `[patch]` section 
 | `wasit-runtime` | Session actor, journal reader, session state reducer, host-level session manager (§3.3). |
 | `wasit-control` | Control protocol: wire types, framing, client, server, link supervisor (§4). |
 | `wasit-fake-cli` | Scriptable fake agent CLI speaking each real wire protocol, for tests. |
+| `wasit-diag` | Content-free diagnostics (§9): `diag_events!`/`diag_enum!`, the `DiagValue` field types, `DiagText` + the scrubber registry, the one sink per process (bounded queue, writer thread, rotation, ring + tail, reader), panic hook, counts-only `tracing` layer. |
 | `wasit-process` | The ONLY place processes are created, in all three repos: `command` / `std_command` (`CREATE_NO_WINDOW` on Windows: no console window ever flashes) and `detached_command` + `spawn_detached` for daemons; `decode_console_output` (UTF-16LE from `wsl.exe`); the process-wide **base environment** (`set_base_env`) every command starts from (§3.5). A source-scan test per repo fails on any other `Command::new`. |
 
 ### 2.2 Wasl crates (after rebuild)
@@ -342,3 +343,46 @@ orchestration layer through the same path.
    wired to it. Layer 2 complete here.
 4. **UI** rebuilt screen by screen from owner-approved mockups, in parallel from step 2 on.
 5. Windows verification on CI runners throughout; packaging/release assets last.
+
+## 9. Diagnostics (`wasit-diag`)
+
+Always on, every process, every user; status only (ids, sizes, counts, timings, states,
+reasons), never content.
+
+- **One typed event model.** A log record is a variant of an enum declared with
+  `diag_events!` (name, level, rate budget, typed fields). A field's type must implement
+  `DiagValue`: numbers, `Ms`/`Bytes`/`TimeMs`, `Ident`, `Code`, `Fp`, `ErrorInfo`, `DiagText`,
+  `HomePath`, `ProjectPath`, `SrcLocation`, `Option`/bounded `Vec` of those, `diag_enum!` enums,
+  and newtypes registered with `diag_value!`. `String`, `&str`, paths, JSON values and
+  `Debug`/`Display` output are not values. New field types and every `diag_value!` /
+  `DiagText::new` site outside `wasit-diag` are reviewed changes to an allow-list
+  (`wasit-diag/tests/value_sites.rs`).
+- **Per data category:** prompts, responses, thinking, tool input/output, plans, answers, gate
+  free text, attachments, file contents, CLI stdout: never — sizes and counts only. CLI/peer
+  error text: `ErrorInfo::foreign` (codes + length + fingerprint, no text). Secrets (host secret
+  variables, MCP env/headers, layer env, askpass answers): never; registered with the scrubber
+  where they become known. Env variable names: `Code`. argv: `argc` + flag names only. Project
+  paths and cwd: `ProjectPath` (hashed today). Marsad's own paths: `HomePath`. Host, session,
+  driver, model, mode, native ids: `Ident`/`Code`. ssh targets: their shape only. Session names,
+  titles, workstream names: never (people type the task into them). Transport stderr: bounded,
+  scrubbed `DiagText(Transport)`. Env capture notes / setup errors: first line only. Panics:
+  location, thread, payload kind and length; text only of a static payload.
+- **Free text** exists only as `DiagText::new(Origin, &str)`: registered secrets and project
+  paths replaced, home → `~`, token-shaped runs redacted, control characters escaped, bounded.
+- **Emitting never waits:** `emit` = budget check + serialize + ring push + `try_send`; a full
+  queue drops and counts (`diag.dropped`). One writer thread per process owns the file:
+  batched writes, no fsync per record, size rotation with generations.
+
+Must not:
+1. Write a file, take an async lock or await anything for diagnostics on a session's path.
+2. Log per streamed delta, per stdout line or per event of a turn; live records are
+   lifecycle-level (connect, adopt, refuse, lose, retry). Trails are computed from the journal.
+3. Create unbounded per-session or per-attempt files.
+4. Accept `Debug`/`Display` of a value as a field, or add `DiagValue` for `String`.
+5. Log RPC error *messages* generically: only the `code`; a message only for codes our own code
+   produces without parameters.
+6. Export the journal, `session.json`, stores, Wasl data or the stderr log.
+7. Fsync per record.
+8. Read remote logs inside a request handler of the UI (the exporter is a task).
+9. Let the webview write free text into the app log (the shell deserializes typed events).
+10. Merge clocks precisely across machines or rewrite timestamps in the files.

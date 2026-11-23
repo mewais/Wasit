@@ -766,6 +766,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasit-diag"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wasit-process",
+]
+
+[[package]]
 name = "wasit-fake-cli"
 version = "0.1.0"
 dependencies = [

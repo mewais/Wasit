@@ -1,5 +1,6 @@
 //! Source scan behind each repository's "all process creation goes through wasit-process"
-//! test: finds `Command::new(` (std or tokio) outside the allowed places.
+//! test (finds `Command::new(`, std or tokio, outside the allowed places), and behind the other
+//! "this may only appear in reviewed places" tests (e.g. `wasit-diag`'s value registrations).
 
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,12 @@ const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "dist", "gen"];
 /// files below a `tests`/`benches`/`examples` directory, `build.rs`, the `#[cfg(test)]`
 /// module at the end of a file, and paths ending with one of `allow` (relative, `/`-separated).
 pub fn raw_spawns(root: &Path, allow: &[&str]) -> Vec<String> {
+    find(root, allow, creates_process)
+}
+
+/// Every `<file>:<line>: <text>` under `root` for which `matches` holds, with the exemptions of
+/// [`raw_spawns`].
+pub fn find(root: &Path, allow: &[&str], matches: impl Fn(&str) -> bool) -> Vec<String> {
     let mut files = Vec::new();
     collect(root, &mut files);
     files.sort();
@@ -37,7 +44,7 @@ pub fn raw_spawns(root: &Path, allow: &[&str]) -> Vec<String> {
             if t.starts_with("//") {
                 continue;
             }
-            if creates_process(line) {
+            if matches(line) {
                 found.push(format!("{rel}:{}: {}", n + 1, line.trim()));
             }
         }
@@ -48,7 +55,11 @@ pub fn raw_spawns(root: &Path, allow: &[&str]) -> Vec<String> {
 /// `Command::new(` not preceded by an identifier character (so `CommandBuilder::new(` and
 /// `ShimCommand::new(` do not count).
 pub fn creates_process(line: &str) -> bool {
-    let pat = "Command::new(";
+    mentions(line, "Command::new(")
+}
+
+/// `pat` occurs in `line` not preceded by an identifier character.
+pub fn mentions(line: &str, pat: &str) -> bool {
     let mut from = 0;
     while let Some(i) = line[from..].find(pat) {
         let at = from + i;
