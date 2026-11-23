@@ -283,7 +283,7 @@ pub(crate) fn write_blob(session_dir: &Path, id: String, bytes: Vec<u8>) {
     }
     tokio::spawn(async move {
         if let Err(e) = store_blob(&path, &bytes).await {
-            tracing::warn!(blob = %id, error = %e, "could not store a blob");
+            crate::diag::blob_write_failed(&id, &e);
         }
         inflight_lock().remove(&path);
         // Waiting readers may have gone away.
@@ -329,7 +329,7 @@ async fn wait_blob(path: &Path) {
             .await
             .is_err()
         {
-            tracing::warn!(path = %path.display(), "blob write did not finish in time");
+            crate::diag::blob_wait_timeout(path);
         }
     }
 }

@@ -426,11 +426,11 @@ impl Actor {
             Source::Retry(reason) => {
                 self.reconnect_attempt += 1;
                 if self.reconnect_attempt > self.cfg.timeouts.reconnect_attempts {
-                    tracing::warn!(session = %self.id, %reason, "giving up on the shim");
+                    diag::lost(&self.id, &reason);
                     self.lose(&format!("cannot reach the shim: {reason}"));
                     self.finish_loading();
                 } else {
-                    tracing::debug!(session = %self.id, %reason, attempt = self.reconnect_attempt, "shim unreachable; retrying");
+                    diag::retry(&self.id, self.reconnect_attempt, &reason);
                     let backoff = Duration::from_millis(50u64 << self.reconnect_attempt.min(6));
                     self.reconnect_at = Some(Instant::now() + backoff);
                 }
@@ -471,7 +471,7 @@ impl Actor {
                 self.finish_loading();
             }
             Some(Err(e)) => {
-                tracing::warn!(session = %self.id, error = %e, "journal stream failed");
+                diag::stream_failed(&self.id, &e);
                 self.stream_ended();
             }
             None => self.stream_ended(),
@@ -684,7 +684,7 @@ impl Actor {
 
     fn push_op(&mut self, op: Op) {
         if self.outbox.len() >= MAX_OUTBOX {
-            tracing::error!(session = %self.id, "shim request queue overflow; dropping the oldest request");
+            diag::outbox_overflow(&self.id);
             if let Some(Op::Note { token: Some(t), .. }) = self.outbox.pop_front() {
                 if let Some(p) = self.pending.remove(&t) {
                     self.answer_busy(p);
@@ -729,19 +729,19 @@ impl Actor {
                 }
             }
             Op::Note { attach: true, .. } => {
-                tracing::debug!(session = %self.id, error = %e, "attach note refused (process ended)");
+                diag::op_refused(&self.id, "attach", &e);
             }
             Op::Note { .. } => {
-                tracing::debug!(session = %self.id, error = %e, "note refused");
+                diag::op_refused(&self.id, "note", &e);
             }
             Op::Write(_) => {
-                tracing::warn!(session = %self.id, error = %e, "writing to the CLI failed");
+                diag::op_failed(&self.id, "write", None, &e);
             }
             Op::Close => {
-                tracing::debug!(session = %self.id, error = %e, "closing stdin failed (already closed?)");
+                diag::op_refused(&self.id, "close", &e);
             }
             Op::Signal(sig) => {
-                tracing::warn!(session = %self.id, error = %e, sig = sig.as_str(), "signalling the CLI failed");
+                diag::op_failed(&self.id, "signal", Some(sig.as_str()), &e);
             }
         }
     }
@@ -1249,7 +1249,7 @@ async fn persist(dir: PathBuf, initial: SessionFile, mut rx: mpsc::UnboundedRece
                     Ok(())
                 }
                 Err(e) => {
-                    tracing::warn!(dir = %dir.display(), error = %e, "cannot write session.json");
+                    diag::persist_failed(&current.id, &e);
                     Err(RuntimeError::Io(format!("write session.json: {e}")))
                 }
             }

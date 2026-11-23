@@ -152,11 +152,7 @@ impl HostEnv {
     pub async fn refresh(&self) -> HostEnvironment {
         let _g = self.running.lock().await;
         let c = capture(&self.opts).await;
-        tracing::info!(
-            source = ?c.report.source,
-            ms = c.report.duration_ms,
-            "captured the user's environment"
-        );
+        crate::diag::env_capture(&c.report.source, c.report.duration_ms);
         self.stage().captured = Some(c);
         self.apply().await
     }
@@ -216,11 +212,7 @@ impl HostEnv {
             if let Some(after) = after {
                 vars = merge_own(after, &captured.vars);
             }
-            tracing::info!(
-                ok = s.ok,
-                ms = s.duration_ms,
-                "ran the host's setup commands"
-            );
+            crate::diag::env_setup(s.ok, s.duration_ms);
             report.setup = Some(s);
         }
         for v in &config.vars {
@@ -940,7 +932,7 @@ impl Drop for ScratchFile {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_file(&self.0) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %self.0.display(), "cannot remove the setup file: {e}");
+                crate::diag::scratch_remove_failed(&e);
             }
         }
     }

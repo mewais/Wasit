@@ -271,7 +271,7 @@ impl SessionManager {
         .await;
         if let Err(e) = launched {
             if let Err(re) = tokio::fs::remove_dir_all(&dir).await {
-                tracing::warn!(dir = %dir.display(), error = %re, "cannot clean up a failed session");
+                diag::cleanup_failed(&id, &re);
             }
             return Err(e);
         }
@@ -353,7 +353,7 @@ impl SessionManager {
                 Ok(true) => report.running.push(id),
                 Ok(false) => report.finished.push(id),
                 Err(e) => {
-                    tracing::warn!(dir = %dir.display(), error = %e, "cannot adopt session");
+                    diag::adopt_failed(&id, &e);
                     report.errors.push((dir, e));
                 }
             }
@@ -365,7 +365,7 @@ impl SessionManager {
         // A session an older build created may be readable by others: close it now. A failure
         // does not stop the adoption (the user's session still shows), it is reported.
         if let Err(e) = store::tighten_session(dir).await {
-            tracing::warn!(dir = %dir.display(), error = %e, "cannot make a session directory private");
+            diag::tighten_failed(id, &e);
         }
         let file = store::read(dir).await?;
         if &file.id != id {
@@ -413,6 +413,7 @@ impl SessionManager {
             let feed = self.inner.feed.clone();
             let permits = self.inner.replays.clone();
             let w = watch_tx.clone();
+            let sid = id.clone();
             let loader = tokio::spawn(async move {
                 // The semaphore is never closed.
                 let Ok(_permit) = permits.acquire_owned().await else {
@@ -424,9 +425,7 @@ impl SessionManager {
                         w.send_replace(s.clone());
                         feed.upsert(s);
                     }
-                    Err(e) => {
-                        tracing::warn!(dir = %dir2.display(), error = %e, "cannot rebuild snapshot")
-                    }
+                    Err(e) => diag::snapshot_failed(&sid, &e),
                 }
             });
             (watch_tx, loader)

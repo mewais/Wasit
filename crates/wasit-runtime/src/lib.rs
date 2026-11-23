@@ -57,7 +57,7 @@ pub fn default_registry() -> DriverRegistry {
     ] {
         if let Err(e) = r.register(d) {
             // Ids are distinct constants of the driver crates; a duplicate is a build bug.
-            tracing::error!(error = %e, "duplicate driver in the default registry");
+            diag::registry_failed(&e);
         }
     }
     r

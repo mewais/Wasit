@@ -4,13 +4,34 @@
 //!
 //! Today: the two records of a command's path before it is journaled (design §5.1, legs 6 and
 //! 14), so "the prompt never arrived" can be told apart from "it arrived and was refused" and
-//! from "it was applied after the requester gave up". The rest of the runtime's events join
-//! this enum in a later step.
+//! from "it was applied after the requester gave up"; and the runtime's failures and lifecycle
+//! facts that used to be free-form log lines. A failure's text comes from another program, a
+//! peer or stored data is kept as [`ErrorInfo::foreign`] (its length and fingerprint), an OS
+//! error as [`ErrorInfo::io`] (its kind and number).
+
+use std::fmt::Display;
+use std::io;
+use std::path::Path;
 
 use wasit_control::TraceId;
-use wasit_diag::{Code, Ident};
+use wasit_core::RegistryError;
+use wasit_diag::{Code, ErrorInfo, Ident};
 
-use crate::wire::{CommandError, SessionId};
+use crate::wire::{CommandError, EnvSource, SessionId};
+
+wasit_diag::diag_enum! {
+    /// Where the host's environment was taken from (mirrors `wire::EnvSource`).
+    pub(crate) enum EnvSourceKind {
+        /// The login shell in login + interactive mode.
+        LoginInteractiveShell,
+        /// The login shell in login mode only.
+        LoginShell,
+        /// The user's and machine's variables from the registry.
+        Registry,
+        /// The daemon's own environment.
+        Process,
+    }
+}
 
 wasit_diag::diag_events! {
     /// Events of the session runtime.
@@ -33,6 +54,72 @@ wasit_diag::diag_events! {
             trace: Option<TraceId>,
             kind: Code,
         },
+        /// The host's environment was captured from `source` in `ms` milliseconds.
+        #[diag(ev = "env.capture", lvl = info)]
+        EnvCapture { source: EnvSourceKind, ms: u64 },
+        /// The host's setup commands ran; `ok` is whether they ran to the end.
+        #[diag(ev = "env.setup", lvl = info)]
+        EnvSetup { ok: bool, ms: u64 },
+        /// A temporary file of the host's setup could not be removed.
+        #[diag(ev = "env.scratch_remove_failed", lvl = warn)]
+        ScratchRemoveFailed { error: ErrorInfo },
+        /// A driver could not be registered in the default registry (a build bug).
+        #[diag(ev = "runtime.registry_error", lvl = error)]
+        RegistryFailed { driver: Ident },
+        /// A failed session's directory could not be removed.
+        #[diag(ev = "session.cleanup_failed", lvl = warn)]
+        CleanupFailed { session: Ident, error: ErrorInfo },
+        /// A session directory could not be made private (the adoption goes on).
+        #[diag(ev = "session.tighten_failed", lvl = warn)]
+        TightenFailed { session: Ident, error: ErrorInfo },
+        /// A session directory found at start-up could not be adopted.
+        #[diag(ev = "runtime.adopt_failed", lvl = warn)]
+        AdoptFailed { session: Ident, error: ErrorInfo },
+        /// The snapshot of a finished session could not be rebuilt from its journal.
+        #[diag(ev = "session.snapshot_failed", lvl = warn)]
+        SnapshotFailed { session: Ident, error: ErrorInfo },
+        /// The session's process is given up: its shim could not be reached.
+        #[diag(ev = "session.lost", lvl = warn)]
+        Lost { session: Ident, error: ErrorInfo },
+        /// The shim could not be reached; the runtime tries again (`attempt` counts from 1).
+        #[diag(ev = "session.retry", lvl = debug)]
+        Retry {
+            session: Ident,
+            attempt: u32,
+            error: ErrorInfo,
+        },
+        /// The shim's journal stream failed; the session's stream ends here.
+        #[diag(ev = "session.stream_failed", lvl = warn)]
+        StreamFailed { session: Ident, error: ErrorInfo },
+        /// The shim's request queue was full; the oldest request was dropped.
+        #[diag(ev = "session.outbox_overflow", lvl = error)]
+        OutboxOverflow { session: Ident },
+        /// The shim refused a request that does not change the session (an attach, a note, a
+        /// close of stdin); `op` names it.
+        #[diag(ev = "session.op_refused", lvl = debug)]
+        OpRefused {
+            session: Ident,
+            op: Code,
+            error: ErrorInfo,
+        },
+        /// The shim failed a request that writes to the CLI (`op` is `write` or `signal`; `sig`
+        /// is the signal of a `signal`).
+        #[diag(ev = "session.op_failed", lvl = warn)]
+        OpFailed {
+            session: Ident,
+            op: Code,
+            sig: Option<Code>,
+            error: ErrorInfo,
+        },
+        /// `session.json` could not be written.
+        #[diag(ev = "session.persist_failed", lvl = warn)]
+        PersistFailed { session: Ident, error: ErrorInfo },
+        /// A blob could not be stored.
+        #[diag(ev = "blob.write_failed", lvl = warn)]
+        BlobWriteFailed { blob: Ident, error: ErrorInfo },
+        /// A blob still being written did not finish in time; the reader stopped waiting.
+        #[diag(ev = "blob.wait_timeout", lvl = warn)]
+        BlobWaitTimeout { blob: Ident },
     }
 }
 
@@ -54,6 +141,11 @@ fn session(id: &SessionId) -> Ident {
     Ident::new(id.as_str())
 }
 
+/// An error whose text came from outside this code (a CLI, a shim, stored data).
+fn foreign(code: &'static str, e: &impl Display) -> ErrorInfo {
+    ErrorInfo::foreign(Code::st(code), &e.to_string())
+}
+
 /// `intent` was refused with `err` before it was journaled.
 pub(crate) fn command_refused(id: &SessionId, intent: &Intent, err: &CommandError) {
     wasit_diag::emit(&RuntimeEvent::CommandRefused {
@@ -70,6 +162,152 @@ pub(crate) fn command_timeout(id: &SessionId, intent: &Intent) {
         session: session(id),
         trace: intent.trace.clone(),
         kind: Code::new(intent.kind),
+    });
+}
+
+/// The host's environment was captured from `source`.
+pub(crate) fn env_capture(source: &EnvSource, ms: u64) {
+    let source = match source {
+        EnvSource::LoginInteractiveShell => EnvSourceKind::LoginInteractiveShell,
+        EnvSource::LoginShell => EnvSourceKind::LoginShell,
+        EnvSource::Registry => EnvSourceKind::Registry,
+        EnvSource::Process => EnvSourceKind::Process,
+    };
+    wasit_diag::emit(&RuntimeEvent::EnvCapture { source, ms });
+}
+
+/// The host's setup commands ran.
+pub(crate) fn env_setup(ok: bool, ms: u64) {
+    wasit_diag::emit(&RuntimeEvent::EnvSetup { ok, ms });
+}
+
+/// A setup temporary file could not be removed.
+pub(crate) fn scratch_remove_failed(e: &io::Error) {
+    wasit_diag::emit(&RuntimeEvent::ScratchRemoveFailed {
+        error: ErrorInfo::io(e),
+    });
+}
+
+/// `e` is why a driver could not be registered.
+pub(crate) fn registry_failed(e: &RegistryError) {
+    let (RegistryError::DuplicateDriver(d) | RegistryError::UnknownDriver(d)) = e;
+    wasit_diag::emit(&RuntimeEvent::RegistryFailed {
+        driver: Ident::new(&d.0),
+    });
+}
+
+/// A failed session's directory could not be removed.
+pub(crate) fn cleanup_failed(id: &SessionId, e: &io::Error) {
+    wasit_diag::emit(&RuntimeEvent::CleanupFailed {
+        session: session(id),
+        error: ErrorInfo::io(e),
+    });
+}
+
+/// A session directory could not be made private.
+pub(crate) fn tighten_failed(id: &SessionId, e: &io::Error) {
+    wasit_diag::emit(&RuntimeEvent::TightenFailed {
+        session: session(id),
+        error: ErrorInfo::io(e),
+    });
+}
+
+/// A session directory could not be adopted; `e` is the reason the runtime gave.
+pub(crate) fn adopt_failed(id: &SessionId, e: &str) {
+    wasit_diag::emit(&RuntimeEvent::AdoptFailed {
+        session: session(id),
+        error: foreign("adopt", &e),
+    });
+}
+
+/// The snapshot of a finished session could not be rebuilt; `e` is the reason the runtime gave.
+pub(crate) fn snapshot_failed(id: &SessionId, e: &str) {
+    wasit_diag::emit(&RuntimeEvent::SnapshotFailed {
+        session: session(id),
+        error: foreign("replay", &e),
+    });
+}
+
+/// The session's process is given up; `reason` is what the shim connection reported.
+pub(crate) fn lost(id: &SessionId, reason: &str) {
+    wasit_diag::emit(&RuntimeEvent::Lost {
+        session: session(id),
+        error: foreign("shim_unreachable", &reason),
+    });
+}
+
+/// The shim could not be reached on attempt `attempt`; the runtime tries again.
+pub(crate) fn retry(id: &SessionId, attempt: u32, reason: &str) {
+    wasit_diag::emit(&RuntimeEvent::Retry {
+        session: session(id),
+        attempt,
+        error: foreign("shim_unreachable", &reason),
+    });
+}
+
+/// The shim's journal stream failed.
+pub(crate) fn stream_failed(id: &SessionId, e: &impl Display) {
+    wasit_diag::emit(&RuntimeEvent::StreamFailed {
+        session: session(id),
+        error: foreign("journal_stream", e),
+    });
+}
+
+/// The shim's request queue overflowed.
+pub(crate) fn outbox_overflow(id: &SessionId) {
+    wasit_diag::emit(&RuntimeEvent::OutboxOverflow {
+        session: session(id),
+    });
+}
+
+/// The shim refused the request `op` (`attach`, `note` or `close`).
+pub(crate) fn op_refused(id: &SessionId, op: &'static str, e: &impl Display) {
+    wasit_diag::emit(&RuntimeEvent::OpRefused {
+        session: session(id),
+        op: Code::st(op),
+        error: foreign("shim_refused", e),
+    });
+}
+
+/// The shim failed the request `op` (`write`, or `signal` with its `sig`).
+pub(crate) fn op_failed(
+    id: &SessionId,
+    op: &'static str,
+    sig: Option<&'static str>,
+    e: &impl Display,
+) {
+    wasit_diag::emit(&RuntimeEvent::OpFailed {
+        session: session(id),
+        op: Code::st(op),
+        sig: sig.map(Code::st),
+        error: foreign("shim_failed", e),
+    });
+}
+
+/// `session.json` could not be written.
+pub(crate) fn persist_failed(id: &SessionId, e: &io::Error) {
+    wasit_diag::emit(&RuntimeEvent::PersistFailed {
+        session: session(id),
+        error: ErrorInfo::io(e),
+    });
+}
+
+/// The blob `blob` could not be stored.
+pub(crate) fn blob_write_failed(blob: &str, e: &io::Error) {
+    wasit_diag::emit(&RuntimeEvent::BlobWriteFailed {
+        blob: Ident::new(blob),
+        error: ErrorInfo::io(e),
+    });
+}
+
+/// A reader stopped waiting for the blob at `path` (its file name is the blob's id).
+pub(crate) fn blob_wait_timeout(path: &Path) {
+    let blob = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    wasit_diag::emit(&RuntimeEvent::BlobWaitTimeout {
+        blob: Ident::new(blob),
     });
 }
 
@@ -99,30 +337,31 @@ mod tests {
         lines[1].clone()
     }
 
-    fn check(e: RuntimeEvent, ev: &str, fields: &[&str]) -> serde_json::Value {
+    fn check(e: RuntimeEvent, ev: &str, lvl: &str, fields: &[&str]) -> serde_json::Value {
         assert_eq!(e.ev(), ev);
         let v = line_of(&e);
         let keys: BTreeSet<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         let want: BTreeSet<&str> = HEADER.iter().chain(fields).copied().collect();
         assert_eq!(keys, want, "{v}");
-        assert_eq!(
-            (v["ev"].as_str(), v["lvl"].as_str()),
-            (Some(ev), Some("warn"))
-        );
+        assert_eq!((v["ev"].as_str(), v["lvl"].as_str()), (Some(ev), Some(lvl)));
         v
     }
 
     #[test]
     fn the_records_write_the_header_and_their_declared_fields_only() {
         let id = SessionId::random();
+        let trace = || Some(TraceId::new("u-0123456789abcdef").unwrap());
+        let err = || ErrorInfo::foreign(Code::st("x"), "SECRET");
+        let io = io::Error::from(io::ErrorKind::PermissionDenied);
         let v = check(
             RuntimeEvent::CommandRefused {
                 session: session(&id),
-                trace: Some(TraceId::new("u-0123456789abcdef").unwrap()),
+                trace: trace(),
                 kind: Code::st("prompt"),
                 code: Code::st("busy"),
             },
             "session.command_refused",
+            "warn",
             &["session", "trace", "kind", "code"],
         );
         assert_eq!(v["trace"], "u-0123456789abcdef");
@@ -133,8 +372,163 @@ mod tests {
                 kind: Code::st("interrupt"),
             },
             "session.command_timeout",
+            "warn",
             &["session", "kind"],
         );
         assert_eq!(v["kind"], "interrupt");
+
+        let v = check(
+            RuntimeEvent::EnvCapture {
+                source: EnvSourceKind::LoginShell,
+                ms: 12,
+            },
+            "env.capture",
+            "info",
+            &["source", "ms"],
+        );
+        assert_eq!(v["source"], "login_shell");
+        check(
+            RuntimeEvent::EnvSetup { ok: true, ms: 3 },
+            "env.setup",
+            "info",
+            &["ok", "ms"],
+        );
+        check(
+            RuntimeEvent::ScratchRemoveFailed {
+                error: ErrorInfo::io(&io),
+            },
+            "env.scratch_remove_failed",
+            "warn",
+            &["error"],
+        );
+        check(
+            RuntimeEvent::RegistryFailed {
+                driver: Ident::st("claude"),
+            },
+            "runtime.registry_error",
+            "error",
+            &["driver"],
+        );
+        check(
+            RuntimeEvent::CleanupFailed {
+                session: session(&id),
+                error: ErrorInfo::io(&io),
+            },
+            "session.cleanup_failed",
+            "warn",
+            &["session", "error"],
+        );
+        check(
+            RuntimeEvent::TightenFailed {
+                session: session(&id),
+                error: ErrorInfo::io(&io),
+            },
+            "session.tighten_failed",
+            "warn",
+            &["session", "error"],
+        );
+        check(
+            RuntimeEvent::AdoptFailed {
+                session: session(&id),
+                error: err(),
+            },
+            "runtime.adopt_failed",
+            "warn",
+            &["session", "error"],
+        );
+        check(
+            RuntimeEvent::SnapshotFailed {
+                session: session(&id),
+                error: err(),
+            },
+            "session.snapshot_failed",
+            "warn",
+            &["session", "error"],
+        );
+        check(
+            RuntimeEvent::Lost {
+                session: session(&id),
+                error: err(),
+            },
+            "session.lost",
+            "warn",
+            &["session", "error"],
+        );
+        let v = check(
+            RuntimeEvent::Retry {
+                session: session(&id),
+                attempt: 2,
+                error: err(),
+            },
+            "session.retry",
+            "debug",
+            &["session", "attempt", "error"],
+        );
+        assert_eq!(v["attempt"], 2);
+        check(
+            RuntimeEvent::StreamFailed {
+                session: session(&id),
+                error: err(),
+            },
+            "session.stream_failed",
+            "warn",
+            &["session", "error"],
+        );
+        check(
+            RuntimeEvent::OutboxOverflow {
+                session: session(&id),
+            },
+            "session.outbox_overflow",
+            "error",
+            &["session"],
+        );
+        check(
+            RuntimeEvent::OpRefused {
+                session: session(&id),
+                op: Code::st("attach"),
+                error: err(),
+            },
+            "session.op_refused",
+            "debug",
+            &["session", "op", "error"],
+        );
+        let v = check(
+            RuntimeEvent::OpFailed {
+                session: session(&id),
+                op: Code::st("signal"),
+                sig: Some(Code::st("term")),
+                error: err(),
+            },
+            "session.op_failed",
+            "warn",
+            &["session", "op", "sig", "error"],
+        );
+        assert_eq!(v["sig"], "term");
+        check(
+            RuntimeEvent::PersistFailed {
+                session: session(&id),
+                error: ErrorInfo::io(&io),
+            },
+            "session.persist_failed",
+            "warn",
+            &["session", "error"],
+        );
+        check(
+            RuntimeEvent::BlobWriteFailed {
+                blob: Ident::st("b-1"),
+                error: ErrorInfo::io(&io),
+            },
+            "blob.write_failed",
+            "warn",
+            &["blob", "error"],
+        );
+        check(
+            RuntimeEvent::BlobWaitTimeout {
+                blob: Ident::st("b-1"),
+            },
+            "blob.wait_timeout",
+            "warn",
+            &["blob"],
+        );
     }
 }
