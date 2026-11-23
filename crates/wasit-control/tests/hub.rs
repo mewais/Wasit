@@ -76,7 +76,7 @@ impl LinkConnector for MemConnector {
         }
     }
 
-    fn hold(&self, spec: &HostSpec) -> Option<String> {
+    async fn hold(&self, spec: &HostSpec) -> Option<String> {
         self.held
             .lock()
             .unwrap()

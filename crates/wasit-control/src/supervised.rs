@@ -192,7 +192,11 @@ pub trait SupervisorHooks: Send + Sync + 'static {
     /// For a link whose every connect asks a person for something (a code, a push approval):
     /// retrying it on a timer would spend that on nobody. Never a failure of an attempt, so
     /// nothing is lost: the link keeps the reason it was down.
-    fn hold(&self) -> Option<String> {
+    ///
+    /// Asynchronous because what decides it may need a look outside the process (the product
+    /// asks whether a shared connection that would carry the attempt without a sign-in is
+    /// still open).
+    async fn hold(&self) -> Option<String> {
         None
     }
 }
@@ -506,7 +510,11 @@ async fn run(
         }
         // A link the product says must wait for a person (the first attempt of a link that
         // asks for a sign-in each time, or one that follows a failure) is not tried.
-        if let Some(detail) = hold(&hooks) {
+        let held = tokio::select! {
+            _ = stop.cancelled() => break,
+            h = hold(&hooks) => h,
+        };
+        if let Some(detail) = held {
             if !wait_for_person(
                 &shared,
                 &mut reconnect_rx,
@@ -803,7 +811,11 @@ async fn run(
             Next::Backoff => {
                 // No "reconnecting at …" for a link that will not: it waits for a person, and
                 // says why it was down.
-                if let Some(detail) = hold(&hooks) {
+                let held = tokio::select! {
+                    _ = stop.cancelled() => break,
+                    h = hold(&hooks) => h,
+                };
+                if let Some(detail) = held {
                     if !wait_for_person(
                         &shared,
                         &mut reconnect_rx,
@@ -856,8 +868,11 @@ async fn run(
     shared.set(LinkState::Stopped, None, n);
 }
 
-fn hold(hooks: &Option<Arc<dyn SupervisorHooks>>) -> Option<String> {
-    hooks.as_ref().and_then(|h| h.hold())
+async fn hold(hooks: &Option<Arc<dyn SupervisorHooks>>) -> Option<String> {
+    match hooks {
+        Some(h) => h.hold().await,
+        None => None,
+    }
 }
 
 /// Parks the link as waiting for a person ([`SupervisorHooks::hold`]) and waits for

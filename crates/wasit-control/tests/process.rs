@@ -495,3 +495,22 @@ async fn a_child_that_goes_away_gives_one_handshake_failure_in_either_order() {
         assert_eq!(seen[0], seen[1], "{program} {code} {words:?}");
     }
 }
+
+/// `wait_exit_unbounded` returns with the child's status whenever the child ends, however long
+/// that takes (here: when its input is closed): it is pending while the child runs, and has no
+/// bound of its own to give up at.
+#[cfg(unix)]
+#[tokio::test]
+async fn waiting_for_a_childs_exit_has_no_bound_of_its_own() {
+    use futures::FutureExt as _;
+    let spec = CommandSpec::new(["sh", "-c", "read x; exit 3"]);
+    let (io, child) = CommandTransport::spawn(&spec).unwrap();
+    assert!(child.exit().is_none());
+    let mut waiting = Box::pin(child.wait_exit_unbounded());
+    // Polled once while the child runs: pending (nothing waited for).
+    assert!(waiting.as_mut().now_or_never().is_none());
+    // Its input closes: it reads EOF and exits with its own status.
+    drop(io);
+    let exit = within(waiting).await.expect("it exited");
+    assert_eq!(exit.code, Some(3));
+}

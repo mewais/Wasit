@@ -413,6 +413,19 @@ impl ChildHandle {
         res
     }
 
+    /// Wait for the child to exit, however long that takes: for a command whose end is the
+    /// answer itself (an ssh that detaches into the background once the user has signed in).
+    /// The wait has no bound of its own; whoever cancels the future that awaits it (the link's
+    /// connect bound, a stop) ends it, and the child dies with its handle.
+    pub async fn wait_exit_unbounded(&self) -> Option<ExitInfo> {
+        let mut rx = self.view.exit.clone();
+        let res = match rx.wait_for(Option::is_some).await {
+            Ok(v) => *v,
+            Err(_) => self.view.exit(),
+        };
+        res
+    }
+
     /// Explains a failed handshake (the hello exchange over this child's stdio) from the child:
     /// the one place that does, used by [`CommandTransport::connect`] and by any connector that
     /// talks to the child before the hello (the product's bootstrap) and then runs the hello
