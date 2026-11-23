@@ -217,6 +217,16 @@ impl InstanceLock {
     }
 }
 
+impl Drop for InstanceLock {
+    /// Released explicitly, not only by closing the file: `flock` locks belong to the open file
+    /// description, and a child forked by another thread of this process holds a copy of it
+    /// until its `exec`, which would keep the lock (and so "an instance is running") alive for
+    /// the next owner in this process. `LOCK_UN` releases it whoever has a copy.
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 /// The lock file used for an endpoint path: `<path>.lock`.
 pub fn lock_path_for(endpoint_path: &Path) -> PathBuf {
     let mut s = endpoint_path.as_os_str().to_owned();
