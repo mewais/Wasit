@@ -19,13 +19,15 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use wasit_control::demo::DemoService;
 use wasit_control::{
-    codes, connector_reporting, connector_with_attempt, Attempt, Backoff, CallError, ClientOptions,
-    CloseReason, CommandFailureKind, CommandSpec, CommandTransport, ConnConfig, ConnectError,
-    ControlClient, ControlServer, Cursor, EventStream, Hello, HostId, HostSpec, Hub, HubConfig,
-    LinkConnector, LinkState, ProtocolVersion, ProvisionError, ProvisionReason, RequestOpts,
-    RoutingService, RpcError, Service, SubscribeOpts, Supervised, SupervisedConfig,
-    SupervisedOptions, SupervisorHooks, TraceId,
+    codes, connector_with_attempt, Attempt, Backoff, CallError, ClientOptions, CloseReason,
+    CommandFailureKind, ConnConfig, ConnectError, ControlClient, ControlServer, Cursor,
+    EventStream, Hello, HostId, HostSpec, Hub, HubConfig, LinkConnector, LinkState,
+    ProtocolVersion, ProvisionError, ProvisionReason, RequestOpts, RoutingService, RpcError,
+    Service, SubscribeOpts, Supervised, SupervisedConfig, SupervisedOptions, SupervisorHooks,
+    TraceId,
 };
+#[cfg(unix)]
+use wasit_control::{connector_reporting, CommandSpec, CommandTransport};
 use wasit_diag::{Code, Ident, SinkConfig};
 
 const FILE: &str = "control.ndjson";
@@ -969,8 +971,10 @@ async fn a_transport_that_exits_with_stderr_is_recorded_with_its_exit_and_scrubb
 
 /// A connector like the product's bootstrap: it starts the transport itself, would talk to the
 /// child before the hello, runs the hello itself and explains a failed hello with the child.
+#[cfg(unix)]
 struct OwnConnector;
 
+#[cfg(unix)]
 #[async_trait]
 impl LinkConnector for OwnConnector {
     async fn connect(

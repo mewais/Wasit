@@ -7,9 +7,11 @@ use std::time::Duration;
 use common::*;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
+#[cfg(unix)]
+use wasit_control::ControlClient;
 use wasit_control::{
     codes, ClientOptions, CloseReason, CommandFailureKind, CommandSpec, CommandTransport,
-    ConnClose, ConnectError, ControlClient, ProtocolVersion, SubscribeOpts,
+    ConnClose, ConnectError, ProtocolVersion, SubscribeOpts,
 };
 
 const D: Duration = Duration::from_secs(10);

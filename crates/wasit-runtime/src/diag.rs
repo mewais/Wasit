@@ -182,6 +182,7 @@ pub(crate) fn env_setup(ok: bool, ms: u64) {
 }
 
 /// A setup temporary file could not be removed.
+#[cfg(unix)]
 pub(crate) fn scratch_remove_failed(e: &io::Error) {
     wasit_diag::emit(&RuntimeEvent::ScratchRemoveFailed {
         error: ErrorInfo::io(e),

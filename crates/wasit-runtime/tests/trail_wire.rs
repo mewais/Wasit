@@ -15,7 +15,9 @@ use wasit_core::{
     BusyPrompt, Command, FileInput, GateChoiceKind, GateDecision, GateRequest, QuestionAnswer,
 };
 use wasit_fake_cli::scenario::{Scenario, Turn};
-use wasit_runtime::wire::{topics, SessionEventKind, SessionId, TrailItem};
+#[cfg(unix)]
+use wasit_runtime::wire::SessionEventKind;
+use wasit_runtime::wire::{topics, SessionId, TrailItem};
 use wasit_runtime::{ClientError, TypedSubscription};
 
 fn trace(s: &str) -> TraceId {
@@ -36,6 +38,7 @@ async fn next_item(sub: &mut TypedSubscription<TrailItem>) -> TrailItem {
     }
 }
 
+#[cfg(unix)]
 fn ev(item: &TrailItem) -> String {
     item.entry.ev().to_owned()
 }

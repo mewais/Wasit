@@ -192,6 +192,7 @@ impl RuntimeConfig {
     }
 
     /// Root of the per-session runtime directories.
+    #[cfg(unix)]
     pub(crate) fn run_sessions_dir(&self) -> PathBuf {
         self.run_dir
             .as_deref()
