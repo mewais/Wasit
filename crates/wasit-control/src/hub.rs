@@ -86,7 +86,7 @@ pub trait LinkConnector: Send + Sync + 'static {
     /// Whether the link to `spec` must wait for a person before its next attempt
     /// ([`SupervisorHooks::hold`]): `Some(detail)` parks it, saying why in `detail`. The
     /// default never holds.
-    fn hold(&self, _spec: &HostSpec) -> Option<String> {
+    async fn hold(&self, _spec: &HostSpec) -> Option<String> {
         None
     }
 }
@@ -201,8 +201,8 @@ impl SupervisorHooks for HubHooks {
         Some(p.ensure(&self.spec, reason.clone()).await)
     }
 
-    fn hold(&self) -> Option<String> {
-        self.connector.hold(&self.spec)
+    async fn hold(&self) -> Option<String> {
+        self.connector.hold(&self.spec).await
     }
 }
 
