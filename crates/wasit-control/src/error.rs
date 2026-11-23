@@ -70,6 +70,23 @@ pub enum ConnClose {
     Local,
 }
 
+impl ConnClose {
+    /// The kind as the word the `kind` tag serializes to (`eof`, `goodbye`, `io`, `protocol`,
+    /// `frame_too_large`, `idle_timeout`, `local`): what diagnostics record of a close, never
+    /// the message a peer or a parser produced.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ConnClose::Eof => "eof",
+            ConnClose::Goodbye { .. } => "goodbye",
+            ConnClose::Io { .. } => "io",
+            ConnClose::Protocol { .. } => "protocol",
+            ConnClose::FrameTooLarge => "frame_too_large",
+            ConnClose::IdleTimeout => "idle_timeout",
+            ConnClose::Local => "local",
+        }
+    }
+}
+
 impl fmt::Display for ConnClose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -12,7 +12,10 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
-use crate::client::{ClientOptions, ControlClient, Diagnostics};
+use wasit_diag::Ident;
+
+use crate::client::{ClientOptions, ControlClient, Diagnostics, TransportFacts};
+use crate::diag;
 use crate::error::ConnectError;
 use crate::transport::{join_duplex, BoxDuplex};
 
@@ -48,6 +51,25 @@ pub enum CommandFailureKind {
 }
 
 impl CommandFailureKind {
+    /// The kind as the word it serializes to (`auth_needed`, `host_key_unknown`, …): what
+    /// diagnostics record of a failed transport.
+    pub fn code(self) -> &'static str {
+        match self {
+            CommandFailureKind::AuthNeeded => "auth_needed",
+            CommandFailureKind::HostKeyUnknown => "host_key_unknown",
+            CommandFailureKind::HostKeyChanged => "host_key_changed",
+            CommandFailureKind::Unreachable => "unreachable",
+            CommandFailureKind::CommandNotFound => "command_not_found",
+            CommandFailureKind::UnknownDistro => "unknown_distro",
+            CommandFailureKind::WslUnavailable => "wsl_unavailable",
+            CommandFailureKind::PermissionDenied => "permission_denied",
+            CommandFailureKind::UnsupportedPlatform => "unsupported_platform",
+            CommandFailureKind::HelperMissing => "helper_missing",
+            CommandFailureKind::UnexpectedOutput => "unexpected_output",
+            CommandFailureKind::Other => "other",
+        }
+    }
+
     /// Needs a human action before retrying makes sense.
     pub fn needs_human(self) -> bool {
         matches!(
@@ -176,6 +198,19 @@ pub struct CommandSpec {
     /// Bytes of stderr kept (the tail) for diagnostics.
     #[serde(default = "default_stderr_limit")]
     pub stderr_limit: usize,
+    /// The link attempt this command serves. With it, spawning and exiting are recorded
+    /// (`transport.spawned`, `transport.exited`); without it nothing is. Never serialized.
+    #[serde(skip)]
+    pub trace: Option<TransportTrace>,
+}
+
+/// The link attempt a transport command belongs to (see [`CommandSpec::trace`]): the link's
+/// diagnostics label and the attempt number the supervisor passed to the connector, so the
+/// transport's records join the supervisor's on `(link, n)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportTrace {
+    pub link: Ident,
+    pub attempt: u64,
 }
 
 fn default_stderr_limit() -> usize {
@@ -192,7 +227,14 @@ impl CommandSpec {
             argv: argv.into_iter().map(Into::into).collect(),
             env: Vec::new(),
             stderr_limit: default_stderr_limit(),
+            trace: None,
         }
+    }
+
+    /// Records this command's spawn and exit as belonging to attempt `attempt` of `link`.
+    pub fn traced(mut self, link: Ident, attempt: u64) -> Self {
+        self.trace = Some(TransportTrace { link, attempt });
+        self
     }
 }
 
@@ -216,6 +258,8 @@ impl std::fmt::Display for ExitInfo {
 struct Tail {
     buf: VecDeque<u8>,
     limit: usize,
+    /// Bytes the child wrote to stderr in all (`buf` keeps only the last `limit`).
+    seen: u64,
 }
 
 /// Owns the transport child. The child is killed when the last handle is dropped.
@@ -265,15 +309,10 @@ impl ChildHandle {
 
 #[async_trait]
 impl Diagnostics for ChildHandle {
-    async fn describe(&self) -> Option<String> {
+    async fn facts(&self) -> Option<TransportFacts> {
         let exit = self.wait_exit(Duration::from_secs(1)).await;
         let stderr = self.stderr_tail();
-        match (exit, stderr.is_empty()) {
-            (None, true) => None,
-            (None, false) => Some(format!("stderr: {stderr}")),
-            (Some(e), true) => Some(format!("transport {e}")),
-            (Some(e), false) => Some(format!("transport {e}; stderr: {stderr}")),
-        }
+        (exit.is_some() || !stderr.is_empty()).then_some(TransportFacts { exit, stderr })
     }
 }
 
@@ -311,12 +350,18 @@ impl CommandTransport {
             .take()
             .ok_or_else(|| ConnectError::Spawn("no stderr".into()))?;
 
+        if let Some(t) = &spec.trace {
+            diag::transport_spawned(t, program, spec.argv.len(), pid);
+        }
         let tail = Arc::new(Mutex::new(Tail {
             buf: VecDeque::new(),
             limit: spec.stderr_limit.max(1),
+            seen: 0,
         }));
         let (exit_tx, exit_rx) = watch::channel(None);
         let tail2 = tail.clone();
+        let tail3 = tail.clone();
+        let trace = spec.trace.clone();
         let waiter = tokio::spawn(async move {
             let mut stderr_reader = Box::pin(async move {
                 let mut chunk = [0u8; 4096];
@@ -325,6 +370,7 @@ impl CommandTransport {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let mut t = tail2.lock().unwrap_or_else(|e| e.into_inner());
+                            t.seen = t.seen.saturating_add(n as u64);
                             t.buf.extend(&chunk[..n]);
                             let excess = t.buf.len().saturating_sub(t.limit);
                             t.buf.drain(..excess);
@@ -355,6 +401,10 @@ impl CommandTransport {
                     signal: None,
                 },
             };
+            if let Some(t) = &trace {
+                let seen = tail3.lock().unwrap_or_else(|e| e.into_inner()).seen;
+                diag::transport_exited(t, &info, seen);
+            }
             let _ = exit_tx.send(Some(info)); // receivers may all be gone
         });
         let handle = ChildHandle {

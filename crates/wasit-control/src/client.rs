@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::command::ExitInfo;
 use crate::connection::{ConnConfig, Connection};
 use crate::error::ConnectError;
 use crate::service::Service;
@@ -42,10 +43,36 @@ impl ClientOptions {
     }
 }
 
+/// What a transport can say about why it went away: a child process's exit status and the tail
+/// of its stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportFacts {
+    pub exit: Option<ExitInfo>,
+    /// The last bytes of stderr, decoded and trimmed (empty when there were none).
+    pub stderr: String,
+}
+
+impl TransportFacts {
+    /// The one-line explanation shown with a link's last error.
+    pub fn describe(&self) -> String {
+        match (self.exit, self.stderr.is_empty()) {
+            (None, true) => String::new(),
+            (None, false) => format!("stderr: {}", self.stderr),
+            (Some(e), true) => format!("transport {e}"),
+            (Some(e), false) => format!("transport {e}; stderr: {}", self.stderr),
+        }
+    }
+}
+
 /// Explains why a transport went away (e.g. a child process's exit status and stderr).
 #[async_trait]
 pub trait Diagnostics: Send + Sync + 'static {
-    async fn describe(&self) -> Option<String>;
+    /// The facts, `None` when the transport knows nothing (no exit, no stderr).
+    async fn facts(&self) -> Option<TransportFacts>;
+
+    async fn describe(&self) -> Option<String> {
+        self.facts().await.map(|f| f.describe())
+    }
 }
 
 /// A dialed connection. Derefs to [`Connection`] for `request`/`subscribe`/`closed`.
@@ -101,6 +128,14 @@ impl ControlClient {
     pub async fn diagnostics(&self) -> Option<String> {
         match &self.diagnostics {
             Some(d) => d.describe().await,
+            None => None,
+        }
+    }
+
+    /// The same explanation as structured facts (exit status, stderr tail).
+    pub async fn transport_facts(&self) -> Option<TransportFacts> {
+        match &self.diagnostics {
+            Some(d) => d.facts().await,
             None => None,
         }
     }
