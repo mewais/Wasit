@@ -335,6 +335,11 @@ One protocol for GUI↔daemon, daemon↔daemon and (later) phone↔daemon.
   Failed{reason}`), exponential backoff, state published as events. ssh runs with
   `BatchMode=yes`, `ServerAliveInterval`, no ControlMaster; anything interactive (password,
   host-key confirmation) surfaces as `AuthNeeded` with an action in the UI, never a hang.
+  A product whose links ask a person for something at every connect (a code, a push approval)
+  says so through `LinkConnector::hold` / `SupervisorHooks::hold`: asked before every attempt
+  the supervisor would start by itself (first, after a drop, after a backoff), `Some(detail)`
+  parks the link as `AuthNeeded { held: true, cause }` until `reconnect_now`: no attempt, no
+  "reconnecting" it will not do, and `cause` keeps why the link had been down.
 - **Provisioning:** on connect the hub runs one bounded probe (`marsad-agent --version` + OS/arch).
   Missing or different build ⇒ copy the matching binary over the same ssh (scp/sftp, or stdin
   upload) into `~/.marsad/bin/` (`%LOCALAPPDATA%\Marsad\bin`), atomically renamed, then start.
