@@ -20,6 +20,18 @@
 //!   was never written (the previous daemon died first) and is written then; lines produced while
 //!   replaying history that do have an `in` echo are never written twice.
 //!
+//! # Inputs
+//!
+//! Every journaled command is an *input* whose id ([`InputId`]) is the seq of the note that
+//! carried it; a session's first prompt travels inside the generation's `start` note and is the
+//! first input of that generation, applied exactly like a later `command` note (same `input`
+//! event, same `encode`, same queueing). The protocol reports what happens to a queued input
+//! (`input_sent` / `input_dropped`) and what the CLI says about it (`input_acknowledged`,
+//! `turn_started.input`); the core adds what only the journal knows: `written` once every line
+//! the input asked for has its `in` echo, `write_failed` from the shim's `stdin_error` note, and
+//! `input_dropped{process_ended}` for inputs still queued or unwritten when the process
+//! generation ends.
+//!
 //! Lines the CLI prints after a `spawned` record but before the generation's `start` note, and
 //! commands journaled in that window, are buffered and applied right after `start` — in live
 //! operation and in replay alike.
@@ -28,14 +40,16 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use wasit_core::{
-    AgentEvent, Command, DriverDescriptor, DriverError, Encoded, Protocol, SpawnSpec, Step,
+    AgentEvent, Command, DriverDescriptor, DriverError, Encoded, InputDropReason, InputId,
+    Protocol, ResumeMode, SpawnSpec, Step,
 };
 use wasit_shim::{Kind, Record};
 
 use crate::note::{classify, NoteKind, RuntimeNote};
 use crate::wire::{
-    event_cursor, synthetic_cursor, CommandStatus, ExitSummary, PendingGate, Phase, SessionEvent,
-    SessionEventKind, SessionSnapshot, SubagentInfo, TurnInfo, TurnOutcome,
+    event_cursor, synthetic_cursor, AnomalyKind, CommandStatus, ExitSummary, GateClearing,
+    NoticeCode, PendingGate, Phase, PhaseCause, SessionEvent, SessionEventKind, SessionSnapshot,
+    StartResume, SubagentInfo, TurnInfo, TurnOutcome,
 };
 
 /// Bounded diagnostics.
@@ -45,8 +59,13 @@ const FAILED_TAIL_LINES: usize = 10;
 const TITLE_CHARS: usize = 120;
 const REPLY_CHARS: usize = 2000;
 const MAX_SUBAGENTS: usize = 100;
-/// Cap on owed (written-but-not-echoed) lines; beyond it the oldest are forgotten.
+/// Cap on owed (written-but-not-echoed) lines; beyond it the oldest are forgotten (and count as
+/// written).
 const MAX_OWED: usize = 4096;
+/// Cap on inputs remembered as queued in the protocol or waiting for their lines' echoes.
+const MAX_OPEN_INPUTS: usize = 4096;
+/// Cap on prompt texts kept for the turn that will run them (`TurnInfo::prompt`).
+const MAX_PROMPT_TEXTS: usize = 64;
 
 /// Static facts about a session.
 #[derive(Debug, Clone)]
@@ -111,8 +130,21 @@ pub(crate) fn blank_snapshot(
 /// Something received before the generation's `start` note.
 enum Buffered {
     Line(String),
-    Command { token: String, command: Command },
-    Stop,
+    Command {
+        token: String,
+        input: InputId,
+        command: Command,
+    },
+    Stop {
+        input: InputId,
+    },
+}
+
+/// A line the protocol asked to write, until its `in` echo.
+struct Owed {
+    line: String,
+    /// The inputs whose step asked for it (an input is written once none of its lines is owed).
+    inputs: Vec<InputId>,
 }
 
 enum Gen {
@@ -171,7 +203,13 @@ pub(crate) struct Core {
     desc: Arc<dyn DriverDescriptor>,
     snap: SessionSnapshot,
     gen: Gen,
-    owed: VecDeque<String>,
+    owed: VecDeque<Owed>,
+    /// Inputs some of whose lines are owed, oldest first.
+    writing: VecDeque<InputId>,
+    /// Inputs of the last echoed line (a `stdin_error` note right behind it is theirs).
+    last_echoed: Vec<InputId>,
+    /// Inputs the protocol holds (`Queued`, not yet sent or dropped), oldest first.
+    queued: VecDeque<InputId>,
     close_owed: bool,
     last_seq: u64,
     partial: HashMap<Kind, String>,
@@ -181,7 +219,12 @@ pub(crate) struct Core {
     start_t: Option<u64>,
     lost: Option<String>,
     exit_phase: Option<Phase>,
-    prompts: VecDeque<String>,
+    /// Texts of accepted prompts / slash commands, by input, until a turn starts for them.
+    prompt_texts: VecDeque<(InputId, String)>,
+    /// Facts of the record being applied that can change the phase (see [`Core::cause_for`]).
+    causes: Vec<PhaseCause>,
+    /// An `activity_while_idle` anomaly was reported since the last phase change.
+    anomaly_reported: bool,
     stderr_tail: VecDeque<String>,
     /// Request ids of pending gates raised from outside the CLI protocol (see
     /// [`RuntimeNote::RaiseGate`]). They survive turn ends, are answered without the protocol,
@@ -205,6 +248,32 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn push_bounded<T>(q: &mut VecDeque<T>, item: T, max: usize) {
+    q.push_back(item);
+    while q.len() > max {
+        q.pop_front();
+    }
+}
+
+/// Remove and return the text of `input`.
+fn take_text(texts: &mut VecDeque<(InputId, String)>, input: InputId) -> Option<String> {
+    let i = texts.iter().position(|(id, _)| *id == input)?;
+    texts.remove(i).map(|(_, t)| t)
+}
+
+/// The event type of agent activity (output that means the agent is working).
+fn activity(e: &AgentEvent) -> Option<&'static str> {
+    Some(match e {
+        AgentEvent::AssistantDelta { .. } => "assistant_delta",
+        AgentEvent::AssistantContent { .. } => "assistant_content",
+        AgentEvent::ThinkingDelta { .. } => "thinking_delta",
+        AgentEvent::ToolCallStarted { .. } => "tool_call_started",
+        AgentEvent::ToolCallUpdated { .. } => "tool_call_updated",
+        AgentEvent::ToolCallFinished { .. } => "tool_call_finished",
+        _ => return None,
+    })
+}
+
 impl Core {
     /// Modes to offer until (unless) the CLI reports its own list.
     pub(crate) fn hint_modes(&mut self, modes: Vec<wasit_core::SessionMode>) {
@@ -220,6 +289,9 @@ impl Core {
             snap,
             gen: Gen::None,
             owed: VecDeque::new(),
+            writing: VecDeque::new(),
+            last_echoed: Vec::new(),
+            queued: VecDeque::new(),
             close_owed: false,
             last_seq: 0,
             partial: HashMap::new(),
@@ -229,7 +301,9 @@ impl Core {
             start_t: None,
             lost: None,
             exit_phase: None,
-            prompts: VecDeque::new(),
+            prompt_texts: VecDeque::new(),
+            causes: Vec::new(),
+            anomaly_reported: false,
             stderr_tail: VecDeque::new(),
             external: BTreeSet::new(),
             withdrawn: VecDeque::new(),
@@ -253,7 +327,7 @@ impl Core {
 
     /// Lines requested but not yet seen as written.
     pub(crate) fn owed(&self) -> impl Iterator<Item = &String> {
-        self.owed.iter()
+        self.owed.iter().map(|o| &o.line)
     }
 
     pub(crate) fn close_owed(&self) -> bool {
@@ -298,6 +372,8 @@ impl Core {
             return out;
         }
         self.last_seq = rec.seq;
+        let phase_before = self.snap.phase.clone();
+        self.causes.clear();
         let mut em = Emitter {
             seq: rec.seq,
             t: rec.t,
@@ -328,7 +404,7 @@ impl Core {
                     Gen::Awaiting(buf) => buf.push(Buffered::Line(text)),
                     Gen::Running(p) => {
                         let step = p.on_line(&text);
-                        self.step(step, &mut em, &mut out);
+                        self.step(step, None, &mut em, &mut out);
                     }
                     // Output outside a generation cannot occur (`exited` is the last record of
                     // a run); nothing to feed it to.
@@ -346,12 +422,12 @@ impl Core {
             }
             Kind::In => {
                 self.snap.last_activity_ms = rec.t;
-                self.on_echo(&text);
+                self.on_echo(&text, &mut em);
             }
             Kind::Exited => self.on_exited(rec, &mut em, &mut out),
             Kind::Note => self.on_note(rec, &mut em, &mut out),
         }
-        self.finish(em, &mut out);
+        self.finish(em, &mut out, &phase_before);
         out
     }
 
@@ -361,6 +437,11 @@ impl Core {
         if self.lost.is_some() || matches!(self.gen, Gen::Exited) {
             return Vec::new();
         }
+        let mut kinds = Vec::new();
+        for event in self.end_inputs() {
+            self.reduce(&event, 0, self.snap.last_activity_ms);
+            kinds.push(SessionEventKind::Agent { event });
+        }
         self.lost = Some(reason.to_string());
         self.clear_live_state();
         let slot = synthetic_cursor(self.last_seq);
@@ -368,20 +449,24 @@ impl Core {
         let phase = self.compute_phase();
         self.snap.phase = phase.clone();
         self.snap.cursor = slot;
-        vec![
-            SessionEvent {
-                cursor: slot - 1,
+        self.anomaly_reported = false;
+        kinds.push(SessionEventKind::Lost {
+            reason: reason.to_string(),
+        });
+        kinds.push(SessionEventKind::Phase {
+            phase,
+            cause: PhaseCause::Lost,
+        });
+        let n = kinds.len() as u64;
+        kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| SessionEvent {
+                cursor: slot - (n - 1 - i as u64),
                 t,
-                kind: SessionEventKind::Lost {
-                    reason: reason.to_string(),
-                },
-            },
-            SessionEvent {
-                cursor: slot,
-                t,
-                kind: SessionEventKind::Phase { phase },
-            },
-        ]
+                kind,
+            })
+            .collect()
     }
 
     // ── record handlers ─────────────────────────────────────────────────────
@@ -390,7 +475,9 @@ impl Core {
         if matches!(self.gen, Gen::Awaiting(_) | Gen::Running(_)) && self.lost.is_none() {
             em.push(SessionEventKind::Notice {
                 message: "the previous process ended without an exit record".into(),
+                code: NoticeCode::PreviousGenerationUnclosed,
             });
+            self.end_generation_inputs(em);
         }
         self.gen = Gen::Awaiting(Vec::new());
         self.owed.clear();
@@ -401,9 +488,12 @@ impl Core {
         self.start_t = None;
         self.lost = None;
         self.exit_phase = None;
-        self.prompts.clear();
+        self.prompt_texts.clear();
         self.clear_live_state();
         self.snap.generation += 1;
+        self.causes.push(PhaseCause::Spawned {
+            generation: self.snap.generation,
+        });
         self.snap.exit = None;
         let pid = rec
             .data
@@ -434,7 +524,28 @@ impl Core {
             return;
         }
         let info = rec.exit_info().unwrap_or_default();
-        self.gen = Gen::Exited;
+        if let Gen::Awaiting(buf) = std::mem::replace(&mut self.gen, Gen::Exited) {
+            // Commands journaled before a `start` that never came: the process ended first.
+            for b in buf {
+                if let Buffered::Command {
+                    token,
+                    input,
+                    command,
+                } = b
+                {
+                    let status = CommandStatus::NotRunning {
+                        reason: "the process ended before it started".into(),
+                    };
+                    em.push(SessionEventKind::Input {
+                        input,
+                        command: crate::media::without_bytes(command),
+                        status: status.clone(),
+                    });
+                    out.resolved.push((token, status));
+                }
+            }
+        }
+        self.end_generation_inputs(em);
         self.owed.clear();
         self.close_owed = false;
         // External gates end with the process: their requests are gone.
@@ -454,6 +565,12 @@ impl Core {
             signal: info.signal,
             at_ms: rec.t,
             requested: self.stop_requested,
+        });
+        self.causes.push(PhaseCause::Exited {
+            code: info.code,
+            signal: info.signal,
+            requested: self.stop_requested,
+            handshake_timeout: self.handshake_timeout.is_some(),
         });
         let tail: Vec<String> = self
             .stderr_tail
@@ -497,9 +614,11 @@ impl Core {
             NoteKind::Runtime(RuntimeNote::Start { spec }) => self.on_start(&spec, rec, em, out),
             NoteKind::Runtime(RuntimeNote::Command { token, command }) => {
                 self.snap.last_activity_ms = rec.t;
+                let input = InputId(rec.seq);
                 if let Some(request_id) = self.answers_withdrawn(&command) {
                     let status = CommandStatus::Withdrawn { request_id };
                     em.push(SessionEventKind::Input {
+                        input,
                         command,
                         status: status.clone(),
                     });
@@ -507,17 +626,22 @@ impl Core {
                     return;
                 }
                 if self.answers_external(&command) {
-                    self.answer_external(token, command, em, out);
+                    self.answer_external(token, input, command, em, out);
                     return;
                 }
                 match &mut self.gen {
-                    Gen::Awaiting(buf) => buf.push(Buffered::Command { token, command }),
-                    Gen::Running(_) => self.apply_command(token, command, em, out),
+                    Gen::Awaiting(buf) => buf.push(Buffered::Command {
+                        token,
+                        input,
+                        command,
+                    }),
+                    Gen::Running(_) => self.apply_command(Some(token), input, command, em, out),
                     Gen::None | Gen::Exited => {
                         let status = CommandStatus::NotRunning {
                             reason: "the process is not running".into(),
                         };
                         em.push(SessionEventKind::Input {
+                            input,
                             command: crate::media::without_bytes(command),
                             status: status.clone(),
                         });
@@ -534,10 +658,13 @@ impl Core {
                 out.stop_applied = true;
                 em.push(SessionEventKind::Notice {
                     message: "stop requested".into(),
+                    code: NoticeCode::StopRequested,
                 });
                 match &mut self.gen {
-                    Gen::Awaiting(buf) => buf.push(Buffered::Stop),
-                    Gen::Running(_) => self.apply_stop(em, out),
+                    Gen::Awaiting(buf) => buf.push(Buffered::Stop {
+                        input: InputId(rec.seq),
+                    }),
+                    Gen::Running(_) => self.apply_stop(InputId(rec.seq), em, out),
                     Gen::None | Gen::Exited => {}
                 }
             }
@@ -548,6 +675,7 @@ impl Core {
                         message: format!(
                             "handshake deadline of {after_ms} ms passed; stopping the process"
                         ),
+                        code: NoticeCode::HandshakeDeadline,
                     });
                 }
             }
@@ -558,55 +686,106 @@ impl Core {
                 self.resolve_external(token, request_id, em, out)
             }
             NoteKind::StdinClosed => self.close_owed = false,
-            NoteKind::Other(message) => em.push(SessionEventKind::Notice { message }),
+            NoteKind::StdinError(error) => {
+                if self.last_echoed.is_empty() {
+                    em.push(SessionEventKind::WriteFailed { input: None, error });
+                } else {
+                    for input in self.last_echoed.clone() {
+                        em.push(SessionEventKind::WriteFailed {
+                            input: Some(input),
+                            error: error.clone(),
+                        });
+                    }
+                }
+            }
+            NoteKind::Other { code, message } => {
+                em.push(SessionEventKind::Notice { message, code })
+            }
         }
     }
 
     fn on_start(&mut self, spec: &SpawnSpec, rec: &Record, em: &mut Emitter, out: &mut Output) {
+        // The first prompt is the generation's first input, journaled in this very note.
+        let (spec, first) = spec.split_first_prompt();
+        let input = InputId(rec.seq);
         if !matches!(self.gen, Gen::Awaiting(_)) {
             em.push(SessionEventKind::Notice {
                 message: "ignored a start note outside a fresh process generation".into(),
+                code: NoticeCode::StartIgnored,
             });
+            if let Some(command) = first {
+                let status = if self.process_running() {
+                    CommandStatus::Rejected {
+                        reason: "the process generation had already started".into(),
+                    }
+                } else {
+                    CommandStatus::NotRunning {
+                        reason: "the process is not running".into(),
+                    }
+                };
+                em.push(SessionEventKind::Input {
+                    input,
+                    command,
+                    status,
+                });
+            }
             return;
         }
         let Gen::Awaiting(buf) = std::mem::replace(&mut self.gen, Gen::None) else {
             return;
         };
+        let (resume, resume_id) = match &spec.resume {
+            ResumeMode::Fresh => (StartResume::Fresh, None),
+            ResumeMode::Continue => (StartResume::Continue, None),
+            ResumeMode::Resume(id) => (StartResume::Resume, Some(id.clone())),
+        };
+        em.push(SessionEventKind::Started {
+            generation: self.snap.generation,
+            resume,
+            resume_id,
+            model: spec.model.clone().filter(|m| !m.is_empty()),
+            mode: Some(spec.mode.clone()).filter(|m| !m.is_empty()),
+            first_input: first.as_ref().map(|_| input),
+        });
         let mut p = self.desc.new_protocol();
-        let step = p.start(spec);
+        let step = p.start(&spec);
         self.gen = Gen::Running(p);
         self.start_t = Some(rec.t);
         out.started = true;
-        if let Some(first) = &spec.first_prompt {
-            self.prompts.push_back(first.clone());
-            if self.snap.title.is_none() {
-                self.snap.title = Some(truncate(first, TITLE_CHARS));
-            }
-        }
         if self.snap.model.is_none() {
             self.snap.model = spec.model.clone().filter(|m| !m.is_empty());
         }
         if self.snap.mode.is_none() && !spec.mode.is_empty() {
             self.snap.mode = Some(spec.mode.clone());
         }
-        self.step(step, em, out);
+        self.step(step, None, em, out);
+        if let Some(command) = first {
+            self.apply_command(None, input, command, em, out);
+        }
         for b in buf {
             match b {
                 Buffered::Line(line) => {
                     if let Gen::Running(p) = &mut self.gen {
                         let step = p.on_line(&line);
-                        self.step(step, em, out);
+                        self.step(step, None, em, out);
                     }
                 }
-                Buffered::Command { token, command } => self.apply_command(token, command, em, out),
-                Buffered::Stop => self.apply_stop(em, out),
+                Buffered::Command {
+                    token,
+                    input,
+                    command,
+                } => self.apply_command(Some(token), input, command, em, out),
+                Buffered::Stop { input } => self.apply_stop(input, em, out),
             }
         }
     }
 
+    /// Encode one input and report it (`input` event; the requester's result when `token`
+    /// names one). The first prompt (no requester) and every `command` note take this path.
     fn apply_command(
         &mut self,
-        token: String,
+        token: Option<String>,
+        input: InputId,
         command: Command,
         em: &mut Emitter,
         out: &mut Output,
@@ -614,7 +793,7 @@ impl Core {
         let Gen::Running(p) = &mut self.gen else {
             return;
         };
-        let (status, step) = match p.encode(command.clone()) {
+        let (status, step) = match p.encode(input, command.clone()) {
             Ok(Encoded::Sent(step)) => (CommandStatus::Sent, Some(step)),
             Ok(Encoded::Queued) => (CommandStatus::Queued, None),
             Err(DriverError::Unsupported { operation }) => {
@@ -636,14 +815,14 @@ impl Core {
         let accepted = matches!(status, CommandStatus::Sent | CommandStatus::Queued);
         if accepted {
             match &command {
-                Command::Prompt { text, .. } => self.note_prompt(text.clone()),
+                Command::Prompt { text, .. } => self.note_prompt(input, text.clone()),
                 Command::RunSlash { name, args } => {
                     let text = if args.is_empty() {
                         format!("/{name}")
                     } else {
                         format!("/{name} {args}")
                     };
-                    self.note_prompt(text)
+                    self.note_prompt(input, text)
                 }
                 Command::AnswerGate { request_id, .. }
                 | Command::AnswerQuestion { request_id, .. }
@@ -652,17 +831,27 @@ impl Core {
                     self.snap
                         .pending_gates
                         .retain(|g| g.gate.request_id() != request_id);
+                    self.causes.push(PhaseCause::GateCleared {
+                        request_id: request_id.clone(),
+                        how: GateClearing::Answered,
+                    });
                 }
                 _ => {}
             }
         }
+        if status == CommandStatus::Queued {
+            push_bounded(&mut self.queued, input, MAX_OPEN_INPUTS);
+        }
         em.push(SessionEventKind::Input {
+            input,
             command: crate::media::without_bytes(command),
             status: status.clone(),
         });
-        out.resolved.push((token, status));
+        if let Some(token) = token {
+            out.resolved.push((token, status));
+        }
         if let Some(step) = step {
-            self.step(step, em, out);
+            self.step(step, Some(input), em, out);
         }
     }
 
@@ -704,6 +893,7 @@ impl Core {
     fn answer_external(
         &mut self,
         token: String,
+        input: InputId,
         command: Command,
         em: &mut Emitter,
         out: &mut Output,
@@ -724,6 +914,7 @@ impl Core {
             if let Some(Err(reason)) = check {
                 let status = CommandStatus::Rejected { reason };
                 em.push(SessionEventKind::Input {
+                    input,
                     command,
                     status: status.clone(),
                 });
@@ -738,8 +929,13 @@ impl Core {
             self.snap
                 .pending_gates
                 .retain(|g| g.gate.request_id() != request_id);
+            self.causes.push(PhaseCause::GateCleared {
+                request_id: request_id.clone(),
+                how: GateClearing::Answered,
+            });
         }
         em.push(SessionEventKind::Input {
+            input,
             command,
             status: CommandStatus::Sent,
         });
@@ -809,49 +1005,106 @@ impl Core {
         out.resolved.push((token, status));
     }
 
-    fn note_prompt(&mut self, text: String) {
+    fn note_prompt(&mut self, input: InputId, text: String) {
         if self.snap.title.is_none() {
             self.snap.title = Some(truncate(&text, TITLE_CHARS));
         }
-        self.prompts.push_back(text);
-        while self.prompts.len() > 64 {
-            self.prompts.pop_front();
-        }
+        push_bounded(&mut self.prompt_texts, (input, text), MAX_PROMPT_TEXTS);
     }
 
-    fn apply_stop(&mut self, em: &mut Emitter, out: &mut Output) {
+    /// `input` is the `stop` note's id (a shutdown is not a user input, but it is encoded like
+    /// one).
+    fn apply_stop(&mut self, input: InputId, em: &mut Emitter, out: &mut Output) {
         let Gen::Running(p) = &mut self.gen else {
             return;
         };
-        match p.encode(Command::Shutdown) {
-            Ok(Encoded::Sent(step)) => self.step(step, em, out),
+        match p.encode(input, Command::Shutdown) {
+            Ok(Encoded::Sent(step)) => self.step(step, None, em, out),
             // Already shut down / nothing to encode: the actor's escalation takes over.
             Ok(Encoded::Queued) | Err(_) => {}
         }
     }
 
-    fn on_echo(&mut self, text: &str) {
-        if self.owed.front().map(String::as_str) == Some(text) {
-            self.owed.pop_front();
-        } else if let Some(i) = self.owed.iter().position(|l| l == text) {
-            self.owed.remove(i);
-        }
+    fn on_echo(&mut self, text: &str, em: &mut Emitter) {
+        let pos = if self.owed.front().map(|o| o.line.as_str()) == Some(text) {
+            Some(0)
+        } else {
+            self.owed.iter().position(|o| o.line == text)
+        };
         // Otherwise a foreign write (another tool on the shim): nothing was owed.
+        if let Some(owed) = pos.and_then(|i| self.owed.remove(i)) {
+            self.settle_written(&owed.inputs, em);
+            self.last_echoed = owed.inputs;
+        }
     }
 
-    // ── protocol output ─────────────────────────────────────────────────────
+    /// `written` for each of `inputs` none of whose lines is owed any more.
+    fn settle_written(&mut self, inputs: &[InputId], em: &mut Emitter) {
+        for input in inputs {
+            if self.writing.contains(input) && !self.owed.iter().any(|o| o.inputs.contains(input)) {
+                self.writing.retain(|w| w != input);
+                em.push(SessionEventKind::Written { input: *input });
+            }
+        }
+    }
 
-    fn step(&mut self, step: Step, em: &mut Emitter, out: &mut Output) {
-        for mut event in step.events {
-            crate::media::externalize(&mut event, &mut out.blobs);
+    /// The inputs that will never be written now that the generation ended (still queued in the
+    /// protocol, or their lines never echoed), oldest first; forgets them.
+    fn end_inputs(&mut self) -> Vec<AgentEvent> {
+        let mut ids: Vec<InputId> = self.queued.drain(..).collect();
+        ids.extend(self.writing.drain(..));
+        ids.into_iter()
+            .map(|input| AgentEvent::InputDropped {
+                input,
+                reason: InputDropReason::ProcessEnded,
+                error: None,
+            })
+            .collect()
+    }
+
+    fn end_generation_inputs(&mut self, em: &mut Emitter) {
+        for event in self.end_inputs() {
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, em.t);
             em.push(SessionEventKind::Agent { event });
         }
+    }
+
+    // ── protocol output ─────────────────────────────────────────────────────
+
+    /// Publish a protocol step. `input` is the command whose `encode` produced it (its lines
+    /// are its writes); inputs the step reports sent are added.
+    fn step(&mut self, step: Step, input: Option<InputId>, em: &mut Emitter, out: &mut Output) {
+        let mut inputs: Vec<InputId> = input.into_iter().collect();
+        for mut event in step.events {
+            crate::media::externalize(&mut event, &mut out.blobs);
+            match &event {
+                AgentEvent::InputSent { input } => {
+                    self.queued.retain(|q| q != input);
+                    inputs.push(*input);
+                }
+                AgentEvent::InputDropped { input, .. } => self.queued.retain(|q| q != input),
+                _ => {}
+            }
+            let cursor = em.next_cursor();
+            self.reduce(&event, cursor, em.t);
+            em.push(SessionEventKind::Agent { event });
+        }
+        if !step.write.is_empty() {
+            for input in &inputs {
+                push_bounded(&mut self.writing, *input, MAX_OPEN_INPUTS);
+            }
+        }
         for line in step.write {
-            self.owed.push_back(line.0.clone());
+            self.owed.push_back(Owed {
+                line: line.0.clone(),
+                inputs: inputs.clone(),
+            });
             if self.owed.len() > MAX_OWED {
-                self.owed.pop_front();
+                // Forgotten: counts as written.
+                if let Some(old) = self.owed.pop_front() {
+                    self.settle_written(&old.inputs, em);
+                }
             }
             out.writes.push(line.0);
         }
@@ -863,6 +1116,7 @@ impl Core {
 
     fn reduce(&mut self, event: &AgentEvent, cursor: u64, t: u64) {
         let s = &mut self.snap;
+        let mut cause = None;
         match event {
             AgentEvent::SessionInit {
                 native_session_id,
@@ -892,16 +1146,21 @@ impl Core {
                     s.cli_version = Some(cli_version.clone());
                 }
             }
-            AgentEvent::TurnStarted { native_turn_id } => {
+            AgentEvent::TurnStarted {
+                native_turn_id,
+                input,
+            } => {
+                let prompt = input.and_then(|i| take_text(&mut self.prompt_texts, i));
                 s.turn = Some(TurnInfo {
                     started_at_ms: t,
                     native_turn_id: native_turn_id.clone(),
-                    prompt: self.prompts.pop_front(),
+                    prompt,
                     tool_calls: 0,
                     last_tool: None,
                     current_tool: None,
                     current_call: None,
                 });
+                cause = Some(PhaseCause::TurnStarted { input: *input });
             }
             AgentEvent::TurnCompleted {
                 end_reason,
@@ -935,6 +1194,10 @@ impl Core {
                     was_interrupted: *was_interrupted,
                     num_turns: *num_turns,
                     reply: reply.as_deref().map(|r| truncate(r, REPLY_CHARS)),
+                });
+                cause = Some(PhaseCause::TurnCompleted {
+                    end_reason: *end_reason,
+                    interrupted: *was_interrupted,
                 });
             }
             AgentEvent::ToolCallStarted {
@@ -993,10 +1256,25 @@ impl Core {
                     raised_at_ms: t,
                     cursor,
                 });
+                cause = Some(PhaseCause::GateRaised {
+                    request_id: gate.request_id().to_string(),
+                    external: self.external.contains(gate.request_id()),
+                });
             }
-            AgentEvent::GateResolved { request_id, .. } => {
+            AgentEvent::GateResolved { request_id, reason } => {
                 s.pending_gates
                     .retain(|g| g.gate.request_id() != request_id);
+                cause = Some(PhaseCause::GateCleared {
+                    request_id: request_id.clone(),
+                    how: if reason.as_deref() == Some(WITHDRAWN) {
+                        GateClearing::Withdrawn
+                    } else {
+                        GateClearing::Resolved
+                    },
+                });
+            }
+            AgentEvent::InputDropped { input, .. } => {
+                take_text(&mut self.prompt_texts, *input);
             }
             AgentEvent::UsageUpdate { usage, context_pct } => {
                 s.live_usage = Some(usage.clone());
@@ -1034,8 +1312,11 @@ impl Core {
             | AgentEvent::AssistantContent { .. }
             | AgentEvent::UserContent { .. }
             | AgentEvent::ProcessExited { .. }
+            | AgentEvent::InputSent { .. }
+            | AgentEvent::InputAcknowledged { .. }
             | AgentEvent::Unknown { .. } => {}
         }
+        self.causes.extend(cause);
     }
 
     fn clear_live_state(&mut self) {
@@ -1077,16 +1358,70 @@ impl Core {
         }
     }
 
-    fn finish(&mut self, mut em: Emitter, out: &mut Output) {
+    /// Why the phase became `phase`: the last fact of this record that leads to it, else the
+    /// last fact, else `other`.
+    fn cause_for(&self, phase: &Phase) -> PhaseCause {
+        let leads_to = |c: &PhaseCause| match phase {
+            Phase::Starting => matches!(c, PhaseCause::Spawned { .. }),
+            Phase::Idle => matches!(
+                c,
+                PhaseCause::TurnCompleted { .. }
+                    | PhaseCause::GateCleared { .. }
+                    | PhaseCause::HandshakeDone
+            ),
+            Phase::Working => matches!(
+                c,
+                PhaseCause::TurnStarted { .. }
+                    | PhaseCause::GateCleared { .. }
+                    | PhaseCause::HandshakeDone
+            ),
+            Phase::NeedsYou => matches!(c, PhaseCause::GateRaised { .. }),
+            Phase::Exited { .. } | Phase::Failed { .. } => matches!(c, PhaseCause::Exited { .. }),
+            Phase::Lost { .. } => matches!(c, PhaseCause::Lost),
+        };
+        self.causes
+            .iter()
+            .rev()
+            .find(|c| leads_to(c))
+            .or(self.causes.last())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn finish(&mut self, mut em: Emitter, out: &mut Output, phase_before: &Phase) {
         if let Gen::Running(p) = &self.gen {
             if !self.handshake_done && p.is_ready() {
                 self.handshake_done = true;
+                self.causes.push(PhaseCause::HandshakeDone);
             }
         }
         let phase = self.compute_phase();
+        // The agent working while the session reads as not working (background work, a turn
+        // the CLI started by itself): once per such period.
+        if !self.anomaly_reported
+            && phase == *phase_before
+            && matches!(
+                phase,
+                Phase::Idle | Phase::Exited { .. } | Phase::Failed { .. }
+            )
+        {
+            let first = em.events.iter().find_map(|e| match &e.kind {
+                SessionEventKind::Agent { event } => activity(event),
+                _ => None,
+            });
+            if let Some(first) = first {
+                self.anomaly_reported = true;
+                em.push(SessionEventKind::Anomaly {
+                    anomaly: AnomalyKind::ActivityWhileIdle,
+                    first: first.to_string(),
+                });
+            }
+        }
         if phase != self.snap.phase {
             self.snap.phase = phase.clone();
-            em.push(SessionEventKind::Phase { phase });
+            self.anomaly_reported = false;
+            let cause = self.cause_for(&phase);
+            em.push(SessionEventKind::Phase { phase, cause });
         }
         if let Some(last) = em.events.last() {
             self.snap.cursor = last.cursor;
@@ -1446,7 +1781,7 @@ mod tests {
         assert_eq!(live.snapshot().phase, Phase::Idle);
         assert!(out.events.iter().any(|e| matches!(
             &e.kind,
-            SessionEventKind::Input { command: Command::AnswerGate { request_id, .. }, status: CommandStatus::Sent } if request_id == "x1"
+            SessionEventKind::Input { command: Command::AnswerGate { request_id, .. }, status: CommandStatus::Sent, .. } if request_id == "x1"
         )));
         // Raise + withdraw.
         feed(
@@ -1646,5 +1981,541 @@ mod tests {
         assert!(ev[0].cursor < ev[1].cursor);
         assert!(matches!(c.snapshot().phase, Phase::Lost { .. }));
         assert!(c.mark_lost("again").is_empty());
+    }
+
+    // ── inputs: first prompt, ids, written, drops, turn association, causes, anomaly ──
+
+    const RESULT_OK: &str =
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#;
+
+    /// Drives a core like the live actor (records in, the shim's `in` echo for writes when
+    /// asked), keeping the journal so a replay can be compared.
+    struct Sim {
+        core: Core,
+        j: J,
+        events: Vec<SessionEvent>,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Sim {
+                core: Core::new(wasit_claude::descriptor(), &meta()),
+                j: J::new(),
+                events: vec![],
+            }
+        }
+
+        /// Apply one record (no echo).
+        fn rec(&mut self, kind: Kind, data: serde_json::Value) -> Output {
+            let r = self.j.push(kind, data);
+            let out = self.core.apply(&r);
+            self.events.extend(out.events.clone());
+            out
+        }
+
+        /// The shim writes (and journals) every line `out` asked for.
+        fn echo(&mut self, out: &Output) {
+            for w in &out.writes {
+                self.rec(Kind::In, json!(w));
+            }
+        }
+
+        fn feed(&mut self, kind: Kind, data: serde_json::Value) -> Output {
+            let out = self.rec(kind, data);
+            self.echo(&out);
+            out
+        }
+
+        fn note(&mut self, n: RuntimeNote) -> Output {
+            self.feed(Kind::Note, n.to_value())
+        }
+
+        fn command(&mut self, command: Command) -> (InputId, Output) {
+            let out = self.note(RuntimeNote::Command {
+                token: format!("t{}", self.j.seq + 1),
+                command,
+            });
+            (InputId(self.j.seq - out.writes.len() as u64), out)
+        }
+
+        fn start(&mut self, first_prompt: Option<&str>) -> Output {
+            self.feed(Kind::Spawned, json!({"pid": 7, "argv": ["claude"]}));
+            self.note(RuntimeNote::Start {
+                spec: Box::new(SpawnSpec {
+                    first_prompt: first_prompt.map(str::to_string),
+                    session_id: Some("aaaaaaaaaaaa".into()),
+                    ..SpawnSpec::default()
+                }),
+            })
+        }
+
+        /// A fresh core over the same journal publishes exactly the same events and state.
+        fn assert_replay_exact(&self) {
+            let mut replay = Core::new(wasit_claude::descriptor(), &meta());
+            let mut events = vec![];
+            for r in &self.j.recs {
+                events.extend(replay.apply(r).events);
+            }
+            assert_eq!(events, self.events);
+            assert_eq!(replay.snapshot(), self.core.snapshot());
+            assert_eq!(
+                replay.owed().collect::<Vec<_>>(),
+                self.core.owed().collect::<Vec<_>>()
+            );
+            assert!(self.events.windows(2).all(|w| w[0].cursor < w[1].cursor));
+        }
+
+        fn kinds(&self) -> Vec<String> {
+            self.events.iter().map(|e| short(&e.kind)).collect()
+        }
+    }
+
+    /// A compact name of an event, with the input it is about.
+    fn short(k: &SessionEventKind) -> String {
+        let v = serde_json::to_value(k).unwrap();
+        let name = match k {
+            SessionEventKind::Agent { event } => serde_json::to_value(event).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            _ => v["kind"].as_str().unwrap().to_string(),
+        };
+        let input = match k {
+            SessionEventKind::Agent {
+                event:
+                    AgentEvent::InputSent { input }
+                    | AgentEvent::InputAcknowledged { input, .. }
+                    | AgentEvent::InputDropped { input, .. }
+                    | AgentEvent::TurnStarted {
+                        input: Some(input), ..
+                    },
+            }
+            | SessionEventKind::Input { input, .. }
+            | SessionEventKind::Written { input }
+            | SessionEventKind::WriteFailed {
+                input: Some(input), ..
+            } => Some(*input),
+            _ => None,
+        };
+        match input {
+            Some(i) => format!("{name}:{i}"),
+            None => name,
+        }
+    }
+
+    fn phases(sim: &Sim) -> Vec<(String, PhaseCause)> {
+        sim.events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Phase { phase, cause } => {
+                    Some((phase.name().to_string(), cause.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_first_prompt_is_an_ordinary_input_applied_with_the_start() {
+        let mut sim = Sim::new();
+        let out = sim.start(Some("hello"));
+        // Journaled in the start note (seq 2): its id is that seq.
+        let start_events: Vec<String> = out.events.iter().map(|e| short(&e.kind)).collect();
+        assert_eq!(start_events, ["started", "input:2"], "{:#?}", out.events);
+        assert!(matches!(
+            &out.events[0].kind,
+            SessionEventKind::Started {
+                generation: 1,
+                first_input: Some(InputId(2)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &out.events[1].kind,
+            SessionEventKind::Input {
+                command: Command::Prompt { text, .. },
+                status: CommandStatus::Queued,
+                ..
+            } if text == "hello"
+        ));
+        assert!(out.resolved.is_empty(), "nobody waits for a first prompt");
+        sim.feed(Kind::Out, json!(INIT_OK));
+        let k = sim.kinds();
+        let at = |name: &str| {
+            k.iter()
+                .position(|x| x == name)
+                .unwrap_or_else(|| panic!("{name} in {k:?}"))
+        };
+        assert!(at("input:2") < at("input_sent:2"));
+        assert!(at("input_sent:2") < at("turn_started:2"));
+        assert!(at("turn_started:2") < at("written:2"));
+        assert_eq!(k.iter().filter(|x| x.starts_with("input:")).count(), 1);
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.turn.as_ref().unwrap().prompt.as_deref(), Some("hello"));
+        assert_eq!(snap.title.as_deref(), Some("hello"));
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        assert_eq!(sim.core.snapshot().phase, Phase::Idle);
+        sim.assert_replay_exact();
+    }
+
+    /// A journal written by the build before input ids (the first prompt inside the journaled
+    /// spec, no session id, the lines that build wrote) replays with the `input` event and
+    /// without owing anything: nothing would be written twice after an upgrade.
+    #[test]
+    fn a_journal_of_the_previous_build_replays_with_the_first_prompt_input() {
+        let recs = [
+            (Kind::Spawned, json!({"pid": 7, "argv": ["claude"]})),
+            (
+                Kind::Note,
+                json!({"wasit":"start","spec":{"cwd":"/w","session_dir":"/d/sessions/aaaaaaaaaaaa","model":"haiku","resume":"fresh","first_prompt":"hello"}}),
+            ),
+            (
+                Kind::In,
+                json!(
+                    r#"{"request":{"hooks":null,"subtype":"initialize"},"request_id":"req_1","type":"control_request"}"#
+                ),
+            ),
+            (Kind::Out, json!(INIT_OK)),
+            (
+                Kind::In,
+                json!(
+                    r#"{"message":{"content":[{"text":"hello","type":"text"}],"role":"user"},"type":"user"}"#
+                ),
+            ),
+            (Kind::Out, json!(RESULT_OK)),
+        ];
+        let mut sim = Sim::new();
+        for (kind, data) in recs {
+            sim.rec(kind, data);
+        }
+        assert_eq!(sim.core.owed().count(), 0, "every line matched its echo");
+        assert_eq!(
+            sim.kinds(),
+            [
+                "spawned",
+                "started",
+                "input:2",
+                "slash_commands_updated",
+                "models_updated",
+                "modes_updated",
+                "input_sent:2",
+                "turn_started:2",
+                "phase",
+                "written:2",
+                "turn_completed",
+                "phase"
+            ]
+            .map(|s| s.to_string())
+        );
+        sim.assert_replay_exact();
+    }
+
+    #[test]
+    fn written_waits_for_every_line_of_the_input() {
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        let (go, _) = sim.command(Command::prompt("go"));
+        sim.feed(
+            Kind::Out,
+            json!(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#),
+        );
+        // The interrupt writes two lines (deny the gate, interrupt): echo one, a foreign line,
+        // then the other.
+        let out = sim.rec(
+            Kind::Note,
+            RuntimeNote::Command {
+                token: "i".into(),
+                command: Command::Interrupt,
+            }
+            .to_value(),
+        );
+        let interrupt = InputId(sim.j.seq);
+        assert_eq!(out.writes.len(), 2);
+        let written = |sim: &Sim| {
+            sim.events
+                .iter()
+                .filter(
+                    |e| matches!(e.kind, SessionEventKind::Written { input } if input == interrupt),
+                )
+                .count()
+        };
+        sim.rec(Kind::In, json!(out.writes[0]));
+        sim.rec(Kind::In, json!("a line someone else wrote"));
+        assert_eq!(written(&sim), 0);
+        sim.rec(Kind::In, json!(out.writes[1]));
+        assert_eq!(written(&sim), 1);
+        assert!(sim.kinds().contains(&format!("written:{go}")));
+        sim.assert_replay_exact();
+    }
+
+    #[test]
+    fn a_failed_stdin_write_is_reported_for_its_input() {
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        let (go, _) = sim.command(Command::prompt("go"));
+        let out = sim.rec(
+            Kind::Note,
+            json!({"stdin_error": "write to child stdin: Broken pipe (os error 32)"}),
+        );
+        assert!(matches!(
+            &out.events[..],
+            [SessionEvent { kind: SessionEventKind::WriteFailed { input: Some(i), error }, .. }]
+                if *i == go && error.contains("Broken pipe")
+        ));
+        sim.assert_replay_exact();
+    }
+
+    /// Inputs still queued in the protocol, or whose lines never reached the shim, are dropped
+    /// by the runtime when the generation ends — and only those.
+    #[test]
+    fn inputs_left_when_the_process_ends_are_dropped() {
+        let mut sim = Sim::new();
+        sim.start(Some("first"));
+        // Never written: the handshake does not complete.
+        let (second, _) = sim.command(Command::prompt("second"));
+        let out = sim.feed(Kind::Exited, json!({"code": 1}));
+        let drops: Vec<(InputId, InputDropReason)> = out
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Agent {
+                    event: AgentEvent::InputDropped { input, reason, .. },
+                } => Some((*input, *reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            drops,
+            [
+                (InputId(2), InputDropReason::ProcessEnded),
+                (second, InputDropReason::ProcessEnded)
+            ]
+        );
+        sim.assert_replay_exact();
+
+        // Written but never echoed (the shim died first), then lost.
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        let out = sim.rec(
+            Kind::Note,
+            RuntimeNote::Command {
+                token: "p".into(),
+                command: Command::prompt("go"),
+            }
+            .to_value(),
+        );
+        assert_eq!(out.writes.len(), 1);
+        let pending = InputId(sim.j.seq);
+        // Sent and echoed inputs are not dropped.
+        let (echoed, _) = sim.command(Command::SetModel {
+            model: "haiku".into(),
+        });
+        let lost = sim.core.mark_lost("gone");
+        let names: Vec<String> = lost.iter().map(|e| short(&e.kind)).collect();
+        assert_eq!(
+            names,
+            [
+                format!("input_dropped:{pending}"),
+                "lost".into(),
+                "phase".into()
+            ]
+        );
+        assert!(lost.windows(2).all(|w| w[0].cursor < w[1].cursor));
+        assert!(!names.contains(&format!("input_dropped:{echoed}")));
+        assert!(matches!(
+            &lost[2].kind,
+            SessionEventKind::Phase {
+                cause: PhaseCause::Lost,
+                ..
+            }
+        ));
+    }
+
+    /// The running turn names the prompt that started it — not a prompt an interrupt dropped
+    /// (the FIFO of prompt texts this replaces handed the next turn a dropped prompt's text).
+    #[test]
+    fn a_turn_after_an_interrupt_names_its_own_prompt() {
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        let (a, _) = sim.command(Command::prompt("A"));
+        let (b, out) = sim.command(Command::prompt("B"));
+        assert!(out.writes.is_empty(), "B waits behind A's turn");
+        let (c, _) = sim.command(Command::prompt("C"));
+        sim.command(Command::Interrupt);
+        sim.feed(
+            Kind::Out,
+            json!(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}"#),
+        );
+        let (d, _) = sim.command(Command::prompt("D"));
+        let k = sim.kinds();
+        for dropped in [b, c] {
+            assert!(k.contains(&format!("input_dropped:{dropped}")), "{k:?}");
+            assert!(!k.contains(&format!("turn_started:{dropped}")), "{k:?}");
+        }
+        assert!(k.contains(&format!("turn_started:{a}")));
+        assert!(k.contains(&format!("turn_started:{d}")));
+        assert_eq!(
+            sim.core.snapshot().turn.as_ref().unwrap().prompt.as_deref(),
+            Some("D")
+        );
+        sim.assert_replay_exact();
+    }
+
+    #[test]
+    fn every_phase_change_carries_its_cause() {
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        let (go, _) = sim.command(Command::prompt("go"));
+        sim.feed(
+            Kind::Out,
+            json!(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#),
+        );
+        sim.command(Command::AnswerGate {
+            request_id: "g1".into(),
+            decision: GateDecision::choose("allow"),
+        });
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        sim.note(RuntimeNote::Stop { token: "s".into() });
+        sim.feed(Kind::Exited, json!({"code": 0}));
+        assert_eq!(
+            phases(&sim),
+            [
+                ("idle".to_string(), PhaseCause::HandshakeDone),
+                (
+                    "working".into(),
+                    PhaseCause::TurnStarted { input: Some(go) }
+                ),
+                (
+                    "needs_you".into(),
+                    PhaseCause::GateRaised {
+                        request_id: "g1".into(),
+                        external: false
+                    }
+                ),
+                (
+                    "working".into(),
+                    PhaseCause::GateCleared {
+                        request_id: "g1".into(),
+                        how: GateClearing::Answered
+                    }
+                ),
+                (
+                    "idle".into(),
+                    PhaseCause::TurnCompleted {
+                        end_reason: None,
+                        interrupted: false
+                    }
+                ),
+                (
+                    "exited".into(),
+                    PhaseCause::Exited {
+                        code: Some(0),
+                        signal: None,
+                        requested: true,
+                        handshake_timeout: false
+                    }
+                ),
+            ]
+        );
+        assert!(sim.events.iter().any(|e| matches!(
+            &e.kind,
+            SessionEventKind::Notice {
+                code: NoticeCode::StopRequested,
+                ..
+            }
+        )));
+        sim.assert_replay_exact();
+    }
+
+    /// Output while the session reads as idle (a turn the CLI started by itself, background
+    /// work) is reported once per idle period.
+    #[test]
+    fn activity_while_idle_is_an_anomaly_once_per_idle_period() {
+        let mut sim = Sim::new();
+        sim.start(None);
+        sim.feed(Kind::Out, json!(INIT_OK));
+        let anomalies = |sim: &Sim| {
+            sim.events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    SessionEventKind::Anomaly { anomaly, first } => Some((*anomaly, first.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let tool = r#"{"type":"assistant","message":{"id":"m9","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        sim.feed(Kind::Out, json!(tool));
+        sim.feed(Kind::Out, json!(tool));
+        assert_eq!(
+            anomalies(&sim),
+            [(
+                AnomalyKind::ActivityWhileIdle,
+                "tool_call_started".to_string()
+            )]
+        );
+        // A turn of ours, then idle again: a new period.
+        sim.command(Command::prompt("go"));
+        sim.feed(
+            Kind::Out,
+            json!(r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#),
+        );
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        assert_eq!(anomalies(&sim).len(), 1);
+        sim.feed(Kind::Out, json!(tool));
+        assert_eq!(anomalies(&sim).len(), 2);
+        sim.assert_replay_exact();
+    }
+
+    /// The prompt of a continued session's first generation is not applied again.
+    #[test]
+    fn a_new_generation_starts_without_the_first_prompt() {
+        let mut sim = Sim::new();
+        sim.start(Some("hello"));
+        sim.feed(Kind::Out, json!(INIT_OK));
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        sim.note(RuntimeNote::Stop { token: "s".into() });
+        sim.feed(Kind::Exited, json!({"code": 0}));
+        // What `continue` journals: the stored spec without the first prompt.
+        sim.feed(
+            Kind::Spawned,
+            json!({"pid": 8, "argv": ["claude", "--resume", "x"]}),
+        );
+        let out = sim.note(RuntimeNote::Start {
+            spec: Box::new(SpawnSpec {
+                resume: ResumeMode::Resume("x".into()),
+                session_id: Some("aaaaaaaaaaaa".into()),
+                ..SpawnSpec::default()
+            }),
+        });
+        assert!(matches!(
+            &out.events[0].kind,
+            SessionEventKind::Started {
+                generation: 2,
+                resume: StartResume::Resume,
+                resume_id: Some(id),
+                first_input: None,
+                ..
+            } if id == "x"
+        ));
+        let prompts = sim
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    SessionEventKind::Input {
+                        command: Command::Prompt { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(prompts, 1);
+        sim.assert_replay_exact();
     }
 }

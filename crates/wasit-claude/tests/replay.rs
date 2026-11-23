@@ -1,11 +1,14 @@
-//! Replays real claude 2.1.326 transcripts (recorded with `wasit-smoke
-//! --record`) through `ClaudeProtocol` and checks the events and the exact
-//! lines written back.
+//! Replays real claude transcripts (recorded with `wasit-smoke --record`)
+//! through `ClaudeProtocol` and checks the events and the exact lines written
+//! back. CLI versions: 2.1.326 (basic, gates, interrupt, mode, resume,
+//! continue), 2.1.327 (the image fixtures), 2.1.293 (lifecycle: user messages
+//! carry a uuid; names and the home path in the CLI's own output sanitized,
+//! long lists trimmed).
 
 use serde_json::Value;
 use wasit_claude::{descriptor, ClaudeProtocol};
 use wasit_core::transcript::{parse, replay, Record, Replay};
-use wasit_core::{AgentEvent, EndReason, GateRequest, ResumeMode};
+use wasit_core::{AgentEvent, EndReason, GateRequest, InputDropReason, InputId, ResumeMode};
 
 fn load(name: &str) -> Vec<Record> {
     let path = format!(
@@ -298,4 +301,65 @@ fn read_of_a_png_reports_the_image_as_a_tool_result_part() {
             RED_PNG_B64
         )]
     );
+}
+
+// ── message lifecycle (claude 2.1.293) ──────────────────────────────────────
+
+/// The first prompt (input 1, journaled with the start) runs a long tool; two prompts sent
+/// meanwhile wait in the protocol (inputs 9, 10); an interrupt drops both and ends the turn;
+/// the next prompt (input 17) gets its own turn. Each prompt is acknowledged on the CLI's
+/// `command_lifecycle started` for its uuid — nothing else acknowledges.
+#[test]
+fn lifecycle_acknowledges_and_an_interrupt_drops_held_prompts() {
+    let r = run("lifecycle");
+    let users: Vec<Value> = r
+        .written
+        .iter()
+        .map(|l| json(l))
+        .filter(|v| v["type"] == "user")
+        .collect();
+    assert_eq!(users.len(), 2, "the dropped prompts were never written");
+    assert!(users.iter().all(|u| u["uuid"].is_string()));
+    assert_ne!(users[0]["uuid"], users[1]["uuid"]);
+    let ids = |f: &dyn Fn(&AgentEvent) -> Option<InputId>| -> Vec<InputId> {
+        r.events.iter().filter_map(f).collect()
+    };
+    assert_eq!(
+        ids(&|e| match e {
+            AgentEvent::InputAcknowledged { input, .. } => Some(*input),
+            _ => None,
+        }),
+        [InputId(1), InputId(17)]
+    );
+    assert_eq!(
+        ids(&|e| match e {
+            AgentEvent::TurnStarted { input, .. } => *input,
+            _ => None,
+        }),
+        [InputId(1), InputId(17)]
+    );
+    let drops: Vec<(InputId, InputDropReason)> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputDropped { input, reason, .. } => Some((*input, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        drops,
+        [
+            (InputId(9), InputDropReason::Interrupted),
+            (InputId(10), InputDropReason::Interrupted)
+        ]
+    );
+    let t = turns(&r);
+    assert_eq!(t.len(), 2);
+    assert_eq!((t[0].0, t[0].1), (Some(EndReason::Cancelled), true));
+    assert_eq!(t[1], (None, false, Some("after".into())));
+    // The running message had started: the interrupt asked to cancel nothing.
+    assert!(!r
+        .written
+        .iter()
+        .any(|l| json(l)["request"]["subtype"] == "cancel_async_message"));
 }

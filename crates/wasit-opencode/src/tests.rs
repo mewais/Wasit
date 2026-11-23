@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 use wasit_core::{
     AgentEvent, Command, DriverError, Encoded, EndReason, GateDecision, GateRequest,
-    QuestionAnswer, ResumeMode, SkillRef, Step,
+    InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, Step,
 };
 
 fn w(step: &Step) -> Vec<Value> {
@@ -32,13 +32,20 @@ fn ready() -> AcpProtocol {
 #[test]
 fn handshake_applies_launch_model_and_mode_then_first_prompt() {
     let mut p = AcpProtocol::new("wasit-kilo");
-    let step = p.start(&SpawnSpec {
+    let (spec, first) = SpawnSpec {
         cwd: Some("/c".into()),
         model: Some("opencode/free".into()),
         mode: "plan".into(),
         first_prompt: Some("hi".into()),
         ..SpawnSpec::default()
-    });
+    }
+    .split_first_prompt();
+    let step = p.start(&spec);
+    // The first prompt is the first input, encoded right after start.
+    assert_eq!(
+        p.encode(InputId(1), first.unwrap()).unwrap(),
+        Encoded::Queued
+    );
     assert_eq!(
         w(&step)[0],
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"wasit-kilo","version":env!("CARGO_PKG_VERSION")}}})
@@ -78,10 +85,16 @@ fn handshake_applies_launch_model_and_mode_then_first_prompt() {
         json!({"sessionId":"ses_1","configId":"mode","value":"plan"})
     );
     assert_eq!(lines[2]["method"], "session/prompt");
-    assert!(matches!(
-        step.events.last(),
-        Some(AgentEvent::TurnStarted { .. })
-    ));
+    assert_eq!(
+        step.events[step.events.len() - 2..],
+        [
+            AgentEvent::InputSent { input: InputId(1) },
+            AgentEvent::TurnStarted {
+                native_turn_id: None,
+                input: Some(InputId(1))
+            }
+        ]
+    );
 }
 
 #[test]
@@ -123,9 +136,12 @@ fn continue_lists_then_loads_latest() {
 #[test]
 fn prompt_turn_usage_and_queueing() {
     let mut p = ready();
-    let step = sent(p.encode(Command::prompt("a")));
+    let step = sent(p.encode(InputId(101), Command::prompt("a")));
     assert_eq!(w(&step)[0]["params"]["prompt"][0]["text"], "a");
-    assert_eq!(p.encode(Command::prompt("b")).unwrap(), Encoded::Queued);
+    assert_eq!(
+        p.encode(InputId(102), Command::prompt("b")).unwrap(),
+        Encoded::Queued
+    );
     let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{"type":"text","text":"Hi"}}}}"#).events;
     assert_eq!(
         ev,
@@ -177,43 +193,58 @@ fn permission_gate_options_and_answers() {
         }
         e => panic!("{e:?}"),
     }
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "c1".into(),
-        decision: GateDecision::choose("once"),
-    }));
+    let step = sent(p.encode(
+        InputId(103),
+        Command::AnswerGate {
+            request_id: "c1".into(),
+            decision: GateDecision::choose("once"),
+        },
+    ));
     assert_eq!(
         w(&step)[0],
         json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"once"}}})
     );
     for id in ["reject", "always"] {
         p.on_line(gate);
-        let step = sent(p.encode(Command::AnswerGate {
-            request_id: "c1".into(),
-            decision: GateDecision::choose(id),
-        }));
+        let step = sent(p.encode(
+            InputId(104),
+            Command::AnswerGate {
+                request_id: "c1".into(),
+                decision: GateDecision::choose(id),
+            },
+        ));
         assert_eq!(w(&step)[0]["result"]["outcome"]["optionId"], id);
     }
     // An id the agent did not offer is refused and the gate stays pending.
     p.on_line(gate);
     assert!(matches!(
-        p.encode(Command::AnswerGate {
-            request_id: "c1".into(),
-            decision: GateDecision::choose("nope"),
-        }),
+        p.encode(
+            InputId(105),
+            Command::AnswerGate {
+                request_id: "c1".into(),
+                decision: GateDecision::choose("nope"),
+            }
+        ),
         Err(DriverError::Invalid { .. })
     ));
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "c1".into(),
-        decision: GateDecision::choose("once"),
-    }));
+    let step = sent(p.encode(
+        InputId(106),
+        Command::AnswerGate {
+            request_id: "c1".into(),
+            decision: GateDecision::choose("once"),
+        },
+    ));
     assert_eq!(w(&step)[0]["result"]["outcome"]["optionId"], "once");
     // ACP has no question requests.
     p.on_line(gate);
     assert!(matches!(
-        p.encode(Command::AnswerQuestion {
-            request_id: "c1".into(),
-            answer: QuestionAnswer::default()
-        }),
+        p.encode(
+            InputId(107),
+            Command::AnswerQuestion {
+                request_id: "c1".into(),
+                answer: QuestionAnswer::default()
+            }
+        ),
         Err(DriverError::Invalid { .. })
     ));
 }
@@ -221,9 +252,9 @@ fn permission_gate_options_and_answers() {
 #[test]
 fn interrupt_cancels_gates_then_sends_cancel_notification() {
     let mut p = ready();
-    sent(p.encode(Command::prompt("a")));
+    sent(p.encode(InputId(108), Command::prompt("a")));
     p.on_line(r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"c2"},"options":[]}}"#);
-    let step = sent(p.encode(Command::Interrupt));
+    let step = sent(p.encode(InputId(109), Command::Interrupt));
     let lines = w(&step);
     assert_eq!(
         lines[0],
@@ -256,9 +287,12 @@ fn interrupt_cancels_gates_then_sends_cancel_notification() {
 #[test]
 fn config_updates_tools_subagents_and_slash() {
     let mut p = ready();
-    let step = sent(p.encode(Command::SetMode {
-        mode: "plan".into(),
-    }));
+    let step = sent(p.encode(
+        InputId(110),
+        Command::SetMode {
+            mode: "plan".into(),
+        },
+    ));
     assert_eq!(w(&step)[0]["method"], "session/set_config_option");
     let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"mode","currentValue":"plan","options":[]}]}}}"#).events;
     assert_eq!(
@@ -285,10 +319,13 @@ fn config_updates_tools_subagents_and_slash() {
     assert!(
         matches!(&ev[0], AgentEvent::SlashCommandsUpdated { commands } if commands[0].argument_hint == "[pr]")
     );
-    let step = sent(p.encode(Command::RunSlash {
-        name: "review".into(),
-        args: "12".into(),
-    }));
+    let step = sent(p.encode(
+        InputId(111),
+        Command::RunSlash {
+            name: "review".into(),
+            args: "12".into(),
+        },
+    ));
     assert_eq!(w(&step)[0]["params"]["prompt"][0]["text"], "/review 12");
     let step = p.on_line(r#"{"jsonrpc":"2.0","id":5,"method":"fs/read_text_file","params":{}}"#);
     assert_eq!(w(&step)[0]["error"]["code"], -32601);
@@ -414,15 +451,15 @@ fn determinism_same_inputs_same_outputs() {
         let mut out = vec![format!(
             "{:?}",
             p.start(&SpawnSpec {
-                first_prompt: Some("a".into()),
                 model: Some("opencode/free".into()),
                 ..SpawnSpec::default()
             })
         )];
+        out.push(format!("{:?}", p.encode(InputId(1), Command::prompt("a"))));
         for l in [r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, SESSION_NEW] {
             out.push(format!("{:?}", p.on_line(l)));
         }
-        out.push(format!("{:?}", p.encode(Command::Interrupt)));
+        out.push(format!("{:?}", p.encode(InputId(112), Command::Interrupt)));
         out
     };
     assert_eq!(run(), run());
@@ -655,5 +692,81 @@ fn agent_and_tool_media_become_parts() {
             }],
             message_id: Some("m".into()),
         }]
+    );
+}
+
+// ── queued prompts leave the queue visibly ──────────────────────────────────
+
+fn drops(events: &[AgentEvent]) -> Vec<(InputId, InputDropReason)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputDropped { input, reason, .. } => Some((*input, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn interrupt_drops_the_prompts_queued_behind_the_turn() {
+    let mut p = ready();
+    let step = sent(p.encode(InputId(10), Command::prompt("go")));
+    assert!(step.events.contains(&AgentEvent::TurnStarted {
+        native_turn_id: None,
+        input: Some(InputId(10))
+    }));
+    assert_eq!(
+        p.encode(InputId(11), Command::prompt("a")).unwrap(),
+        Encoded::Queued
+    );
+    assert_eq!(
+        p.encode(
+            InputId(12),
+            Command::RunSlash {
+                name: "review".into(),
+                args: String::new()
+            }
+        )
+        .unwrap(),
+        Encoded::Queued
+    );
+    let step = sent(p.encode(InputId(13), Command::Interrupt));
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(11), InputDropReason::Interrupted),
+            (InputId(12), InputDropReason::Interrupted)
+        ]
+    );
+    assert_eq!(w(&step)[0]["method"], "session/cancel");
+}
+
+#[test]
+fn interrupt_before_ready_and_shutdown_drop_what_is_queued() {
+    let mut p = AcpProtocol::new("x");
+    p.start(&SpawnSpec::default());
+    p.encode(InputId(2), Command::prompt("a")).unwrap();
+    p.encode(
+        InputId(3),
+        Command::SetMode {
+            mode: "plan".into(),
+        },
+    )
+    .unwrap();
+    let step = sent(p.encode(InputId(4), Command::Interrupt));
+    assert!(step.write.is_empty());
+    assert_eq!(
+        drops(&step.events),
+        vec![(InputId(2), InputDropReason::Interrupted)]
+    );
+    p.encode(InputId(5), Command::prompt("b")).unwrap();
+    let step = sent(p.encode(InputId(6), Command::Shutdown));
+    assert!(step.close_stdin);
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(3), InputDropReason::Shutdown),
+            (InputId(5), InputDropReason::Shutdown)
+        ]
     );
 }

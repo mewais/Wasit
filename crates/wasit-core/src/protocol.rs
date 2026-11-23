@@ -75,10 +75,30 @@ pub enum Encoded {
     /// The command was encoded now; perform the step.
     Sent(Step),
     /// The protocol is still handshaking (or waiting on a value it needs,
-    /// e.g. the active turn id) and buffered the command. Its lines will be
-    /// part of the [`Step`] returned by a later `on_line`, in the order the
-    /// commands were encoded.
+    /// e.g. the active turn id, or for the running turn to end) and buffered
+    /// the command. Its lines will be part of the [`Step`] returned by a later
+    /// `on_line`, in the order the commands were encoded; that step carries
+    /// [`AgentEvent::InputSent`] for it. A buffered command the protocol
+    /// gives up on is reported with [`AgentEvent::InputDropped`].
     Queued,
+}
+
+/// The identity of one input (a command the runtime journaled): the journal seq of the note
+/// that carried it (the `start` note for a session's first prompt). Assigned by the journal,
+/// so a replay reproduces it; drivers echo it back in [`AgentEvent::InputSent`],
+/// [`AgentEvent::InputAcknowledged`], [`AgentEvent::InputDropped`] and
+/// [`AgentEvent::TurnStarted`]. `0` means "unknown" (an event from a peer that predates ids).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(transparent)]
+pub struct InputId(pub u64);
+
+impl std::fmt::Display for InputId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// A user/runtime command for the CLI.
@@ -163,15 +183,18 @@ pub enum DriverError {
 /// A pure, deterministic driver state machine. See the module docs.
 pub trait Protocol: Send {
     /// Lines to write right after the process starts (the handshake opener).
-    /// Called exactly once, before any `on_line` or `encode`.
+    /// Called exactly once, before any `on_line` or `encode`. A session's first
+    /// prompt is not part of the spec the protocol sees: it arrives as the first
+    /// `encode` (see [`SpawnSpec::split_first_prompt`]).
     fn start(&mut self, spec: &SpawnSpec) -> Step;
 
     /// Feed one line the CLI wrote to stdout (without the newline).
     fn on_line(&mut self, line: &str) -> Step;
 
-    /// Encode a command. `Err(Unsupported)` only when the descriptor's
-    /// capabilities say the operation is unsupported.
-    fn encode(&mut self, cmd: Command) -> Result<Encoded, DriverError>;
+    /// Encode a command. `input` is its identity; every event the protocol reports about this
+    /// command later carries it. `Err(Unsupported)` only when the descriptor's capabilities say
+    /// the operation is unsupported.
+    fn encode(&mut self, input: InputId, cmd: Command) -> Result<Encoded, DriverError>;
 
     /// `true` once the handshake has completed and the CLI accepts commands
     /// (commands are no longer queued *for the handshake*; they may still be

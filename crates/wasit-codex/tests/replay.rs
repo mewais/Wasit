@@ -90,7 +90,8 @@ fn handshake_and_turn() {
     assert!(r.events.iter().any(|e| matches!(
         e,
         AgentEvent::TurnStarted {
-            native_turn_id: Some(_)
+            native_turn_id: Some(_),
+            ..
         }
     )));
     assert!(r.events.iter().any(
@@ -142,7 +143,7 @@ fn interrupt_uses_turn_id_and_declines_gate() {
         .events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::TurnStarted { native_turn_id } => native_turn_id.clone(),
+            AgentEvent::TurnStarted { native_turn_id, .. } => native_turn_id.clone(),
             _ => None,
         })
         .collect();

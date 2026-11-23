@@ -34,8 +34,9 @@ use wasit_core::wire::{
 };
 use wasit_core::{
     AgentEvent, Attachment, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
-    GateChoice, GateChoiceKind, GateDecision, GateRequest, MediaSource, ModelInfo, OutLine,
-    PlanEntry, Protocol, ResumeMode, SessionMode, SlashCommandInfo, SpawnSpec, Step, Usage,
+    GateChoice, GateChoiceKind, GateDecision, GateRequest, InputDropReason, InputId, MediaSource,
+    ModelInfo, OutLine, PlanEntry, Protocol, ResumeMode, SessionMode, SlashCommandInfo, SpawnSpec,
+    Step, Usage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +84,7 @@ pub struct AcpProtocol {
     phase: Phase,
     next_id: u64,
     outstanding: HashMap<u64, Req>,
-    queue: VecDeque<Command>,
+    queue: VecDeque<(InputId, Command)>,
     spec: SpawnSpec,
     session_id: Option<String>,
     can_list: bool,
@@ -252,10 +253,10 @@ impl AcpProtocol {
         }
     }
 
-    fn encode_now(&mut self, cmd: Command) -> Result<Step, DriverError> {
+    fn encode_now(&mut self, input: InputId, cmd: Command) -> Result<Step, DriverError> {
         let mut step = Step::default();
         match cmd {
-            Command::Prompt { text, attachments } => step = self.prompt(&text, &attachments),
+            Command::Prompt { text, attachments } => step = self.prompt(input, &text, &attachments),
             Command::RunSlash { name, args } => {
                 let name = name.trim_start_matches('/');
                 let text = if args.trim().is_empty() {
@@ -263,7 +264,7 @@ impl AcpProtocol {
                 } else {
                     format!("/{name} {}", args.trim())
                 };
-                step = self.prompt(&text, &[]);
+                step = self.prompt(input, &text, &[]);
             }
             Command::AnswerGate {
                 request_id,
@@ -294,14 +295,17 @@ impl AcpProtocol {
             }
             Command::Shutdown => {
                 self.phase = Phase::Closed;
-                self.queue.clear();
+                step.events = std::mem::take(&mut self.queue)
+                    .into_iter()
+                    .map(|(input, _)| dropped(input, InputDropReason::Shutdown))
+                    .collect();
                 step.close_stdin = true;
             }
         }
         Ok(step)
     }
 
-    fn prompt(&mut self, text: &str, attachments: &[Attachment]) -> Step {
+    fn prompt(&mut self, input: InputId, text: &str, attachments: &[Attachment]) -> Step {
         self.prompt_active = true;
         self.cancel_sent = false;
         let blocks = prompt_blocks(text, attachments, self.prompt_image, self.prompt_embedded);
@@ -313,6 +317,7 @@ impl AcpProtocol {
         Step {
             events: vec![AgentEvent::TurnStarted {
                 native_turn_id: None,
+                input: Some(input),
             }],
             write: vec![line],
             close_stdin: false,
@@ -330,10 +335,20 @@ impl AcpProtocol {
         Ok(self.gates.remove(pos))
     }
 
+    /// Take the queued prompts out of the queue: one `InputDropped` each, in queue order.
+    fn drop_queued_prompts(&mut self, reason: InputDropReason) -> Vec<AgentEvent> {
+        let (prompts, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.queue)
+            .into_iter()
+            .partition(|(_, c)| matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
+        self.queue = rest;
+        prompts
+            .into_iter()
+            .map(|(input, _)| dropped(input, reason))
+            .collect()
+    }
+
     fn interrupt(&mut self) -> Step {
-        let mut step = Step::default();
-        self.queue
-            .retain(|c| !matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
+        let mut step = events(self.drop_queued_prompts(InputDropReason::Interrupted));
         for g in std::mem::take(&mut self.gates) {
             step.write.push(cancelled(&g.raw_id));
             step.events.push(AgentEvent::GateResolved {
@@ -353,18 +368,21 @@ impl AcpProtocol {
 
     fn drain(&mut self) -> Step {
         let mut step = Step::default();
-        while let Some(cmd) = self.queue.front() {
+        while let Some((_, cmd)) = self.queue.front() {
             let prompt = matches!(cmd, Command::Prompt { .. } | Command::RunSlash { .. });
             if self.phase != Phase::Ready || (prompt && self.prompt_active) {
                 break;
             }
-            let cmd = self.queue.pop_front().expect("front exists");
-            let name = cmd.name();
-            match self.encode_now(cmd) {
-                Ok(s) => step.extend(s),
-                Err(e) => step.events.push(AgentEvent::CommandRejected {
-                    command: name.into(),
-                    message: e.to_string(),
+            let (input, cmd) = self.queue.pop_front().expect("front exists");
+            match self.encode_now(input, cmd) {
+                Ok(s) => {
+                    step.events.push(AgentEvent::InputSent { input });
+                    step.extend(s);
+                }
+                Err(e) => step.events.push(AgentEvent::InputDropped {
+                    input,
+                    reason: InputDropReason::Unencodable,
+                    error: Some(e.to_string()),
                 }),
             }
         }
@@ -782,9 +800,6 @@ impl Protocol for AcpProtocol {
     fn start(&mut self, spec: &SpawnSpec) -> Step {
         self.spec = spec.clone();
         self.phase = Phase::Handshaking;
-        if let Some(p) = &spec.first_prompt {
-            self.queue.push_back(Command::prompt(p.clone()));
-        }
         let line = self.request(
             Req::Initialize,
             "initialize",
@@ -825,20 +840,20 @@ impl Protocol for AcpProtocol {
         self.phase == Phase::Ready
     }
 
-    fn encode(&mut self, cmd: Command) -> Result<Encoded, DriverError> {
+    fn encode(&mut self, input: InputId, cmd: Command) -> Result<Encoded, DriverError> {
         if self.phase == Phase::Closed {
             return Err(DriverError::Shutdown);
         }
         if matches!(cmd, Command::Interrupt) && self.phase != Phase::Ready {
-            self.queue
-                .retain(|c| !matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
-            return Ok(Encoded::Sent(Step::default()));
+            // Nothing is running yet: what the interrupt clears is the queued prompts.
+            let dropped = self.drop_queued_prompts(InputDropReason::Interrupted);
+            return Ok(Encoded::Sent(events(dropped)));
         }
         if self.must_queue(&cmd) {
-            self.queue.push_back(cmd);
+            self.queue.push_back((input, cmd));
             return Ok(Encoded::Queued);
         }
-        self.encode_now(cmd).map(Encoded::Sent)
+        self.encode_now(input, cmd).map(Encoded::Sent)
     }
 }
 
@@ -846,6 +861,14 @@ fn events(events: Vec<AgentEvent>) -> Step {
     Step {
         events,
         ..Step::default()
+    }
+}
+
+fn dropped(input: InputId, reason: InputDropReason) -> AgentEvent {
+    AgentEvent::InputDropped {
+        input,
+        reason,
+        error: None,
     }
 }
 

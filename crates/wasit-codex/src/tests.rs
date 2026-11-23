@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 use wasit_core::{
     AgentEvent, Command, DriverError, Encoded, EndReason, GateDecision, GateRequest,
-    QuestionAnswer, ResumeMode, SkillRef, Step,
+    InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, Step,
 };
 
 fn w(step: &Step) -> Vec<Value> {
@@ -31,12 +31,19 @@ fn ready() -> CodexProtocol {
 #[test]
 fn handshake_order_and_session_init() {
     let mut p = CodexProtocol::new();
-    let step = p.start(&SpawnSpec {
+    let (spec, first) = SpawnSpec {
         cwd: Some("/c".into()),
         model: Some("gpt".into()),
         first_prompt: Some("hi".into()),
         ..SpawnSpec::default()
-    });
+    }
+    .split_first_prompt();
+    let step = p.start(&spec);
+    // The first prompt is the first input, encoded right after start.
+    assert_eq!(
+        p.encode(InputId(1), first.unwrap()).unwrap(),
+        Encoded::Queued
+    );
     assert_eq!(w(&step)[0]["method"], "initialize");
     assert_eq!(
         w(&step)[0]["params"]["capabilities"]["experimentalApi"],
@@ -44,7 +51,8 @@ fn handshake_order_and_session_init() {
     );
     // Commands wait for the handshake.
     assert_eq!(
-        p.encode(Command::SetModel { model: "x".into() }).unwrap(),
+        p.encode(InputId(101), Command::SetModel { model: "x".into() })
+            .unwrap(),
         Encoded::Queued
     );
     let step = p.on_line(r#"{"id":1,"result":{}}"#);
@@ -66,8 +74,7 @@ fn handshake_order_and_session_init() {
     );
     let lines = w(&step);
     assert_eq!(lines[0]["method"], "collaborationMode/list");
-    // Queued commands in order: the first prompt (queued by start), then
-    // set_model.
+    // Queued commands in order: the first prompt, then set_model.
     assert_eq!(lines[1]["method"], "turn/start");
     assert_eq!(lines[1]["params"]["input"][0]["text"], "hi");
     assert_eq!(lines[2]["method"], "thread/settings/update");
@@ -101,10 +108,12 @@ fn continue_lists_latest_thread_then_resumes() {
     assert_eq!(lines[0]["method"], "thread/start");
 }
 
+const PROMPT_ID: InputId = InputId(102);
+
 #[test]
 fn turn_lifecycle_usage_and_reply() {
     let mut p = ready();
-    let s = sent(p.encode(Command::prompt("go")));
+    let s = sent(p.encode(InputId(102), Command::prompt("go")));
     let id = w(&s)[0]["id"].as_u64().unwrap();
     p.on_line(&format!(
         r#"{{"id":{id},"result":{{"turn":{{"id":"u1","status":"inProgress","items":[]}}}}}}"#
@@ -115,7 +124,8 @@ fn turn_lifecycle_usage_and_reply() {
     assert_eq!(
         ev,
         vec![AgentEvent::TurnStarted {
-            native_turn_id: Some("u1".into())
+            native_turn_id: Some("u1".into()),
+            input: Some(PROMPT_ID)
         }]
     );
     let ev = p
@@ -143,9 +153,12 @@ fn turn_lifecycle_usage_and_reply() {
 #[test]
 fn prompt_during_turn_is_steered_with_turn_id() {
     let mut p = ready();
-    sent(p.encode(Command::prompt("a")));
+    sent(p.encode(InputId(103), Command::prompt("a")));
     // Turn id unknown yet: queued.
-    assert_eq!(p.encode(Command::prompt("b")).unwrap(), Encoded::Queued);
+    assert_eq!(
+        p.encode(InputId(104), Command::prompt("b")).unwrap(),
+        Encoded::Queued
+    );
     let step = p.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"u9"}}}"#);
     let lines = w(&step);
     assert_eq!(lines[0]["method"], "turn/steer");
@@ -156,9 +169,11 @@ fn prompt_during_turn_is_steered_with_turn_id() {
 #[test]
 fn interrupt_uses_tracked_turn_and_declines_gates() {
     let mut p = ready();
-    sent(p.encode(Command::prompt("a")));
+    sent(p.encode(InputId(105), Command::prompt("a")));
     // Interrupt before the turn id is known waits for it.
-    assert!(sent(p.encode(Command::Interrupt)).write.is_empty());
+    assert!(sent(p.encode(InputId(106), Command::Interrupt))
+        .write
+        .is_empty());
     let step = p.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"u2"}}}"#);
     let lines = w(&step);
     assert_eq!(lines[0]["method"], "turn/interrupt");
@@ -174,10 +189,10 @@ fn interrupt_uses_tracked_turn_and_declines_gates() {
     ));
 
     // With a pending gate: decline first, then interrupt.
-    sent(p.encode(Command::prompt("b")));
+    sent(p.encode(InputId(107), Command::prompt("b")));
     p.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"u3"}}}"#);
     p.on_line(r#"{"method":"item/commandExecution/requestApproval","id":0,"params":{"itemId":"call_1","command":"touch x","cwd":"/c"}}"#);
-    let step = sent(p.encode(Command::Interrupt));
+    let step = sent(p.encode(InputId(108), Command::Interrupt));
     let lines = w(&step);
     assert_eq!(
         lines[0],
@@ -207,10 +222,13 @@ fn gates_route_by_item_id_and_encode_per_method() {
         }
         e => panic!("{e:?}"),
     }
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "call_3".into(),
-        decision: GateDecision::choose("accept"),
-    }));
+    let step = sent(p.encode(
+        InputId(109),
+        Command::AnswerGate {
+            request_id: "call_3".into(),
+            decision: GateDecision::choose("accept"),
+        },
+    ));
     assert_eq!(
         w(&step)[0],
         json!({"jsonrpc":"2.0","id":0,"result":{"decision":"accept"}})
@@ -240,40 +258,52 @@ fn gates_route_by_item_id_and_encode_per_method() {
         gate.choices()[1].description,
         "commands starting with `curl`"
     );
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "call_4".into(),
-        decision: GateDecision::choose("acceptWithExecpolicyAmendment"),
-    }));
+    let step = sent(p.encode(
+        InputId(110),
+        Command::AnswerGate {
+            request_id: "call_4".into(),
+            decision: GateDecision::choose("acceptWithExecpolicyAmendment"),
+        },
+    ));
     assert_eq!(
         w(&step)[0]["result"],
         json!({"decision":{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["curl"]}}})
     );
 
     p.on_line(r#"{"method":"execCommandApproval","id":5,"params":{"command":["ls"]}}"#);
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "codex:5".into(),
-        decision: GateDecision::choose("approved_for_session"),
-    }));
+    let step = sent(p.encode(
+        InputId(111),
+        Command::AnswerGate {
+            request_id: "codex:5".into(),
+            decision: GateDecision::choose("approved_for_session"),
+        },
+    ));
     assert_eq!(
         w(&step)[0]["result"],
         json!({"decision":"approved_for_session"})
     );
 
     p.on_line(r#"{"method":"item/permissions/requestApproval","id":6,"params":{"itemId":"p1","permissions":{"network":{"enabled":true}}}}"#);
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "p1".into(),
-        decision: GateDecision::choose("accept"),
-    }));
+    let step = sent(p.encode(
+        InputId(112),
+        Command::AnswerGate {
+            request_id: "p1".into(),
+            decision: GateDecision::choose("accept"),
+        },
+    ));
     assert_eq!(
         w(&step)[0]["result"],
         json!({"permissions":{"network":{"enabled":true}},"scope":"turn"})
     );
 
     p.on_line(r#"{"method":"mcpServer/elicitation/request","id":7,"params":{"serverName":"hares","message":"ok?","requestedSchema":{"properties":{"grant":{"enum":["once"]}}}}}"#);
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "codex:7".into(),
-        decision: GateDecision::choose("decline"),
-    }));
+    let step = sent(p.encode(
+        InputId(113),
+        Command::AnswerGate {
+            request_id: "codex:7".into(),
+            decision: GateDecision::choose("decline"),
+        },
+    ));
     assert_eq!(w(&step)[0]["result"], json!({"action":"decline"}));
 
     // A gate resolved by codex itself.
@@ -298,19 +328,25 @@ fn user_input_question_maps_text_to_ids() {
         matches!(&ev[0], AgentEvent::GateRequested { gate: GateRequest::Question { questions, .. } } if questions[0].options[0].label == "Red")
     );
     assert!(matches!(
-        p.encode(Command::AnswerGate {
-            request_id: "q1".into(),
-            decision: GateDecision::choose("accept")
-        }),
+        p.encode(
+            InputId(114),
+            Command::AnswerGate {
+                request_id: "q1".into(),
+                decision: GateDecision::choose("accept")
+            }
+        ),
         Err(DriverError::Invalid { .. })
     ));
     let mut a = QuestionAnswer::default();
     a.answers
         .insert("color".into(), vec!["Red".into(), "Blue".into()]);
-    let step = sent(p.encode(Command::AnswerQuestion {
-        request_id: "q1".into(),
-        answer: a,
-    }));
+    let step = sent(p.encode(
+        InputId(115),
+        Command::AnswerQuestion {
+            request_id: "q1".into(),
+            answer: a,
+        },
+    ));
     assert_eq!(
         w(&step)[0]["result"],
         json!({"answers":{"color":{"answers":["Red","Blue"]}}})
@@ -324,9 +360,12 @@ fn modes_model_and_settings_updates() {
     assert!(
         matches!(&ev[0], AgentEvent::ModesUpdated { available_modes, current_mode: None } if available_modes.len() == 2 && available_modes[0].label == "Plan")
     );
-    let step = sent(p.encode(Command::SetMode {
-        mode: "plan".into(),
-    }));
+    let step = sent(p.encode(
+        InputId(116),
+        Command::SetMode {
+            mode: "plan".into(),
+        },
+    ));
     assert_eq!(
         w(&step)[0]["params"],
         json!({"threadId":"t1","collaborationMode":{"mode":"plan","settings":{"model":"m","developer_instructions":null}}})
@@ -341,9 +380,12 @@ fn modes_model_and_settings_updates() {
     );
     let ev = p.on_line(r#"{"method":"thread/settings/updated","params":{"threadSettings":{"model":"m2","collaborationMode":{"mode":"plan"}}}}"#).events;
     assert_eq!(ev, vec![AgentEvent::ModelChanged { model: "m2".into() }]);
-    let s = sent(p.encode(Command::SetModel {
-        model: "bad".into(),
-    }));
+    let s = sent(p.encode(
+        InputId(117),
+        Command::SetModel {
+            model: "bad".into(),
+        },
+    ));
     let id = w(&s)[0]["id"].as_u64().unwrap();
     let ev = p
         .on_line(&format!(
@@ -382,10 +424,13 @@ fn tool_items_and_unknown_server_requests() {
     let step = p.on_line(r#"{"method":"currentTime/read","id":44,"params":{}}"#);
     assert_eq!(w(&step)[0]["error"]["code"], -32601);
     assert!(p
-        .encode(Command::RunSlash {
-            name: "x".into(),
-            args: String::new()
-        })
+        .encode(
+            InputId(99),
+            Command::RunSlash {
+                name: "x".into(),
+                args: String::new()
+            }
+        )
         .is_err());
 }
 
@@ -482,13 +527,8 @@ fn sessions_parser() {
 fn determinism_same_inputs_same_outputs() {
     let run = || {
         let mut p = CodexProtocol::new();
-        let mut out = vec![format!(
-            "{:?}",
-            p.start(&SpawnSpec {
-                first_prompt: Some("a".into()),
-                ..SpawnSpec::default()
-            })
-        )];
+        let mut out = vec![format!("{:?}", p.start(&SpawnSpec::default()))];
+        out.push(format!("{:?}", p.encode(InputId(1), Command::prompt("a"))));
         for l in [
             r#"{"id":1,"result":{}}"#,
             r#"{"id":3,"result":{"thread":{"id":"t"},"model":"m"}}"#,
@@ -497,7 +537,7 @@ fn determinism_same_inputs_same_outputs() {
         ] {
             out.push(format!("{:?}", p.on_line(l)));
         }
-        out.push(format!("{:?}", p.encode(Command::Interrupt)));
+        out.push(format!("{:?}", p.encode(InputId(118), Command::Interrupt)));
         out
     };
     assert_eq!(run(), run());
@@ -590,10 +630,13 @@ fn images_go_as_local_images_and_files_by_path() {
         path: format!("/up/{name}"),
         data: None,
     };
-    let s = sent(p.encode(Command::Prompt {
-        text: "see".into(),
-        attachments: vec![att("a.png", "image/png"), att("r.pdf", "application/pdf")],
-    }));
+    let s = sent(p.encode(
+        InputId(119),
+        Command::Prompt {
+            text: "see".into(),
+            attachments: vec![att("a.png", "image/png"), att("r.pdf", "application/pdf")],
+        },
+    ));
     let input = &w(&s)[0]["params"]["input"];
     assert_eq!(input[0]["type"], "text");
     assert!(input[0]["text"]
@@ -615,5 +658,96 @@ fn image_view_items_carry_the_image_path() {
     };
     assert!(
         matches!(&parts[0], wasit_core::ContentPart::Image { mime, source: wasit_core::MediaSource::Path { path }, .. } if mime == "image/png" && path == "/w/p.png")
+    );
+}
+
+// ── queued prompts leave the queue visibly ──────────────────────────────────
+
+fn drops(events: &[AgentEvent]) -> Vec<(InputId, InputDropReason)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputDropped { input, reason, .. } => Some((*input, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn interrupt_drops_prompts_waiting_for_the_turn_id() {
+    let mut p = ready();
+    // `turn/start` written, its turn id not known yet: later prompts wait.
+    let start = sent(p.encode(InputId(10), Command::prompt("go")));
+    let start_id = w(&start)[0]["id"].as_u64().unwrap();
+    assert_eq!(
+        p.encode(InputId(11), Command::prompt("a")).unwrap(),
+        Encoded::Queued
+    );
+    assert_eq!(
+        p.encode(InputId(12), Command::prompt("b")).unwrap(),
+        Encoded::Queued
+    );
+    let step = sent(p.encode(InputId(13), Command::Interrupt));
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(11), InputDropReason::Interrupted),
+            (InputId(12), InputDropReason::Interrupted)
+        ]
+    );
+    // The turn id arrives: the deferred interrupt goes out, nothing else.
+    let step = p.on_line(&format!(
+        r#"{{"id":{start_id},"result":{{"turn":{{"id":"u1"}}}}}}"#
+    ));
+    let lines = w(&step);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["method"], "turn/interrupt");
+}
+
+#[test]
+fn interrupt_before_ready_and_shutdown_drop_what_is_queued() {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec::default());
+    p.encode(InputId(2), Command::prompt("a")).unwrap();
+    p.encode(InputId(3), Command::SetModel { model: "x".into() })
+        .unwrap();
+    let step = sent(p.encode(InputId(4), Command::Interrupt));
+    assert!(step.write.is_empty());
+    assert_eq!(
+        drops(&step.events),
+        vec![(InputId(2), InputDropReason::Interrupted)]
+    );
+    p.encode(InputId(5), Command::prompt("b")).unwrap();
+    let step = sent(p.encode(InputId(6), Command::Shutdown));
+    assert!(step.close_stdin);
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(3), InputDropReason::Shutdown),
+            (InputId(5), InputDropReason::Shutdown)
+        ]
+    );
+}
+
+#[test]
+fn drained_commands_report_input_sent() {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec::default());
+    p.encode(InputId(2), Command::prompt("a")).unwrap();
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    let step = p.on_line(r#"{"id":3,"result":{"thread":{"id":"t1"},"model":"m"}}"#);
+    assert!(step
+        .events
+        .contains(&AgentEvent::InputSent { input: InputId(2) }));
+    // The turn it started names it.
+    let ev = p
+        .on_line(r#"{"method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1"}}}"#)
+        .events;
+    assert_eq!(
+        ev[0],
+        AgentEvent::TurnStarted {
+            native_turn_id: Some("u1".into()),
+            input: Some(InputId(2))
+        }
     );
 }

@@ -99,7 +99,15 @@ claude and codex.
 ## Fidelity
 
 `reference/<persona>/*.jsonl` are real exchanges recorded from claude 2.1.326, opencode 1.19.6,
-kilo 7.8.27 and codex-cli 0.169.1 (see `reference/record/README.md` for how). The personas clone
+kilo 7.8.27 and codex-cli 0.169.1 (see `reference/record/README.md` for how);
+`reference/claude/lifecycle.jsonl` is from claude 2.1.293 (sanitized: home path, MCP server and
+skill names). The claude persona reports the lifecycle of a user message that carries a `uuid`
+the way that recording shows: `command_lifecycle` `queued` when the line is read, `started`
+before the turn's `system/init`, `completed` / `cancelled` (interrupted) after its `result`,
+whose `user_message_uuids` lists it; `cancel_async_message` removes a still-queued message
+(`cancelled` frame, then `{cancelled:true}`) and answers `{cancelled:false}` for one that
+started; `interrupt` answers `still_queued` with the messages read during the turn, which then
+run as their own turns. The personas clone
 large static objects (claude `system/init` and the initialize reply, codex thread objects, ACP
 `initialize`) straight from those recordings, and `tests/reference.rs` replays the client side of
 every recording against the fake and compares message structure (keys and JSON kinds, not values).
@@ -108,6 +116,10 @@ Known gaps: JSON key order is alphabetical, not the real CLI's order; codex `fil
 codex reasoning items, ACP `plan` updates (real opencode reports todos as a `todowrite` tool call,
 the ACP spec shape is emitted here) and claude `ExitPlanMode` were not captured from the real
 CLIs and follow the protocol specs; claude `rate_limit_event` and codex `warning` /
-`account/rateLimits/updated` / `thread/readState/changed` noise is not emitted; `session/load`
+`account/rateLimits/updated` / `thread/readState/changed` noise is not emitted; claude's
+`system/init` is printed once, not at the start of every turn; a claude message read during a
+turn waits for the next turn, while the real CLI may also take it into the running turn at its
+next model call (`started` mid-turn, one `result` listing both); the lifecycle state after a
+failed turn was not recorded (`completed` is sent); `session/load`
 history replay and codex `thread/resume` history are simplified; kilo's `effort` config option is
 not advertised.

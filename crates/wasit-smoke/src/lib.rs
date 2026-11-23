@@ -12,10 +12,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command as Proc};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Instant};
-use wasit_core::transcript::{to_line, Record};
+use wasit_core::transcript::{input_id, to_line, Record};
 use wasit_core::{
     AgentConfig, AgentEvent, Command, DriverDescriptor, DriverId, DriverRegistry, Encoded,
-    GateChoiceKind, GateDecision, GateRequest, Protocol, QuestionAnswer, SpawnSpec, Step,
+    GateChoiceKind, GateDecision, GateRequest, InputId, Protocol, QuestionAnswer, SpawnSpec, Step,
 };
 
 /// Every driver this workspace ships, in a stable order.
@@ -114,13 +114,20 @@ impl Live {
         step.events
     }
 
+    /// Record and encode a command; its input id is its transcript position (as a replay
+    /// derives it).
     async fn command(&mut self, cmd: Command) -> Vec<AgentEvent> {
         self.rec(&Record::Cmd(cmd.clone()));
+        let input = input_id(self.outcome.transcript.len() - 1);
+        self.encode(input, cmd).await
+    }
+
+    async fn encode(&mut self, input: InputId, cmd: Command) -> Vec<AgentEvent> {
         let name = cmd.name();
-        match self.protocol.encode(cmd) {
+        match self.protocol.encode(input, cmd) {
             Ok(Encoded::Sent(step)) => self.apply(step).await,
             Ok(Encoded::Queued) => {
-                println!("note: {name} queued until the protocol is ready");
+                println!("note: {name} queued by the protocol");
                 vec![]
             }
             Err(e) => {
@@ -172,6 +179,14 @@ pub async fn run(mut opts: RunOptions) -> Result<Outcome, String> {
     let desc: Arc<dyn DriverDescriptor> = registry()
         .get(&DriverId::new(opts.driver.clone()))
         .map_err(|e| e.to_string())?;
+    if opts.spec.session_id.is_none() {
+        // What the runtime gives every session: drivers derive per-session ids from it.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        opts.spec.session_id = Some(format!("smoke{nanos:x}"));
+    }
     if let Some(cfg) = &opts.config {
         if opts.spec.session_dir.is_none() {
             opts.spec.session_dir = Some(std::env::temp_dir().to_string_lossy().into_owned());
@@ -211,9 +226,15 @@ pub async fn run(mut opts: RunOptions) -> Result<Outcome, String> {
         echo: opts.echo,
         outcome: Outcome::default(),
     };
+    // The first prompt is recorded inside the start record and encoded right after `start`,
+    // as the runtime does (and as a replay of the transcript will).
     live.rec(&Record::Start(Box::new(opts.spec.clone())));
-    let step = live.protocol.start(&opts.spec);
+    let (spec, first) = opts.spec.split_first_prompt();
+    let step = live.protocol.start(&spec);
     live.apply(step).await;
+    if let Some(cmd) = first {
+        live.encode(input_id(0), cmd).await;
+    }
 
     match &opts.script {
         Some(steps) => {

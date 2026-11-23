@@ -613,7 +613,14 @@ impl Persona for Acp {
         }
     }
 
-    fn turn_begin(&mut self, _io: &mut Io, _prompt: &str, _stats: &mut TurnStats) {}
+    fn turn_begin(
+        &mut self,
+        _io: &mut Io,
+        _prompt: &str,
+        _id: Option<&str>,
+        _stats: &mut TurnStats,
+    ) {
+    }
 
     fn say(&mut self, io: &mut Io, text: &str, chunks: usize, _stats: &mut TurnStats) {
         self.msg_id = format!("msg_{}", hex(26));

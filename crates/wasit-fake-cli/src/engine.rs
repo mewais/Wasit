@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 pub enum Incoming {
     /// A user prompt (starts a turn, or is queued while one runs).
     Prompt(String),
+    /// A user prompt with the client's id for it (claude: the user message's `uuid`).
+    TrackedPrompt { text: String, id: String },
+    /// The client asks to drop the queued prompt `id` (claude `cancel_async_message`);
+    /// `request` is the id of that request.
+    Cancel { request: Value, id: String },
     /// Interrupt / cancel the running turn (the persona already acked it on the wire).
     Interrupt,
     /// The client's answer to a request the fake sent; `id` is the request id.
@@ -48,7 +53,8 @@ pub trait Persona {
     /// Interpret one incoming line. `in_turn` says whether a turn is running. Protocol-level
     /// requests (initialize, set mode, list, …) are answered here, whatever `in_turn` is.
     fn handle_line(&mut self, io: &mut Io, line: &str, in_turn: bool) -> Incoming;
-    fn turn_begin(&mut self, io: &mut Io, prompt: &str, stats: &mut TurnStats);
+    /// A turn starts for `prompt` (`id`: the client's id for it, when it gave one).
+    fn turn_begin(&mut self, io: &mut Io, prompt: &str, id: Option<&str>, stats: &mut TurnStats);
     fn say(&mut self, io: &mut Io, text: &str, chunks: usize, stats: &mut TurnStats);
     fn think(&mut self, io: &mut Io, text: &str, stats: &mut TurnStats);
     /// Emit the tool call. With `needs_permission`, also emit the permission request and return
@@ -80,6 +86,23 @@ pub trait Persona {
     /// The MCP server `name` this CLI was configured with (for `mcp_call` steps).
     fn mcp_server(&self, _name: &str) -> Option<crate::mcp::McpLaunch> {
         None
+    }
+    /// Answer an [`Incoming::Cancel`]: `cancelled` says whether the prompt was still queued
+    /// (and is now removed).
+    fn cancel_answered(&mut self, _io: &mut Io, _request: &Value, _id: &str, _cancelled: bool) {}
+}
+
+/// A prompt waiting for its turn.
+struct Queued {
+    text: String,
+    id: Option<String>,
+}
+
+/// Remove the queued prompt `id`; `true` when it was there.
+fn cancel_queued(queue: &mut VecDeque<Queued>, id: &str) -> bool {
+    match queue.iter().position(|q| q.id.as_deref() == Some(id)) {
+        Some(i) => queue.remove(i).is_some(),
+        None => false,
     }
 }
 
@@ -141,19 +164,24 @@ pub fn serve<P: Persona>(p: &mut P, io: &mut Io, cursor: &mut Cursor) {
             _ => {}
         }
     }
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue: VecDeque<Queued> = VecDeque::new();
     loop {
         let prompt = match queue.pop_front() {
             Some(q) => q,
             None => {
                 let Some(line) = io.recv() else { return };
                 match p.handle_line(io, &line, false) {
-                    Incoming::Prompt(t) => t,
+                    Incoming::Prompt(text) => Queued { text, id: None },
+                    Incoming::TrackedPrompt { text, id } => Queued { text, id: Some(id) },
+                    Incoming::Cancel { request, id } => {
+                        p.cancel_answered(io, &request, &id, false);
+                        continue;
+                    }
                     _ => continue,
                 }
             }
         };
-        let turn = cursor.select(&prompt);
+        let turn = cursor.select(&prompt.text);
         if run_turn(p, io, &turn, &prompt, &mut queue) == Flow::Eof {
             return;
         }
@@ -177,14 +205,14 @@ fn run_turn<P: Persona>(
     p: &mut P,
     io: &mut Io,
     turn: &Turn,
-    prompt: &str,
-    queue: &mut VecDeque<String>,
+    prompt: &Queued,
+    queue: &mut VecDeque<Queued>,
 ) -> Flow {
     let mut stats = TurnStats {
         started: Some(Instant::now()),
         ..TurnStats::default()
     };
-    p.turn_begin(io, prompt, &mut stats);
+    p.turn_begin(io, &prompt.text, prompt.id.as_deref(), &mut stats);
     let mut outcome = Outcome::Completed;
     // Results saved by `mcp_call` steps, for `{{name.path}}` placeholders.
     let mut vars: std::collections::BTreeMap<String, Value> = Default::default();
@@ -341,7 +369,7 @@ fn run_turn<P: Persona>(
 fn wait<P: Persona>(
     p: &mut P,
     io: &mut Io,
-    queue: &mut VecDeque<String>,
+    queue: &mut VecDeque<Queued>,
     timeout: Option<Duration>,
     mut matches: impl FnMut(&Incoming) -> bool,
 ) -> Wake {
@@ -370,7 +398,14 @@ fn wait<P: Persona>(
                 }
                 match inc {
                     Incoming::Interrupt => return Wake::Interrupted,
-                    Incoming::Prompt(t) => queue.push_back(t),
+                    Incoming::Prompt(text) => queue.push_back(Queued { text, id: None }),
+                    Incoming::TrackedPrompt { text, id } => {
+                        queue.push_back(Queued { text, id: Some(id) })
+                    }
+                    Incoming::Cancel { request, id } => {
+                        let cancelled = cancel_queued(queue, &id);
+                        p.cancel_answered(io, &request, &id, cancelled);
+                    }
                     Incoming::Response { .. } | Incoming::Handled => {}
                 }
             }

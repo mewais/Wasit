@@ -105,15 +105,24 @@ pub trait Protocol: Send {
     /// Feed one line the CLI wrote; get events plus any lines to write back (handshake
     /// continuation, protocol-level acks).
     fn on_line(&mut self, line: &str) -> Step;          // Step { events, write }
-    /// Encode a command. Err(Unsupported) only when the descriptor says so.
-    fn encode(&mut self, cmd: Command) -> Result<Vec<OutLine>, DriverError>;
+    /// Encode a command; `input` is its identity. Err(Unsupported) only when the descriptor says so.
+    fn encode(&mut self, input: InputId, cmd: Command) -> Result<Vec<OutLine>, DriverError>;
 }
 ```
 
 `Command` = Prompt, AnswerGate, AnswerQuestion, Interrupt, SetModel, SetMode, RunSlash,
 Shutdown. The state machine is deterministic in its inputs (start spec, lines read, commands
 encoded), so replaying a journal reproduces state exactly. Request ids are counters inside the
-protocol state, never clock-derived. `DriverDescriptor` carries: id, display name, default
+protocol state, never clock-derived.
+
+Every journaled command is an *input*: `InputId` = the journal seq of the note that carried it.
+A session's first prompt is journaled inside the generation's `start` note and is applied as
+that generation's first input through the same path as any later prompt (protocols never read
+it from the spec). The driver is the one owner of what happens to a command it holds or writes
+and says so in the event model: `InputSent` (left its queue), `InputAcknowledged` (only on the
+CLI's own report about that input), `InputDropped{reason}` (interrupt, shutdown, unencodable,
+refused), `TurnStarted{input}`; the runtime adds what only the journal knows (`written`,
+`write_failed`, `InputDropped{process_ended}`). `DriverDescriptor` carries: id, display name, default
 binary name, `argv(spec)`, `env(spec)`, capabilities, a `new_protocol()` factory, discovery
 hooks (list models, list resumable sessions, version) and a `ConfigRenderer` (§6).
 

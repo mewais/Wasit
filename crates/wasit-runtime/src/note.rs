@@ -7,15 +7,19 @@
 use serde::{Deserialize, Serialize};
 use wasit_core::{Command, GateRequest, SpawnSpec};
 
+use crate::wire::NoticeCode;
+
 /// A runtime note. Serialized as `{"wasit": "<kind>", …}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "wasit", rename_all = "snake_case")]
 pub(crate) enum RuntimeNote {
     /// A controller attached; everything journaled before this note was history to it.
     Attach { token: String },
-    /// `Protocol::start(spec)` for the current process generation.
+    /// `Protocol::start(spec)` for the current process generation. A `first_prompt` in the
+    /// spec is the session's first input, encoded right after `start` with this note's seq as
+    /// its id: journaled in the same record as the start, so neither exists without the other.
     Start { spec: Box<SpawnSpec> },
-    /// `Protocol::encode(command)`.
+    /// `Protocol::encode(seq, command)`, where `seq` is this note's journal seq.
     Command { token: String, command: Command },
     /// A graceful stop was requested (`Protocol::encode(Shutdown)`).
     Stop { token: String },
@@ -48,27 +52,42 @@ pub(crate) enum NoteKind {
     Runtime(RuntimeNote),
     /// Shim: stdin was closed.
     StdinClosed,
+    /// Shim: writing the line journaled just before failed.
+    StdinError(String),
     /// Any other annotation (signal sent, shim diagnostics, unknown runtime note versions).
-    Other(String),
+    Other {
+        code: NoticeCode,
+        message: String,
+    },
 }
 
 pub(crate) fn classify(data: &serde_json::Value) -> NoteKind {
+    let other = |code, message| NoteKind::Other { code, message };
     if data.get("wasit").is_some() {
         return match serde_json::from_value::<RuntimeNote>(data.clone()) {
             Ok(n) => NoteKind::Runtime(n),
-            Err(e) => NoteKind::Other(format!("unrecognised runtime note ({e}): {data}")),
+            Err(e) => other(
+                NoticeCode::UnrecognisedNote,
+                format!("unrecognised runtime note ({e}): {data}"),
+            ),
         };
     }
     if data.get("stdin").and_then(|v| v.as_str()) == Some("closed") {
         return NoteKind::StdinClosed;
     }
+    if let Some(msg) = data.get("stdin_error").and_then(|v| v.as_str()) {
+        return NoteKind::StdinError(msg.to_string());
+    }
     if let Some(sig) = data.get("signal").and_then(|v| v.as_str()) {
-        return NoteKind::Other(format!("signal {sig} sent to the process"));
+        return other(
+            NoticeCode::SignalSent,
+            format!("signal {sig} sent to the process"),
+        );
     }
     if let Some(msg) = data.get("shim").and_then(|v| v.as_str()) {
-        return NoteKind::Other(format!("shim: {msg}"));
+        return other(NoticeCode::Shim, format!("shim: {msg}"));
     }
-    NoteKind::Other(data.to_string())
+    other(NoticeCode::Other, data.to_string())
 }
 
 #[cfg(test)]
@@ -90,11 +109,18 @@ mod tests {
         );
         assert!(matches!(
             classify(&serde_json::json!({"signal": "term", "by": "controller"})),
-            NoteKind::Other(m) if m.contains("term")
+            NoteKind::Other { code: NoticeCode::SignalSent, message } if message.contains("term")
         ));
         assert!(matches!(
             classify(&serde_json::json!({"wasit": "from_the_future"})),
-            NoteKind::Other(_)
+            NoteKind::Other {
+                code: NoticeCode::UnrecognisedNote,
+                ..
+            }
         ));
+        assert_eq!(
+            classify(&serde_json::json!({"stdin_error": "write to child stdin: broken pipe"})),
+            NoteKind::StdinError("write to child stdin: broken pipe".into())
+        );
     }
 }

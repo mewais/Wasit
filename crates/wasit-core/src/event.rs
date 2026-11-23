@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::content::ContentPart;
+use crate::protocol::InputId;
 
 // ── Usage ───────────────────────────────────────────────────────────────────
 
@@ -521,6 +522,27 @@ pub enum EndReason {
     CompactionNeeded,
 }
 
+// ── Inputs ────────────────────────────────────────────────────────────────────
+
+/// Why an input was dropped ([`AgentEvent::InputDropped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum InputDropReason {
+    /// An interrupt cleared it (it was waiting behind the turn, or the CLI cancelled it from
+    /// its own queue on our request).
+    Interrupted,
+    /// The session was stopped while it waited.
+    Shutdown,
+    /// The protocol could not encode it when its turn came (e.g. the gate it answers is gone).
+    Unencodable,
+    /// The CLI refused or discarded it without running it.
+    Refused,
+    /// The process generation ended while it was still waiting to be written. Emitted by the
+    /// runtime, never by a protocol.
+    ProcessEnded,
+}
+
 // ── AgentEvent ────────────────────────────────────────────────────────────────
 
 /// Everything a driver can report. Internally tagged on `"type"`.
@@ -567,6 +589,35 @@ pub enum AgentEvent {
         /// Native turn id (codex only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_turn_id: Option<String>,
+        /// The input (prompt / slash command) the turn runs for; `None` when the turn is not
+        /// one of ours or the driver cannot tell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<InputId>,
+    },
+
+    /// A command the protocol had buffered ([`Encoded::Queued`](crate::Encoded::Queued)) was
+    /// encoded now; its lines are in the same step.
+    InputSent { input: InputId },
+
+    /// The CLI itself reported that it took the input in (claude: the `command_lifecycle`
+    /// frame `started` for the message's uuid, or the message listed in a `result`). Never
+    /// inferred from unrelated output: an input that was written but is never acknowledged
+    /// stays "written".
+    InputAcknowledged {
+        input: InputId,
+        /// The input joined a turn that was already running instead of starting its own.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        steered: bool,
+    },
+
+    /// An input will never reach the CLI (or the CLI discarded it before running it).
+    InputDropped {
+        input: InputId,
+        reason: InputDropReason,
+        /// Why, in words, when there is more to say than the reason (an encode error, the CLI's
+        /// refusal).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     /// A turn ended.

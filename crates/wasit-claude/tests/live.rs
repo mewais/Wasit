@@ -48,6 +48,11 @@ async fn live_prompt_reply() {
             ..
         }
     )));
+    // The CLI reported taking the first prompt (input 1: the start record) in.
+    assert!(out.events.contains(&AgentEvent::InputAcknowledged {
+        input: wasit_core::InputId(1),
+        steered: false
+    }));
 }
 
 #[tokio::test]

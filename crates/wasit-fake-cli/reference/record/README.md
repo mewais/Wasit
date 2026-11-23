@@ -3,6 +3,9 @@ kilo 7.8.27, codex-cli 0.169.1). They are kept for reproducibility, not run by `
 
 * `rec.mjs` spawns a CLI and logs every stdin line (`in`) and stdout line (`out`).
 * `claude1.mjs`, `claude2.mjs <scenario>`: claude stream-json (`--model haiku`).
+* `claude3.mjs`: the message lifecycle (`uuid` on user messages, `command_lifecycle`,
+  `cancel_async_message`, `interrupt` with a queued message); recorded with claude 2.1.293
+  (`REC_CWD` sets the working directory), then `trim.py` and the names sanitized by hand.
 * `acp.mjs <opencode|kilo> <scenario>`: ACP (free models).
 * `codex.mjs <scenario>`: `codex app-server`, with `CODEX_HOME` pointing at a config whose model
   provider is `http://127.0.0.1:18080/v1`, served by `fake-responses.mjs` (a minimal OpenAI

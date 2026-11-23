@@ -185,7 +185,7 @@ mod tests {
         fn on_line(&mut self, _: &str) -> Step {
             Step::empty()
         }
-        fn encode(&mut self, _: Command) -> Result<Encoded, DriverError> {
+        fn encode(&mut self, _: crate::InputId, _: Command) -> Result<Encoded, DriverError> {
             Ok(Encoded::Queued)
         }
         fn is_ready(&self) -> bool {

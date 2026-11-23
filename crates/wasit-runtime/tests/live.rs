@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use common::*;
 use wasit_core::{AgentEvent, Command, DriverId};
-use wasit_runtime::wire::{CreateSession, Phase, SessionEventKind, SessionId};
+use wasit_runtime::wire::{CreateSession, Phase, SessionEventKind, SessionId, SessionSnapshot};
 use wasit_runtime::{default_registry, RuntimeConfig, SessionManager, ShimLauncher};
 
 const LIVE: Duration = Duration::from_secs(240);
@@ -79,6 +79,10 @@ async fn live_turn(driver: &str, model: Option<&str>, env: Vec<(String, String)>
             snap.model, snap.native_session_id, snap.usage, snap.context_pct
         );
         assert!(snap.native_session_id.is_some());
+        // Compared at the exit: the CLI may print lines that change the snapshot without an
+        // event after the turn's `result` (claude: `command_lifecycle completed`), so a
+        // snapshot read while it runs can be a record behind the replay at the same cursor.
+        let snap = stop(&mgr, &id).await;
         (id, snap)
     };
     // Re-adopt: the replayed snapshot equals the live one.
@@ -91,10 +95,9 @@ async fn live_turn(driver: &str, model: Option<&str>, env: Vec<(String, String)>
     let mut a = after.clone();
     a.loaded = before.loaded;
     assert_eq!(a, before);
-    stop(&mgr, &id).await;
 }
 
-async fn stop(mgr: &SessionManager, id: &SessionId) {
+async fn stop(mgr: &SessionManager, id: &SessionId) -> SessionSnapshot {
     mgr.stop(id).await.unwrap();
     let snap = wait_snapshot_within(mgr, id, "exit", LIVE, |s| !s.phase.is_live()).await;
     assert!(
@@ -102,6 +105,7 @@ async fn stop(mgr: &SessionManager, id: &SessionId) {
         "{:?}",
         snap.phase
     );
+    snap
 }
 
 #[tokio::test]
@@ -115,6 +119,143 @@ async fn live_claude() {
         "Reply with exactly the word: ok",
     )
     .await;
+}
+
+/// The real claude through the whole runtime: the first prompt given at creation is an
+/// `input` (journaled with the start) before the turn that names it; the CLI's own lifecycle
+/// report acknowledges it; two prompts held behind the running turn are dropped by an
+/// interrupt and never start; the next prompt is acknowledged and gets its own turn.
+#[tokio::test]
+#[ignore = "live: needs an authenticated claude CLI"]
+async fn live_claude_inputs() {
+    use wasit_core::{InputDropReason, InputId};
+    use wasit_runtime::wire::{CommandOutcome, SessionEvent};
+    require("claude");
+    let d = TempDir::new();
+    let work = d.path().join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let mgr = live_manager(d.path()).await;
+    let mut req = CreateSession::new("claude");
+    req.cwd = Some(work.to_string_lossy().into_owned());
+    req.model = Some("haiku".into());
+    req.first_prompt =
+        Some("Use the Bash tool to run: sleep 15 . Then reply with exactly the word: done".into());
+    let id = mgr.create(req).await.unwrap().id;
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    let mut events = tokio::time::timeout(
+        LIVE,
+        until(&mut s, |e| {
+            is_agent(e, |a| matches!(a, AgentEvent::ToolCallStarted { .. }))
+        }),
+    )
+    .await
+    .expect("the tool started");
+    for text in [
+        "Reply with exactly the word: second",
+        "Reply with exactly the word: third",
+    ] {
+        let out = mgr.command(&id, Command::prompt(text)).await.unwrap();
+        assert_eq!(out, CommandOutcome::Queued);
+    }
+    mgr.command(&id, Command::Interrupt).await.unwrap();
+    events.extend(
+        tokio::time::timeout(LIVE, until(&mut s, is_turn_completed))
+            .await
+            .expect("the turn ended"),
+    );
+    mgr.command(&id, Command::prompt("Reply with exactly the word: after"))
+        .await
+        .unwrap();
+    events.extend(
+        tokio::time::timeout(LIVE, until(&mut s, is_turn_completed))
+            .await
+            .expect("the next turn ended"),
+    );
+    let input_of = |text: &str| {
+        events
+            .iter()
+            .find_map(|e| match &e.kind {
+                SessionEventKind::Input {
+                    input,
+                    command: Command::Prompt { text: t, .. },
+                    ..
+                } if t.ends_with(text) => Some(*input),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("an input for {text:?}"))
+    };
+    let pos = |f: &dyn Fn(&SessionEvent) -> bool| events.iter().position(f);
+    let agent = |e: &SessionEvent, f: &dyn Fn(&AgentEvent) -> bool| is_agent(e, f);
+    let first = input_of("word: done");
+    let (second, third, after) = (input_of("second"), input_of("third"), input_of("after"));
+    let input_at =
+        pos(&|e| matches!(&e.kind, SessionEventKind::Input { input, .. } if *input == first));
+    let turn_at = pos(&|e| {
+        agent(
+            e,
+            &|a| matches!(a, AgentEvent::TurnStarted { input: Some(i), .. } if *i == first),
+        )
+    });
+    assert!(input_at.is_some() && input_at < turn_at, "{events:#?}");
+    for i in [first, after] {
+        assert!(
+            pos(&|e| agent(
+                e,
+                &|a| matches!(a, AgentEvent::InputAcknowledged { input, .. } if *input == i)
+            ))
+            .is_some(),
+            "{i} acknowledged: {events:#?}"
+        );
+        assert!(
+            pos(&|e| matches!(e.kind, SessionEventKind::Written { input, .. } if input == i))
+                .is_some()
+        );
+    }
+    let drops: Vec<(InputId, InputDropReason)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::Agent {
+                event: AgentEvent::InputDropped { input, reason, .. },
+            } => Some((*input, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        drops,
+        [
+            (second, InputDropReason::Interrupted),
+            (third, InputDropReason::Interrupted)
+        ]
+    );
+    for i in [second, third] {
+        assert!(pos(&|e| agent(
+            e,
+            &|a| matches!(a, AgentEvent::TurnStarted { input: Some(x), .. } if *x == i)
+        ))
+        .is_none());
+    }
+    let summary: Vec<String> = events
+        .iter()
+        .filter_map(|e| {
+            let v = serde_json::to_value(&e.kind).ok()?;
+            let kind = v["kind"].as_str()?.to_string();
+            let name = match kind.as_str() {
+                "agent" => v["event"]["type"].as_str()?.to_string(),
+                _ => kind,
+            };
+            let input = v["input"].as_u64().or_else(|| v["event"]["input"].as_u64());
+            (!matches!(
+                name.as_str(),
+                "assistant_delta" | "usage_update" | "unknown"
+            ))
+            .then(|| match input {
+                Some(i) => format!("{name}:{i}"),
+                None => name,
+            })
+        })
+        .collect();
+    eprintln!("[claude] inputs {first} {second} {third} {after}; events {summary:?}");
+    stop(&mgr, &id).await;
 }
 
 #[tokio::test]

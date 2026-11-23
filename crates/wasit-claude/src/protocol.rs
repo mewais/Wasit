@@ -20,6 +20,19 @@
 //! - `control_request {subtype:"interrupt"}` ends the running turn with a
 //!   `result {subtype:"error_during_execution"}`; the result carries no
 //!   interrupt flag, so the protocol remembers that it asked.
+//! - A user message may carry a `uuid`. Claude (verified on 2.1.293) then
+//!   reports what happens to it with `command_lifecycle {command_uuid, state}`
+//!   frames: `queued` (read from stdin), `started` (taken into a turn — the
+//!   acknowledgement this protocol reports), `completed`, `cancelled`; a
+//!   `result` lists the uuids it ran in `user_message_uuids`. A message the CLI
+//!   holds but has not started survives an `interrupt` and runs right after it;
+//!   `control_request {subtype:"cancel_async_message", message_uuid}` removes
+//!   it (`{cancelled:true}` plus a `cancelled` frame; `{cancelled:false}` when
+//!   it already started). Nothing here assumes a CLI version: the protocol
+//!   sends uuids only when the runtime gave it a session id to derive them from,
+//!   acknowledges only on those frames, and asks for cancellations only after
+//!   the CLI has shown it reports lifecycles. A CLI that reports nothing leaves
+//!   its prompts "written, not acknowledged".
 //! - `set_model` / `set_permission_mode` control requests switch model / mode;
 //!   errors come back as `control_response {subtype:"error"}`.
 
@@ -30,9 +43,9 @@ use wasit_core::content::{path_reference_text, COMMON_IMAGE_MIMES};
 use wasit_core::wire::{opt_s, s, u};
 use wasit_core::{
     AgentEvent, Attachment, ChoiceText, Command, CompactionInfo, ContentPart, DriverError, Encoded,
-    EndReason, GateChoice, GateChoiceKind, GateRequest, McpServerInfo, MediaSource, ModelInfo,
-    ModelUsage, OutLine, Protocol, QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo,
-    SlashCommandInfo, SpawnSpec, Step, Usage,
+    EndReason, GateChoice, GateChoiceKind, GateRequest, InputDropReason, InputId, McpServerInfo,
+    MediaSource, ModelInfo, ModelUsage, OutLine, Protocol, QuestionAnswer, QuestionOption,
+    QuestionPrompt, RateLimitInfo, SlashCommandInfo, SpawnSpec, Step, Usage,
 };
 
 /// What a pending gate needs to encode its answer.
@@ -62,6 +75,32 @@ enum ToolAnswer {
     Deny { interrupt: bool },
 }
 
+/// What the CLI reported about a user message we wrote (by its uuid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliState {
+    /// Nothing yet.
+    Unknown,
+    /// `command_lifecycle queued`: read, waiting in the CLI's own queue.
+    Queued,
+    /// `command_lifecycle started`: taken into a turn.
+    Started,
+}
+
+/// A user message we wrote with a uuid, until the CLI reports it completed or cancelled.
+#[derive(Debug, Clone)]
+struct Written {
+    input: InputId,
+    uuid: String,
+    cli: CliState,
+    /// `InputAcknowledged` was reported.
+    acknowledged: bool,
+    /// We asked the CLI to drop it (`cancel_async_message`).
+    cancel_requested: bool,
+}
+
+/// How many written messages are remembered for the CLI's lifecycle reports.
+const MAX_WRITTEN: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// `start` not called yet.
@@ -79,12 +118,22 @@ pub struct ClaudeProtocol {
     phase: Phase,
     next_request: u64,
     init_request_id: String,
-    /// Our outstanding control requests: request id → command name.
-    outstanding: HashMap<String, &'static str>,
+    /// Our outstanding control requests: request id → command name, and the input a
+    /// `cancel_async_message` is about.
+    outstanding: HashMap<String, (&'static str, Option<InputId>)>,
     /// Commands waiting for the handshake or for the running turn to end.
-    queue: VecDeque<Command>,
+    queue: VecDeque<(InputId, Command)>,
     /// A turn is running (prompt written, `result` not seen).
     busy: bool,
+    /// The input whose prompt started the running turn.
+    turn_input: Option<InputId>,
+    /// Seed of the message uuids (from `SpawnSpec::session_id`); `None`: messages carry no
+    /// uuid (a spec from before session ids: the lines stay what they always were).
+    uuid_seed: Option<u64>,
+    /// Messages written with a uuid whose lifecycle has not ended, oldest first (bounded).
+    written: VecDeque<Written>,
+    /// The CLI has reported a `command_lifecycle` in this process.
+    lifecycle_seen: bool,
     /// We sent `interrupt` during the running turn.
     interrupt_sent: bool,
     session_init_sent: bool,
@@ -111,6 +160,10 @@ impl ClaudeProtocol {
             outstanding: HashMap::new(),
             queue: VecDeque::new(),
             busy: false,
+            turn_input: None,
+            uuid_seed: None,
+            written: VecDeque::new(),
+            lifecycle_seen: false,
             interrupt_sent: false,
             session_init_sent: false,
             model: None,
@@ -128,8 +181,17 @@ impl ClaudeProtocol {
     }
 
     fn control_request(&mut self, command: &'static str, request: Value) -> OutLine {
+        self.control_request_about(command, None, request)
+    }
+
+    fn control_request_about(
+        &mut self,
+        command: &'static str,
+        input: Option<InputId>,
+        request: Value,
+    ) -> OutLine {
         let id = self.request_id();
-        self.outstanding.insert(id.clone(), command);
+        self.outstanding.insert(id.clone(), (command, input));
         OutLine::json(&json!({"type": "control_request", "request_id": id, "request": request}))
     }
 
@@ -153,10 +215,10 @@ impl ClaudeProtocol {
         }
     }
 
-    fn encode_now(&mut self, cmd: Command) -> Result<Step, DriverError> {
+    fn encode_now(&mut self, input: InputId, cmd: Command) -> Result<Step, DriverError> {
         match cmd {
             Command::Prompt { text, attachments } => {
-                Ok(self.write_prompt_with(&text, &attachments))
+                Ok(self.write_prompt(input, &text, &attachments))
             }
             Command::RunSlash { name, args } => {
                 let name = name.trim_start_matches('/');
@@ -165,7 +227,7 @@ impl ClaudeProtocol {
                 } else {
                     format!("/{name} {}", args.trim())
                 };
-                Ok(self.write_prompt(&text))
+                Ok(self.write_prompt(input, &text, &[]))
             }
             Command::AnswerGate {
                 request_id,
@@ -253,8 +315,12 @@ impl ClaudeProtocol {
             }
             Command::Shutdown => {
                 self.phase = Phase::Closed;
-                self.queue.clear();
+                let events = std::mem::take(&mut self.queue)
+                    .into_iter()
+                    .map(|(input, _)| dropped(input, InputDropReason::Shutdown))
+                    .collect();
                 Ok(Step {
+                    events,
                     close_stdin: true,
                     ..Step::default()
                 })
@@ -262,19 +328,117 @@ impl ClaudeProtocol {
         }
     }
 
-    fn write_prompt(&mut self, text: &str) -> Step {
-        self.write_prompt_with(text, &[])
-    }
-
-    fn write_prompt_with(&mut self, text: &str, attachments: &[Attachment]) -> Step {
+    fn write_prompt(&mut self, input: InputId, text: &str, attachments: &[Attachment]) -> Step {
         self.busy = true;
         self.interrupt_sent = false;
+        self.turn_input = Some(input);
+        let uuid = self.uuid_seed.map(|seed| message_uuid(seed, input));
+        let line = user_message(text, attachments, uuid.as_deref());
+        if let Some(uuid) = uuid {
+            self.written.push_back(Written {
+                input,
+                uuid,
+                cli: CliState::Unknown,
+                acknowledged: false,
+                cancel_requested: false,
+            });
+            if self.written.len() > MAX_WRITTEN {
+                self.written.pop_front();
+            }
+        }
         Step {
             events: vec![AgentEvent::TurnStarted {
                 native_turn_id: None,
+                input: Some(input),
             }],
-            write: vec![encode_user_message_with(text, attachments)],
+            write: vec![line],
             close_stdin: false,
+        }
+    }
+
+    /// Take the queued prompts out of the queue: one `InputDropped` each, in queue order.
+    fn drop_queued_prompts(&mut self, reason: InputDropReason) -> Vec<AgentEvent> {
+        let (prompts, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.queue)
+            .into_iter()
+            .partition(|(_, c)| matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
+        self.queue = rest;
+        prompts
+            .into_iter()
+            .map(|(input, _)| dropped(input, reason))
+            .collect()
+    }
+
+    /// The CLI reported that it took the message at `pos` in.
+    fn acknowledge(&mut self, pos: usize) -> Vec<AgentEvent> {
+        let w = &mut self.written[pos];
+        if w.acknowledged {
+            return vec![];
+        }
+        w.acknowledged = true;
+        vec![AgentEvent::InputAcknowledged {
+            input: w.input,
+            steered: false,
+        }]
+    }
+
+    /// The CLI dropped the message at `pos` (lifecycle `cancelled`, or `cancelled:true` in
+    /// the answer to our `cancel_async_message`).
+    fn cancelled(&mut self, pos: usize) -> Step {
+        let Some(w) = self.written.remove(pos) else {
+            return Step::default();
+        };
+        if w.cli == CliState::Started || w.acknowledged {
+            // It ran and was interrupted; the turn's `result` says so.
+            return Step::default();
+        }
+        let reason = if w.cancel_requested {
+            InputDropReason::Interrupted
+        } else {
+            InputDropReason::Refused
+        };
+        let mut step = events(vec![dropped(w.input, reason)]);
+        if self.busy && self.turn_input == Some(w.input) {
+            // Our turn was this message, and it will never run: no `result` will end it.
+            self.busy = false;
+            self.turn_input = None;
+            step.events.push(AgentEvent::TurnCompleted {
+                end_reason: Some(EndReason::Cancelled),
+                was_interrupted: true,
+                num_turns: 0,
+                usage: Usage::default(),
+                per_model: HashMap::new(),
+                reply: None,
+            });
+            step.extend(self.drain());
+        }
+        step
+    }
+
+    fn on_lifecycle(&mut self, v: Value) -> Step {
+        let uuid = s(&v, "command_uuid");
+        let Some(pos) = self.written.iter().position(|w| w.uuid == uuid) else {
+            return events(vec![AgentEvent::Unknown { raw: v }]);
+        };
+        self.lifecycle_seen = true;
+        match s(&v, "state") {
+            "queued" => {
+                let w = &mut self.written[pos];
+                if w.cli == CliState::Unknown {
+                    w.cli = CliState::Queued;
+                }
+                Step::default()
+            }
+            "started" => {
+                self.written[pos].cli = CliState::Started;
+                events(self.acknowledge(pos))
+            }
+            "completed" => {
+                let step = events(self.acknowledge(pos));
+                self.written.remove(pos);
+                step
+            }
+            "cancelled" => self.cancelled(pos),
+            _ => events(vec![AgentEvent::Unknown { raw: v }]),
         }
     }
 
@@ -289,12 +453,11 @@ impl ClaudeProtocol {
         Ok(self.gates.remove(pos).1)
     }
 
-    /// Interrupt: drop prompts that never started, decline pending gates,
-    /// then ask claude to stop the turn.
+    /// Interrupt: drop prompts that never started, decline pending gates, ask
+    /// claude to drop the messages it holds but has not started, then ask it to
+    /// stop the turn.
     fn interrupt(&mut self) -> Step {
-        let mut step = Step::default();
-        self.queue
-            .retain(|c| !matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
+        let mut step = events(self.drop_queued_prompts(InputDropReason::Interrupted));
         for (id, kind) in std::mem::take(&mut self.gates) {
             let line = match kind {
                 GateKind::Elicitation { .. } => encode_elicitation_cancel(&id),
@@ -308,6 +471,28 @@ impl ClaudeProtocol {
                 reason: None,
             });
         }
+        // A message the CLI has read but not started would survive the interrupt and run right
+        // after it. Ask only a CLI that reports lifecycles (it knows the uuids); ask before the
+        // interrupt so the message cannot start in between.
+        if self.lifecycle_seen {
+            let unstarted: Vec<(InputId, String)> = self
+                .written
+                .iter_mut()
+                .filter(|w| w.cli != CliState::Started && !w.acknowledged && !w.cancel_requested)
+                .map(|w| {
+                    w.cancel_requested = true;
+                    (w.input, w.uuid.clone())
+                })
+                .collect();
+            for (input, uuid) in unstarted {
+                let line = self.control_request_about(
+                    "interrupt",
+                    Some(input),
+                    json!({"subtype": "cancel_async_message", "message_uuid": uuid}),
+                );
+                step.write.push(line);
+            }
+        }
         if self.busy && !self.interrupt_sent {
             self.interrupt_sent = true;
             let line = self.control_request("interrupt", json!({"subtype": "interrupt"}));
@@ -319,17 +504,21 @@ impl ClaudeProtocol {
     /// Send queued commands that may go now, in order.
     fn drain(&mut self) -> Step {
         let mut step = Step::default();
-        while let Some(cmd) = self.queue.front() {
+        while let Some((_, cmd)) = self.queue.front() {
             let is_prompt = matches!(cmd, Command::Prompt { .. } | Command::RunSlash { .. });
             if self.phase != Phase::Ready || (is_prompt && self.busy) {
                 break;
             }
-            let cmd = self.queue.pop_front().expect("front exists");
-            match self.encode_now(cmd) {
-                Ok(s) => step.extend(s),
-                Err(e) => step.events.push(AgentEvent::CommandRejected {
-                    command: "queued".into(),
-                    message: e.to_string(),
+            let (input, cmd) = self.queue.pop_front().expect("front exists");
+            match self.encode_now(input, cmd) {
+                Ok(s) => {
+                    step.events.push(AgentEvent::InputSent { input });
+                    step.extend(s);
+                }
+                Err(e) => step.events.push(AgentEvent::InputDropped {
+                    input,
+                    reason: InputDropReason::Unencodable,
+                    error: Some(e.to_string()),
                 }),
             }
         }
@@ -361,6 +550,7 @@ impl ClaudeProtocol {
             "user" => events(self.on_user(&v)),
             "result" => self.on_result(&v),
             "rate_limit_event" => events(vec![rate_limit(&v)]),
+            "command_lifecycle" => self.on_lifecycle(v),
             _ => events(vec![AgentEvent::Unknown { raw: v }]),
         }
     }
@@ -384,7 +574,7 @@ impl ClaudeProtocol {
             step.extend(self.drain());
             return step;
         }
-        let Some(command) = self.outstanding.remove(&id) else {
+        let Some((command, about)) = self.outstanding.remove(&id) else {
             return events(vec![AgentEvent::Unknown { raw: v.clone() }]);
         };
         if !ok {
@@ -392,6 +582,17 @@ impl ClaudeProtocol {
                 command: command.into(),
                 message: error_text(&resp),
             }]);
+        }
+        if let Some(input) = about {
+            // The answer to `cancel_async_message`: `cancelled:false` means it already started
+            // (its lifecycle says the rest); a `cancelled` frame usually came first.
+            let pos = self.written.iter().position(|w| w.input == input);
+            return match pos {
+                Some(pos) if payload.get("cancelled").and_then(Value::as_bool) == Some(true) => {
+                    self.cancelled(pos)
+                }
+                _ => Step::default(),
+            };
         }
         match command {
             "set_model" => match opt_s(&payload, "model") {
@@ -638,16 +839,32 @@ impl ClaudeProtocol {
                 })
                 .filter(|s| !s.is_empty() && is_error && !interrupted)
         });
+        // The messages this turn ran, as the CLI lists them: proof they were taken in, also
+        // when it reported no lifecycle frame for them.
+        let mut acks = Vec::new();
+        for uuid in v
+            .get("user_message_uuids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if let Some(pos) = self.written.iter().position(|w| w.uuid == uuid) {
+                acks.extend(self.acknowledge(pos));
+            }
+        }
         self.busy = false;
+        self.turn_input = None;
         self.interrupt_sent = false;
-        let mut step = events(vec![AgentEvent::TurnCompleted {
+        let mut step = events(acks);
+        step.events.push(AgentEvent::TurnCompleted {
             end_reason,
             was_interrupted: interrupted,
             num_turns: u(v, "num_turns"),
             usage,
             per_model,
             reply,
-        }]);
+        });
         step.extend(self.drain());
         step
     }
@@ -657,15 +874,13 @@ impl Protocol for ClaudeProtocol {
     fn start(&mut self, spec: &SpawnSpec) -> Step {
         self.phase = Phase::Initializing;
         self.model = spec.model.clone();
+        self.uuid_seed = spec.session_id.as_deref().map(fnv1a);
         self.init_request_id = self.request_id();
         let init = OutLine::json(&json!({
             "type": "control_request",
             "request_id": self.init_request_id,
             "request": {"subtype": "initialize", "hooks": null},
         }));
-        if let Some(p) = &spec.first_prompt {
-            self.queue.push_back(Command::prompt(p.clone()));
-        }
         Step {
             write: vec![init],
             ..Step::default()
@@ -689,21 +904,20 @@ impl Protocol for ClaudeProtocol {
         self.phase == Phase::Ready
     }
 
-    fn encode(&mut self, cmd: Command) -> Result<Encoded, DriverError> {
+    fn encode(&mut self, input: InputId, cmd: Command) -> Result<Encoded, DriverError> {
         if self.phase == Phase::Closed {
             return Err(DriverError::Shutdown);
         }
         if matches!(cmd, Command::Interrupt) && self.phase != Phase::Ready {
-            // Nothing is running yet: drop queued prompts.
-            self.queue
-                .retain(|c| !matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
-            return Ok(Encoded::Sent(Step::default()));
+            // Nothing is running yet: what the interrupt clears is the queued prompts.
+            let dropped = self.drop_queued_prompts(InputDropReason::Interrupted);
+            return Ok(Encoded::Sent(events(dropped)));
         }
         if self.must_queue(&cmd) {
-            self.queue.push_back(cmd);
+            self.queue.push_back((input, cmd));
             return Ok(Encoded::Queued);
         }
-        self.encode_now(cmd).map(Encoded::Sent)
+        self.encode_now(input, cmd).map(Encoded::Sent)
     }
 }
 
@@ -712,6 +926,37 @@ fn events(events: Vec<AgentEvent>) -> Step {
         events,
         ..Step::default()
     }
+}
+
+fn dropped(input: InputId, reason: InputDropReason) -> AgentEvent {
+    AgentEvent::InputDropped {
+        input,
+        reason,
+        error: None,
+    }
+}
+
+/// 64-bit FNV-1a: a stable hash (the same in every build), so replays derive the same uuids.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The `uuid` of the user message carrying `input`: 60 bits of the session's seed and 62 bits
+/// of the input id in the shape of an RFC 9562 version-4 uuid. Unique per session and input,
+/// deterministic (replay writes the same line), never reused by a later process generation
+/// (input ids are journal seqs).
+fn message_uuid(seed: u64, input: InputId) -> String {
+    let lo = input.0;
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        seed >> 32,
+        (seed >> 16) & 0xffff,
+        (seed >> 4) & 0xfff,
+        0x8000 | ((lo >> 48) & 0x3fff),
+        lo & 0xffff_ffff_ffff
+    )
 }
 
 fn error_text(resp: &Value) -> String {
@@ -1124,6 +1369,11 @@ pub fn encode_user_message(text: &str) -> OutLine {
 /// A user message with attachments: images as `image` content blocks (base64 source); every
 /// other file is named by path in the text (claude reads it with its own tools).
 pub fn encode_user_message_with(text: &str, attachments: &[Attachment]) -> OutLine {
+    user_message(text, attachments, None)
+}
+
+/// A user message, with the `uuid` claude reports its lifecycle by when there is one.
+fn user_message(text: &str, attachments: &[Attachment], uuid: Option<&str>) -> OutLine {
     let (images, files): (Vec<&Attachment>, Vec<&Attachment>) = attachments
         .iter()
         .partition(|a| a.data.is_some() && COMMON_IMAGE_MIMES.contains(&a.mime.as_str()));
@@ -1133,10 +1383,14 @@ pub fn encode_user_message_with(text: &str, attachments: &[Attachment]) -> OutLi
         content.push(json!({"type": "image", "source": {
             "type": "base64", "media_type": a.mime, "data": a.data}}));
     }
-    OutLine::json(&json!({
+    let mut msg = json!({
         "type": "user",
         "message": {"role": "user", "content": content},
-    }))
+    });
+    if let Some(uuid) = uuid {
+        msg["uuid"] = json!(uuid);
+    }
+    OutLine::json(&msg)
 }
 
 /// The image / document a claude content block carries (`{"type":"image","source":{…}}`).
@@ -1175,4 +1429,37 @@ fn claude_part(block: &Value) -> Option<ContentPart> {
             uri: None,
         }
     })
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    /// A queued command that cannot be encoded when its turn comes is dropped with the reason.
+    /// (No command claude queues fails today; this pins the mapping.)
+    #[test]
+    fn drain_failure_drops_the_input() {
+        let mut p = ClaudeProtocol::new();
+        p.start(&SpawnSpec::default());
+        p.queue.push_back((
+            InputId(4),
+            Command::AnswerQuestion {
+                request_id: "gone".into(),
+                answer: QuestionAnswer::default(),
+            },
+        ));
+        p.queue.push_back((InputId(5), Command::prompt("next")));
+        let step = p.on_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#,
+        );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::InputDropped {
+                input: InputId(4),
+                reason: InputDropReason::Unencodable,
+                error: Some(e),
+            } if e.contains("gone")
+        ));
+        assert_eq!(step.events[1], AgentEvent::InputSent { input: InputId(5) });
+    }
 }

@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 use wasit_core::{
-    AgentEvent, Command, Encoded, EndReason, GateDecision, GateRequest, McpServerConfig,
+    AgentEvent, Command, Encoded, EndReason, GateDecision, GateRequest, InputId, McpServerConfig,
     McpTransport, PluginRef, QuestionAnswer, SkillRef, Step,
 };
 
@@ -29,29 +29,57 @@ fn writes(step: &Step) -> Vec<Value> {
         .collect()
 }
 
+/// The first prompt is an ordinary input: encoded right after `start` (the protocol never
+/// reads it from the spec), queued until the handshake, sent with its id.
 #[test]
-fn start_writes_initialize_and_queues_first_prompt() {
+fn start_writes_initialize_and_the_first_prompt_waits_for_the_handshake() {
     let mut p = ClaudeProtocol::new();
-    let step = p.start(&SpawnSpec {
+    let spec = SpawnSpec {
         first_prompt: Some("hi".into()),
         ..SpawnSpec::default()
-    });
+    };
+    let step = p.start(&spec);
     assert_eq!(
         step.write[0].0,
         r#"{"request":{"hooks":null,"subtype":"initialize"},"request_id":"req_1","type":"control_request"}"#
     );
     assert_eq!(step.write.len(), 1);
+    let init = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#;
+    // A spec's first prompt is not the protocol's business.
+    assert!(p.on_line(init).write.is_empty());
+
+    let mut p = ClaudeProtocol::new();
+    let (spec, first) = spec.split_first_prompt();
+    p.start(&spec);
+    assert_eq!(
+        p.encode(InputId(2), first.unwrap()).unwrap(),
+        Encoded::Queued
+    );
     // A prompt before the initialize response is queued.
-    assert_eq!(p.encode(Command::prompt("x")).unwrap(), Encoded::Queued);
-    let step = p.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#);
+    assert_eq!(
+        p.encode(InputId(3), Command::prompt("x")).unwrap(),
+        Encoded::Queued
+    );
+    let step = p.on_line(init);
     // Only the first prompt goes out; the second waits for the turn to end.
     assert_eq!(step.write.len(), 1);
     assert!(step.write[0].0.contains(r#""text":"hi""#));
-    assert!(matches!(step.events[0], AgentEvent::TurnStarted { .. }));
+    assert!(!step.write[0].0.contains("uuid"), "no session id, no uuid");
+    assert_eq!(
+        step.events,
+        vec![
+            AgentEvent::InputSent { input: InputId(2) },
+            AgentEvent::TurnStarted {
+                native_turn_id: None,
+                input: Some(InputId(2))
+            }
+        ]
+    );
     let step = p.on_line(
         r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#,
     );
     assert!(matches!(step.events[0], AgentEvent::TurnCompleted { .. }));
+    assert_eq!(step.events[1], AgentEvent::InputSent { input: InputId(3) });
     assert_eq!(step.write.len(), 1);
     assert!(step.write[0].0.contains(r#""text":"x""#));
 }
@@ -93,7 +121,10 @@ fn unknown_lines_before_init_are_tolerated() {
     let step = p.on_line("not json at all");
     assert!(matches!(step.events[0], AgentEvent::Unknown { .. }));
     // The handshake still completes afterwards.
-    assert_eq!(p.encode(Command::prompt("x")).unwrap(), Encoded::Queued);
+    assert_eq!(
+        p.encode(InputId(101), Command::prompt("x")).unwrap(),
+        Encoded::Queued
+    );
     let step = p.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#);
     assert_eq!(step.write.len(), 1);
 }
@@ -204,38 +235,50 @@ fn permission_gate_approve_echoes_input_and_deny_has_message() {
         }
         e => panic!("{e:?}"),
     }
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "g1".into(),
-        decision: GateDecision::choose("allow"),
-    }));
+    let step = sent(p.encode(
+        InputId(102),
+        Command::AnswerGate {
+            request_id: "g1".into(),
+            decision: GateDecision::choose("allow"),
+        },
+    ));
     assert_eq!(
         writes(&step)[0],
         json!({"type":"control_response","response":{"subtype":"success","request_id":"g1","response":{"behavior":"allow","updatedInput":{"command":"touch a","description":"Create a"}}}})
     );
     // Answered gates are gone.
     assert!(matches!(
-        p.encode(Command::AnswerGate {
-            request_id: "g1".into(),
-            decision: GateDecision::choose("allow")
-        }),
+        p.encode(
+            InputId(103),
+            Command::AnswerGate {
+                request_id: "g1".into(),
+                decision: GateDecision::choose("allow")
+            }
+        ),
         Err(wasit_core::DriverError::NotFound { .. })
     ));
     // "Allow and remember" echoes every suggestion as updatedPermissions.
     p.on_line(r#"{"type":"control_request","request_id":"g3","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls"}],"behavior":"allow","destination":"session"}]}}"#);
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "g3".into(),
-        decision: GateDecision::choose("allow_always"),
-    }));
+    let step = sent(p.encode(
+        InputId(104),
+        Command::AnswerGate {
+            request_id: "g3".into(),
+            decision: GateDecision::choose("allow_always"),
+        },
+    ));
     assert_eq!(
         writes(&step)[0]["response"]["response"]["updatedPermissions"][0]["rules"][0]
             ["ruleContent"],
         "ls"
     );
     p.on_line(r#"{"type":"control_request","request_id":"g2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm x"}}}"#);
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "g2".into(),
-        decision: GateDecision::choose_with("deny", Some("no")),
-    }));
+    let step = sent(p.encode(
+        InputId(105),
+        Command::AnswerGate {
+            request_id: "g2".into(),
+            decision: GateDecision::choose_with("deny", Some("no")),
+        },
+    ));
     assert_eq!(
         writes(&step)[0]["response"]["response"],
         json!({"behavior":"deny","message":"no"})
@@ -243,16 +286,22 @@ fn permission_gate_approve_echoes_input_and_deny_has_message() {
     // Without suggestions there is no "remember" choice; deny_stop interrupts.
     p.on_line(r#"{"type":"control_request","request_id":"g4","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm y"}}}"#);
     assert!(matches!(
-        p.encode(Command::AnswerGate {
-            request_id: "g4".into(),
-            decision: GateDecision::choose("allow_always")
-        }),
+        p.encode(
+            InputId(106),
+            Command::AnswerGate {
+                request_id: "g4".into(),
+                decision: GateDecision::choose("allow_always")
+            }
+        ),
         Err(wasit_core::DriverError::Invalid { .. })
     ));
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "g4".into(),
-        decision: GateDecision::choose("deny_stop"),
-    }));
+    let step = sent(p.encode(
+        InputId(107),
+        Command::AnswerGate {
+            request_id: "g4".into(),
+            decision: GateDecision::choose("deny_stop"),
+        },
+    ));
     assert_eq!(
         writes(&step)[0]["response"]["response"],
         json!({"behavior":"deny","message":"denied by user","interrupt":true})
@@ -269,20 +318,26 @@ fn question_and_plan_and_elicitation_gates() {
     ));
     // Wrong command kind is rejected and the gate stays pending.
     assert!(matches!(
-        p.encode(Command::AnswerGate {
-            request_id: "q1".into(),
-            decision: GateDecision::choose("allow")
-        }),
+        p.encode(
+            InputId(108),
+            Command::AnswerGate {
+                request_id: "q1".into(),
+                decision: GateDecision::choose("allow")
+            }
+        ),
         Err(wasit_core::DriverError::Invalid { .. })
     ));
     let mut answer = QuestionAnswer::default();
     answer
         .answers
         .insert("Color?".into(), vec!["Red".into(), "my own".into()]);
-    let step = sent(p.encode(Command::AnswerQuestion {
-        request_id: "q1".into(),
-        answer,
-    }));
+    let step = sent(p.encode(
+        InputId(109),
+        Command::AnswerQuestion {
+            request_id: "q1".into(),
+            answer,
+        },
+    ));
     let w = writes(&step);
     assert_eq!(
         w[0]["response"]["response"]["updatedInput"]["answers"],
@@ -328,10 +383,13 @@ fn question_and_plan_and_elicitation_gates() {
         &ev[0],
         AgentEvent::GateRequested { gate: GateRequest::Permission { tool_name, choices, .. } } if tool_name == "hares" && choices.len() == 4 && choices[0].id == "accept:once"
     ));
-    let step = sent(p.encode(Command::AnswerGate {
-        request_id: "e1".into(),
-        decision: GateDecision::choose("accept:once"),
-    }));
+    let step = sent(p.encode(
+        InputId(110),
+        Command::AnswerGate {
+            request_id: "e1".into(),
+            decision: GateDecision::choose("accept:once"),
+        },
+    ));
     assert_eq!(
         writes(&step)[0]["response"]["response"],
         json!({"action":"accept","content":{"grant":"once"}})
@@ -351,9 +409,9 @@ fn unsupported_control_request_gets_error_reply() {
 #[test]
 fn interrupt_declines_gates_then_interrupts_and_marks_cancel() {
     let (mut p, _) = ready();
-    sent(p.encode(Command::prompt("go")));
+    sent(p.encode(InputId(111), Command::prompt("go")));
     p.on_line(r#"{"type":"control_request","request_id":"g1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"x"}}}"#);
-    let step = sent(p.encode(Command::Interrupt));
+    let step = sent(p.encode(InputId(112), Command::Interrupt));
     let w = writes(&step);
     assert_eq!(w.len(), 2);
     assert_eq!(w[0]["response"]["response"]["behavior"], "deny");
@@ -369,7 +427,9 @@ fn interrupt_declines_gates_then_interrupts_and_marks_cancel() {
         }]
     );
     // A second interrupt during the same turn writes nothing.
-    assert!(sent(p.encode(Command::Interrupt)).write.is_empty());
+    assert!(sent(p.encode(InputId(113), Command::Interrupt))
+        .write
+        .is_empty());
     let ev = p.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_2","response":{"still_queued":[]}}}"#).events;
     assert!(ev.is_empty());
     let ev = p.on_line(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":2,"errors":["x"]}"#).events;
@@ -383,7 +443,7 @@ fn interrupt_declines_gates_then_interrupts_and_marks_cancel() {
         }
     ));
     // Idle interrupt: nothing to do.
-    assert!(sent(p.encode(Command::Interrupt)).is_empty());
+    assert!(sent(p.encode(InputId(114), Command::Interrupt)).is_empty());
 }
 
 #[test]
@@ -427,9 +487,12 @@ fn result_variants_and_cumulative_usage() {
 #[test]
 fn set_model_mode_and_rejections() {
     let (mut p, _) = ready();
-    let step = sent(p.encode(Command::SetModel {
-        model: "sonnet".into(),
-    }));
+    let step = sent(p.encode(
+        InputId(115),
+        Command::SetModel {
+            model: "sonnet".into(),
+        },
+    ));
     assert_eq!(
         writes(&step)[0]["request"],
         json!({"subtype":"set_model","model":"sonnet"})
@@ -441,9 +504,12 @@ fn set_model_mode_and_rejections() {
             model: "claude-sonnet-5-5".into()
         }]
     );
-    sent(p.encode(Command::SetMode {
-        mode: "bogus".into(),
-    }));
+    sent(p.encode(
+        InputId(116),
+        Command::SetMode {
+            mode: "bogus".into(),
+        },
+    ));
     let ev = p.on_line(r#"{"type":"control_response","response":{"subtype":"error","request_id":"req_3","error":"Cannot set permission mode"}}"#).events;
     assert_eq!(
         ev,
@@ -463,20 +529,26 @@ fn set_model_mode_and_rejections() {
 #[test]
 fn slash_command_is_a_user_message() {
     let (mut p, _) = ready();
-    let step = sent(p.encode(Command::RunSlash {
-        name: "/context".into(),
-        args: String::new(),
-    }));
+    let step = sent(p.encode(
+        InputId(117),
+        Command::RunSlash {
+            name: "/context".into(),
+            args: String::new(),
+        },
+    ));
     assert_eq!(
         writes(&step)[0]["message"]["content"][0]["text"],
         "/context"
     );
     let step = p.on_line(r#"{"type":"result","subtype":"success","is_error":false}"#);
     assert!(step.write.is_empty());
-    let step = sent(p.encode(Command::RunSlash {
-        name: "review".into(),
-        args: " 12 ".into(),
-    }));
+    let step = sent(p.encode(
+        InputId(118),
+        Command::RunSlash {
+            name: "review".into(),
+            args: " 12 ".into(),
+        },
+    ));
     assert_eq!(
         writes(&step)[0]["message"]["content"][0]["text"],
         "/review 12"
@@ -486,9 +558,9 @@ fn slash_command_is_a_user_message() {
 #[test]
 fn shutdown_closes_stdin_and_rejects_more() {
     let (mut p, _) = ready();
-    assert!(sent(p.encode(Command::Shutdown)).close_stdin);
+    assert!(sent(p.encode(InputId(119), Command::Shutdown)).close_stdin);
     assert_eq!(
-        p.encode(Command::prompt("x")),
+        p.encode(InputId(120), Command::prompt("x")),
         Err(wasit_core::DriverError::Shutdown)
     );
 }
@@ -673,10 +745,11 @@ fn determinism_same_inputs_same_outputs() {
         let mut out = vec![format!(
             "{:?}",
             p.start(&SpawnSpec {
-                first_prompt: Some("a".into()),
+                session_id: Some("aaaaaaaaaaaa".into()),
                 ..SpawnSpec::default()
             })
         )];
+        out.push(format!("{:?}", p.encode(InputId(1), Command::prompt("a"))));
         for l in [
             r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#,
             r#"{"type":"control_request","request_id":"g","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"b":1,"a":2}}}"#,
@@ -685,11 +758,14 @@ fn determinism_same_inputs_same_outputs() {
         }
         out.push(format!(
             "{:?}",
-            p.encode(Command::SetMode {
-                mode: "plan".into()
-            })
+            p.encode(
+                InputId(121),
+                Command::SetMode {
+                    mode: "plan".into()
+                }
+            )
         ));
-        out.push(format!("{:?}", p.encode(Command::Interrupt)));
+        out.push(format!("{:?}", p.encode(InputId(122), Command::Interrupt)));
         out
     };
     assert_eq!(run(), run());
@@ -829,5 +905,354 @@ fn disabled_items_render_as_one_settings_flag() {
             "deniedMcpServers": [{"serverName": "pstdio"}],
             "enabledPlugins": {"demo@localmkt": false}
         })
+    );
+}
+
+// ── inputs: queue, acknowledgement, drops (lifecycle frames as claude 2.1.293 prints them) ──
+
+const INIT_OK: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#;
+const RESULT_OK: &str =
+    r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1}"#;
+
+/// A ready protocol that sends message uuids (the runtime gave it a session id).
+fn ready_with_ids() -> ClaudeProtocol {
+    let mut p = ClaudeProtocol::new();
+    p.start(&SpawnSpec {
+        session_id: Some("abcdefghijkl".into()),
+        ..SpawnSpec::default()
+    });
+    p.on_line(INIT_OK);
+    p
+}
+
+fn uuid_of(step: &Step) -> String {
+    let w = writes(step);
+    let user = w
+        .iter()
+        .find(|v| v["type"] == "user")
+        .expect("a user message");
+    user["uuid"].as_str().expect("a uuid").to_string()
+}
+
+fn lifecycle(uuid: &str, state: &str) -> String {
+    format!(
+        r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"{state}","uuid":"e9cc3bf9-5691-43dc-9491-cf9459579ef0","session_id":"be6990f7-288c-4c6e-ace3-a5547598c189"}}"#
+    )
+}
+
+fn drops(events: &[AgentEvent]) -> Vec<(InputId, wasit_core::InputDropReason)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::InputDropped { input, reason, .. } => Some((*input, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn turn_starts(events: &[AgentEvent]) -> Vec<Option<InputId>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnStarted { input, .. } => Some(*input),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn message_uuids_are_deterministic_per_session_and_input() {
+    let line = |session: &str, input: u64| {
+        let mut p = ClaudeProtocol::new();
+        p.start(&SpawnSpec {
+            session_id: Some(session.into()),
+            ..SpawnSpec::default()
+        });
+        p.on_line(INIT_OK);
+        uuid_of(&sent(p.encode(InputId(input), Command::prompt("x"))))
+    };
+    let a = line("abcdefghijkl", 7);
+    assert_eq!(a, line("abcdefghijkl", 7));
+    assert_ne!(a, line("abcdefghijkl", 8));
+    assert_ne!(a, line("mnopqrstuvwx", 7));
+    // RFC 9562 shape: 8-4-4-4-12 hex, version 4, variant 10xx.
+    let parts: Vec<&str> = a.split('-').collect();
+    assert_eq!(
+        parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+        [8, 4, 4, 4, 12]
+    );
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    assert!(parts[2].starts_with('4'));
+    assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
+}
+
+#[test]
+fn two_queued_prompts_then_interrupt_are_dropped_and_never_start() {
+    let mut p = ready_with_ids();
+    let first = sent(p.encode(InputId(10), Command::prompt("long")));
+    assert_eq!(turn_starts(&first.events), vec![Some(InputId(10))]);
+    assert_eq!(
+        p.encode(InputId(11), Command::prompt("second")).unwrap(),
+        Encoded::Queued
+    );
+    assert_eq!(
+        p.encode(InputId(12), Command::prompt("third")).unwrap(),
+        Encoded::Queued
+    );
+    let step = sent(p.encode(InputId(13), Command::Interrupt));
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(11), wasit_core::InputDropReason::Interrupted),
+            (InputId(12), wasit_core::InputDropReason::Interrupted)
+        ]
+    );
+    // No lifecycle seen yet: no cancellation is asked for, only the interrupt.
+    let w = writes(&step);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0]["request"]["subtype"], "interrupt");
+    let step = p.on_line(
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":2}"#,
+    );
+    assert!(matches!(
+        step.events[..],
+        [AgentEvent::TurnCompleted {
+            was_interrupted: true,
+            ..
+        }]
+    ));
+    assert!(step.write.is_empty(), "the dropped prompts are never sent");
+    assert!(turn_starts(&step.events).is_empty());
+}
+
+#[test]
+fn interrupt_before_ready_drops_the_queued_prompts() {
+    let mut p = ClaudeProtocol::new();
+    p.start(&SpawnSpec::default());
+    assert_eq!(
+        p.encode(InputId(2), Command::prompt("first")).unwrap(),
+        Encoded::Queued
+    );
+    assert_eq!(
+        p.encode(
+            InputId(3),
+            Command::SetModel {
+                model: "haiku".into()
+            }
+        )
+        .unwrap(),
+        Encoded::Queued
+    );
+    let step = sent(p.encode(InputId(4), Command::Interrupt));
+    assert!(step.write.is_empty());
+    assert_eq!(
+        drops(&step.events),
+        vec![(InputId(2), wasit_core::InputDropReason::Interrupted)]
+    );
+    // The handshake sends what is left (the model switch), never the dropped prompt.
+    let step = p.on_line(INIT_OK);
+    assert_eq!(
+        step.events,
+        vec![AgentEvent::InputSent { input: InputId(3) }]
+    );
+    assert_eq!(writes(&step)[0]["request"]["subtype"], "set_model");
+    assert!(turn_starts(&step.events).is_empty());
+}
+
+#[test]
+fn shutdown_drops_everything_still_queued() {
+    let mut p = ClaudeProtocol::new();
+    p.start(&SpawnSpec::default());
+    p.encode(InputId(2), Command::prompt("a")).unwrap();
+    p.encode(
+        InputId(3),
+        Command::SetMode {
+            mode: "plan".into(),
+        },
+    )
+    .unwrap();
+    let step = sent(p.encode(InputId(4), Command::Shutdown));
+    assert!(step.close_stdin);
+    assert_eq!(
+        drops(&step.events),
+        vec![
+            (InputId(2), wasit_core::InputDropReason::Shutdown),
+            (InputId(3), wasit_core::InputDropReason::Shutdown)
+        ]
+    );
+    // Ready later: nothing goes out.
+    assert!(p.on_line(INIT_OK).write.is_empty());
+}
+
+/// Acknowledged on the CLI's own report for this message (`started`), never on output the CLI
+/// produces by itself: a CLI-initiated turn (`system/init` … `result` with an `origin`), a
+/// background task's frames, lifecycle frames for messages that are not ours.
+#[test]
+fn acknowledgement_comes_from_the_message_lifecycle_only() {
+    let mut p = ready_with_ids();
+    let step = sent(p.encode(InputId(5), Command::prompt("go")));
+    let uuid = uuid_of(&step);
+    let unrelated = [
+        r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"t1","status":"completed","output_file":"","summary":"s"}"#.to_string(),
+        r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku","cwd":"/p","tools":[],"mcp_servers":[],"permissionMode":"default","claude_code_version":"2.1.293","slash_commands":[]}"#.to_string(),
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"on my own"}]}}"#.to_string(),
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"x"}]}}"#.to_string(),
+        lifecycle("11111111-1111-4111-8111-111111111111", "started"),
+        lifecycle(&uuid, "queued"),
+    ];
+    for l in &unrelated {
+        let ev = p.on_line(l).events;
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, AgentEvent::InputAcknowledged { .. })),
+            "{l} acknowledged: {ev:?}"
+        );
+    }
+    let ev = p.on_line(&lifecycle(&uuid, "started")).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::InputAcknowledged {
+            input: InputId(5),
+            steered: false
+        }]
+    );
+    // Once.
+    let ev = p.on_line(&format!(
+        r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"user_message_uuids":["{uuid}"]}}"#
+    ));
+    assert!(matches!(ev.events[..], [AgentEvent::TurnCompleted { .. }]));
+    assert!(p.on_line(&lifecycle(&uuid, "completed")).events.is_empty());
+}
+
+#[test]
+fn a_result_listing_the_message_acknowledges_it_without_lifecycle_frames() {
+    let mut p = ready_with_ids();
+    let uuid = uuid_of(&sent(p.encode(InputId(5), Command::prompt("go"))));
+    let ev = p
+        .on_line(&format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"user_message_uuids":["{uuid}"]}}"#
+        ))
+        .events;
+    assert_eq!(
+        ev[0],
+        AgentEvent::InputAcknowledged {
+            input: InputId(5),
+            steered: false
+        }
+    );
+    assert!(matches!(ev[1], AgentEvent::TurnCompleted { .. }));
+}
+
+/// A CLI that reports nothing about messages (or a session from before message ids) leaves
+/// its prompts written but unacknowledged, whatever it prints.
+#[test]
+fn without_lifecycle_reports_nothing_is_acknowledged() {
+    let (mut p, _) = ready();
+    let step = sent(p.encode(InputId(5), Command::prompt("go")));
+    assert!(writes(&step)[0].get("uuid").is_none());
+    let mut events = vec![];
+    for l in [
+        r#"{"type":"system","subtype":"init","session_id":"s1","model":"m","cwd":"/p","tools":[],"mcp_servers":[],"permissionMode":"default","claude_code_version":"2.1.326","slash_commands":[]}"#,
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#,
+        RESULT_OK,
+    ] {
+        events.extend(p.on_line(l).events);
+    }
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::InputAcknowledged { .. })));
+    // An interrupt does not ask such a CLI to cancel anything.
+    sent(p.encode(InputId(6), Command::prompt("again")));
+    let w = writes(&sent(p.encode(InputId(7), Command::Interrupt)));
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0]["request"]["subtype"], "interrupt");
+}
+
+/// A message the CLI has read but not started (it sits in the CLI's own queue, e.g. behind a
+/// turn the CLI started by itself) is cancelled before the interrupt; the CLI's `cancelled`
+/// report drops it, and our turn for it — which will never produce a `result` — ends.
+#[test]
+fn interrupt_cancels_a_message_waiting_in_the_clis_queue() {
+    let mut p = ready_with_ids();
+    // An earlier message shows the CLI reports lifecycles.
+    let u1 = uuid_of(&sent(p.encode(InputId(5), Command::prompt("one"))));
+    p.on_line(&lifecycle(&u1, "queued"));
+    p.on_line(&lifecycle(&u1, "started"));
+    p.on_line(RESULT_OK);
+    p.on_line(&lifecycle(&u1, "completed"));
+    // The next one is read but not started.
+    let u2 = uuid_of(&sent(p.encode(InputId(6), Command::prompt("two"))));
+    p.on_line(&lifecycle(&u2, "queued"));
+    let step = sent(p.encode(InputId(7), Command::Interrupt));
+    let w = writes(&step);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert_eq!(w[0]["request"]["subtype"], "cancel_async_message");
+    assert_eq!(w[0]["request"]["message_uuid"], u2.as_str());
+    assert_eq!(w[1]["request"]["subtype"], "interrupt");
+    let cancel_id = w[0]["request_id"].as_str().unwrap().to_string();
+    // A prompt sent meanwhile waits behind our (still open) turn.
+    assert_eq!(
+        p.encode(InputId(8), Command::prompt("three")).unwrap(),
+        Encoded::Queued
+    );
+    // The CLI: `cancelled` frame first, then the answer (real order, 2.1.293).
+    let step = p.on_line(&lifecycle(&u2, "cancelled"));
+    assert_eq!(
+        drops(&step.events),
+        vec![(InputId(6), wasit_core::InputDropReason::Interrupted)]
+    );
+    assert!(matches!(
+        step.events[1],
+        AgentEvent::TurnCompleted {
+            end_reason: Some(EndReason::Cancelled),
+            was_interrupted: true,
+            ..
+        }
+    ));
+    assert_eq!(turn_starts(&step.events), vec![Some(InputId(8))]);
+    let ev = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{cancel_id}","response":{{"cancelled":true}}}}}}"#)).events;
+    assert!(ev.is_empty(), "dropped once: {ev:?}");
+}
+
+/// Asked too late: the message had started (`cancelled:false`); it runs, is acknowledged, and
+/// its interrupted turn ends with the `result`.
+#[test]
+fn a_cancel_that_comes_too_late_changes_nothing() {
+    let mut p = ready_with_ids();
+    let u1 = uuid_of(&sent(p.encode(InputId(5), Command::prompt("one"))));
+    p.on_line(&lifecycle(&u1, "queued"));
+    let w = writes(&sent(p.encode(InputId(6), Command::Interrupt)));
+    assert_eq!(w[0]["request"]["subtype"], "cancel_async_message");
+    let cancel_id = w[0]["request_id"].as_str().unwrap().to_string();
+    let ev = p.on_line(&lifecycle(&u1, "started")).events;
+    assert!(matches!(ev[..], [AgentEvent::InputAcknowledged { .. }]));
+    let ev = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{cancel_id}","response":{{"cancelled":false}}}}}}"#)).events;
+    assert!(ev.is_empty());
+    let ev = p
+        .on_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}"#,
+        )
+        .events;
+    assert!(matches!(
+        ev[..],
+        [AgentEvent::TurnCompleted {
+            was_interrupted: true,
+            ..
+        }]
+    ));
+    // The `cancelled` frame for a message that ran is not a drop.
+    assert!(p.on_line(&lifecycle(&u1, "cancelled")).events.is_empty());
+}
+
+#[test]
+fn a_cancel_the_cli_refuses_is_reported() {
+    let mut p = ready_with_ids();
+    let u1 = uuid_of(&sent(p.encode(InputId(5), Command::prompt("one"))));
+    p.on_line(&lifecycle(&u1, "queued"));
+    let w = writes(&sent(p.encode(InputId(6), Command::Interrupt)));
+    let cancel_id = w[0]["request_id"].as_str().unwrap().to_string();
+    let ev = p.on_line(&format!(r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{cancel_id}","error":"unknown subtype"}}}}"#)).events;
+    assert!(
+        matches!(&ev[..], [AgentEvent::CommandRejected { command, .. }] if command == "interrupt")
     );
 }

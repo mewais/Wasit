@@ -224,6 +224,21 @@ fn setup(persona: &'static str, name: &str, ins: &[Value], ref_discs: &BTreeSet<
     };
     let is_acp = !matches!(persona, "claude" | "codex");
     match name {
+        // claude 2.1.293: a reply; a long tool (a queued message is cancelled, the running one is
+        // not, a third stays queued through the interrupt); then the queued one's own turn.
+        "lifecycle" if persona == "claude" => {
+            sc = sc.turn(Turn::builder().say("pong")).turn(
+                Turn::builder()
+                    .tool(
+                        "Bash",
+                        json!({"command": "sleep 20", "description": "Sleep"}),
+                    )
+                    .done()
+                    .sleep_ms(60_000)
+                    .say("done"),
+            );
+            turn = turn.say("after");
+        }
         "tool_allow" | "tool_deny" => {
             if has("update:agent_thought_chunk") || has("assistant:thinking") {
                 turn = turn.think("Let me run it.");
@@ -412,6 +427,16 @@ fn wait_for(
     {
         return;
     }
+    // claude messages with a `uuid` in the lifecycle exchange: the CLI reads each one at once
+    // (`queued`), whether or not a turn runs; the next client line may follow right away.
+    if wire == Wire::Claude && lifecycle && cur["type"] == "user" {
+        if let Some(uuid) = cur["uuid"].as_str() {
+            drain_until(fake, &|m| {
+                m["type"] == "command_lifecycle" && m["command_uuid"] == uuid
+            });
+            return;
+        }
+    }
     match next {
         Some(n) if is_response_in(n, wire) => drain_until(fake, &|m| is_server_request(m, wire)),
         Some(n) if !lifecycle && is_interrupt_in(n, wire) => drain_until(fake, &progress),
@@ -542,6 +567,45 @@ fn replay(persona: &'static str, name: &str) {
         fake_by.entry(disc(m, wire, &methods)).or_default().push(m);
     }
     let mut problems = vec![];
+    // The claude lifecycle exchange (2.1.293) grounds the message lifecycle; the other message
+    // shapes of that version differ from the 2.1.326 recordings the persona clones, which the
+    // other exchanges check.
+    let compared = |d: &str| {
+        !(persona == "claude" && name == "lifecycle")
+            || matches!(
+                d,
+                "command_lifecycle"
+                    | "control_response:success:cancel_async_message"
+                    | "control_response:success:interrupt"
+            )
+    };
+    ref_by.retain(|d, _| compared(d));
+    fake_by.retain(|d, _| compared(d));
+    if persona == "claude" && name == "lifecycle" {
+        // The `result` of a turn run for messages with a uuid lists them.
+        let listed = |ms: &[Value]| -> Vec<Value> {
+            ms.iter()
+                .filter(|m| m["type"] == "result")
+                .map(|m| m["user_message_uuids"].clone())
+                .collect()
+        };
+        assert_eq!(listed(&fake.seen), listed(&refs), "user_message_uuids");
+        // Lifecycle states per message, in order, as the real CLI reported them.
+        let states = |ms: &[Value]| -> BTreeMap<String, Vec<String>> {
+            let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for m in ms.iter().filter(|m| m["type"] == "command_lifecycle") {
+                by.entry(m["command_uuid"].as_str().unwrap_or("").to_string())
+                    .or_default()
+                    .push(m["state"].as_str().unwrap_or("").to_string());
+            }
+            by
+        };
+        assert_eq!(
+            states(&fake.seen),
+            states(&refs),
+            "command_lifecycle states"
+        );
+    }
     // A recorded interrupt happened before any output; the fake streams a first chunk so the
     // client has something to interrupt. Those chunk shapes are verified by the other recordings.
     let extra_ok = |d: &str| {
@@ -602,6 +666,7 @@ replays! {
     claude_set_mode => ("claude", "set_mode"),
     claude_turn_error => ("claude", "turn_error"),
     claude_partial_messages => ("claude", "partial_messages"),
+    claude_lifecycle => ("claude", "lifecycle"),
     codex_handshake => ("codex", "handshake"),
     codex_simple => ("codex", "simple"),
     codex_tool_allow => ("codex", "tool_allow"),

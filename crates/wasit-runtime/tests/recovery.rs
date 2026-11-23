@@ -123,6 +123,116 @@ async fn kilo_restart_mid_turn() {
     restart_mid_turn("kilo").await
 }
 
+/// A daemon restart while a prompt waits behind a turn at a gate: after adoption the replayed
+/// history (inputs, `written`, phase causes …) equals what subscribers saw live, the prompt is
+/// sent exactly once when the turn ends and starts its own turn, and the CLI received every line
+/// once.
+async fn restart_with_a_queued_prompt(driver: &str) {
+    let d = TempDir::new();
+    let transcript = d.path().join("fake-transcript.ndjson");
+    let sc = Scenario::builder()
+        .turn(
+            Turn::builder()
+                .tool("Bash", json!({"command": "make"}))
+                .needs_permission()
+                .result_if_allowed("built")
+                .done()
+                .say("all done"),
+        )
+        .turn(Turn::builder().say("second reply"))
+        .build();
+    let mut req = create(d.path(), driver, &sc);
+    req.config.env.push((
+        "WASIT_FAKE_TRANSCRIPT".into(),
+        transcript.to_string_lossy().into_owned(),
+    ));
+    let (id, before, seen) = {
+        let mgr = manager(d.path()).await;
+        let id = mgr.create(req).await.unwrap().id;
+        wait_phase(&mgr, &id, "idle").await;
+        let mut s = mgr.subscribe(&id, None).await.unwrap();
+        mgr.command(&id, Command::prompt("build it")).await.unwrap();
+        wait_phase(&mgr, &id, "needs_you").await;
+        let out = mgr.command(&id, Command::prompt("and then")).await.unwrap();
+        assert_eq!(out, wasit_runtime::wire::CommandOutcome::Queued);
+        let snap = mgr.snapshot(&id).unwrap();
+        let seen = until(&mut s, |e| e.cursor >= snap.cursor).await;
+        (id, snap, seen)
+    };
+    let later = seen
+        .iter()
+        .find_map(|e| match &e.kind {
+            SessionEventKind::Input {
+                input,
+                command: Command::Prompt { text, .. },
+                ..
+            } if text == "and then" => Some(*input),
+            _ => None,
+        })
+        .expect("the queued prompt's input");
+    let last = seen.last().unwrap().cursor;
+    let mgr = manager(d.path()).await;
+    mgr.adopt_all().await.unwrap();
+    let after = wait_snapshot(&mgr, &id, "replayed snapshot", |s| {
+        s.loaded && s.cursor == before.cursor
+    })
+    .await;
+    assert_eq!(comparable(&after), comparable(&before));
+    let mut s = mgr.subscribe(&id, Some(last)).await.unwrap();
+    let gate = after.pending_gates[0].gate.clone();
+    mgr.command(
+        &id,
+        Command::AnswerGate {
+            request_id: gate.request_id().into(),
+            decision: GateDecision::by_kind(&gate, &[GateChoiceKind::AllowOnce]).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut resumed = until(&mut s, is_turn_completed).await;
+    resumed.extend(until(&mut s, is_turn_completed).await);
+    assert!(assistant_text(&resumed).contains("second reply"));
+    let full = mgr.history(&id, None, 2000).await.unwrap().events;
+    let mut joined: Vec<SessionEvent> = seen.clone();
+    joined.extend(resumed.iter().cloned());
+    assert_eq!(&full[..joined.len()], &joined[..]);
+    let count = |f: &dyn Fn(&AgentEvent) -> bool| {
+        full.iter()
+            .filter(|e| matches!(&e.kind, SessionEventKind::Agent { event } if f(event)))
+            .count()
+    };
+    assert_eq!(
+        count(&|a| matches!(a, AgentEvent::InputSent { input } if *input == later)),
+        1
+    );
+    assert_eq!(
+        count(&|a| matches!(a, AgentEvent::TurnStarted { input: Some(i), .. } if *i == later)),
+        1
+    );
+    let text = std::fs::read_to_string(&transcript).unwrap();
+    let ins: Vec<String> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["dir"] == "in")
+        .map(|v| v["msg"].to_string())
+        .collect();
+    let unique: HashSet<&String> = ins.iter().collect();
+    assert_eq!(unique.len(), ins.len(), "duplicate writes: {ins:#?}");
+}
+
+#[tokio::test]
+async fn claude_restart_with_a_queued_prompt() {
+    restart_with_a_queued_prompt("claude").await
+}
+#[tokio::test]
+async fn opencode_restart_with_a_queued_prompt() {
+    restart_with_a_queued_prompt("opencode").await
+}
+#[tokio::test]
+async fn kilo_restart_with_a_queued_prompt() {
+    restart_with_a_queued_prompt("kilo").await
+}
+
 /// A command whose effects the previous daemon never wrote is written after adoption: the
 /// first prompt is queued until the handshake, and the daemon is dropped before the CLI answers
 /// the handshake... approximated by dropping right after create.
@@ -261,14 +371,69 @@ async fn continue_starts_a_second_generation_with_monotonic_history() {
     assert!(argv
         .windows(2)
         .any(|w| w[0] == "--resume" && w[1] == native));
-    // Re-adoption replays both generations to the same snapshot.
-    let before = mgr.snapshot(&id).unwrap();
+    // Re-adoption replays both generations to the same snapshot. Compared at the exit: the
+    // CLI may print lines that change the snapshot without an event (claude reports a
+    // message's `command_lifecycle completed` after the turn's `result`), so a snapshot read
+    // while it runs can be a record behind the replay at the same cursor.
+    mgr.stop(&id).await.unwrap();
+    let before = wait_phase(&mgr, &id, "exited").await;
     drop(s);
     drop(mgr);
     let mgr = manager(d.path()).await;
     mgr.adopt_all().await.unwrap();
     let after = wait_snapshot(&mgr, &id, "replayed", |s| s.cursor == before.cursor).await;
     assert_eq!(comparable(&after), comparable(&before));
+}
+
+/// The first prompt belongs to the first generation: a continued session does not send it
+/// again, and replaying both generations shows it once.
+#[tokio::test]
+async fn the_first_prompt_is_applied_once_across_continue_and_readoption() {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let sc = Scenario::builder().turn(Turn::builder().say("one")).build();
+    let mut req = create(d.path(), "claude", &sc);
+    req.first_prompt = Some("only once".into());
+    let id = mgr.create(req).await.unwrap().id;
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    until(&mut s, is_turn_completed).await;
+    mgr.stop(&id).await.unwrap();
+    wait_phase(&mgr, &id, "exited").await;
+    mgr.continue_session(&id).await.unwrap();
+    wait_snapshot(&mgr, &id, "generation 2 idle", |s| {
+        s.generation == 2 && s.phase == Phase::Idle
+    })
+    .await;
+    let check = |events: &[SessionEvent]| {
+        let firsts = events
+            .iter()
+            .filter(|e| matches!(&e.kind, SessionEventKind::Input { command: Command::Prompt { text, .. }, .. } if text == "only once"))
+            .count();
+        assert_eq!(firsts, 1, "{events:#?}");
+        let started: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Started { first_input, .. } => Some(first_input.is_some()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, [true, false]);
+    };
+    let full = mgr.history(&id, None, 2000).await.unwrap().events;
+    check(&full);
+    drop(s);
+    drop(mgr);
+    let mgr = manager(d.path()).await;
+    mgr.adopt_all().await.unwrap();
+    let before_cursor = full.last().unwrap().cursor;
+    wait_snapshot(&mgr, &id, "replayed", |s| {
+        s.loaded && s.cursor >= before_cursor
+    })
+    .await;
+    let replayed = mgr.history(&id, None, 2000).await.unwrap().events;
+    assert_eq!(&replayed[..full.len()], &full[..]);
+    check(&replayed);
+    mgr.stop(&id).await.unwrap();
 }
 
 #[tokio::test]

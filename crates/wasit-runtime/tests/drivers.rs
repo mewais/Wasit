@@ -5,7 +5,9 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use wasit_core::{AgentEvent, Command, GateChoiceKind, GateDecision, GateRequest, QuestionAnswer};
+use wasit_core::{
+    AgentEvent, Command, GateChoiceKind, GateDecision, GateRequest, InputId, QuestionAnswer,
+};
 use wasit_fake_cli::scenario::{Scenario, Step, Turn};
 use wasit_runtime::wire::{CommandError, CommandOutcome, Phase, SessionEventKind};
 
@@ -442,7 +444,7 @@ async fn clean_exit(driver: &str) {
     })
     .await;
     assert!(events.iter().any(
-        |e| matches!(&e.kind, SessionEventKind::Notice { message } if message.contains("stop"))
+        |e| matches!(&e.kind, SessionEventKind::Notice { message, .. } if message.contains("stop"))
     ));
     let snap = wait_phase(&mgr, &id, "exited").await;
     assert!(snap.exit.unwrap().requested);
@@ -564,4 +566,222 @@ async fn first_prompt_and_unknown_driver() {
         r,
         Err(wasit_runtime::wire::RuntimeError::UnknownDriver(_))
     ));
+}
+
+// ── inputs: the first prompt is an input; queued prompts leave the queue visibly ───────────
+
+/// The `input` event of the prompt `text` (exactly one) and its id.
+fn prompt_input(events: &[wasit_runtime::wire::SessionEvent], text: &str) -> (usize, InputId) {
+    let found: Vec<(usize, InputId)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match &e.kind {
+            SessionEventKind::Input {
+                input,
+                command: Command::Prompt { text: t, .. },
+                ..
+            } if t == text => Some((i, *input)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one input for {text:?}: {events:#?}");
+    found[0]
+}
+
+/// The first prompt given at creation is an ordinary input: journaled with the start (its id
+/// is the start note's), announced by `started`, its `input` event before the turn it starts,
+/// which names it, written once.
+async fn first_prompt_is_an_input(driver: &str) {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let sc = Scenario::builder()
+        .turn(Turn::builder().say("first reply"))
+        .build();
+    let mut req = create(d.path(), driver, &sc);
+    req.first_prompt = Some("start here".into());
+    let id = mgr.create(req).await.unwrap().id;
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    let events = until(&mut s, is_turn_completed).await;
+    assert!(assistant_text(&events).contains("first reply"));
+    let (at, input) = prompt_input(&events, "start here");
+    let started = events
+        .iter()
+        .position(|e| matches!(&e.kind, SessionEventKind::Started { first_input: Some(i), .. } if *i == input))
+        .unwrap_or_else(|| panic!("started names the first input: {events:#?}"));
+    let turn = events
+        .iter()
+        .position(|e| {
+            is_agent(
+                e,
+                |a| matches!(a, AgentEvent::TurnStarted { input: Some(i), .. } if *i == input),
+            )
+        })
+        .unwrap_or_else(|| panic!("a turn names the first input: {events:#?}"));
+    assert!(started < at && at < turn, "{events:#?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, SessionEventKind::Written { input: i, .. } if i == input))
+            .count(),
+        1
+    );
+    let snap = wait_phase(&mgr, &id, "idle").await;
+    assert_eq!(snap.title.as_deref(), Some("start here"));
+}
+
+#[tokio::test]
+async fn claude_first_prompt_is_an_input() {
+    first_prompt_is_an_input("claude").await
+}
+#[tokio::test]
+async fn codex_first_prompt_is_an_input() {
+    first_prompt_is_an_input("codex").await
+}
+#[tokio::test]
+async fn opencode_first_prompt_is_an_input() {
+    first_prompt_is_an_input("opencode").await
+}
+#[tokio::test]
+async fn kilo_first_prompt_is_an_input() {
+    first_prompt_is_an_input("kilo").await
+}
+
+enum Ends {
+    Interrupt,
+    Stop,
+}
+
+/// A prompt the driver holds behind the running turn is reported dropped when an interrupt or
+/// a stop clears it, and never starts a turn. Drivers that hold prompts say so
+/// (`prompt_while_busy: queued_by_protocol`); for the others there is nothing to hold.
+async fn queued_prompt_dropped(driver: &str, how: Ends) {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let sc = Scenario::builder()
+        .turn(Turn::builder().say("working").wait_for_interrupt())
+        .turn(Turn::builder().say("next"))
+        .build();
+    let id = create_idle(&mgr, d.path(), driver, &sc).await;
+    let caps = mgr.snapshot(&id).unwrap().capabilities;
+    assert_eq!(
+        caps.prompt_while_busy,
+        wasit_core::BusyPrompt::QueuedByProtocol
+    );
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    mgr.command(&id, Command::prompt("long")).await.unwrap();
+    until(&mut s, |e| {
+        is_agent(e, |a| matches!(a, AgentEvent::AssistantDelta { .. }))
+    })
+    .await;
+    let out = mgr.command(&id, Command::prompt("later")).await.unwrap();
+    assert_eq!(out, CommandOutcome::Queued);
+    let events = until(&mut s, |e| {
+        matches!(&e.kind, SessionEventKind::Input { command: Command::Prompt { text, .. }, .. } if text == "later")
+    })
+    .await;
+    let (_, later) = prompt_input(&events[events.len() - 1..], "later");
+    let reason = match how {
+        Ends::Interrupt => {
+            mgr.command(&id, Command::Interrupt).await.unwrap();
+            wasit_core::InputDropReason::Interrupted
+        }
+        Ends::Stop => {
+            mgr.stop(&id).await.unwrap();
+            wasit_core::InputDropReason::Shutdown
+        }
+    };
+    let events = until(&mut s, |e| match how {
+        Ends::Interrupt => is_turn_completed(e),
+        Ends::Stop => matches!(e.kind, SessionEventKind::Exited { .. }),
+    })
+    .await;
+    let drops: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::Agent {
+                event: AgentEvent::InputDropped { input, reason, .. },
+            } => Some((*input, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(drops, vec![(later, reason)], "{events:#?}");
+    assert!(!events.iter().any(|e| is_agent(e, |a| matches!(
+        a,
+        AgentEvent::TurnStarted { input: Some(i), .. } | AgentEvent::InputSent { input: i } if *i == later
+    ))));
+    if let Ends::Interrupt = how {
+        // The session stays; the next prompt gets its own turn.
+        wait_phase(&mgr, &id, "idle").await;
+        mgr.command(&id, Command::prompt("again")).await.unwrap();
+        let events = until(&mut s, is_turn_completed).await;
+        let (_, again) = prompt_input(&events, "again");
+        assert!(events.iter().any(|e| is_agent(e, |a| matches!(
+            a,
+            AgentEvent::TurnStarted { input: Some(i), .. } if *i == again
+        ))));
+        assert!(
+            !mgr.snapshot(&id)
+                .unwrap()
+                .last_turn
+                .unwrap()
+                .was_interrupted
+        );
+    }
+}
+
+#[tokio::test]
+async fn claude_queued_prompt_dropped_by_interrupt() {
+    queued_prompt_dropped("claude", Ends::Interrupt).await
+}
+#[tokio::test]
+async fn claude_queued_prompt_dropped_by_stop() {
+    queued_prompt_dropped("claude", Ends::Stop).await
+}
+#[tokio::test]
+async fn opencode_queued_prompt_dropped_by_interrupt() {
+    queued_prompt_dropped("opencode", Ends::Interrupt).await
+}
+#[tokio::test]
+async fn opencode_queued_prompt_dropped_by_stop() {
+    queued_prompt_dropped("opencode", Ends::Stop).await
+}
+#[tokio::test]
+async fn kilo_queued_prompt_dropped_by_interrupt() {
+    queued_prompt_dropped("kilo", Ends::Interrupt).await
+}
+#[tokio::test]
+async fn kilo_queued_prompt_dropped_by_stop() {
+    queued_prompt_dropped("kilo", Ends::Stop).await
+}
+
+/// claude acknowledges a prompt on the CLI's own report (the fake reports message lifecycles
+/// as claude 2.1.293 does); nothing else acknowledges it.
+#[tokio::test]
+async fn claude_prompt_is_acknowledged_by_the_cli() {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let sc = Scenario::builder().turn(Turn::builder().say("hi")).build();
+    let id = create_idle(&mgr, d.path(), "claude", &sc).await;
+    let mut s = mgr.subscribe(&id, None).await.unwrap();
+    mgr.command(&id, Command::prompt("hello")).await.unwrap();
+    let events = until(&mut s, is_turn_completed).await;
+    let (at, input) = prompt_input(&events, "hello");
+    let pos = |f: &dyn Fn(&SessionEventKind) -> bool| {
+        events
+            .iter()
+            .position(|e| f(&e.kind))
+            .unwrap_or_else(|| panic!("{events:#?}"))
+    };
+    let written = pos(&|k| matches!(k, SessionEventKind::Written { input: i, .. } if *i == input));
+    let acked = pos(
+        &|k| matches!(k, SessionEventKind::Agent { event: AgentEvent::InputAcknowledged { input: i, steered: false } } if *i == input),
+    );
+    assert!(at < written && written < acked, "{events:#?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| is_agent(e, |a| matches!(a, AgentEvent::InputAcknowledged { .. })))
+            .count(),
+        1
+    );
 }

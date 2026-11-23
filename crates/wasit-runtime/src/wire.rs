@@ -44,8 +44,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
-    GateRequest, ModelInfo, ModelUsage, PlanEntry, PromptInput, ResumableSession, SessionMode,
-    SlashCommandInfo, Unsupported, Usage,
+    GateRequest, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput, ResumableSession,
+    SessionMode, SlashCommandInfo, Unsupported, Usage,
 };
 
 /// Method names.
@@ -419,7 +419,114 @@ pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
 
+/// What made the phase change (the last fact of the journal record that decided the new phase).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PhaseCause {
+    /// A process generation was spawned.
+    Spawned { generation: u32 },
+    /// The CLI completed its handshake.
+    HandshakeDone,
+    /// A turn started (for this input, when it is one of ours).
+    TurnStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<InputId>,
+    },
+    /// A turn ended.
+    TurnCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_reason: Option<EndReason>,
+        interrupted: bool,
+    },
+    /// A gate was raised (by the CLI, or from outside the CLI protocol: `external`).
+    GateRaised { request_id: String, external: bool },
+    /// A gate stopped being pending.
+    GateCleared {
+        request_id: String,
+        how: GateClearing,
+    },
+    /// The process exited.
+    Exited {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+        /// A stop was requested before the exit.
+        requested: bool,
+        /// The handshake deadline had passed.
+        handshake_timeout: bool,
+    },
+    /// The shim vanished without an exit record.
+    Lost,
+    /// Nothing more specific is known (also: a peer that predates causes).
+    #[default]
+    Other,
+}
+
+/// How a gate stopped being pending ([`PhaseCause::GateCleared`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum GateClearing {
+    /// Answered by the human (or a policy they set).
+    Answered,
+    /// Resolved by the CLI or the protocol (e.g. declined on interrupt).
+    Resolved,
+    /// An external gate taken down by its owner, or ended with its process.
+    Withdrawn,
+}
+
+/// What a [`SessionEventKind::Notice`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeCode {
+    /// A graceful stop was requested.
+    StopRequested,
+    /// The handshake deadline passed; the process is being stopped.
+    HandshakeDeadline,
+    /// A signal was sent to the process.
+    SignalSent,
+    /// A new process generation started although the journal never recorded the previous
+    /// one's exit.
+    PreviousGenerationUnclosed,
+    /// A `start` note arrived outside a fresh process generation and was ignored.
+    StartIgnored,
+    /// A note of the shim about itself.
+    Shim,
+    /// A runtime note this build does not understand.
+    UnrecognisedNote,
+    /// Anything else.
+    #[default]
+    Other,
+}
+
+/// How a process generation was started ([`SessionEventKind::Started`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum StartResume {
+    Fresh,
+    /// The CLI's most recent conversation in the working directory.
+    Continue,
+    /// A conversation by its native id.
+    Resume,
+}
+
+/// A fact the runtime noticed that does not fit the session's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalyKind {
+    /// The agent produced output (text, thinking, tool calls) while no turn of the session was
+    /// running (`idle`), e.g. background work or a turn the CLI started by itself.
+    ActivityWhileIdle,
+}
+
 /// The payload of a [`SessionEvent`].
+///
+/// Variants marked `#[non_exhaustive]` gain fields over time: match them with `..`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -432,17 +539,59 @@ pub enum SessionEventKind {
         #[serde(default)]
         argv: Vec<String>,
     },
+    /// The generation's `start` note was applied: how the CLI was asked to start.
+    #[non_exhaustive]
+    Started {
+        generation: u32,
+        resume: StartResume,
+        /// The native id resumed ([`StartResume::Resume`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// The first prompt journaled with the start (its `input` event follows).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_input: Option<InputId>,
+    },
     /// Something the driver reported.
     Agent { event: AgentEvent },
-    /// A user command, as applied in journal order.
+    /// A user command, as applied in journal order. The first prompt of a session is one too
+    /// (journaled with the `start` note).
+    #[non_exhaustive]
     Input {
+        /// Its identity: the journal seq of the note that carried it.
+        #[serde(default)]
+        input: InputId,
         command: Command,
         status: CommandStatus,
     },
+    /// The lines an input asked to write all reached the shim's journal of stdin writes (the
+    /// shim records a line, then writes it; a failure follows as [`Self::WriteFailed`]).
+    #[non_exhaustive]
+    Written { input: InputId },
+    /// Writing to the CLI's stdin failed (for the input whose line it was, when known).
+    #[non_exhaustive]
+    WriteFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<InputId>,
+        error: String,
+    },
     /// A line the CLI wrote to stderr.
     Stderr { text: String },
-    /// The phase changed.
-    Phase { phase: Phase },
+    /// The phase changed, and why.
+    #[non_exhaustive]
+    Phase {
+        phase: Phase,
+        #[serde(default)]
+        cause: PhaseCause,
+    },
+    /// Something that does not fit the session's state (once per occurrence period: an
+    /// `activity_while_idle` is reported once until the phase changes). `first` is the type of
+    /// the first event that showed it (e.g. `tool_call_started`).
+    #[non_exhaustive]
+    Anomaly { anomaly: AnomalyKind, first: String },
     /// The process exited.
     Exited {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -453,7 +602,12 @@ pub enum SessionEventKind {
     /// The shim vanished without an exit record.
     Lost { reason: String },
     /// A runtime / shim annotation (stop requested, signal sent, handshake deadline, …).
-    Notice { message: String },
+    #[non_exhaustive]
+    Notice {
+        message: String,
+        #[serde(default)]
+        code: NoticeCode,
+    },
 }
 
 /// Cursor of the `index`-th event derived from journal record `seq`.

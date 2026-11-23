@@ -229,6 +229,7 @@ impl SessionManager {
             model: req.model.clone().filter(|m| !m.is_empty()),
             mode: req.mode.clone().unwrap_or_default(),
             first_prompt: req.first_prompt.clone().filter(|p| !p.is_empty()),
+            session_id: Some(id.to_string()),
             resume,
             ..SpawnSpec::default()
         };

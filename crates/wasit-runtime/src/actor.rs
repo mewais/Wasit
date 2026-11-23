@@ -1005,7 +1005,14 @@ impl Actor {
         };
         let mut spec = self.file.spec.clone();
         spec.resume = ResumeMode::Resume(native);
+        // The first prompt belongs to the first generation (its `start` note); a continued
+        // session starts without one.
         spec.first_prompt = None;
+        // A session created before session ids gets one now: the new generation's protocol
+        // starts fresh, so its lines may differ from the old generation's.
+        if spec.session_id.is_none() {
+            spec.session_id = Some(self.id.to_string());
+        }
         let shim_spec = match store::shim_spec(&self.cfg, self.desc.as_ref(), &self.dir, &spec) {
             Ok(s) => s,
             Err(e) => {

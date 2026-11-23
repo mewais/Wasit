@@ -65,6 +65,10 @@ pub struct Claude {
     tool_use_id: String,
     msg_id: String,
     mcp: std::collections::BTreeMap<String, crate::mcp::McpLaunch>,
+    /// `uuid`s of user messages read while a turn ran, not started or cancelled yet.
+    waiting: Vec<String>,
+    /// `uuid` of the message the running turn is for.
+    current: Option<String>,
 }
 
 fn resolve_model(m: &str) -> String {
@@ -131,7 +135,21 @@ impl Claude {
                 .as_deref()
                 .map(crate::mcp::servers_from_config)
                 .unwrap_or_default(),
+            waiting: Vec::new(),
+            current: None,
         }
+    }
+
+    /// `command_lifecycle` for the user message `uuid` (shape: `reference/claude/lifecycle`,
+    /// claude 2.1.293): `queued` when read, `started` when its turn begins (before
+    /// `system/init`), `completed` after its turn's `result`, `cancelled` when dropped from the
+    /// queue or when its turn was interrupted.
+    fn lifecycle(&self, io: &mut Io, uuid: &str, state: &str) {
+        let mut m = first_where("lifecycle", |m| ty(m, "command_lifecycle"));
+        set(&mut m, "command_uuid", json!(uuid));
+        set(&mut m, "state", json!(state));
+        let m = self.envelope(m);
+        io.send(&m);
     }
 
     fn envelope(&self, mut m: Value) -> Value {
@@ -474,7 +492,9 @@ impl Persona for Claude {
                         Incoming::Handled
                     }
                     "interrupt" => {
-                        self.control_ok(io, &id, json!({"still_queued": []}));
+                        // Queued messages survive an interrupt (they run after it).
+                        let still: Vec<Value> = self.waiting.iter().map(|u| json!(u)).collect();
+                        self.control_ok(io, &id, json!({ "still_queued": still }));
                         if in_turn {
                             Incoming::Interrupt
                         } else {
@@ -513,6 +533,10 @@ impl Persona for Claude {
                         self.control_ok(io, &id, json!({"model": model}));
                         Incoming::Handled
                     }
+                    "cancel_async_message" => Incoming::Cancel {
+                        request: id,
+                        id: req["message_uuid"].as_str().unwrap_or("").to_string(),
+                    },
                     "" => {
                         self.control_err(io, &id, "Missing request subtype", None);
                         Incoming::Handled
@@ -547,13 +571,30 @@ impl Persona for Claude {
                         .join("\n"),
                     _ => String::new(),
                 };
-                Incoming::Prompt(text)
+                match v["uuid"].as_str() {
+                    Some(uuid) => {
+                        self.lifecycle(io, uuid, "queued");
+                        if in_turn {
+                            self.waiting.push(uuid.to_string());
+                        }
+                        Incoming::TrackedPrompt {
+                            text,
+                            id: uuid.to_string(),
+                        }
+                    }
+                    None => Incoming::Prompt(text),
+                }
             }
             _ => Incoming::Handled,
         }
     }
 
-    fn turn_begin(&mut self, io: &mut Io, _prompt: &str, _stats: &mut TurnStats) {
+    fn turn_begin(&mut self, io: &mut Io, _prompt: &str, id: Option<&str>, _stats: &mut TurnStats) {
+        self.current = id.map(str::to_string);
+        if let Some(uuid) = id {
+            self.waiting.retain(|w| w != uuid);
+            self.lifecycle(io, uuid, "started");
+        }
         self.send_system_init(io);
         if self.partial {
             let mut s = first_where("partial_messages", |m| {
@@ -776,6 +817,14 @@ impl Persona for Claude {
         self.mcp.get(name).cloned()
     }
 
+    fn cancel_answered(&mut self, io: &mut Io, request: &Value, id: &str, cancelled: bool) {
+        if cancelled {
+            self.waiting.retain(|w| w != id);
+            self.lifecycle(io, id, "cancelled");
+        }
+        self.control_ok(io, request, json!({ "cancelled": cancelled }));
+    }
+
     fn turn_end(&mut self, io: &mut Io, outcome: &Outcome, stats: &mut TurnStats) {
         match outcome {
             Outcome::Completed => {
@@ -810,8 +859,19 @@ impl Persona for Claude {
                 io.send(&a);
             }
         }
-        let r = self.result_message(outcome, stats);
+        let mut r = self.result_message(outcome, stats);
+        if let Some(uuid) = &self.current {
+            set(&mut r, "user_message_uuids", json!([uuid]));
+        }
         io.send(&r);
+        if let Some(uuid) = self.current.take() {
+            // Not recorded for a failed turn; `completed` is assumed (it ran).
+            let state = match outcome {
+                Outcome::Interrupted => "cancelled",
+                Outcome::Completed | Outcome::Failed(_) => "completed",
+            };
+            self.lifecycle(io, &uuid, state);
+        }
         if stats.tool_calls > 0 {
             let mut t = first_where("tool_allow", |m| {
                 ty(m, "system") && m["subtype"] == "task_summary" && m["detail"].is_null()

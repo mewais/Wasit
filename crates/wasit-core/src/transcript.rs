@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::AgentEvent;
-use crate::protocol::{Command, DriverError, Encoded, Protocol, Step};
+use crate::protocol::{Command, DriverError, Encoded, InputId, Protocol, Step};
 use crate::spec::SpawnSpec;
 
 /// One transcript record (one NDJSON line, externally tagged).
@@ -52,7 +52,17 @@ pub fn to_line(r: &Record) -> String {
     serde_json::to_string(r).expect("records are always serializable")
 }
 
-/// Feed `records` through `protocol`.
+/// The [`InputId`] of the command carried by the record at `index` (0-based) of a transcript:
+/// its 1-based position, the way a journal's seq names a runtime note. A `start` record's first
+/// prompt gets the start record's id.
+pub fn input_id(index: usize) -> InputId {
+    InputId(index as u64 + 1)
+}
+
+/// Feed `records` through `protocol`. A `start` record's first prompt is encoded right after
+/// `start`, as the runtime does ([`SpawnSpec::split_first_prompt`]).
+///
+/// [`SpawnSpec::split_first_prompt`]: crate::SpawnSpec::split_first_prompt
 pub fn replay(protocol: &mut dyn Protocol, records: &[Record]) -> Replay {
     let mut out = Replay::default();
     let apply = |out: &mut Replay, step: Step| {
@@ -60,21 +70,29 @@ pub fn replay(protocol: &mut dyn Protocol, records: &[Record]) -> Replay {
         out.written.extend(step.write.into_iter().map(|l| l.0));
         out.closed_stdin |= step.close_stdin;
     };
-    for r in records {
+    let encode =
+        |protocol: &mut dyn Protocol, out: &mut Replay, input, cmd: &Command| match protocol
+            .encode(input, cmd.clone())
+        {
+            Ok(Encoded::Sent(step)) => apply(out, step),
+            Ok(Encoded::Queued) => {}
+            Err(e) => out.encode_errors.push((cmd.name().to_string(), e)),
+        };
+    for (i, r) in records.iter().enumerate() {
         match r {
             Record::Start(spec) => {
-                let step = protocol.start(spec);
+                let (spec, first) = spec.split_first_prompt();
+                let step = protocol.start(&spec);
                 apply(&mut out, step);
+                if let Some(cmd) = first {
+                    encode(protocol, &mut out, input_id(i), &cmd);
+                }
             }
             Record::Out(line) => {
                 let step = protocol.on_line(line);
                 apply(&mut out, step);
             }
-            Record::Cmd(cmd) => match protocol.encode(cmd.clone()) {
-                Ok(Encoded::Sent(step)) => apply(&mut out, step),
-                Ok(Encoded::Queued) => {}
-                Err(e) => out.encode_errors.push((cmd.name().to_string(), e)),
-            },
+            Record::Cmd(cmd) => encode(protocol, &mut out, input_id(i), cmd),
             Record::In(line) => out.expected_written.push(line.clone()),
             Record::CloseStdin => {}
         }

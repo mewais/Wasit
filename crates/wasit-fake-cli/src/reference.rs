@@ -19,7 +19,7 @@ macro_rules! refs {
 refs! {
     "claude"/"simple", "claude"/"tool_allow", "claude"/"tool_deny", "claude"/"ask_question",
     "claude"/"interrupt", "claude"/"resume", "claude"/"set_mode", "claude"/"turn_error",
-    "claude"/"partial_messages",
+    "claude"/"partial_messages", "claude"/"lifecycle",
     "codex"/"handshake", "codex"/"simple", "codex"/"tool_allow", "codex"/"tool_deny",
     "codex"/"interrupt", "codex"/"resume", "codex"/"mode", "codex"/"error", "codex"/"question",
     "codex"/"lifecycle",

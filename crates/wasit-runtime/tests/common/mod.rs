@@ -295,7 +295,7 @@ pub fn is_turn_completed(e: &SessionEvent) -> bool {
 }
 
 pub fn is_phase(e: &SessionEvent, name: &str) -> bool {
-    matches!(&e.kind, SessionEventKind::Phase { phase } if phase.name() == name)
+    matches!(&e.kind, SessionEventKind::Phase { phase, .. } if phase.name() == name)
 }
 
 pub fn assistant_text(events: &[SessionEvent]) -> String {

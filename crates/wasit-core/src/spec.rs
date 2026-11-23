@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::protocol::Command;
+
 /// How to resume or start a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -96,13 +98,34 @@ pub struct SpawnSpec {
     #[serde(default)]
     pub resume: ResumeMode,
 
-    /// Optional first prompt. The protocol sends it as soon as its handshake
-    /// allows (it is queued inside the protocol until then).
+    /// Optional first prompt. It is the session's first input, applied like any later
+    /// [`Command::Prompt`]: whoever starts the protocol takes it out with
+    /// [`SpawnSpec::split_first_prompt`] and encodes it right after
+    /// [`Protocol::start`](crate::Protocol::start). Protocols never read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_prompt: Option<String>,
+
+    /// The runtime's id of this session (random, unique per host), set by the runtime for the
+    /// sessions it starts. Drivers derive ids that must never repeat across sessions from it
+    /// (claude: the `uuid` of each user message). `None` in specs written before it existed:
+    /// such a session keeps writing exactly what it wrote before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl SpawnSpec {
+    /// The spec a protocol is started with (no first prompt) and the first prompt as the
+    /// command to encode right after `start`, before anything else.
+    pub fn split_first_prompt(&self) -> (SpawnSpec, Option<Command>) {
+        let mut spec = self.clone();
+        let first = spec
+            .first_prompt
+            .take()
+            .filter(|p| !p.is_empty())
+            .map(Command::prompt);
+        (spec, first)
+    }
+
     /// The binary to execute: `bin` if set, else `default`.
     pub fn binary_or<'a>(&'a self, default: &'a str) -> &'a str {
         self.bin.as_deref().unwrap_or(default)

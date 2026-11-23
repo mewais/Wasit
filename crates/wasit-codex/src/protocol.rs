@@ -32,9 +32,9 @@ use wasit_core::wire::{
 };
 use wasit_core::{
     AgentEvent, Attachment, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
-    GateChoice, GateChoiceKind, GateRequest, MediaSource, ModelInfo, OutLine, PlanEntry, Protocol,
-    QuestionAnswer, QuestionOption, QuestionPrompt, ResumeMode, SessionMode, SpawnSpec, Step,
-    Usage,
+    GateChoice, GateChoiceKind, GateRequest, InputDropReason, InputId, MediaSource, ModelInfo,
+    OutLine, PlanEntry, Protocol, QuestionAnswer, QuestionOption, QuestionPrompt, ResumeMode,
+    SessionMode, SpawnSpec, Step, Usage,
 };
 
 /// `protocol_options` key holding skill roots (a JSON array of absolute
@@ -100,7 +100,9 @@ pub struct CodexProtocol {
     phase: Phase,
     next_id: u64,
     outstanding: HashMap<u64, Req>,
-    queue: VecDeque<Command>,
+    queue: VecDeque<(InputId, Command)>,
+    /// The input of the `turn/start` whose turn has not been announced yet.
+    starting_input: Option<InputId>,
     spec: SpawnSpec,
     thread_id: Option<String>,
     model: Option<String>,
@@ -129,6 +131,7 @@ impl CodexProtocol {
             next_id: 1,
             outstanding: HashMap::new(),
             queue: VecDeque::new(),
+            starting_input: None,
             spec: SpawnSpec::default(),
             thread_id: None,
             model: None,
@@ -258,23 +261,24 @@ impl CodexProtocol {
         }
     }
 
-    fn encode_now(&mut self, cmd: Command) -> Result<Step, DriverError> {
+    fn encode_now(&mut self, input: InputId, cmd: Command) -> Result<Step, DriverError> {
         let mut step = Step::default();
         match cmd {
             Command::Prompt { text, attachments } => {
-                let input = Value::Array(user_input(&text, &attachments));
+                let items = Value::Array(user_input(&text, &attachments));
                 let line = match self.active_turn.clone() {
                     Some(turn) => self.request(
                         Req::Steer,
                         "turn/steer",
-                        json!({"threadId": self.thread(), "expectedTurnId": turn, "input": input}),
+                        json!({"threadId": self.thread(), "expectedTurnId": turn, "input": items}),
                     ),
                     None => {
                         self.turn_pending = true;
+                        self.starting_input = Some(input);
                         self.request(
                             Req::TurnStart,
                             "turn/start",
-                            json!({"threadId": self.thread(), "input": input}),
+                            json!({"threadId": self.thread(), "input": items}),
                         )
                     }
                 };
@@ -331,7 +335,10 @@ impl CodexProtocol {
             }
             Command::Shutdown => {
                 self.phase = Phase::Closed;
-                self.queue.clear();
+                step.events = std::mem::take(&mut self.queue)
+                    .into_iter()
+                    .map(|(input, _)| dropped(input, InputDropReason::Shutdown))
+                    .collect();
                 step.close_stdin = true;
             }
         }
@@ -349,9 +356,20 @@ impl CodexProtocol {
         Ok(self.gates.remove(pos))
     }
 
+    /// Take the queued prompts out of the queue: one `InputDropped` each, in queue order.
+    fn drop_queued_prompts(&mut self, reason: InputDropReason) -> Vec<AgentEvent> {
+        let (prompts, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.queue)
+            .into_iter()
+            .partition(|(_, c)| matches!(c, Command::Prompt { .. }));
+        self.queue = rest;
+        prompts
+            .into_iter()
+            .map(|(input, _)| dropped(input, reason))
+            .collect()
+    }
+
     fn interrupt(&mut self) -> Step {
-        let mut step = Step::default();
-        self.queue.retain(|c| !matches!(c, Command::Prompt { .. }));
+        let mut step = events(self.drop_queued_prompts(InputDropReason::Interrupted));
         for g in std::mem::take(&mut self.gates) {
             step.write.push(rpc_result(&g.raw_id, interrupt_answer(&g)));
             step.events.push(AgentEvent::GateResolved {
@@ -395,7 +413,7 @@ impl CodexProtocol {
 
     fn drain(&mut self) -> Step {
         let mut step = Step::default();
-        while let Some(cmd) = self.queue.front() {
+        while let Some((_, cmd)) = self.queue.front() {
             if self.phase != Phase::Ready {
                 break;
             }
@@ -405,13 +423,16 @@ impl CodexProtocol {
             {
                 break;
             }
-            let cmd = self.queue.pop_front().expect("front exists");
-            let name = cmd.name();
-            match self.encode_now(cmd) {
-                Ok(s) => step.extend(s),
-                Err(e) => step.events.push(AgentEvent::CommandRejected {
-                    command: name.into(),
-                    message: e.to_string(),
+            let (input, cmd) = self.queue.pop_front().expect("front exists");
+            match self.encode_now(input, cmd) {
+                Ok(s) => {
+                    step.events.push(AgentEvent::InputSent { input });
+                    step.extend(s);
+                }
+                Err(e) => step.events.push(AgentEvent::InputDropped {
+                    input,
+                    reason: InputDropReason::Unencodable,
+                    error: Some(e.to_string()),
                 }),
             }
         }
@@ -518,6 +539,7 @@ impl CodexProtocol {
             Req::TurnStart => {
                 self.turn_pending = false;
                 self.interrupt_wanted = false;
+                self.starting_input = None;
                 let mut step = events(vec![AgentEvent::TurnCompleted {
                     end_reason: Some(EndReason::ExecutionError),
                     was_interrupted: false,
@@ -602,6 +624,7 @@ impl CodexProtocol {
                 let turn = params.get("turn").and_then(|t| opt_s(t, "id"));
                 let mut step = events(vec![AgentEvent::TurnStarted {
                     native_turn_id: turn.clone(),
+                    input: self.starting_input.take(),
                 }]);
                 if let Some(t) = turn {
                     if self.active_turn.as_deref() != Some(t.as_str()) {
@@ -929,9 +952,6 @@ impl Protocol for CodexProtocol {
         self.spec = spec.clone();
         self.phase = Phase::Handshaking;
         self.mode = None;
-        if let Some(p) = &spec.first_prompt {
-            self.queue.push_back(Command::prompt(p.clone()));
-        }
         let line = self.request(
             Req::Initialize,
             "initialize",
@@ -969,22 +989,23 @@ impl Protocol for CodexProtocol {
         self.phase == Phase::Ready
     }
 
-    fn encode(&mut self, cmd: Command) -> Result<Encoded, DriverError> {
+    fn encode(&mut self, input: InputId, cmd: Command) -> Result<Encoded, DriverError> {
         if self.phase == Phase::Closed {
             return Err(DriverError::Shutdown);
         }
         if matches!(cmd, Command::RunSlash { .. }) {
-            return self.encode_now(cmd).map(Encoded::Sent);
+            return self.encode_now(input, cmd).map(Encoded::Sent);
         }
         if matches!(cmd, Command::Interrupt) && self.phase != Phase::Ready {
-            self.queue.retain(|c| !matches!(c, Command::Prompt { .. }));
-            return Ok(Encoded::Sent(Step::default()));
+            // Nothing is running yet: what the interrupt clears is the queued prompts.
+            let dropped = self.drop_queued_prompts(InputDropReason::Interrupted);
+            return Ok(Encoded::Sent(events(dropped)));
         }
         if self.must_queue(&cmd) {
-            self.queue.push_back(cmd);
+            self.queue.push_back((input, cmd));
             return Ok(Encoded::Queued);
         }
-        self.encode_now(cmd).map(Encoded::Sent)
+        self.encode_now(input, cmd).map(Encoded::Sent)
     }
 }
 
@@ -992,6 +1013,14 @@ fn events(events: Vec<AgentEvent>) -> Step {
     Step {
         events,
         ..Step::default()
+    }
+}
+
+fn dropped(input: InputId, reason: InputDropReason) -> AgentEvent {
+    AgentEvent::InputDropped {
+        input,
+        reason,
+        error: None,
     }
 }
 

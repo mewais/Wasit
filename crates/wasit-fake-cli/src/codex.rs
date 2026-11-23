@@ -580,7 +580,7 @@ impl Persona for Codex {
         }
     }
 
-    fn turn_begin(&mut self, io: &mut Io, prompt: &str, stats: &mut TurnStats) {
+    fn turn_begin(&mut self, io: &mut Io, prompt: &str, _id: Option<&str>, stats: &mut TurnStats) {
         stats.started = Some(std::time::Instant::now());
         self.items.clear();
         let turn = self.turn_obj("inProgress", json!([]), false, now_ms());
