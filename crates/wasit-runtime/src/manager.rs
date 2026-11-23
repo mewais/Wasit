@@ -293,6 +293,38 @@ impl SessionManager {
         };
         store::apply_override(cfg, &req.driver, &mut spec);
         let unsupported = desc.render_config(&req.config, &mut spec);
+        // "Continue the most recent conversation here" is resolved by the runtime, from the
+        // agent's own list of the conversations of the folder, and resumes that one by its id:
+        // the agent's own "continue" would start a new conversation without a word when the
+        // folder has none.
+        if matches!(req.resume, ResumeRequest::Latest) {
+            let folder = match &spec.cwd {
+                Some(c) => c.clone(),
+                None => std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(|e| io_err("the working directory", e))?,
+            };
+            match crate::discovery::latest_conversation(cfg, desc.as_ref(), &folder, &spec.env)
+                .await
+            {
+                Ok(Some(found)) => spec.resume = ResumeMode::Resume(found.id),
+                Ok(None) => return Err(RuntimeError::NothingToContinue(folder)),
+                Err(e) => {
+                    return Err(RuntimeError::Io(format!(
+                        "cannot look for the most recent conversation in {folder}: {e}"
+                    )))
+                }
+            }
+        }
+        // A conversation this session did not start has earlier history its journal lacks: the
+        // runtime decides, before the agent writes to its storage again, how that reaches the
+        // journal.
+        let earlier = match &spec.resume {
+            ResumeMode::Resume(native) => {
+                crate::history::plan(cfg, desc.as_ref(), &spec, native).await
+            }
+            _ => None,
+        };
         store::private_dir_all(&dir)
             .await
             .map_err(|e| io_err(&format!("create {}", dir.display()), e))?;
@@ -305,6 +337,7 @@ impl SessionManager {
             unsupported.clone(),
         );
         file.display_name = name;
+        file.earlier = earlier;
         let launched = async {
             store::write_generated(&dir, &file.spec).await?;
             store::write(&dir, &file)
@@ -907,6 +940,31 @@ impl SessionManager {
         limit: usize,
         scope: HistoryScope,
     ) -> Result<HistoryPage, RuntimeError> {
+        self.history_page(id, before, limit, scope, false).await
+    }
+
+    /// The last `limit` items of the conversation's *earlier* history (the part of the transcript
+    /// before the session's own events: `wasit_core::AgentEvent::History` items) with
+    /// `cursor < before`, oldest first, restricted to `scope` by what the items hold. Always
+    /// read from the journal.
+    pub async fn earlier_scoped(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+        scope: HistoryScope,
+    ) -> Result<HistoryPage, RuntimeError> {
+        self.history_page(id, before, limit, scope, true).await
+    }
+
+    async fn history_page(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+        scope: HistoryScope,
+        earlier: bool,
+    ) -> Result<HistoryPage, RuntimeError> {
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
         let (has_actor, dir, desc, meta) = {
             let map = lock(&self.inner.sessions);
@@ -926,6 +984,7 @@ impl SessionManager {
                     before,
                     limit,
                     scope: scope.clone(),
+                    earlier,
                     reply,
                 })
                 .await?
@@ -933,7 +992,7 @@ impl SessionManager {
                 return Ok(p);
             }
         }
-        replay::history(&dir, desc, &meta, before, limit, scope)
+        replay::history(&dir, desc, &meta, before, limit, scope, earlier)
             .await
             .map_err(RuntimeError::Io)
     }

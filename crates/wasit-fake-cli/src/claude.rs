@@ -5,6 +5,7 @@ use crate::engine::{Incoming, Outcome, Persona, TaskEnd, TaskIds, TurnStats};
 use crate::io::Io;
 use crate::reference::find_out;
 use crate::scenario::{AskStep, BackgroundStep, PlanEntry, Scenario, ToolStep};
+use crate::transcript::{self, encode_project_dir, Writer};
 use crate::util::{alnum, chunk_text, hex, iso_now, now_ms, set, unset, uuid};
 use serde_json::{json, Value};
 
@@ -78,6 +79,14 @@ pub struct Claude {
     project_dir: std::path::PathBuf,
     /// The conversation was started with `--name` and its title is not in a transcript yet.
     name_unsaved: Option<String>,
+    /// Where this conversation's transcript is (the stored one when it is resumed, else the
+    /// working directory's project), and its writer, opened on first use.
+    transcript: Option<std::path::PathBuf>,
+    writer: Option<Writer>,
+    /// The writers of the subagents' own files, by agent id.
+    subs: Vec<(String, Writer)>,
+    /// The `assistant` record of the tool call being answered (a result's `sourceToolAssistantUUID`).
+    tool_assistant: String,
     model: String,
     mode: String,
     cwd: String,
@@ -138,14 +147,6 @@ fn first_where(name: &str, pred: impl Fn(&Value) -> bool) -> Value {
 
 fn ty(m: &Value, t: &str) -> bool {
     m["type"] == t
-}
-
-/// Claude's per-project transcript directory name: every non-alphanumeric character of the
-/// absolute working directory becomes `-`.
-fn encode_project_dir(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
 }
 
 /// Where the real CLI keeps its state: `CLAUDE_CONFIG_DIR`, else (the fake never touches the
@@ -212,11 +213,17 @@ impl Claude {
         let project_dir = config_dir().join("projects").join(encode_project_dir(&cwd));
         let mut title = args.name.clone();
         let mut resumed = args.resume.clone();
+        let mut resumed_path = None;
         if resumed.is_none() && args.continue_latest && args.session_id.is_none() {
             // No conversation to continue: a fresh one, silently.
             resumed = latest_in(&project_dir);
         }
         if let Some(id) = &resumed {
+            // A conversation the scenario says exists is a real transcript in the agent's
+            // storage, as one a real run left.
+            if let Some(info) = scenario.sessions.iter().find(|s| &s.id == id) {
+                transcript::materialise_session(&config_dir(), &cwd, info);
+            }
             let stored = find_transcript(id);
             let known = scenario.sessions.iter().any(|s| &s.id == id);
             if stored.is_none() && !known {
@@ -236,6 +243,7 @@ impl Claude {
             if title.is_none() {
                 title = stored.as_deref().and_then(title_of);
             }
+            resumed_path = stored;
         }
         if resumed.is_none() {
             if let Some(id) = &args.session_id {
@@ -262,6 +270,7 @@ impl Claude {
             scenario,
         );
         c.title = title;
+        c.transcript = resumed_path;
         c.project_dir = project_dir;
         c.name_unsaved = name_unsaved;
         Ok(c)
@@ -292,6 +301,10 @@ impl Claude {
             title: None,
             project_dir: std::path::PathBuf::new(),
             name_unsaved: None,
+            transcript: None,
+            writer: None,
+            subs: Vec::new(),
+            tool_assistant: String::new(),
             model,
             mode: args
                 .permission_mode
@@ -336,42 +349,51 @@ impl Claude {
         io.send(&m);
     }
 
-    /// Append records to this conversation's transcript, creating it (with the title records
-    /// first, as the real CLI writes them for `--name`) when it is the first write: the
-    /// conversation exists in storage from its first prompt on, not before.
-    fn store_records(&mut self, records: Vec<Value>) {
-        use std::io::Write;
-        let mut lines: Vec<Value> = Vec::new();
-        if let Some(name) = self.name_unsaved.take() {
-            lines.push(
-                json!({"type":"custom-title","customTitle":name,"sessionId":self.session_id}),
-            );
-            lines.push(json!({"type":"agent-name","agentName":name,"sessionId":self.session_id}));
-        }
-        lines.extend(records);
-        let path = self.project_dir.join(format!("{}.jsonl", self.session_id));
-        let written = std::fs::create_dir_all(&self.project_dir).and_then(|_| {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            for l in &lines {
-                writeln!(f, "{l}")?;
+    /// The writer of this conversation's transcript (opened on first use: the conversation
+    /// exists in storage from its first record on, not before). The conversation's title, when
+    /// it was started with `--name`, is its first record.
+    fn main_writer(&mut self) -> &mut Writer {
+        if self.writer.is_none() {
+            let path = self
+                .transcript
+                .clone()
+                .unwrap_or_else(|| self.project_dir.join(format!("{}.jsonl", self.session_id)));
+            let mut w = Writer::open(path, &self.session_id, &self.cwd);
+            if let Some(name) = self.name_unsaved.take() {
+                w.titles(&name);
             }
-            Ok(())
-        });
-        // A transcript that cannot be written is a conversation the next process cannot resume:
-        // say so.
-        if let Err(e) = written {
-            eprintln!("wasit-fake-cli: cannot write {}: {e}", path.display());
+            self.writer = Some(w);
         }
+        self.writer.as_mut().expect("just opened")
     }
 
-    /// A user or assistant record of the transcript.
-    fn transcript_message(&self, role: &str, text: &str) -> Value {
-        json!({"type":role,"uuid":uuid(),"sessionId":self.session_id,"cwd":self.cwd,
-               "entrypoint":"sdk-cli","version":self.version,"timestamp":iso_now(),
-               "message":{"role":role,"content":[{"type":"text","text":text}]}})
+    /// The writer of the conversation the lines printed now belong to: the running subagent's own
+    /// file, else the session's transcript.
+    fn rec(&mut self) -> &mut Writer {
+        let agent = self.scope.as_ref().map(|s| s.agent_id.clone());
+        if let Some(i) = agent.and_then(|a| self.subs.iter().position(|(id, _)| *id == a)) {
+            return &mut self.subs[i].1;
+        }
+        self.main_writer()
+    }
+
+    /// Record a tool result the persona just printed (`m` is the stream line) in the transcript.
+    fn record_tool_result(&mut self, m: &Value) {
+        let block = &m["message"]["content"][0];
+        let call = block["tool_use_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let content = block["content"].clone();
+        let is_error = block["is_error"].as_bool().unwrap_or(false);
+        let result = match &m["tool_use_result"] {
+            Value::Null => content.clone(),
+            r => r.clone(),
+        };
+        let assistant = self.tool_assistant.clone();
+        let w = self.rec();
+        w.tool_result(&call, content, is_error, result, &assistant);
+        w.flush_logged();
     }
 
     /// `tasks` of a `background_tasks_changed`: the background tasks running now, in the shape of
@@ -576,6 +598,13 @@ impl Claude {
             set(&mut a, "thinking_display", json!("updates"));
         }
         io.send(&a);
+        let w = self.rec();
+        if kind == "thinking" {
+            w.assistant_thinking();
+        } else {
+            w.assistant_text(text);
+        }
+        w.flush_logged();
         if self.partial {
             let e = self.stream_event(json!({"type":"content_block_stop","index":0}));
             io.send(&e);
@@ -623,6 +652,11 @@ impl Claude {
         set(&mut m, "request_id", json!(format!("req_{}", alnum(24))));
         let m = self.envelope(m);
         io.send(&m);
+        let call = self.tool_use_id.clone();
+        let w = self.rec();
+        let assistant = w.tool_use_with_id(&call, name, input);
+        w.flush_logged();
+        self.tool_assistant = assistant;
     }
 
     fn tool_result_message(
@@ -644,6 +678,12 @@ impl Claude {
             unset(&mut m, "tool_use_result");
         }
         self.envelope(m)
+    }
+
+    /// Print a tool result and record it in the transcript.
+    fn send_result(&mut self, io: &mut Io, m: Value) {
+        io.send(&m);
+        self.record_tool_result(&m);
     }
 
     fn task_summary(&self, io: &mut Io, detail: &str) {
@@ -869,8 +909,9 @@ impl Persona for Claude {
     }
 
     fn turn_begin(&mut self, io: &mut Io, prompt: &str, id: Option<&str>, _stats: &mut TurnStats) {
-        let user = self.transcript_message("user", prompt);
-        self.store_records(vec![user]);
+        let w = self.main_writer();
+        w.begin_turn(json!([{"type":"text","text":prompt}]));
+        w.flush_logged();
         self.current = id.map(str::to_string);
         if let Some(uuid) = id {
             self.waiting.retain(|w| w != uuid);
@@ -936,7 +977,7 @@ impl Persona for Claude {
                 ("tool_result_meta", json!([])),
             ],
         );
-        io.send(&m);
+        self.send_result(io, m);
         None
     }
 
@@ -963,7 +1004,7 @@ impl Persona for Claude {
                     ),
                 ],
             );
-            io.send(&m);
+            self.send_result(io, m);
         } else {
             let msg = body["message"]
                 .as_str()
@@ -983,7 +1024,7 @@ impl Persona for Claude {
                     ),
                 ],
             );
-            io.send(&m);
+            self.send_result(io, m);
             stats
                 .denied
                 .push((tool.name.clone(), tuid, tool.input.clone()));
@@ -1039,7 +1080,7 @@ impl Persona for Claude {
                 json!({"questions": body["updatedInput"]["questions"], "answers": answers}),
             )],
         );
-        io.send(&m);
+        self.send_result(io, m);
     }
 
     fn plan(
@@ -1077,7 +1118,7 @@ impl Persona for Claude {
             json!([{"tool_use_id":tuid,"type":"tool_result","content":"Todos have been modified successfully.","is_error":false}]),
             vec![("tool_use_result", json!({"newTodos": todos})), ("tool_result_meta", json!([]))],
         );
-        io.send(&m);
+        self.send_result(io, m);
         None
     }
 
@@ -1091,7 +1132,7 @@ impl Persona for Claude {
                     "is_error": !approved}]),
             vec![("tool_result_meta", json!([]))],
         );
-        io.send(&m);
+        self.send_result(io, m);
     }
 
     fn mcp_server(&self, name: &str) -> Option<crate::mcp::McpLaunch> {
@@ -1182,6 +1223,38 @@ impl Persona for Claude {
             vec![],
         );
         io.send(&result);
+        if agent {
+            // The subagent's conversation is its own file, which the spawning call's result
+            // links to by `agentId` (as the real CLI writes it).
+            let sub = self.main_writer().begin_subagent(
+                &ids.agent_id,
+                &ids.call_id,
+                &task.description,
+                subagent_type.as_deref().unwrap_or("general-purpose"),
+                &task.description,
+            );
+            self.subs.push((ids.agent_id.clone(), sub));
+            let assistant = self.tool_assistant.clone();
+            let output_file = format!(
+                "/tmp/claude-fake/{}/tasks/{}.output",
+                self.session_id, ids.agent_id
+            );
+            let model = self.model.clone();
+            let w = self.main_writer();
+            w.tool_result(
+                &ids.call_id,
+                json!([{"type":"text","text":content}]),
+                false,
+                json!({"status":"async_launched","agentId":ids.agent_id,
+                       "description":task.description,"prompt":task.description,
+                       "outputFile":output_file,"canReadOutputFile":true,"isAsync":true,
+                       "resolvedModel":model}),
+                &assistant,
+            );
+            w.flush_logged();
+        } else {
+            self.record_tool_result(&result);
+        }
         ids
     }
 
@@ -1352,9 +1425,21 @@ impl Persona for Claude {
                 io.send(&a);
             }
         }
-        if matches!(outcome, Outcome::Completed) {
-            let assistant = self.transcript_message("assistant", &stats.final_text);
-            self.store_records(vec![assistant]);
+        // What the CLI leaves in the transcript when a turn ends: how it ended, then the
+        // bookkeeping after the last message.
+        {
+            let w = self.main_writer();
+            match outcome {
+                Outcome::Completed => {}
+                Outcome::Interrupted => {
+                    w.interrupted();
+                }
+                Outcome::Failed(msg) => {
+                    w.assistant_error(msg);
+                }
+            }
+            w.end_turn();
+            w.flush_logged();
         }
         let mut r = self.result_message(outcome, stats);
         let listed: Vec<&String> = self.current.iter().chain(stats.joined.iter()).collect();

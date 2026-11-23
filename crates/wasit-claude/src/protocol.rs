@@ -1665,7 +1665,7 @@ fn user_message(text: &str, attachments: &[Attachment], uuid: Option<&str>) -> O
 }
 
 /// The image / document a claude content block carries (`{"type":"image","source":{…}}`).
-fn claude_part(block: &Value) -> Option<ContentPart> {
+pub(crate) fn claude_part(block: &Value) -> Option<ContentPart> {
     let kind = s(block, "type");
     if kind != "image" && kind != "document" {
         return None;

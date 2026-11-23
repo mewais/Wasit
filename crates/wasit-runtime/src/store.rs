@@ -57,6 +57,11 @@ pub(crate) struct SessionFile {
     /// User-given name (`sessions.rename`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// How the earlier history of the conversation this session resumed reaches its journal,
+    /// decided at create (see [`crate::note::EarlierPlan`]); read by the actor until it has
+    /// journaled the first `start` note, which carries it from then on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earlier: Option<crate::note::EarlierPlan>,
 }
 
 impl SessionFile {
@@ -79,6 +84,7 @@ impl SessionFile {
             spec,
             unsupported,
             display_name: None,
+            earlier: None,
         }
     }
 

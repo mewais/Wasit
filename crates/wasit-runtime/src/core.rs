@@ -35,6 +35,15 @@
 //! Lines the CLI prints after a `spawned` record but before the generation's `start` note, and
 //! commands journaled in that window, are buffered and applied right after `start` — in live
 //! operation and in replay alike.
+//!
+//! # Earlier history
+//!
+//! The earlier messages of a conversation the session resumed ([`wasit_core::AgentEvent::History`]:
+//! replayed by the agent over its protocol, or imported from its storage in `earlier_chunk`
+//! notes) never reach the reducer or the live event stream: they come out of [`Core::apply`] as
+//! [`Output::earlier`], with cursors of the record they were journaled in, and what the session
+//! knows of their loading is `snapshot.earlier`. The rule for when history is missing is in
+//! [`Core::earlier_on_start`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
@@ -48,11 +57,12 @@ use wasit_core::{
 };
 use wasit_shim::{Kind, Record};
 
-use crate::note::{classify, NoteKind, RuntimeNote};
+use crate::note::{classify, EarlierPlan, NoteKind, RuntimeNote};
 use crate::wire::{
-    event_cursor, synthetic_cursor, AnomalyKind, CommandStatus, ExitSummary, GateClearing,
-    NotContinuable, NoticeCode, PendingGate, Phase, PhaseCause, ResumeCommand, SessionEvent,
-    SessionEventKind, SessionSnapshot, StartResume, SubagentInfo, TurnInfo, TurnOutcome,
+    event_cursor, synthetic_cursor, AnomalyKind, CommandStatus, EarlierGaps, EarlierHistory,
+    EarlierSource, EarlierState, EarlierUnavailable, ExitSummary, GateClearing, NotContinuable,
+    NoticeCode, PendingGate, Phase, PhaseCause, ResumeCommand, SessionEvent, SessionEventKind,
+    SessionSnapshot, StartResume, SubagentInfo, TurnInfo, TurnOutcome,
 };
 
 /// Bounded diagnostics.
@@ -236,6 +246,7 @@ pub(crate) fn blank_snapshot(
         stderr_tail: Vec::new(),
         cursor: 0,
         loaded,
+        earlier: EarlierHistory::default(),
     };
     apply_conversation(&mut snap, desc, &meta.conversation);
     snap
@@ -290,27 +301,98 @@ pub(crate) struct Output {
     pub exited: bool,
     /// Inline media moved out of events: `(blob id, bytes)` for the blob store.
     pub blobs: Vec<(String, Vec<u8>)>,
+    /// Items of the conversation's earlier history this record brought (each an
+    /// `AgentEvent::History`, with its cursor). They are not part of `events`: the live stream,
+    /// the in-memory tail and the trail never see them; they are paged from the journal
+    /// (`session.history {earlier: true}`).
+    pub earlier: Vec<SessionEvent>,
 }
 
 struct Emitter {
     seq: u64,
     t: u64,
+    /// Events and earlier-history items of one record share the numbering of their cursors.
+    next: usize,
     events: Vec<SessionEvent>,
+    earlier: Vec<SessionEvent>,
 }
 
 impl Emitter {
+    fn new(seq: u64, t: u64) -> Self {
+        Emitter {
+            seq,
+            t,
+            next: 0,
+            events: Vec::new(),
+            earlier: Vec::new(),
+        }
+    }
+
     fn next_cursor(&self) -> u64 {
-        event_cursor(self.seq, self.events.len())
+        event_cursor(self.seq, self.next)
     }
 
     fn push(&mut self, kind: SessionEventKind) {
         let cursor = self.next_cursor();
+        self.next += 1;
         self.events.push(SessionEvent {
             cursor,
             t: self.t,
             kind,
         });
     }
+
+    /// An item of the earlier history: only room for as many as a record's cursors can number.
+    fn push_earlier(&mut self, event: AgentEvent) -> bool {
+        if self.next >= EARLIER_ITEMS_PER_RECORD {
+            return false;
+        }
+        let cursor = self.next_cursor();
+        self.next += 1;
+        self.earlier.push(SessionEvent {
+            cursor,
+            t: self.t,
+            kind: SessionEventKind::Agent { event },
+        });
+        true
+    }
+}
+
+/// Most earlier-history items one journal record can number (a record's events share 16 bits of
+/// cursor); what a protocol replays beyond it is counted as omitted.
+const EARLIER_ITEMS_PER_RECORD: usize = 0xFF00;
+
+/// The core's part of the loading of the conversation's earlier history: what the snapshot shows
+/// and the facts the next record is judged by (all of them derived from the journal).
+#[derive(Debug, Clone, Default)]
+struct EarlierCore {
+    info: EarlierHistory,
+    /// The session's first `start` note decided what the conversation needs.
+    decided: bool,
+    /// Nothing more is expected: the history is complete, was given up on, or none is needed.
+    closed: bool,
+    /// Items of the agent's replay seen in this process generation (the replay of a reloaded
+    /// conversation starts from its beginning each time).
+    replay_pos: u64,
+    /// Items accepted from replays so far: a later replay's first `accepted` items are the
+    /// ones the journal already holds.
+    accepted: u64,
+    /// The replay of this generation was ignored already (counted once).
+    replay_ignored: bool,
+    /// The import of the agent's file, when the plan is one: its path and the length it reads.
+    import: Option<(String, u64)>,
+    /// History items of the import in the journal: the next chunk starts with this number.
+    imported: u64,
+}
+
+/// What the actor does to bring the earlier history of the agent's file into the journal
+/// ([`Core::earlier_work`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportWork {
+    pub path: String,
+    pub len: u64,
+    /// The history items before this number are journaled already.
+    pub skip: u64,
 }
 
 /// How a turn's gates are being taken down ([`Core::end_turn_gates`]).
@@ -362,6 +444,8 @@ pub(crate) struct Core {
     /// Request ids of external gates that were withdrawn or ended with their process (newest
     /// last, bounded): a late answer to one is refused as [`CommandStatus::Withdrawn`].
     withdrawn: VecDeque<String>,
+    /// The conversation's earlier history (see [`EarlierCore`]).
+    earlier: EarlierCore,
 }
 
 /// How many withdrawn external gate ids are remembered for refusing late answers.
@@ -526,6 +610,7 @@ impl Core {
             external: BTreeMap::new(),
             interrupt_applied: false,
             withdrawn: VecDeque::new(),
+            earlier: EarlierCore::default(),
         }
     }
 
@@ -622,11 +707,7 @@ impl Core {
         self.last_seq = rec.seq;
         let phase_before = self.snap.phase.clone();
         self.causes.clear();
-        let mut em = Emitter {
-            seq: rec.seq,
-            t: rec.t,
-            events: Vec::new(),
-        };
+        let mut em = Emitter::new(rec.seq, rec.t);
         let text = match rec.kind {
             Kind::Out | Kind::Err | Kind::In => {
                 let piece = rec.text().unwrap_or_default();
@@ -691,6 +772,14 @@ impl Core {
             kinds.push(SessionEventKind::Agent { event });
         }
         self.lost = Some(reason.to_string());
+        if self.earlier.info.state == EarlierState::Loading {
+            self.earlier.info.state = EarlierState::Loaded { complete: false };
+            self.earlier.info.gaps.interrupted = true;
+            self.snap.earlier = self.earlier.info.clone();
+            kinds.push(SessionEventKind::Earlier {
+                earlier: self.earlier.info.clone(),
+            });
+        }
         self.clear_live_state(self.snap.last_activity_ms);
         let slot = synthetic_cursor(self.last_seq);
         let t = self.snap.last_activity_ms;
@@ -807,6 +896,7 @@ impl Core {
             }
         }
         self.end_generation_inputs(em);
+        self.earlier_generation_ended(em);
         self.owed.clear();
         self.close_owed = false;
         // External gates end with the process: their requests are gone.
@@ -871,8 +961,19 @@ impl Core {
     fn on_note(&mut self, rec: &Record, em: &mut Emitter, out: &mut Output) {
         match classify(&rec.data) {
             NoteKind::Runtime(RuntimeNote::Attach { token }) => out.attach = Some(token),
-            NoteKind::Runtime(RuntimeNote::Start { spec, trace }) => {
-                self.on_start(&spec, trace, rec, em, out)
+            NoteKind::Runtime(RuntimeNote::Start {
+                spec,
+                trace,
+                earlier,
+            }) => self.on_start(&spec, trace, earlier, rec, em, out),
+            NoteKind::Runtime(RuntimeNote::EarlierChunk { first, events }) => {
+                self.on_earlier_chunk(first, events, em, out)
+            }
+            NoteKind::Runtime(RuntimeNote::EarlierEnd { report }) => {
+                self.on_earlier_end(&report, em)
+            }
+            NoteKind::Runtime(RuntimeNote::EarlierFailed { reason }) => {
+                self.on_earlier_failed(reason, em)
             }
             NoteKind::Runtime(RuntimeNote::Command {
                 token,
@@ -983,6 +1084,7 @@ impl Core {
         &mut self,
         spec: &SpawnSpec,
         trace: Option<TraceId>,
+        earlier: Option<EarlierPlan>,
         rec: &Record,
         em: &mut Emitter,
         out: &mut Output,
@@ -1045,6 +1147,7 @@ impl Core {
         if adopt {
             self.conversation_is(started);
         }
+        self.earlier_on_start(&spec, earlier, em);
         let mut p = self.desc.new_protocol();
         let step = p.start(&spec);
         self.gen = Gen::Running(p);
@@ -1458,6 +1561,12 @@ impl Core {
     fn step(&mut self, step: Step, input: Option<InputId>, em: &mut Emitter, out: &mut Output) {
         let mut inputs: Vec<InputId> = input.into_iter().collect();
         for mut event in step.events {
+            if matches!(event, AgentEvent::History { .. }) {
+                // The conversation as it was before this session: kept apart from the live
+                // events, never reduced.
+                self.earlier_replayed(event, em, out);
+                continue;
+            }
             crate::media::externalize(&mut event, &mut out.blobs);
             match &event {
                 AgentEvent::InputSent { input } => {
@@ -1480,7 +1589,12 @@ impl Core {
             }
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, em.t);
+            let opened = matches!(event, AgentEvent::SessionInit { .. });
             em.push(SessionEventKind::Agent { event });
+            if opened {
+                // The agent has told everything it replays of a resumed conversation.
+                self.earlier_replay_done(em);
+            }
         }
         if !step.write.is_empty() {
             for input in &inputs {
@@ -1774,6 +1888,9 @@ impl Core {
             | AgentEvent::Notice { .. }
             | AgentEvent::AssistantContent { .. }
             | AgentEvent::UserContent { .. }
+            | AgentEvent::UserMessage { .. }
+            // Never reaches here: `step` keeps history out of the reducer.
+            | AgentEvent::History { .. }
             | AgentEvent::ProcessExited { .. }
             | AgentEvent::InputSent { .. }
             | AgentEvent::InputAcknowledged { .. }
@@ -1896,6 +2013,219 @@ impl Core {
             .unwrap_or_default()
     }
 
+    // ── earlier history ─────────────────────────────────────────────────────
+
+    /// What the first generation's start says about the conversation, and what a later one does
+    /// to an earlier history that was interrupted. The rule, from journaled facts alone:
+    /// the journal covers the conversation's beginning exactly when the session's first process
+    /// generation started it (`Fresh`); a session whose first generation resumed (or continued)
+    /// a conversation lacks everything before it, and gets it from the agent's replay or the
+    /// import the start note planned, until that is complete.
+    fn earlier_on_start(&mut self, spec: &SpawnSpec, plan: Option<EarlierPlan>, em: &mut Emitter) {
+        self.earlier.replay_pos = 0;
+        self.earlier.replay_ignored = false;
+        if self.earlier.decided {
+            if !self.earlier.closed && self.earlier.info.state != EarlierState::Loading {
+                // An interrupted history goes on: the replay skips what the journal holds, the
+                // import carries on from its next chunk.
+                self.earlier.info.state = EarlierState::Loading;
+                self.earlier.info.gaps.interrupted = false;
+                self.earlier_changed(em);
+            }
+            return;
+        }
+        self.earlier.decided = true;
+        if matches!(spec.resume, ResumeMode::Fresh) {
+            // The conversation begins here: nothing earlier exists.
+            self.earlier.closed = true;
+            return;
+        }
+        let delivery = self.desc.capabilities().earlier_history;
+        match (delivery, plan) {
+            (wasit_core::HistoryDelivery::Wire, _) => {
+                self.earlier.info.source = Some(EarlierSource::AgentReplay);
+                self.earlier.info.state = EarlierState::Loading;
+            }
+            (wasit_core::HistoryDelivery::Storage, Some(EarlierPlan::Storage { path, len })) => {
+                self.earlier.info.source = Some(EarlierSource::AgentStorage);
+                self.earlier.info.state = EarlierState::Loading;
+                self.earlier.import = Some((path, len));
+            }
+            (wasit_core::HistoryDelivery::Storage, Some(EarlierPlan::Unavailable { why })) => {
+                self.earlier.info.source = Some(EarlierSource::AgentStorage);
+                self.earlier.info.state = EarlierState::Unavailable { reason: why };
+                self.earlier.closed = true;
+            }
+            // A journal of a build that planned nothing, or an agent with nothing to read.
+            (wasit_core::HistoryDelivery::Storage | wasit_core::HistoryDelivery::None, _) => {
+                self.earlier.closed = true;
+                return;
+            }
+        }
+        self.earlier_changed(em);
+    }
+
+    /// The snapshot's `earlier` changed: say so in the live stream.
+    fn earlier_changed(&mut self, em: &mut Emitter) {
+        em.push(SessionEventKind::Earlier {
+            earlier: self.earlier.info.clone(),
+        });
+    }
+
+    /// An item the agent replayed over its protocol ([`AgentEvent::History`]).
+    fn earlier_replayed(&mut self, mut event: AgentEvent, em: &mut Emitter, out: &mut Output) {
+        let e = &mut self.earlier;
+        if e.closed || e.info.source != Some(EarlierSource::AgentReplay) {
+            // The journal has this history already (or none is expected): a reloaded
+            // conversation is replayed in full at every start.
+            if !e.replay_ignored {
+                e.replay_ignored = true;
+                e.info.gaps.replays_ignored = e.info.gaps.replays_ignored.saturating_add(1);
+            }
+            return;
+        }
+        let pos = e.replay_pos;
+        e.replay_pos += 1;
+        if pos < e.accepted {
+            // An interrupted replay went on: this item is in the journal already.
+            return;
+        }
+        crate::media::externalize(&mut event, &mut out.blobs);
+        if em.push_earlier(event) {
+            e.accepted += 1;
+            e.info.items += 1;
+        } else {
+            e.info.gaps.omitted += 1;
+        }
+    }
+
+    /// The agent's handshake reported the conversation: whatever it replays came before.
+    fn earlier_replay_done(&mut self, em: &mut Emitter) {
+        let e = &mut self.earlier;
+        if e.closed || e.info.source != Some(EarlierSource::AgentReplay) {
+            return;
+        }
+        e.closed = true;
+        e.info.state = EarlierState::Loaded {
+            complete: e.info.gaps.is_empty(),
+        };
+        self.earlier_changed(em);
+    }
+
+    /// The process generation ended: a history still arriving will not, from this process.
+    fn earlier_generation_ended(&mut self, em: &mut Emitter) {
+        if self.earlier.info.state != EarlierState::Loading {
+            return;
+        }
+        self.earlier.info.state = EarlierState::Loaded { complete: false };
+        self.earlier.info.gaps.interrupted = true;
+        self.earlier_changed(em);
+    }
+
+    /// The chunk of the imported history that starts with item `first`.
+    fn on_earlier_chunk(
+        &mut self,
+        first: u64,
+        events: Vec<AgentEvent>,
+        em: &mut Emitter,
+        out: &mut Output,
+    ) {
+        let e = &mut self.earlier;
+        if e.import.is_none() || e.info.state != EarlierState::Loading {
+            em.push(SessionEventKind::Notice {
+                message: "ignored a chunk of earlier history outside an import".into(),
+                code: NoticeCode::Other,
+            });
+            return;
+        }
+        if first > e.imported {
+            em.push(SessionEventKind::Notice {
+                message: format!(
+                    "ignored a chunk of earlier history that starts at item {first}: item {} is next",
+                    e.imported
+                ),
+                code: NoticeCode::Other,
+            });
+            return;
+        }
+        // What the journal holds already (a chunk journaled twice, an import resumed with another
+        // chunking) is skipped by its number.
+        let held = (e.imported - first) as usize;
+        let mut changed = false;
+        for mut event in events.into_iter().skip(held) {
+            changed = true;
+            e.imported += 1;
+            if !matches!(event, AgentEvent::History { .. }) {
+                e.info.gaps.unrecognised += 1;
+                continue;
+            }
+            crate::media::externalize(&mut event, &mut out.blobs);
+            if em.push_earlier(event) {
+                e.info.items += 1;
+            } else {
+                e.info.gaps.omitted += 1;
+            }
+        }
+        if changed {
+            self.earlier_changed(em);
+        }
+    }
+
+    /// The import ended: all its chunks are journaled.
+    fn on_earlier_end(&mut self, report: &wasit_core::HistoryReport, em: &mut Emitter) {
+        let e = &mut self.earlier;
+        if e.import.is_none() || e.closed {
+            return;
+        }
+        let replays = e.info.gaps.replays_ignored;
+        e.info.gaps = EarlierGaps::of_report(report);
+        e.info.gaps.replays_ignored = replays;
+        e.closed = true;
+        e.info.state = EarlierState::Loaded {
+            complete: e.info.gaps.is_empty(),
+        };
+        self.earlier_changed(em);
+    }
+
+    /// The import failed: what it had journaled stays, and the rest is not coming.
+    fn on_earlier_failed(&mut self, reason: EarlierUnavailable, em: &mut Emitter) {
+        let e = &mut self.earlier;
+        if e.import.is_none() || e.closed {
+            return;
+        }
+        e.closed = true;
+        if e.info.items == 0 {
+            e.info.state = EarlierState::Unavailable { reason };
+        } else {
+            e.info.state = EarlierState::Loaded { complete: false };
+            e.info.gaps.interrupted = true;
+        }
+        self.earlier_changed(em);
+    }
+
+    /// The first `start` note of the session was applied: what its conversation needs is known.
+    pub(crate) fn earlier_decided(&self) -> bool {
+        self.earlier.decided
+    }
+
+    /// The import the actor must run now (or carry on), when there is one: the history is being
+    /// loaded from the agent's file, the process runs, and not every chunk is journaled.
+    pub(crate) fn earlier_work(&self) -> Option<ImportWork> {
+        let e = &self.earlier;
+        match &e.import {
+            Some((path, len))
+                if e.info.state == EarlierState::Loading && self.process_running() =>
+            {
+                Some(ImportWork {
+                    path: path.clone(),
+                    len: *len,
+                    skip: e.imported,
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn finish(&mut self, mut em: Emitter, out: &mut Output, phase_before: &Phase) {
         if let Gen::Running(p) = &self.gen {
             if !self.handshake_done && p.is_ready() {
@@ -1938,7 +2268,11 @@ impl Core {
         if let Some(last) = em.events.last() {
             self.snap.cursor = last.cursor;
         }
+        if self.snap.earlier != self.earlier.info {
+            self.snap.earlier = self.earlier.info.clone();
+        }
         out.events = em.events;
+        out.earlier = em.earlier;
     }
 }
 
@@ -2008,6 +2342,7 @@ mod tests {
                 RuntimeNote::Start {
                     spec: Box::new(SpawnSpec::default()),
                     trace: None,
+                    earlier: None,
                 }
                 .to_value(),
             ),
@@ -2067,6 +2402,7 @@ mod tests {
             RuntimeNote::Start {
                 spec: Box::new(spec),
                 trace: None,
+                earlier: None,
             }
             .to_value(),
         );
@@ -2163,6 +2499,7 @@ mod tests {
             RuntimeNote::Start {
                 spec: Box::new(SpawnSpec::default()),
                 trace: None,
+                earlier: None,
             }
             .to_value(),
         );
@@ -2253,6 +2590,7 @@ mod tests {
                     ..SpawnSpec::default()
                 }),
                 trace: None,
+                earlier: None,
             }
             .to_value(),
         );
@@ -2790,6 +3128,7 @@ mod tests {
                     RuntimeNote::Start {
                         spec: Box::default(),
                         trace: None,
+                        earlier: None,
                     }
                     .to_value(),
                 ),
@@ -2839,6 +3178,7 @@ mod tests {
                 RuntimeNote::Start {
                     spec: Box::default(),
                     trace: None,
+                    earlier: None,
                 }
                 .to_value(),
             ),
@@ -2939,6 +3279,7 @@ mod tests {
                     ..SpawnSpec::default()
                 }),
                 trace: None,
+                earlier: None,
             })
         }
 
@@ -3106,6 +3447,7 @@ mod tests {
                 ..SpawnSpec::default()
             }),
             trace: trace("u-create-0000001"),
+            earlier: None,
         });
         assert!(matches!(
             &start.events[0].kind,
@@ -3520,6 +3862,7 @@ mod tests {
                 ..SpawnSpec::default()
             }),
             trace: None,
+            earlier: None,
         });
         assert!(matches!(
             &out.events[0].kind,
@@ -3625,6 +3968,7 @@ mod tests {
             self.note(RuntimeNote::Start {
                 spec: Box::new(spec),
                 trace: None,
+                earlier: None,
             });
             self.feed(Kind::Out, json!(INIT_OK));
             if let Some(id) = reports {
@@ -3768,6 +4112,7 @@ mod tests {
         sim.note(RuntimeNote::Start {
             spec: Box::new(SpawnSpec::default()),
             trace: None,
+            earlier: None,
         });
         handshake(&mut sim);
         // The agent reports the thread's id; nothing is stored yet.
@@ -3786,6 +4131,7 @@ mod tests {
         sim.note(RuntimeNote::Start {
             spec: Box::new(SpawnSpec::default()),
             trace: None,
+            earlier: None,
         });
         handshake(&mut sim);
         sim.command(Command::prompt("go"));
@@ -3856,6 +4202,7 @@ mod tests {
         sim.note(RuntimeNote::Start {
             spec: Box::new(chosen_spec()),
             trace: None,
+            earlier: None,
         });
         assert!(!sim.snap().continuable);
         let lost = sim.core.mark_lost("the shim is gone");
@@ -3898,6 +4245,7 @@ mod tests {
                 ..SpawnSpec::default()
             }),
             trace: None,
+            earlier: None,
         });
         assert!(out.started);
         let inputs: Vec<(InputId, CommandStatus)> = sim.events[before..]
@@ -3949,7 +4297,11 @@ mod tests {
             match r {
                 wasit_core::transcript::Record::Start(spec) => {
                     sim.feed(Kind::Spawned, json!({"pid": 7, "argv": ["claude"]}));
-                    sim.note(RuntimeNote::Start { spec, trace: None });
+                    sim.note(RuntimeNote::Start {
+                        spec,
+                        trace: None,
+                        earlier: None,
+                    });
                 }
                 wasit_core::transcript::Record::Out(line) => {
                     sim.feed(Kind::Out, json!(line));
@@ -3991,7 +4343,11 @@ mod tests {
             let line = match r {
                 wasit_core::transcript::Record::Start(spec) => {
                     sim.feed(Kind::Spawned, json!({"pid": 7, "argv": ["claude"]}));
-                    sim.note(RuntimeNote::Start { spec, trace: None });
+                    sim.note(RuntimeNote::Start {
+                        spec,
+                        trace: None,
+                        earlier: None,
+                    });
                     continue;
                 }
                 wasit_core::transcript::Record::Out(line) => line,

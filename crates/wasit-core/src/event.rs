@@ -916,6 +916,30 @@ pub enum AgentEvent {
     /// user's own prompts are `input` events.
     UserContent { parts: Vec<ContentPart> },
 
+    /// The text of a user message of the conversation as the agent's own history holds it. Only
+    /// ever inside an [`AgentEvent::History`]: a prompt of this session is an `input` event, not
+    /// this. Images and files of the message are a [`AgentEvent::UserContent`] next to it.
+    UserMessage { text: String },
+
+    /// An event of the conversation as it was before this session's journal began: what the
+    /// agent says happened earlier (`event`), with the time it happened when the agent's own
+    /// records say (`at_ms`, never guessed). **History is not live activity**: nothing in it
+    /// changes the session's phase, turn, gates, tasks, subagents, usage or cost, raises a
+    /// notification or counts as agent activity; the runtime keeps it apart from the live
+    /// events (see `wasit-runtime`'s `earlier` documentation). A protocol whose agent replays
+    /// its history over the wire (codex `thread/resume`, ACP `session/load`) emits it this way;
+    /// for an agent that keeps the history in its own storage the driver's history parser
+    /// ([`DriverDescriptor::history_parser`](crate::DriverDescriptor::history_parser)) does.
+    /// `event` is one of the per-message events (`assistant_delta`, `assistant_content`,
+    /// `thinking_delta`, `user_message`, `user_content`, `tool_call_started`, `tool_call_updated`,
+    /// `tool_call_finished`, `scoped` of those, `compaction`, `notice`), never nested history.
+    History {
+        /// Milliseconds since the Unix epoch, when the agent's storage records when it happened.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at_ms: Option<u64>,
+        event: Box<AgentEvent>,
+    },
+
     /// Reasoning / thinking text.
     ThinkingDelta {
         text: String,
@@ -1151,6 +1175,22 @@ impl AgentEvent {
             other => (None, other),
         }
     }
+
+    /// `self` as an event of the conversation's earlier history ([`AgentEvent::History`]).
+    pub fn earlier(self, at_ms: Option<u64>) -> AgentEvent {
+        AgentEvent::History {
+            at_ms,
+            event: Box::new(self),
+        }
+    }
+
+    /// When `self` is history: the time the agent's records give for it and the event itself.
+    pub fn as_history(&self) -> Option<(Option<u64>, &AgentEvent)> {
+        match self {
+            AgentEvent::History { at_ms, event } => Some((*at_ms, event)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1232,6 +1272,47 @@ mod tests {
             serde_json::json!({"total_tokens": 1, "tool_uses": 2, "duration_ms": 3})
         );
         assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), ended);
+    }
+
+    /// Earlier history is wire-stable: a wrapper around the event, the time only when the agent
+    /// recorded one; a user message is its own event.
+    #[test]
+    fn earlier_history_has_its_wire_shape() {
+        let item = AgentEvent::UserMessage {
+            text: "hello".into(),
+        }
+        .earlier(Some(1_700_000_000_123));
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "history", "at_ms": 1_700_000_000_123u64,
+                               "event": {"type": "user_message", "text": "hello"}})
+        );
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), item);
+        // No time recorded: none is written (and none is invented when it is read).
+        let untimed = AgentEvent::AssistantDelta {
+            text: "x".into(),
+            message_id: None,
+        }
+        .scoped(Some(Scope {
+            call_id: "c".into(),
+            agent_id: None,
+        }))
+        .earlier(None);
+        let json = serde_json::to_value(&untimed).unwrap();
+        assert!(json.get("at_ms").is_none());
+        assert_eq!(json["event"]["type"], "scoped");
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), untimed);
+        assert_eq!(
+            item.as_history().map(|(t, _)| t),
+            Some(Some(1_700_000_000_123))
+        );
+        assert_eq!(untimed.as_history().map(|(t, _)| t), Some(None));
+        assert!(AgentEvent::Notice {
+            message: "x".into()
+        }
+        .as_history()
+        .is_none());
     }
 
     #[test]

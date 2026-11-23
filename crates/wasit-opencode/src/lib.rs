@@ -21,8 +21,8 @@ use wasit_core::{
     exec_stdout, modes_from_handshake, parse_version_line, AgentConfig, BusyPrompt, ConfigItem,
     ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
     DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, GeneratedFile,
-    McpServerConfig, McpTransport, ModelInfo, ProbeAction, ProbeOutput, PromptInput, Protocol,
-    ResumableSession, SpawnSpec, Unsupported,
+    HistoryDelivery, McpServerConfig, McpTransport, ModelInfo, ProbeAction, ProbeOutput,
+    PromptInput, Protocol, ResumableSession, SpawnSpec, Unsupported,
 };
 
 pub use protocol::{config_models, config_modes, AcpProtocol};
@@ -137,6 +137,7 @@ impl DriverDescriptor for AcpDescriptor {
             streaming_output: true,
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
             stop_task: false,
+            earlier_history: HistoryDelivery::Wire,
         }
     }
 

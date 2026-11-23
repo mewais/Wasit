@@ -161,30 +161,33 @@ pub fn run_discovery(kind: PersonaKind, args: &[String], scenario: &Scenario) ->
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
+            // The real CLI lists the sessions of the project it runs in, newest first; with
+            // none, `--format json` prints nothing at all (opencode 1.19.6, kilo 7.8.27).
+            let flavor = match kind {
+                PersonaKind::Kilo => crate::acp::Flavor::Kilo,
+                _ => crate::acp::Flavor::Opencode,
+            };
+            let sessions = crate::acp::listed_sessions(flavor, scenario, Some(&cwd));
             if json_format {
-                let list: Vec<_> = scenario
-                    .sessions
-                    .iter()
-                    .map(|s| {
-                        json!({"id": s.id, "title": s.title.clone().unwrap_or_default(),
-                               "updated": crate::util::now_ms(), "created": crate::util::now_ms(),
-                               "projectId": "global",
-                               "directory": s.cwd.clone().unwrap_or_else(|| cwd.clone())})
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&list).expect("serializable")
-                );
+                if !sessions.is_empty() {
+                    let list: Vec<_> = sessions
+                        .iter()
+                        .map(|s| {
+                            json!({"id": s.id, "title": s.title,
+                                   "updated": s.updated_ms, "created": s.created_ms,
+                                   "projectId": "global", "directory": s.cwd})
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&list).expect("serializable")
+                    );
+                }
             } else {
                 println!("{:<31} {:<40} Updated", "Session ID", "Title");
                 println!("{}", "─".repeat(80));
-                for s in &scenario.sessions {
-                    println!(
-                        "{:<31} {:<40} now",
-                        s.id,
-                        s.title.clone().unwrap_or_default()
-                    );
+                for s in &sessions {
+                    println!("{:<31} {:<40} now", s.id, s.title);
                 }
             }
             Some(0)

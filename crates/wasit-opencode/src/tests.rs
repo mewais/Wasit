@@ -95,7 +95,7 @@ fn handshake_applies_launch_model_and_mode_then_first_prompt() {
 }
 
 #[test]
-fn resume_loads_and_suppresses_history_replay() {
+fn resume_loads_and_turns_the_history_replay_into_history_events() {
     let mut p = AcpProtocol::new("x");
     p.start(&SpawnSpec {
         resume: ResumeMode::Resume("ses_old".into()),
@@ -105,7 +105,15 @@ fn resume_loads_and_suppresses_history_replay() {
     assert_eq!(w(&step)[0]["method"], "session/load");
     assert_eq!(w(&step)[0]["params"]["sessionId"], "ses_old");
     let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old"}}}}"#).events;
-    assert!(ev.is_empty());
+    // What `session/load` replays is the conversation's earlier history, not live activity.
+    assert_eq!(
+        ev,
+        vec![AgentEvent::AssistantDelta {
+            text: "old".into(),
+            message_id: None
+        }
+        .earlier(None)]
+    );
     let ev = p
         .on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#)
         .events;
@@ -942,17 +950,44 @@ fn history_replayed_by_session_load_is_never_an_acknowledgement() {
             r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"ses_old","update":{body}}}}}"#
         )
     };
+    let mut replayed = Vec::new();
     for body in [
-        r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old question"}}"#,
+        r#"{"sessionUpdate":"user_message_chunk","messageId":"m1","content":{"type":"text","text":"old "}}"#,
+        r#"{"sessionUpdate":"user_message_chunk","messageId":"m1","content":{"type":"text","text":"question"}}"#,
         r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}"#,
         r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"old thought"}}"#,
         r#"{"sessionUpdate":"tool_call","toolCallId":"c0","title":"bash","status":"pending"}"#,
         r#"{"sessionUpdate":"tool_call_update","toolCallId":"c0","status":"completed"}"#,
-        r#"{"sessionUpdate":"plan","entries":[]}"#,
+        r#"{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{"amount":2.5,"currency":"USD"}}"#,
+        r#"{"sessionUpdate":"plan","entries":[{"content":"x","priority":"high","status":"pending"}]}"#,
     ] {
         let step = p.on_line(&replay(body));
-        assert!(step.events.is_empty(), "{body}: {:?}", step.events);
+        assert!(acks(&step.events).is_empty(), "{body}");
+        replayed.extend(step.events);
     }
+    // All of it is history (the user message in one piece); none of it usage or plan.
+    assert!(
+        replayed.iter().all(|e| e.as_history().is_some()),
+        "{replayed:?}"
+    );
+    let inner: Vec<&AgentEvent> = replayed
+        .iter()
+        .filter_map(|e| e.as_history().map(|(_, e)| e))
+        .collect();
+    assert_eq!(
+        inner[0],
+        &AgentEvent::UserMessage {
+            text: "old question".into()
+        }
+    );
+    assert!(matches!(inner[1], AgentEvent::AssistantDelta { text, .. } if text == "old answer"));
+    assert!(matches!(inner[2], AgentEvent::ThinkingDelta { .. }));
+    assert!(matches!(inner[3], AgentEvent::ToolCallStarted { name, .. } if name == "bash"));
+    assert!(matches!(
+        inner[4],
+        AgentEvent::ToolCallFinished { ok: true, .. }
+    ));
+    assert_eq!(inner.len(), 5, "{inner:?}");
     // The load answers; the queued prompt goes out. Still nothing acknowledged.
     let step = p.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#);
     assert!(acks(&step.events).is_empty());
@@ -1099,4 +1134,111 @@ fn queued_prompts_dropped_by_an_interrupt_are_never_acknowledged() {
     );
     assert_eq!(acks(&after), vec![(InputId(60), false)]);
     assert!(drops(&after).is_empty());
+}
+
+// ── earlier history of a loaded session ─────────────────────────────────────────
+
+fn loading(spec: SpawnSpec) -> AcpProtocol {
+    let mut p = AcpProtocol::new("x");
+    p.start(&SpawnSpec {
+        resume: ResumeMode::Resume("ses_old".into()),
+        ..spec
+    });
+    p.on_line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    p
+}
+
+fn replayed(body: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"ses_old","update":{body}}}}}"#
+    )
+}
+
+#[test]
+fn a_replayed_user_message_is_one_event_flushed_by_the_next_message_or_the_load_result() {
+    let mut p = loading(SpawnSpec::default());
+    let user = |id: &str, text: &str| {
+        replayed(&format!(
+            r#"{{"sessionUpdate":"user_message_chunk","messageId":"{id}","content":{{"type":"text","text":"{text}"}}}}"#
+        ))
+    };
+    assert!(p.on_line(&user("m1", "a")).events.is_empty());
+    assert!(p.on_line(&user("m1", "b")).events.is_empty());
+    // A different message: the first is complete.
+    let ev = p.on_line(&user("m2", "c")).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::UserMessage { text: "ab".into() }.earlier(None)]
+    );
+    // The load result flushes the last one, ahead of SessionInit.
+    let ev = p
+        .on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#)
+        .events;
+    assert_eq!(
+        ev[0],
+        AgentEvent::UserMessage { text: "c".into() }.earlier(None)
+    );
+    assert!(matches!(ev[1], AgentEvent::SessionInit { .. }));
+    // An image in a replayed user message is history content next to the text.
+    let mut p = loading(SpawnSpec::default());
+    let ev = p
+        .on_line(&replayed(
+            r#"{"sessionUpdate":"user_message_chunk","messageId":"m","content":{"type":"image","mimeType":"image/png","uri":"file:///w/a.png"}}"#,
+        ))
+        .events;
+    assert!(matches!(
+        ev.as_slice(),
+        [AgentEvent::History { event, .. }] if matches!(**event, AgentEvent::UserContent { .. })
+    ));
+}
+
+/// Nothing replayed leaves state behind: a call the history left open, a subagent it announced.
+#[test]
+fn replayed_calls_leave_no_state_behind() {
+    let mut p = loading(SpawnSpec::default());
+    for body in [
+        r#"{"sessionUpdate":"tool_call","toolCallId":"c0","title":"replayed-name","status":"in_progress"}"#,
+        r#"{"sessionUpdate":"tool_call","toolCallId":"t0","title":"task","kind":"other","status":"pending"}"#,
+        r#"{"sessionUpdate":"tool_call_update","toolCallId":"t0","status":"in_progress","rawInput":{"description":"sub"}}"#,
+    ] {
+        p.on_line(&replayed(body));
+    }
+    p.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_old","configOptions":[]}}"#);
+    // The same ids, live, are strangers: names come from the update itself and the subagent
+    // is not remembered.
+    let live = |body: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"ses_old","update":{body}}}}}"#
+        )
+    };
+    let ev = p
+        .on_line(&live(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"c0","title":"live-name","status":"completed"}"#,
+        ))
+        .events;
+    assert!(
+        matches!(&ev[..], [AgentEvent::ToolCallFinished { name, .. }] if name == "live-name"),
+        "{ev:?}"
+    );
+    let ev = p
+        .on_line(&live(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"t0","status":"completed"}"#,
+        ))
+        .events;
+    assert!(
+        matches!(&ev[..], [AgentEvent::ToolCallFinished { name, .. }] if name != "subagent"),
+        "{ev:?}"
+    );
+}
+
+/// A replayed usage report and plan are the past's: they are not shown, and cost nothing.
+#[test]
+fn replayed_usage_and_plan_are_not_shown() {
+    let mut p = loading(SpawnSpec::default());
+    for body in [
+        r#"{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{"amount":2.5,"currency":"USD"}}"#,
+        r#"{"sessionUpdate":"plan","entries":[{"content":"x","priority":"high","status":"pending"}]}"#,
+    ] {
+        assert!(p.on_line(&replayed(body)).events.is_empty(), "{body}");
+    }
 }

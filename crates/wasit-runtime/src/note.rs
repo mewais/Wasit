@@ -6,13 +6,31 @@
 
 use serde::{Deserialize, Serialize};
 use wasit_control::TraceId;
-use wasit_core::{Command, GateReason, GateRequest, SpawnSpec, TurnBinding};
+use wasit_core::{
+    AgentEvent, Command, GateReason, GateRequest, HistoryReport, SpawnSpec, TurnBinding,
+};
 
-use crate::wire::NoticeCode;
+use crate::wire::{EarlierUnavailable, NoticeCode};
 
 /// What a `resolve_gate` note journaled before resolutions carried a reason means.
 fn withdrawn() -> GateReason {
     GateReason::new(GateReason::WITHDRAWN)
+}
+
+/// How the first `start` note of a session that resumes a conversation says the conversation's
+/// earlier history reaches the journal, when the agent keeps it in its own storage. The runtime
+/// decides it before the process starts (it is the only one who can look at the agent's file
+/// before the agent writes to it again) and journals the decision, so a replay never decides
+/// anything and an interrupted import resumes from facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub(crate) enum EarlierPlan {
+    /// Read the first `len` bytes of the agent's file `path` (the file as it was when the
+    /// session started; the agent appends to it from then on) and journal what it holds in
+    /// [`RuntimeNote::EarlierChunk`]s.
+    Storage { path: String, len: u64 },
+    /// The import cannot be set up: the history is unavailable, and this is why.
+    Unavailable { why: EarlierUnavailable },
 }
 
 /// A runtime note. Serialized as `{"wasit": "<kind>", …}`.
@@ -30,6 +48,11 @@ pub(crate) enum RuntimeNote {
         spec: Box<SpawnSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trace: Option<TraceId>,
+        /// How the earlier history of a conversation this generation resumes reaches the
+        /// journal (only the session's first generation carries one; see [`EarlierPlan`]). A
+        /// journal of an older build has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        earlier: Option<EarlierPlan>,
     },
     /// `Protocol::encode(seq, command)`, where `seq` is this note's journal seq. `trace` is the
     /// trace id of the request that carried the command, when it had one.
@@ -64,6 +87,17 @@ pub(crate) enum RuntimeNote {
         #[serde(default = "withdrawn")]
         reason: GateReason,
     },
+    /// The history items from number `first` (counting from 0 in the order of the agent's own
+    /// history) on, a chunk's worth, as the import of the agent's file produced them: each event
+    /// is an [`AgentEvent::History`]. Items the journal already holds are skipped by their
+    /// number, so a note journaled twice, or an import that resumed after a restart with a
+    /// different chunking, never duplicates anything.
+    EarlierChunk { first: u64, events: Vec<AgentEvent> },
+    /// The import ended: every chunk is journaled. `report` is what the driver's parser
+    /// counted (never content).
+    EarlierEnd { report: HistoryReport },
+    /// The import failed.
+    EarlierFailed { reason: EarlierUnavailable },
 }
 
 impl RuntimeNote {
@@ -197,8 +231,51 @@ mod tests {
         let old_start = serde_json::json!({"wasit":"start","spec":SpawnSpec::default()});
         assert!(matches!(
             classify(&old_start),
-            NoteKind::Runtime(RuntimeNote::Start { trace: None, .. })
+            NoteKind::Runtime(RuntimeNote::Start {
+                trace: None,
+                earlier: None,
+                ..
+            })
         ));
+        // Earlier history: the plan in the first start note, and the notes of an import.
+        let planned = RuntimeNote::Start {
+            spec: Box::new(SpawnSpec::default()),
+            trace: None,
+            earlier: Some(EarlierPlan::Storage {
+                path: "/a/b.jsonl".into(),
+                len: 7,
+            }),
+        };
+        let v = planned.to_value();
+        assert_eq!(
+            v["earlier"],
+            serde_json::json!({"source": "storage", "path": "/a/b.jsonl", "len": 7})
+        );
+        assert_eq!(classify(&v), NoteKind::Runtime(planned));
+        let unavailable = EarlierPlan::Unavailable {
+            why: EarlierUnavailable::SourceMissing,
+        };
+        assert_eq!(
+            serde_json::to_value(&unavailable).unwrap(),
+            serde_json::json!({"source": "unavailable", "why": {"kind": "source_missing"}})
+        );
+        for n in [
+            RuntimeNote::EarlierChunk {
+                first: 40,
+                events: vec![AgentEvent::UserMessage { text: "q".into() }.earlier(Some(5))],
+            },
+            RuntimeNote::EarlierEnd {
+                report: HistoryReport {
+                    messages: 3,
+                    ..HistoryReport::default()
+                },
+            },
+            RuntimeNote::EarlierFailed {
+                reason: EarlierUnavailable::FormatNotUnderstood { record: 2 },
+            },
+        ] {
+            assert_eq!(classify(&n.to_value()), NoteKind::Runtime(n));
+        }
         assert_eq!(
             classify(&serde_json::json!({"stdin": "closed"})),
             NoteKind::StdinClosed

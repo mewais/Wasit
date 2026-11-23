@@ -119,7 +119,10 @@ in the same turn; an interrupted or failed turn drops it). The engine reads inpu
 waits (`sleep_ms`, `wait_for_interrupt`, a gate), so a steer is seen only then.
 
 Discovery commands (opencode / kilo persona): `--version`, `models [provider] [--verbose]`,
-`session list [--format json]`, answered from `models` / `sessions`. `--version` also works for
+`session list [--format json]`, answered from `models` / `sessions` and the sessions earlier
+processes stored (below). `session list` shows the sessions of the folder it runs in, newest first,
+with the `id`/`title`/`updated`/`created`/`directory` fields the driver's `parse_sessions` reads; a
+folder with none prints nothing at all (opencode 1.19.6, kilo 7.8.27). `--version` also works for
 claude and codex.
 
 ## Agent storage: conversations outlive the process
@@ -148,15 +151,64 @@ exist.
     starts with `custom-title` and `agent-name` records when it is first written; `--resume`
     announces the stored title again;
   * `--continue` in a directory with no conversation starts a new one without a word (E6 of the
-    lifecycle investigation), else resumes the newest.
+    lifecycle investigation), else resumes the newest;
+  * the transcript has the REAL FILE'S SHAPE, written by one module, `wasit_fake_cli::transcript`
+    (the persona and tests share it; its module docs list every field). Taken from claude
+    2.1.293's own files (a one-prompt stream-json run; interactive transcripts for structure only):
+    `queue-operation` (enqueue, dequeue) before a prompt; `user` (`parentUuid` null for the first,
+    `promptId`, `permissionMode`, `promptSource`, `turnOrigin`, `turnPosition`, `message.content` as
+    an array of blocks) with the fields every message record has (`uuid`, `parentUuid`,
+    `isSidechain`, `timestamp` RFC 3339 ms, `userType`, `entrypoint` `sdk-cli`, `cwd`, `sessionId`,
+    `version`, `gitBranch`); `attachment` records chained after a conversation's first prompt
+    (`environment`, `model`, `session_context`, `date`) plus `atis-latch`; ONE `assistant` record per
+    content block (`message.id` shared by the blocks of a message, `apiBlockIndex`, `requestId`; a
+    `say` is a `text` block, a `think` a `thinking` block with empty text and a signature, a tool
+    call a `tool_use` block); a tool result is a `user` record whose content is a `tool_result`
+    block, with `toolUseResult` and `sourceToolAssistantUUID` (denied: `is_error`; an image: an
+    `image` block and `toolUseResult {type:"image", file{…}}`); a background `local_agent` is a
+    `tool_use` of `Agent`, its result `toolUseResult {status:"async_launched", agentId, …}` and the
+    subagent's own conversation in `<id>/subagents/agent-<agentId>.jsonl` (`isSidechain`, `agentId`,
+    own chain from a first `user` record holding the prompt) with `agent-<agentId>.meta.json`
+    (`toolUseId`, `agentType`, …); an interrupt is the `[Request interrupted by user]` user record,
+    a failed turn a `<synthetic>` assistant error record; after the last message of a turn
+    `last-prompt` (`leafUuid`) and `cost-state`; `--name` writes `custom-title` and `agent-name` first.
+    Every message record chains to the previous one, and a resumed run appends to the same file with
+    its first record chained to the file's last leaf. The builder (`Transcript`) also writes what a
+    persona never does, so tests can have it: a rewound branch (file order is not chain order), a
+    compaction (`compact_boundary` with `parentUuid` null and `logicalParentUuid`, then the
+    `isCompactSummary` record), a synchronous subagent, a user prompt with an image, bookkeeping and
+    unknown record kinds, a cut last line, and big files of filler turns. A scenario `sessions[]`
+    entry that is resumed (`--resume <its id>`) is written as such a transcript first
+    (`transcript::materialise_session`), in its `cwd` or the persona's.
 * **codex** (codex-cli 0.161.0, real runs against `codex app-server`): `thread/start` reports a
   thread id at once but writes no rollout; `thread/resume` of it fails with code -32600 `no
   rollout found for thread id <id>`. The rollout exists from the first `turn/start`, so the fake
-  stores a thread then.
+  stores a thread then. The fake stores each turn with every item it had (user message, reasoning,
+  tool items, agent messages, completed), and `thread/resume` hands the conversation back in the
+  result as codex-cli 0.169.1 still does for a paginated thread (`reference/codex/resume.jsonl`,
+  `wasit-codex/tests/fixtures/resume.ndjson`): a `deprecationNotice` and an idle
+  `thread/status/changed` first, then `thread.turns[]` = `{id, rootTurnId, items, itemsView:"full",
+  status, error, startedAt, completedAt, durationMs}`, `historyMode:"paginated"`,
+  `initialTurnsPage: null` and the two backwards cursors. A scenario session's `history` is paired
+  into turns (a user message starts one). The rollout discovery lists is written too:
+  `<CODEX_HOME, else <state>/codex-home>/sessions/YYYY/MM/DD/rollout-<YYYY-MM-DDThh-mm-ss>-<id>.jsonl`,
+  a `session_meta` line (`id`, `session_id`, `cwd`, `originator` = the client's name, `cli_version`,
+  `source`, `history_mode`, …) and one `response_item` message line per user / assistant message
+  (`input_text` / `output_text`), the structure of real `~/.codex/sessions` files (read for their
+  shape only); a scenario session gets its rollout when the persona starts. Thread and rollout are in
+  storage before `turn/completed` is sent. `thread/list` lists the threads of `cwd` newest first.
 * **opencode / kilo** (kilo 7.8.8, real run through `kilo acp`): `session/new` stores the session;
   `session/load` of it works in the next process with no prompt in between. opencode is assumed to
   keep every session it opens too (the driver's own comment says so); no opencode CLI was
-  available to check.
+  available to check. The session keeps what its turns sent (the user's messages, thoughts, text
+  messages whole, tool calls with their outcome, the usage after each turn) and `session/load`
+  replays it as `session/update` notifications before the result, as `reference/{kilo,opencode}/
+  load.jsonl` show (`user_message_chunk`, `agent_thought_chunk`, `agent_message_chunk`; a tool is a
+  `tool_call` and its completed `tool_call_update`, which the recordings do not contain: the
+  shapes are the live ones); a session known only by its messages replays one chunk per message. The
+  session is stored before `session/prompt` is answered. `session/list` and `session list` list the
+  stored sessions too (`updatedAt` / `updated` are the real last change), those of `cwd` when
+  one is asked for.
 
 ## Fidelity
 
@@ -181,14 +233,17 @@ every recording against the fake and compares message structure (keys and JSON k
 `remoteControl/status/changed` line were replaced, and `tests/reference.rs` compares just the
 `turn/steer` replies of it.
 
-Known gaps: the claude transcript holds only the title, user and assistant records the lifecycle
-needs (the real file also has `queue-operation`, `attachment`, `last-prompt`, `cost-state`, … lines),
-and claude's behaviour for `--resume` together with `--session-id`, `--fork-session` and `--name` on a
+Known gaps: the claude transcript lacks what the real file has besides the records above
+(`file-history-snapshot` / `-delta`, `slug`, `session_id`, `queueTranscriptOnly`, `classifier*`,
+`permissionDecision`, the big `prompt_snapshot` attachments, `system/turn_duration`, which the
+stream-json runs examined did not write, thinking text, `tool-results/` files, the `task-notification`
+records of a finished background task), and claude's behaviour for `--resume` together with `--session-id`, `--fork-session` and `--name` on a
 resume (the fake renames) was not observed, and `/rename <name>` over stream-json (observed with
 2.1.293: a second `session_title_changed`, the transcript's title rewritten) is just a prompt to the fake; a codex thread
 persisted by `thread/name/set` without a turn (real codex writes the rollout then: observed
-with 0.161.0) is not modelled, nor is the `thread/name/set` request itself; `session list` of the
-opencode/kilo persona lists only the scenario's sessions, not the stored ones; JSON key order is alphabetical, not the real CLI's order; codex `fileChange` items,
+with 0.161.0) is not modelled, nor is the `thread/name/set` request itself; the
+history a codex resume or ACP load replays is what the fake's own turns produced (no `fileChange`,
+plan or image items), and the real agents' replay of tool calls was not recorded; JSON key order is alphabetical, not the real CLI's order; codex `fileChange` items,
 codex reasoning items, ACP `plan` updates (real opencode reports todos as a `todowrite` tool call,
 the ACP spec shape is emitted here) and claude `ExitPlanMode` were not captured from the real
 CLIs and follow the protocol specs; claude `rate_limit_event` and codex `warning` /

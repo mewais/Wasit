@@ -22,11 +22,14 @@ mod client;
 mod config;
 mod continuation;
 mod core;
+#[cfg(test)]
+mod core_earlier_tests;
 mod cwd;
 mod diag;
 mod diag_service;
 mod discovery;
 pub mod environment;
+mod history;
 mod host;
 pub mod machine;
 mod manager;
@@ -44,6 +47,7 @@ pub use client::{ClientError, RuntimeClient, TypedSubscription};
 pub use config::{AgentCommands, DriverOverride, ModeHints, RuntimeConfig, ShimLauncher, Timeouts};
 pub use diag_service::DiagService;
 pub use discovery::{Discovery, DiscoveryConfig};
+pub use history::HistoryConfig;
 pub use manager::{
     AdoptReport, HostEventStream, SessionEventStream, SessionManager, MAX_HISTORY_PAGE,
 };

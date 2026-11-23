@@ -22,7 +22,7 @@
 //! | [`methods::SESSIONS_DELETE`] | [`SessionRef`] | [`Ack`] |
 //! | [`methods::SESSIONS_RENAME`] | [`RenameSession`] | [`Ack`] |
 //! | [`methods::SESSION_SNAPSHOT`] | [`SessionRef`] | [`SessionSnapshot`] |
-//! | [`methods::SESSION_HISTORY`] | [`HistoryRequest`] | [`HistoryPage`] |
+//! | [`methods::SESSION_HISTORY`] | [`HistoryRequest`] (`earlier: true` pages the conversation's earlier history instead of the session's own events, see [`EarlierHistory`]) | [`HistoryPage`] |
 //! | [`methods::SESSION_TRAIL_PAGE`] | [`TrailRequest`] | [`TrailPage`] |
 //! | [`methods::SESSION_COMMAND`] | [`CommandRequest`] | [`CommandReply`] |
 //! | [`methods::SESSION_ATTACHMENT_PUT`] | [`crate::media::AttachmentPut`] | [`crate::media::AttachmentPutReply`] |
@@ -39,7 +39,7 @@
 //! | topic | payload | cursor |
 //! |---|---|---|
 //! | [`topics::HOST_SESSIONS`] | [`HostEvent`] | `"<epoch>.<n>"`; an unknown or expired cursor restarts with [`HostEvent::Reset`] |
-//! | `session.events:<id>` ([`topics::session_events`]) | [`SessionEvent`] | [`SessionEvent::cursor`] as a decimal `u64`; stable across daemon restarts |
+//! | `session.events:<id>` ([`topics::session_events`]) | [`SessionEvent`] (the loading of earlier history as [`SessionEventKind::Earlier`], never its items) | [`SessionEvent::cursor`] as a decimal `u64`; stable across daemon restarts |
 //! | `session.trail:<id>` ([`topics::session_trail`]) | [`TrailItem`] | the cursor of the [`SessionEvent`] it was projected from, as a decimal `u64`: the same cursors as `session.events:<id>`, stable across daemon restarts |
 //! | [`topics::DRIVERS_INVENTORY`] | [`InventoryReply`] | `"<epoch>.<n>"`; every event is a full inventory |
 //! | [`topics::DIAG_TAIL`] (params [`DiagTailParams`]; served by [`crate::DiagService`]) | [`DiagTailEvent`] | `"<boot>.<seq>"` of the process's diagnostics sink; an unknown or expired cursor restarts with [`DiagTailEvent::Reset`] |
@@ -50,9 +50,9 @@ use serde::{Deserialize, Serialize};
 use wasit_control::TraceId;
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
-    GateRequest, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput, ResumableSession,
-    SessionMode, SlashCommandInfo, TaskInfo, TaskUsage, TurnOrigin, TurnTrigger, Unsupported,
-    Usage,
+    GateRequest, HistoryReport, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput,
+    ResumableSession, SessionMode, SlashCommandInfo, TaskInfo, TaskUsage, TurnOrigin, TurnTrigger,
+    Unsupported, Usage,
 };
 
 /// Method names.
@@ -134,6 +134,7 @@ pub mod codes {
     pub const GATE_WITHDRAWN: &str = "gate_withdrawn";
     pub const CONTINUE_FAILED: &str = "continue_failed";
     pub const BAD_WORKING_DIRECTORY: &str = "bad_working_directory";
+    pub const NOTHING_TO_CONTINUE: &str = "nothing_to_continue";
 }
 
 /// A session id: 12 characters of lowercase RFC 4648 base32 (`a-z2-7`).
@@ -367,6 +368,153 @@ pub struct ResumeCommand {
     pub cwd: String,
 }
 
+/// Where a conversation's earlier history came from ([`EarlierHistory::source`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum EarlierSource {
+    /// The agent sent it over its protocol while the session opened the conversation (codex,
+    /// OpenCode, Kilo).
+    AgentReplay,
+    /// The runtime read it from the agent's own storage (claude's transcript file).
+    AgentStorage,
+}
+
+/// Why a resumed conversation's earlier history is not available ([`EarlierState::Unavailable`]).
+/// Never a silent empty transcript: this says what is wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EarlierUnavailable {
+    /// The agent gives its history out neither over its protocol nor in storage the runtime can
+    /// read.
+    NotOffered,
+    /// The agent's file for the conversation does not exist.
+    SourceMissing,
+    /// The agent's file exists and could not be read (`detail` is the host's own wording).
+    SourceUnreadable { detail: String },
+    /// The agent's file is larger than the runtime reads.
+    TooLarge {
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        bytes: u64,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        limit: u64,
+    },
+    /// Nothing in the file is a record of the format the driver knows (`record`: the 1-based
+    /// number of the first line it did not understand).
+    FormatNotUnderstood {
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        record: u64,
+    },
+    /// The import failed for a reason of the runtime's own (`detail`).
+    Failed { detail: String },
+}
+
+/// Where the loading of a resumed conversation's earlier history stands.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EarlierState {
+    /// The conversation began in this session (or the session predates earlier history):
+    /// nothing earlier exists, or none is expected.
+    #[default]
+    None,
+    /// The history is arriving; what is there already can be shown. The session is usable
+    /// meanwhile.
+    Loading,
+    /// The history is in the journal. `complete: false`: something of the agent's history is not
+    /// shown (see [`EarlierHistory::gaps`]).
+    Loaded { complete: bool },
+    /// It could not be loaded, and why.
+    Unavailable { reason: EarlierUnavailable },
+}
+
+/// What the history that was loaded leaves out. Every count is of the agent's own records or
+/// messages, never a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EarlierGaps {
+    /// Messages older than the import window (or items beyond what one record can carry): they
+    /// exist in the agent's own history and are not shown.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub omitted: u64,
+    /// Items cut to the per-item bound, or whose media was left out.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub shortened: u64,
+    /// Lines of the agent's file that were not records.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub unreadable: u64,
+    /// Records of kinds the driver does not know (`unrecognised_kinds`: the first few names).
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub unrecognised: u64,
+    #[serde(default)]
+    pub unrecognised_kinds: Vec<String>,
+    /// Files of the conversation (a subagent's transcript) that could not be read.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub missing_files: u64,
+    /// The last line of the file had no end: the agent may have been writing it.
+    #[serde(default)]
+    pub truncated_tail: bool,
+    /// The process ended before all of the history arrived.
+    #[serde(default)]
+    pub interrupted: bool,
+    /// How many times the agent sent the history again (a later start of the same session
+    /// reloads the conversation) and the runtime, which already had it, ignored it.
+    #[serde(default)]
+    pub replays_ignored: u32,
+}
+
+impl EarlierGaps {
+    /// Nothing is left out.
+    pub fn is_empty(&self) -> bool {
+        self.omitted == 0
+            && self.shortened == 0
+            && self.unreadable == 0
+            && self.unrecognised == 0
+            && self.missing_files == 0
+            && !self.truncated_tail
+            && !self.interrupted
+    }
+
+    /// What `report` says is left out.
+    pub fn of_report(r: &HistoryReport) -> EarlierGaps {
+        EarlierGaps {
+            omitted: r.older_omitted,
+            shortened: r.shortened,
+            unreadable: r.unreadable,
+            unrecognised: r.unrecognised,
+            unrecognised_kinds: r.unrecognised_kinds.clone(),
+            missing_files: r.missing_files,
+            truncated_tail: r.truncated_tail,
+            interrupted: false,
+            replays_ignored: 0,
+        }
+    }
+}
+
+/// What a session knows of the conversation before it: the earlier messages of a conversation
+/// it resumed (see `ARCHITECTURE.md` §3.8 for the contract clients render by).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EarlierHistory {
+    pub state: EarlierState,
+    /// Where the history comes from, once it is known to be coming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EarlierSource>,
+    /// History items in the journal so far (the transcript's earlier part has this many events:
+    /// page them with `session.history {earlier: true}`).
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub items: u64,
+    #[serde(default)]
+    pub gaps: EarlierGaps,
+}
+
 /// The continuously reduced state of one session. Rebuilt exactly by replaying its journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -467,6 +615,9 @@ pub struct SessionSnapshot {
     /// `false` while the snapshot of an exited session is still being rebuilt from its
     /// journal (only `id`, `driver`, labels and a probe-derived phase are meaningful then).
     pub loaded: bool,
+    /// What the session knows of the conversation before it (see [`EarlierHistory`]).
+    #[serde(default)]
+    pub earlier: EarlierHistory,
 }
 
 // ── Session events ──────────────────────────────────────────────────────────
@@ -731,6 +882,12 @@ pub enum SessionEventKind {
         #[serde(default)]
         code: NoticeCode,
     },
+    /// The loading of the resumed conversation's earlier history moved (it began, made
+    /// progress, ended complete or partial, or turned out unavailable): the new state, which is
+    /// also the snapshot's `earlier`. The history items themselves are never in the live event
+    /// stream: they are paged with `session.history {earlier: true}`.
+    #[non_exhaustive]
+    Earlier { earlier: EarlierHistory },
 }
 
 /// Cursor of the `index`-th event derived from journal record `seq`.
@@ -871,6 +1028,14 @@ pub struct HistoryRequest {
     /// Which events: everything (default), the session's own transcript, or one subagent's.
     #[serde(default, skip_serializing_if = "HistoryScope::is_all")]
     pub scope: HistoryScope,
+    /// Page the conversation's *earlier* history instead of the session's own events: the items
+    /// ([`wasit_core::AgentEvent::History`]) the journal holds of the conversation before this
+    /// session, oldest first, with the same `before` / `limit` / `has_more` and the same
+    /// `scope` filters (applied to the events inside the history items). Their cursors are
+    /// journal cursors like any other (greater than the live events shown before the history
+    /// arrived): render them above the live transcript, in cursor order among themselves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub earlier: bool,
 }
 
 /// Which events a history page holds. The cursors are the same whatever the scope (a scoped page
@@ -899,6 +1064,11 @@ impl HistoryScope {
     pub fn admits(&self, event: &SessionEvent) -> bool {
         let SessionEventKind::Agent { event: agent } = &event.kind else {
             return !matches!(self, HistoryScope::Subagent { .. });
+        };
+        // An earlier-history item is filtered by what it holds.
+        let agent = match agent {
+            AgentEvent::History { event, .. } => event.as_ref(),
+            other => other,
         };
         match self {
             HistoryScope::All => true,
@@ -1053,6 +1223,10 @@ pub enum RuntimeError {
     /// The working directory was refused (it names the path as given).
     #[error("{0}")]
     WorkingDirectory(String),
+    /// "Continue the most recent conversation" found none in the folder (the message names it):
+    /// nothing was started, and nothing is started in its place.
+    #[error("there is no earlier conversation to continue in {0}")]
+    NothingToContinue(String),
 }
 
 impl RuntimeError {
@@ -1068,6 +1242,7 @@ impl RuntimeError {
             RuntimeError::Busy(_) => codes::BUSY,
             RuntimeError::Timeout(_) => wasit_control::codes::TIMEOUT,
             RuntimeError::WorkingDirectory(_) => codes::BAD_WORKING_DIRECTORY,
+            RuntimeError::NothingToContinue(_) => codes::NOTHING_TO_CONTINUE,
         }
     }
 }
@@ -1505,6 +1680,86 @@ mod tests {
         assert!(event_cursor(5, 70000) < synthetic_cursor(5));
         assert!(synthetic_cursor(5) < event_cursor(6, 0));
         assert_eq!(cursor_seq(event_cursor(77, 2)), 77);
+    }
+
+    /// The state of the earlier history is wire-stable, and a snapshot of a build without it
+    /// reads as "nothing earlier".
+    #[test]
+    fn the_earlier_history_has_its_wire_shape() {
+        let e = EarlierHistory {
+            state: EarlierState::Unavailable {
+                reason: EarlierUnavailable::FormatNotUnderstood { record: 4 },
+            },
+            source: Some(EarlierSource::AgentStorage),
+            items: 0,
+            gaps: EarlierGaps::default(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            v["state"],
+            serde_json::json!({"kind": "unavailable",
+                               "reason": {"kind": "format_not_understood", "record": 4}})
+        );
+        assert_eq!(v["source"], "agent_storage");
+        assert_eq!(serde_json::from_value::<EarlierHistory>(v).unwrap(), e);
+        let loaded = serde_json::to_value(EarlierState::Loaded { complete: false }).unwrap();
+        assert_eq!(
+            loaded,
+            serde_json::json!({"kind": "loaded", "complete": false})
+        );
+        assert_eq!(
+            serde_json::from_value::<EarlierHistory>(
+                serde_json::json!({"state": {"kind": "none"}})
+            )
+            .unwrap(),
+            EarlierHistory::default()
+        );
+        // A client that does not know `earlier` asks for the live events; one that does says so.
+        let live: HistoryRequest =
+            serde_json::from_value(serde_json::json!({"id": "aaaaaaaaaaaa", "limit": 5})).unwrap();
+        assert!(!live.earlier);
+        assert!(serde_json::to_value(&live)
+            .unwrap()
+            .get("earlier")
+            .is_none());
+        let asked: HistoryRequest = serde_json::from_value(
+            serde_json::json!({"id": "aaaaaaaaaaaa", "limit": 5, "earlier": true}),
+        )
+        .unwrap();
+        assert!(asked.earlier);
+    }
+
+    /// A scope looks inside an earlier-history item for what it holds.
+    #[test]
+    fn scopes_filter_earlier_items_by_what_they_hold() {
+        let scope = wasit_core::Scope {
+            call_id: "call-1".into(),
+            agent_id: None,
+        };
+        let sub = SessionEvent {
+            cursor: 1,
+            t: 0,
+            kind: SessionEventKind::Agent {
+                event: AgentEvent::AssistantDelta {
+                    text: "x".into(),
+                    message_id: None,
+                }
+                .scoped(Some(scope))
+                .earlier(None),
+            },
+        };
+        let main = SessionEvent {
+            cursor: 2,
+            t: 0,
+            kind: SessionEventKind::Agent {
+                event: AgentEvent::UserMessage { text: "y".into() }.earlier(None),
+            },
+        };
+        let of = |c: &str| HistoryScope::Subagent { call_id: c.into() };
+        assert!(HistoryScope::All.admits(&sub) && HistoryScope::All.admits(&main));
+        assert!(!HistoryScope::Main.admits(&sub) && HistoryScope::Main.admits(&main));
+        assert!(of("call-1").admits(&sub) && !of("call-2").admits(&sub));
+        assert!(!of("call-1").admits(&main));
     }
 
     #[test]

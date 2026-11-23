@@ -226,6 +226,40 @@ fn resume_and_continue() {
         |e| matches!(e, AgentEvent::SessionInit { native_session_id: Some(s), .. } if s == id)
     ));
     assert_eq!(turns(&r).len(), 1);
+    // The recorded `thread/resume` result carries the thread's first turn (a prompt and its
+    // reply): history, before the event that opens the session, with the times codex recorded.
+    let init = r
+        .events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::SessionInit { .. }))
+        .unwrap();
+    let history: Vec<_> = r.events[..init]
+        .iter()
+        .filter_map(|e| e.as_history())
+        .collect();
+    assert_eq!(
+        history,
+        vec![
+            (
+                Some(1_794_958_574_369),
+                &AgentEvent::UserMessage {
+                    text: "hello".into()
+                }
+            ),
+            (
+                Some(1_794_958_574_387),
+                &AgentEvent::AssistantDelta {
+                    text: "Hello from fake: hello".into(),
+                    message_id: Some("msg_6".into())
+                }
+            ),
+        ]
+    );
+    // And no history anywhere else in the recording: the live turn is not history.
+    assert_eq!(
+        r.events.iter().filter(|e| e.as_history().is_some()).count(),
+        2
+    );
 
     let r = run("continue");
     let m = methods(&r);

@@ -37,7 +37,8 @@ use crate::config::RuntimeConfig;
 use crate::continuation::{Continuation, Held};
 use crate::core::{ContinuePlan, Core};
 use crate::diag::{self, Intent};
-use crate::note::RuntimeNote;
+use crate::history::ImportMsg;
+use crate::note::{EarlierPlan, RuntimeNote};
 use crate::store::{self, SessionFile};
 use crate::stream::Subscriber;
 use crate::wire::{
@@ -88,6 +89,9 @@ pub(crate) enum Msg {
         before: Option<u64>,
         limit: usize,
         scope: HistoryScope,
+        /// The conversation's earlier history instead of the session's own events: never in
+        /// memory, always a replay of the journal.
+        earlier: bool,
         reply: oneshot::Sender<Local<HistoryPage>>,
     },
     /// The same window of the session's trail.
@@ -156,6 +160,9 @@ enum Op {
         token: Option<String>,
         attach: bool,
     },
+    /// A note of the import of the conversation's earlier history. Sent only when nothing else
+    /// waits: a prompt never queues behind history.
+    Earlier(serde_json::Value),
     Write(String),
     Close,
     Signal(Sig),
@@ -232,6 +239,19 @@ pub(crate) struct Actor {
     pending_spec: SpawnSpec,
     /// The trace id journaled with the `start` note of the first generation.
     start_trace: Option<TraceId>,
+    /// How the conversation's earlier history reaches the journal, journaled with the `start`
+    /// note of the first generation ([`EarlierPlan`]).
+    start_earlier: Option<EarlierPlan>,
+    /// The import of the agent's file under way: its messages arrive here, off the async path.
+    import: Option<crate::history::ImportRun>,
+    /// The next note of the import, taken from `import`, waiting for the shim to be free.
+    import_note: Option<serde_json::Value>,
+    /// The import was given up on in this process generation (a note was refused): it is not
+    /// started again until the next one.
+    import_aborted: bool,
+    /// The import's last message (its end or its failure) was taken: nothing more comes from the
+    /// channel, and the import stays recorded until the journal shows it ended.
+    import_last: bool,
 
     handshake_deadline: Option<Instant>,
     stop_stage: Option<(Instant, StopStage)>,
@@ -297,6 +317,18 @@ async fn next_record(s: &mut Option<RecordStream>) -> Option<Result<Record, Shim
     match s {
         Some(s) => s.next().await,
         None => std::future::pending().await,
+    }
+}
+
+/// The next message of the import under way, when the actor can take one (the previous is
+/// journaled); never ready otherwise.
+async fn recv_import(
+    run: &mut Option<crate::history::ImportRun>,
+    ready: bool,
+) -> Option<ImportMsg> {
+    match run {
+        Some(run) if ready => run.rx.recv().await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -380,6 +412,7 @@ impl Actor {
         let (file_tx, file_rx) = mpsc::unbounded_channel();
         let writer = tokio::spawn(persist(init.dir.clone(), init.file.clone(), file_rx));
         let source = adopt_source(init.dir.clone(), init.cfg.session_run_dir(&init.dir), 1);
+        let start_earlier = init.file.earlier.clone();
         Actor {
             id: meta.id,
             dir: init.dir,
@@ -410,6 +443,11 @@ impl Actor {
             deferred: VecDeque::new(),
             continuation: Continuation::Idle,
             start_trace: init.start_trace,
+            start_earlier,
+            import: None,
+            import_note: None,
+            import_aborted: false,
+            import_last: false,
             handshake_deadline: None,
             stop_stage: None,
             reconnect_at: None,
@@ -431,6 +469,12 @@ impl Actor {
                 item = next_record(&mut self.stream) => {
                     self.on_stream_item(item);
                     self.drain_ready();
+                }
+                msg = recv_import(
+                    &mut self.import,
+                    self.import_note.is_none() && !self.import_last
+                ) => {
+                    self.on_import_msg(msg);
                 }
                 r = opt_fut(&mut self.inflight) => {
                     self.inflight = None;
@@ -456,6 +500,9 @@ impl Actor {
                 self.offline_state = None;
                 self.live = false;
                 self.attach_token = token();
+                // An import under way belongs to the previous connection: the boundary starts
+                // it again from what the journal holds.
+                self.drop_import(false);
                 // Requests of a previous connection: writes are re-derived from the owed queue
                 // at the boundary; only requester notes survive.
                 self.outbox
@@ -588,6 +635,7 @@ impl Actor {
     fn drop_connection(&mut self) {
         self.client = None;
         self.inflight = None;
+        self.drop_import(false);
         self.live = false;
         self.handshake_deadline = None;
         self.stop_stage = None;
@@ -607,6 +655,7 @@ impl Actor {
         self.fail_continue(RuntimeError::Spawn(format!(
             "could not reach the new process: {reason}"
         )));
+        self.drop_import(false);
         let events = self.core.mark_lost(reason);
         if !events.is_empty() {
             self.snapshot_dirty = true;
@@ -670,6 +719,8 @@ impl Actor {
         }
         let resolved = out.resolved;
         let continued = if out.spawned {
+            // A new process generation: an import given up on may go on with it.
+            self.import_aborted = false;
             // The core shows the new generation now.
             self.continuation.spawned()
         } else {
@@ -724,6 +775,8 @@ impl Actor {
             self.on_boundary();
         }
         if out.exited {
+            // The history that was arriving will not, from this process.
+            self.drop_import(false);
             self.answer_refused_notes();
             self.handshake_deadline = None;
             self.stop_stage = None;
@@ -739,6 +792,74 @@ impl Actor {
             self.file.native_session_id = native;
             self.save_file(None);
         }
+        self.maybe_start_import();
+    }
+
+    // ── earlier history ─────────────────────────────────────────────────────
+
+    /// Start (or carry on) reading the agent's file for the conversation's earlier history when
+    /// the journal says it is being loaded that way and this actor is the one that can write the
+    /// result into it. The session is not held back: the file is read on the blocking pool and
+    /// its chunks are journaled one at a time, only when nothing else waits for the shim.
+    fn maybe_start_import(&mut self) {
+        if self.import.is_some() {
+            // One whose last note is journaled stays until the journal shows it ended: the
+            // note is read back a moment after it was sent, and the core says "loading" until
+            // then.
+            if self.import_last && self.import_note.is_none() && self.core.earlier_work().is_none()
+            {
+                self.drop_import(false);
+            }
+            return;
+        }
+        if !self.live || self.import_aborted {
+            return;
+        }
+        let Some(work) = self.core.earlier_work() else {
+            return;
+        };
+        self.import = Some(crate::history::spawn(
+            self.desc.clone(),
+            self.cfg.history,
+            work,
+        ));
+    }
+
+    /// Stop the import: its channel is dropped (the reader ends at its next send) and its
+    /// pending note is forgotten. `aborted`: do not start it again in this process generation.
+    fn drop_import(&mut self, aborted: bool) {
+        self.import = None;
+        self.import_note = None;
+        self.import_last = false;
+        if aborted {
+            self.import_aborted = true;
+        }
+    }
+
+    /// The import has a note for the journal.
+    fn on_import_msg(&mut self, msg: Option<ImportMsg>) {
+        let (note, last) = match msg {
+            Some(ImportMsg::Chunk { first, events }) => (
+                RuntimeNote::EarlierChunk { first, events }.to_value(),
+                false,
+            ),
+            Some(ImportMsg::End(report)) => (RuntimeNote::EarlierEnd { report }.to_value(), true),
+            Some(ImportMsg::Failed(reason)) => {
+                (RuntimeNote::EarlierFailed { reason }.to_value(), true)
+            }
+            // The reading stopped without a word (its thread died): say that.
+            None => (
+                RuntimeNote::EarlierFailed {
+                    reason: crate::wire::EarlierUnavailable::Failed {
+                        detail: "the import stopped without finishing".into(),
+                    },
+                }
+                .to_value(),
+                true,
+            ),
+        };
+        self.import_last = last;
+        self.import_note = Some(note);
     }
 
     /// We read our own `attach` note: everything before it was history.
@@ -756,6 +877,7 @@ impl Actor {
             let data = RuntimeNote::Start {
                 spec: Box::new(self.pending_spec.clone()),
                 trace: self.start_trace.clone(),
+                earlier: self.start_earlier.clone(),
             }
             .to_value();
             self.push_op(Op::Note {
@@ -845,13 +967,19 @@ impl Actor {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let Some(op) = self.outbox.pop_front() else {
-            return;
+        let op = match self.outbox.pop_front() {
+            Some(op) => op,
+            // Nothing else waits: the next piece of the earlier history may go.
+            None if self.live => match self.import_note.take() {
+                Some(data) => Op::Earlier(data),
+                None => return,
+            },
+            None => return,
         };
         self.inflight = Some(
             async move {
                 let r = match &op {
-                    Op::Note { data, .. } => client.note(data.clone()).await,
+                    Op::Note { data, .. } | Op::Earlier(data) => client.note(data.clone()).await,
                     Op::Write(line) => client.write(line).await,
                     Op::Close => client.close_stdin().await,
                     Op::Signal(sig) => client.signal(*sig).await,
@@ -867,6 +995,23 @@ impl Actor {
             return;
         };
         match op {
+            Op::Earlier(_) => {
+                diag::op_refused(&self.id, "earlier", &e);
+                // The history stops here, and the journal says so: the shim that refused this
+                // note takes (or has taken) the process down, which ends the import there; when
+                // it is only this note, the failure is journaled in its place.
+                self.drop_import(true);
+                self.push_op(Op::Note {
+                    data: RuntimeNote::EarlierFailed {
+                        reason: crate::wire::EarlierUnavailable::Failed {
+                            detail: "the shim refused a note of the earlier history".into(),
+                        },
+                    }
+                    .to_value(),
+                    token: None,
+                    attach: false,
+                });
+            }
             Op::Note { token: Some(t), .. } => {
                 if let Some(mut p) = self.pending.remove(&t) {
                     if p.continued {
@@ -996,9 +1141,10 @@ impl Actor {
                 before,
                 limit,
                 scope,
+                earlier,
                 reply,
             } => {
-                let r = if self.loading {
+                let r = if self.loading || earlier {
                     Local::Replay
                 } else {
                     self.history(before, limit, &scope)
@@ -1485,8 +1631,14 @@ impl Actor {
                 }
             })?;
         self.pending_spec = spec.clone();
-        // The trace of the request that created the session belongs to its first generation.
+        // The trace of the request that created the session belongs to its first generation, and
+        // so does the plan for the conversation's earlier history (an interrupted one is
+        // continued from the journal's own state).
         self.start_trace = None;
+        if self.core.earlier_decided() {
+            self.start_earlier = None;
+            self.file.earlier = None;
+        }
         self.file.spec = spec;
         self.save_file(None);
         self.reconnect_attempt = 0;
