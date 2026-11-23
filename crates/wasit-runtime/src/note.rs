@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use wasit_control::TraceId;
-use wasit_core::{Command, GateReason, GateRequest, SpawnSpec};
+use wasit_core::{Command, GateReason, GateRequest, SpawnSpec, TurnBinding};
 
 use crate::wire::NoticeCode;
 
@@ -46,10 +46,15 @@ pub(crate) enum RuntimeNote {
     /// An external gate was raised on the session from outside the CLI protocol (e.g. an
     /// orchestration handoff). It is pending like any CLI gate until answered with
     /// `answer_gate` / `answer_question` (journaled as a `command` note, never sent to the CLI)
-    /// or withdrawn with `resolve_gate`.
+    /// or withdrawn with `resolve_gate`. A `binding` ties it to the turn open when the note is
+    /// applied: the core then resolves it itself when that turn is interrupted or ends (see
+    /// [`TurnBinding`]). A note journaled before bindings existed has none: the gate belongs to
+    /// the session.
     RaiseGate {
         token: String,
         gate: Box<GateRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<TurnBinding>,
     },
     /// An external gate was taken down by its owner without an answer, for `reason` (a note
     /// journaled before resolutions carried one has none: it reads as `withdrawn`).
@@ -162,6 +167,33 @@ mod tests {
             reason: GateReason::new("denied").with_detail("not now"),
         };
         assert_eq!(classify(&resolve.to_value()), NoteKind::Runtime(resolve));
+        // A raise journaled before bindings existed has none and belongs to the session; one
+        // with a binding round-trips it, and one without writes no key.
+        let old_raise = serde_json::json!({"wasit":"raise_gate","token":"t","gate":
+            {"gate_type":"question","request_id":"r","questions":[]}});
+        assert!(matches!(
+            classify(&old_raise),
+            NoteKind::Runtime(RuntimeNote::RaiseGate { binding: None, .. })
+        ));
+        let raise = |binding| RuntimeNote::RaiseGate {
+            token: "t".into(),
+            gate: Box::new(GateRequest::Question {
+                request_id: "r".into(),
+                questions: vec![],
+            }),
+            binding,
+        };
+        assert!(raise(None).to_value().get("binding").is_none());
+        for binding in [
+            TurnBinding::Interrupt { detail: None },
+            TurnBinding::Turn {
+                interrupted: Some("i".into()),
+                ended: None,
+            },
+        ] {
+            let n = raise(Some(binding));
+            assert_eq!(classify(&n.to_value()), NoteKind::Runtime(n));
+        }
         let old_start = serde_json::json!({"wasit":"start","spec":SpawnSpec::default()});
         assert!(matches!(
             classify(&old_start),

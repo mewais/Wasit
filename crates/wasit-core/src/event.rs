@@ -37,6 +37,12 @@ impl GateReason {
     pub const PROCESS_ENDED: &'static str = "process_ended";
     /// The runtime resolved the gate because the session was asked to stop.
     pub const SESSION_STOPPED: &'static str = "session_stopped";
+    /// The runtime resolved a gate bound to a turn ([`TurnBinding`]) because that turn was
+    /// interrupted.
+    pub const TURN_INTERRUPTED: &'static str = "turn_interrupted";
+    /// The runtime resolved a gate bound to a turn ([`TurnBinding::Turn`]) because that turn
+    /// ended without the gate being answered.
+    pub const TURN_ENDED: &'static str = "turn_ended";
     /// The longest accepted code, in bytes.
     pub const CODE_MAX: usize = 64;
     /// The longest accepted detail, in characters.
@@ -78,6 +84,68 @@ impl GateReason {
             }
         }
         Ok(())
+    }
+}
+
+/// How long an external gate lives relative to the turn that was open when it was raised (the
+/// turn the request belongs to). Without a binding a gate lives until it is answered, resolved
+/// by its owner, or the process ends. With one, the session's reducer resolves it itself, in
+/// the very step that interrupts or ends the turn, with a runtime-owned reason
+/// ([`GateReason::TURN_INTERRUPTED`], [`GateReason::TURN_ENDED`]) and the `detail` the raiser
+/// supplied here for it. Details are the raiser's own wording and obey [`GateReason::check`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ends", rename_all = "snake_case")]
+pub enum TurnBinding {
+    /// The gate ends when the turn is interrupted; a turn that ends normally leaves it pending
+    /// (it then lives on as a session's gate).
+    Interrupt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// The gate ends when the turn is interrupted (`interrupted` detail) or ends without an
+    /// answer (`ended` detail).
+    Turn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupted: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended: Option<String>,
+    },
+}
+
+impl TurnBinding {
+    /// The reason the gate is resolved with when the turn is interrupted.
+    pub fn interrupted_reason(&self) -> GateReason {
+        let detail = match self {
+            TurnBinding::Interrupt { detail } => detail,
+            TurnBinding::Turn { interrupted, .. } => interrupted,
+        };
+        Self::reason(GateReason::TURN_INTERRUPTED, detail)
+    }
+
+    /// The reason the gate is resolved with when the turn ends without an interrupt; `None`
+    /// for a binding that survives a normal turn end.
+    pub fn ended_reason(&self) -> Option<GateReason> {
+        match self {
+            TurnBinding::Interrupt { .. } => None,
+            TurnBinding::Turn { ended, .. } => Some(Self::reason(GateReason::TURN_ENDED, ended)),
+        }
+    }
+
+    fn reason(code: &str, detail: &Option<String>) -> GateReason {
+        let reason = GateReason::new(code);
+        match detail {
+            Some(d) => reason.with_detail(d.clone()),
+            None => reason,
+        }
+    }
+
+    /// `Err` with what is wrong when a detail is not a well-formed [`GateReason`] detail.
+    pub fn check(&self) -> Result<(), String> {
+        self.interrupted_reason().check()?;
+        match self.ended_reason() {
+            Some(r) => r.check(),
+            None => Ok(()),
+        }
     }
 }
 
