@@ -320,6 +320,7 @@ impl Hub {
                 hooks: Some(Arc::new(hooks)),
                 on_state: Some(on_state),
                 diag: Some(spec.diag_link()),
+                diag_host: Some(Ident::new(spec.id.as_str())),
             },
         );
         links.insert(spec.id.clone(), LinkEntry { spec, sup });

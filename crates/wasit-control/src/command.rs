@@ -280,12 +280,14 @@ pub struct CommandSpec {
 }
 
 /// The link attempt a transport command belongs to (see [`CommandSpec::trace`]): the link's
-/// diagnostics label and the attempt the supervisor passed to the connector, so the
-/// transport's records join the supervisor's on `(link, n)` and, should the supervisor end the
-/// attempt, what the transport had said is known to it ([`Attempt`]).
+/// diagnostics label, the host the link leads to (when it has one, as the attempt carries it)
+/// and the attempt the supervisor passed to the connector, so the transport's records join the
+/// supervisor's on `(link, n)` and, should the supervisor end the attempt, what the transport
+/// had said is known to it ([`Attempt`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportTrace {
     pub link: Ident,
+    pub host: Option<Ident>,
     pub attempt: Attempt,
 }
 
@@ -307,11 +309,13 @@ impl CommandSpec {
         }
     }
 
-    /// Records this command's spawn and exit as belonging to `attempt` of `link`, and makes
-    /// the command known to the attempt (what it says, if the attempt is cut short).
+    /// Records this command's spawn and exit as belonging to `attempt` of `link`, with the host
+    /// the attempt's link leads to (`SupervisedOptions::diag_host`), and makes the command known
+    /// to the attempt (what it says, if the attempt is cut short).
     pub fn traced(mut self, link: Ident, attempt: &Attempt) -> Self {
         self.trace = Some(TransportTrace {
             link,
+            host: attempt.host().cloned(),
             attempt: attempt.clone(),
         });
         self

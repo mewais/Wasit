@@ -248,6 +248,9 @@ pub struct SupervisedOptions {
     /// state change, provisioning run and close of the link is recorded; `None` (an in-process
     /// loopback) records nothing.
     pub diag: Option<Ident>,
+    /// The host this link leads to, written as `host` in the link's records so a log can be
+    /// filtered by host; `None` for links that are not to a host.
+    pub diag_host: Option<Ident>,
 }
 
 struct Shared {
@@ -259,16 +262,17 @@ struct Shared {
     backoff: Backoff,
     on_state: Option<StateCallback>,
     diag: Option<Ident>,
+    diag_host: Option<Ident>,
 }
 
 impl Shared {
     /// Publishes `s`. `why` is the text that goes with it in diagnostics when it is not the
-    /// one `s` carries itself.
-    fn set(&self, s: LinkState, why: Option<&str>) {
+    /// one `s` carries itself; `n` is the link's attempt number (0 before the first attempt).
+    fn set(&self, s: LinkState, why: Option<&str>, n: u64) {
         if let Some(link) = &self.diag {
             let from = self.state.borrow().clone();
             if from.code() != s.code() {
-                diag::state(link, &from, &s, why);
+                diag::state(link, self.diag_host.as_ref(), n, &from, &s, why);
             }
         }
         if let Some(cb) = &self.on_state {
@@ -286,7 +290,7 @@ impl Shared {
         error: impl FnOnce() -> Option<ErrorInfo>,
     ) {
         if let Some(link) = &self.diag {
-            diag::attempt_end(link, n, outcome, error(), started);
+            diag::attempt_end(link, self.diag_host.as_ref(), n, outcome, error(), started);
         }
     }
 }
@@ -342,6 +346,7 @@ impl Supervised {
             backoff: opts.config.backoff.clone(),
             on_state: opts.on_state.clone(),
             diag: opts.diag.clone(),
+            diag_host: opts.diag_host.clone(),
         });
         let task = tokio::spawn(run(shared.clone(), connector, opts.config, opts.hooks));
         *shared.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -478,13 +483,13 @@ async fn run(
         }
         // Requests for a reconnect made before this attempt are satisfied by it.
         reconnect_rx.borrow_and_update();
-        shared.set(LinkState::Connecting, None);
         n += 1;
+        shared.set(LinkState::Connecting, None, n);
         let started = Instant::now();
         if let Some(link) = &shared.diag {
-            diag::attempt_begin(link, n);
+            diag::attempt_begin(link, shared.diag_host.as_ref(), n);
         }
-        let this_attempt = Attempt::new(n);
+        let this_attempt = Attempt::new(n).for_host(shared.diag_host.clone());
         let res = tokio::select! {
             _ = stop.cancelled() => break,
             r = tokio::time::timeout(cfg.connect_timeout, connector(this_attempt.clone())) => r,
@@ -527,6 +532,7 @@ async fn run(
                             hello: client.remote_hello().clone(),
                         },
                         None,
+                        n,
                     );
                     enum Ev {
                         Stop,
@@ -545,6 +551,8 @@ async fn run(
                             if let Some(link) = &shared.diag {
                                 diag::link_closed(
                                     link,
+                                    shared.diag_host.as_ref(),
+                                    n,
                                     &ConnClose::Local,
                                     connected_at.elapsed(),
                                     None,
@@ -562,6 +570,8 @@ async fn run(
                             if let Some(link) = &shared.diag {
                                 diag::link_closed(
                                     link,
+                                    shared.diag_host.as_ref(),
+                                    n,
                                     &reason,
                                     connected_at.elapsed(),
                                     facts.as_ref(),
@@ -574,6 +584,8 @@ async fn run(
                             if let Some(link) = &shared.diag {
                                 diag::link_closed(
                                     link,
+                                    shared.diag_host.as_ref(),
+                                    n,
                                     &ConnClose::Local,
                                     connected_at.elapsed(),
                                     None,
@@ -681,6 +693,7 @@ async fn run(
                                 reason: reason.clone(),
                             },
                             Some(&last_why),
+                            n,
                         );
                         provisioned = Some(reason.clone());
                         let began = Instant::now();
@@ -690,7 +703,14 @@ async fn run(
                         };
                         let record = |outcome: ProvisionOutcome, error: Option<&ProvisionError>| {
                             if let Some(link) = &shared.diag {
-                                diag::provision(link, &reason, outcome, error, began);
+                                diag::provision(
+                                    link,
+                                    shared.diag_host.as_ref(),
+                                    &reason,
+                                    outcome,
+                                    error,
+                                    began,
+                                );
                             }
                         };
                         match r {
@@ -742,6 +762,7 @@ async fn run(
                         last_error: last_error.clone(),
                     },
                     Some(&last_why),
+                    n,
                 );
                 tokio::select! {
                     _ = stop.cancelled() => break,
@@ -750,7 +771,7 @@ async fn run(
                 }
             }
             Next::Park(state) => {
-                shared.set(state, park_why.take().as_deref());
+                shared.set(state, park_why.take().as_deref(), n);
                 tokio::select! {
                     _ = stop.cancelled() => break,
                     _ = reconnect_rx.changed() => {
@@ -764,7 +785,7 @@ async fn run(
         }
     }
     shared.client.send_replace(None);
-    shared.set(LinkState::Stopped, None);
+    shared.set(LinkState::Stopped, None, n);
 }
 
 /// Options of a durable subscription.

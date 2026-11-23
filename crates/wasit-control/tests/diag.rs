@@ -136,6 +136,7 @@ impl States {
                 let _ = tx.send(s.clone());
             })),
             diag: Some(Ident::new(label)),
+            diag_host: None,
         };
         (opts, States { rx })
     }
@@ -232,6 +233,8 @@ async fn a_link_that_connects_records_its_attempt_and_every_transition_in_order(
         (Some("connecting"), Some("connected"))
     );
     assert!(r[2].get("error").is_none());
+    // The state the attempt connected in, and the close of that connection, carry its number.
+    assert_eq!((r[2]["n"].as_u64(), r[3]["n"].as_u64()), (Some(1), Some(1)));
     // Stopped by this side: no transport to ask, so only the reason and how long it was up.
     assert_eq!(r[3]["reason"], "local");
     assert!(r[3]["connected_ms"].is_u64());
@@ -240,6 +243,9 @@ async fn a_link_that_connects_records_its_attempt_and_every_transition_in_order(
         (r[4]["from"].as_str(), r[4]["to"].as_str()),
         (Some("connected"), Some("stopped"))
     );
+    assert_eq!(r[4]["n"], 1);
+    // A link that is not to a host writes no `host` on any of its records.
+    assert!(r.iter().all(|v| v.get("host").is_none()), "{r:#?}");
 }
 
 #[tokio::test]
@@ -921,6 +927,8 @@ async fn a_transport_that_exits_with_stderr_is_recorded_with_its_exit_and_scrubb
         ],
         "{r:#?}"
     );
+    // Every record of the link, the transport's included, names the host it leads to.
+    assert!(r.iter().all(|v| v["host"] == host), "{r:#?}");
     let spawned = one(&r, "transport.spawned");
     // The program's file name and the argument count; no argument.
     assert_eq!(spawned["program"], "wasit-control-demo");
@@ -946,6 +954,7 @@ async fn a_transport_that_exits_with_stderr_is_recorded_with_its_exit_and_scrubb
     );
     // The state's text carries the exit and the stderr, with the registered secret masked.
     let st = find(&r, "link.state")[0];
+    assert_eq!(st["n"], 1);
     let t = st["error"].as_str().unwrap();
     assert!(
         t.contains("exit Some(3)") && t.contains("refused by remote-secret-argument"),
@@ -1035,6 +1044,9 @@ async fn a_helper_that_ends_by_itself_parks_the_link_with_its_exit_and_scrubbed_
         );
         assert!(t.contains("••••") && !t.contains(SECRET), "{t}");
         no_secret(&r);
+        // The host reaches the transport's records whichever connector started the transport.
+        assert!(r.iter().all(|v| v["host"] == host.as_str()), "{r:#?}");
+        assert_eq!(one(&r, "transport.spawned")["host"], host.as_str());
         states.push(state);
     }
     // The same state from the same failure, however the transport was started.
@@ -1151,6 +1163,19 @@ async fn the_hub_hands_each_connector_the_links_attempt_number_and_labels_its_li
     let r = of_link(&format!("hosts:{host}"));
     assert_eq!(find(&r, "link.attempt_begin").len(), 2);
     assert_eq!(h.spec(&HostId::new(host)), None);
+    // Every record of the link names its host.
+    assert!(r.iter().all(|v| v["host"] == host), "{r:#?}");
+    // Each state carries the number of the attempt it is in or just ended: the first failure
+    // (1), the retry's start (2) and the second failure (2). A shutdown's `stopped` follows.
+    let states: Vec<(&str, u64)> = find(&r, "link.state")
+        .iter()
+        .map(|v| (v["to"].as_str().unwrap(), v["n"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        states[..3],
+        [("reconnecting", 1), ("connecting", 2), ("reconnecting", 2)],
+        "{r:#?}"
+    );
 }
 
 // ── the accepting side ──────────────────────────────────────────────────────

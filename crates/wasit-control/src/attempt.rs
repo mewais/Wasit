@@ -12,6 +12,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use wasit_diag::Ident;
+
 use crate::command::ChildView;
 
 /// What an attempt has reported so far.
@@ -26,6 +28,7 @@ struct Evidence {
 #[derive(Clone)]
 pub struct Attempt {
     n: u64,
+    host: Option<Ident>,
     evidence: Arc<Mutex<Evidence>>,
 }
 
@@ -50,6 +53,7 @@ impl Attempt {
     pub fn new(n: u64) -> Attempt {
         Attempt {
             n,
+            host: None,
             evidence: Arc::default(),
         }
     }
@@ -59,6 +63,18 @@ impl Attempt {
     /// carries it, so it joins the supervisor's records of the same attempt.
     pub fn n(&self) -> u64 {
         self.n
+    }
+
+    /// Gives the attempt the host its link leads to (`SupervisedOptions::diag_host`), so a
+    /// transport command started for it records the host (see [`crate::CommandSpec::traced`]).
+    pub(crate) fn for_host(mut self, host: Option<Ident>) -> Attempt {
+        self.host = host;
+        self
+    }
+
+    /// The host the attempt's link leads to, if it leads to one.
+    pub(crate) fn host(&self) -> Option<&Ident> {
+        self.host.as_ref()
     }
 
     /// The connector has reached `step`: a fixed phrase in the connector's own words that

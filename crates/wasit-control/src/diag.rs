@@ -5,7 +5,8 @@
 //!   ([`crate::supervised`], [`crate::command`]); a link has a label (`SupervisedOptions::diag`,
 //!   `hosts:<id>` for the hub's links) and `n`, the attempt number the supervisor hands to the
 //!   connector, so a connector's own records join the supervisor's on `(link, n)`. A link
-//!   without a label (an in-process loopback) records nothing.
+//!   without a label (an in-process loopback) records nothing. A link to a host also carries
+//!   that host as `host` (`SupervisedOptions::diag_host`), the field a log is filtered by.
 //! * `conn.*` are the accepting side's view of a connection ([`crate::server`]).
 //! * `rpc.forward_failed` and `sub.closed` are the router's and the subscription pump's
 //!   failures; never a record per request, per event or per frame.
@@ -100,22 +101,30 @@ wasit_diag::diag_events! {
     pub(crate) enum ControlEvent {
         /// A supervised link began connecting; `n` counts attempts of this link, never reset.
         #[diag(ev = "link.attempt_begin", budget = 300)]
-        AttemptBegin { link: Ident, n: u64 },
+        AttemptBegin {
+            link: Ident,
+            host: Option<Ident>,
+            n: u64,
+        },
         /// An attempt ended after `ms`. `error` is the connect error (its code; text only for
         /// our own fixed messages).
         #[diag(ev = "link.attempt_end", budget = 300)]
         AttemptEnd {
             link: Ident,
+            host: Option<Ident>,
             n: u64,
             outcome: AttemptOutcome,
             error: Option<ErrorInfo>,
             ms: Ms,
         },
-        /// The link changed state; `error` is the text that goes with the new state (a
-        /// last error, a parked reason, why provisioning is needed).
+        /// The link changed state; `n` is the attempt in progress or just ended (absent before
+        /// the first attempt). `error` is the text that goes with the new state (a last error, a
+        /// parked reason, why provisioning is needed).
         #[diag(ev = "link.state", budget = 600)]
         State {
             link: Ident,
+            host: Option<Ident>,
+            n: Option<u64>,
             from: Code,
             to: Code,
             attempt: Option<u32>,
@@ -125,17 +134,21 @@ wasit_diag::diag_events! {
         #[diag(ev = "link.provision", budget = 120)]
         Provision {
             link: Ident,
+            host: Option<Ident>,
             reason: Code,
             outcome: ProvisionOutcome,
             ms: Ms,
             error: Option<ErrorInfo>,
         },
-        /// A connected link ended after `connected_ms`. `transport_exit` and `stderr` are the
-        /// transport child's exit code and stderr tail when the link had one and it had
-        /// something to say (not known for a close this side asked for).
+        /// A connected link ended after `connected_ms`; `n` is the attempt that connected it.
+        /// `transport_exit` and `stderr` are the transport child's exit code and stderr tail
+        /// when the link had one and it had something to say (not known for a close this side
+        /// asked for).
         #[diag(ev = "link.closed", lvl = warn, budget = 300)]
         LinkClosed {
             link: Ident,
+            host: Option<Ident>,
+            n: Option<u64>,
             reason: Code,
             connected_ms: Ms,
             transport_exit: Option<i32>,
@@ -146,6 +159,7 @@ wasit_diag::diag_events! {
         #[diag(ev = "transport.spawned", budget = 300)]
         TransportSpawned {
             link: Ident,
+            host: Option<Ident>,
             n: u64,
             program: Code,
             argc: u32,
@@ -155,6 +169,7 @@ wasit_diag::diag_events! {
         #[diag(ev = "transport.exited", budget = 300)]
         TransportExited {
             link: Ident,
+            host: Option<Ident>,
             n: u64,
             code: Option<i32>,
             signal: Option<i32>,
@@ -225,15 +240,22 @@ pub(crate) fn host_link(host: &HostId) -> Ident {
 
 // ── the connection trail ────────────────────────────────────────────────────
 
-pub(crate) fn attempt_begin(link: &Ident, n: u64) {
+/// The attempt number of a record: `None` before the link's first attempt (`n` is 0 then).
+fn attempted(n: u64) -> Option<u64> {
+    (n > 0).then_some(n)
+}
+
+pub(crate) fn attempt_begin(link: &Ident, host: Option<&Ident>, n: u64) {
     emit(ControlEvent::AttemptBegin {
         link: link.clone(),
+        host: host.cloned(),
         n,
     });
 }
 
 pub(crate) fn attempt_end(
     link: &Ident,
+    host: Option<&Ident>,
     n: u64,
     outcome: AttemptOutcome,
     error: Option<ErrorInfo>,
@@ -241,6 +263,7 @@ pub(crate) fn attempt_end(
 ) {
     emit(ControlEvent::AttemptEnd {
         link: link.clone(),
+        host: host.cloned(),
         n,
         outcome,
         error,
@@ -248,10 +271,20 @@ pub(crate) fn attempt_end(
     });
 }
 
-pub(crate) fn state(link: &Ident, from: &LinkState, to: &LinkState, why: Option<&str>) {
+/// A link state change. `n` is the link's attempt number (0 before its first attempt).
+pub(crate) fn state(
+    link: &Ident,
+    host: Option<&Ident>,
+    n: u64,
+    from: &LinkState,
+    to: &LinkState,
+    why: Option<&str>,
+) {
     let text = why.map(str::to_owned).or_else(|| state_reason(to));
     emit(ControlEvent::State {
         link: link.clone(),
+        host: host.cloned(),
+        n: attempted(n),
         from: Code::st(from.code()),
         to: Code::st(to.code()),
         attempt: match to {
@@ -264,6 +297,7 @@ pub(crate) fn state(link: &Ident, from: &LinkState, to: &LinkState, why: Option<
 
 pub(crate) fn provision(
     link: &Ident,
+    host: Option<&Ident>,
     reason: &ProvisionReason,
     outcome: ProvisionOutcome,
     error: Option<&ProvisionError>,
@@ -271,6 +305,7 @@ pub(crate) fn provision(
 ) {
     emit(ControlEvent::Provision {
         link: link.clone(),
+        host: host.cloned(),
         reason: Code::st(reason.code()),
         outcome,
         ms: Ms::of(started.elapsed()),
@@ -280,14 +315,19 @@ pub(crate) fn provision(
     });
 }
 
+/// A connected link ended; `n` is the attempt that connected it.
 pub(crate) fn link_closed(
     link: &Ident,
+    host: Option<&Ident>,
+    n: u64,
     close: &ConnClose,
     connected: Duration,
     facts: Option<&TransportFacts>,
 ) {
     emit(ControlEvent::LinkClosed {
         link: link.clone(),
+        host: host.cloned(),
+        n: attempted(n),
         reason: Code::st(close.code()),
         connected_ms: Ms::of(connected),
         transport_exit: facts.and_then(|f| f.exit).and_then(|e| e.code),
@@ -308,6 +348,7 @@ pub(crate) fn transport_spawned(
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     emit(ControlEvent::TransportSpawned {
         link: trace.link.clone(),
+        host: trace.host.clone(),
         n: trace.attempt.n(),
         program: Code::new(&name),
         argc: count(argc),
@@ -318,6 +359,7 @@ pub(crate) fn transport_spawned(
 pub(crate) fn transport_exited(trace: &TransportTrace, exit: &ExitInfo, stderr_bytes: u64) {
     emit(ControlEvent::TransportExited {
         link: trace.link.clone(),
+        host: trace.host.clone(),
         n: trace.attempt.n(),
         code: exit.code,
         signal: exit.signal,
@@ -590,18 +632,28 @@ mod tests {
         Ident::st("hosts:gpu")
     }
 
+    fn gpu() -> Option<Ident> {
+        Some(Ident::st("gpu"))
+    }
+
     #[test]
     fn every_event_writes_the_header_and_its_declared_fields_only() {
         let err = ErrorInfo::foreign(Code::st("io"), "boom");
-        check(
-            ControlEvent::AttemptBegin { link: link(), n: 3 },
+        let v = check(
+            ControlEvent::AttemptBegin {
+                link: link(),
+                host: gpu(),
+                n: 3,
+            },
             "link.attempt_begin",
             "info",
-            &["link", "n"],
+            &["link", "host", "n"],
         );
+        assert_eq!(v["host"], "gpu");
         let v = check(
             ControlEvent::AttemptEnd {
                 link: link(),
+                host: gpu(),
                 n: 3,
                 outcome: AttemptOutcome::Backoff,
                 error: Some(err.clone()),
@@ -609,12 +661,14 @@ mod tests {
             },
             "link.attempt_end",
             "info",
-            &["link", "n", "outcome", "error", "ms"],
+            &["link", "host", "n", "outcome", "error", "ms"],
         );
         assert_eq!(v["outcome"], "backoff");
+        // A link that is not to a host writes no `host`.
         check(
             ControlEvent::AttemptEnd {
                 link: link(),
+                host: None,
                 n: 4,
                 outcome: AttemptOutcome::Connected,
                 error: None,
@@ -624,9 +678,11 @@ mod tests {
             "info",
             &["link", "n", "outcome", "ms"],
         );
-        check(
+        let v = check(
             ControlEvent::State {
                 link: link(),
+                host: gpu(),
+                n: Some(2),
                 from: Code::st("connecting"),
                 to: Code::st("reconnecting"),
                 attempt: Some(2),
@@ -634,11 +690,18 @@ mod tests {
             },
             "link.state",
             "info",
-            &["link", "from", "to", "attempt", "error"],
+            &["link", "host", "n", "from", "to", "attempt", "error"],
         );
+        assert_eq!(
+            (v["host"].as_str(), v["n"].as_u64()),
+            (Some("gpu"), Some(2))
+        );
+        // Before the first attempt there is no `n`.
         check(
             ControlEvent::State {
                 link: link(),
+                host: None,
+                n: None,
                 from: Code::st("reconnecting"),
                 to: Code::st("connecting"),
                 attempt: None,
@@ -651,6 +714,7 @@ mod tests {
         let v = check(
             ControlEvent::Provision {
                 link: link(),
+                host: gpu(),
                 reason: Code::st("build_mismatch"),
                 outcome: ProvisionOutcome::FailedRetryable,
                 ms: Ms(5),
@@ -658,12 +722,14 @@ mod tests {
             },
             "link.provision",
             "info",
-            &["link", "reason", "outcome", "ms", "error"],
+            &["link", "host", "reason", "outcome", "ms", "error"],
         );
         assert_eq!(v["outcome"], "failed_retryable");
-        check(
+        let v = check(
             ControlEvent::LinkClosed {
                 link: link(),
+                host: gpu(),
+                n: Some(1),
                 reason: Code::st("eof"),
                 connected_ms: Ms(900),
                 transport_exit: Some(3),
@@ -671,11 +737,22 @@ mod tests {
             },
             "link.closed",
             "warn",
-            &["link", "reason", "connected_ms", "transport_exit", "stderr"],
+            &[
+                "link",
+                "host",
+                "n",
+                "reason",
+                "connected_ms",
+                "transport_exit",
+                "stderr",
+            ],
         );
+        assert_eq!(v["n"], 1);
         check(
             ControlEvent::LinkClosed {
                 link: link(),
+                host: None,
+                n: None,
                 reason: Code::st("local"),
                 connected_ms: Ms(1),
                 transport_exit: None,
@@ -685,9 +762,10 @@ mod tests {
             "warn",
             &["link", "reason", "connected_ms"],
         );
-        check(
+        let v = check(
             ControlEvent::TransportSpawned {
                 link: link(),
+                host: gpu(),
                 n: 1,
                 program: Code::st("ssh"),
                 argc: 7,
@@ -695,11 +773,13 @@ mod tests {
             },
             "transport.spawned",
             "info",
-            &["link", "n", "program", "argc", "pid"],
+            &["link", "host", "n", "program", "argc", "pid"],
         );
+        assert_eq!(v["host"], "gpu");
         check(
             ControlEvent::TransportExited {
                 link: link(),
+                host: gpu(),
                 n: 1,
                 code: Some(255),
                 signal: None,
@@ -707,7 +787,7 @@ mod tests {
             },
             "transport.exited",
             "info",
-            &["link", "n", "code", "stderr_bytes"],
+            &["link", "host", "n", "code", "stderr_bytes"],
         );
         check(
             ControlEvent::ConnAccepted {
@@ -927,6 +1007,7 @@ mod tests {
         ] {
             let v = line_of(&ControlEvent::AttemptEnd {
                 link: link(),
+                host: None,
                 n: 1,
                 outcome: AttemptOutcome::Backoff,
                 error: Some(connect_error(&e)),
@@ -968,6 +1049,7 @@ mod tests {
             let record = |error: Option<ErrorInfo>| {
                 line_of(&ControlEvent::AttemptEnd {
                     link: link(),
+                    host: None,
                     n: 1,
                     outcome: AttemptOutcome::Backoff,
                     error,
