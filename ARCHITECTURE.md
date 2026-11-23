@@ -236,7 +236,16 @@ and sent with `host.environment.configure {config, revision}`, kept in memory by
 is applied on top, in this order: captured → **setup commands** (Unix: the login shell in the
 mode the capture succeeded with, so functions such as `module` exist, from the captured
 environment, stdin closed, output between markers, deadline 30 s, process group killed; fish
-runs them as fish, csh-family shells via `/bin/sh` (lines are POSIX); the shell parses them with `-n` first, so a syntax error runs nothing; native Windows: PowerShell `-NoProfile`, its
+runs them as fish, and POSIX shells run them in the shell itself, both after a parse with `-n`
+(a syntax error runs nothing); csh, tcsh and bsd-csh run them in their own syntax, from an
+owner-only file that the same `-c` shell (the one that sources `/etc/csh.login` and `~/.login`)
+`source`s, so aliases such as `module` exist; nu, elvish, xonsh and pwsh run them with `/bin/sh`,
+parsed first too. csh and bsd-csh have no parse-only mode, so the commands before a syntax error
+have already run. tcsh parses the file with `-n` first, but only when a probe identifies the
+shell as tcsh, and that finds lexical errors only (quotes, parentheses): the commands before any
+other error have already run. A failed csh-family run that reached the commands says so in its
+error (`csh-family shells cannot check commands without running them`). A file that did not reach
+its last line (an error or `exit` ends it early) leaves the captured environment; native Windows: PowerShell `-NoProfile`, its
 `$env:` changes taken; the environment the commands leave is taken, keeping the capture's PATH
 entries after theirs; a failure is reported as `SetupReport {ok, exit_code, error, output tail,
 applied}` and a setup that did not finish leaves the captured environment) → **variables** (set
