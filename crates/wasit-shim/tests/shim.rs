@@ -236,8 +236,14 @@ async fn slow_controller_is_dropped_and_child_not_blocked() {
         await_pid_exit(h.shim_pid, T).await,
         "shim waited for a stalled controller"
     );
-    let log = std::fs::read_to_string(d.path().join(wasit_shim::LOG_FILE)).unwrap();
-    assert!(log.contains("did not keep up"), "log: {log}");
+    // The shim has exited, so its log is complete: the controller was dropped for not keeping up.
+    let log = shim_log(d.path());
+    let dropped: Vec<_> = events(&log, "shim.controller")
+        .into_iter()
+        .filter(|r| r["event"] == "slow_dropped")
+        .collect();
+    assert_eq!(dropped.len(), 1, "log: {log:?}");
+    assert_eq!(dropped[0]["write_timeout_ms"], 300);
 
     // The stalled connection received only a prefix, gap-free.
     let mut rd = BufReader::new(rd);
@@ -692,4 +698,263 @@ async fn runtime_dir_holds_lock_and_endpoint() {
         wasit_shim::probe_at(&data, &run).await.unwrap(),
         ShimState::Exited(_)
     ));
+}
+
+/// `shim.log` is NDJSON diagnostic records: a header, then events for start, attach and exit,
+/// every line JSON, and nothing a child or a controller said (nor an argument, nor an
+/// environment value).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shim_log_holds_diagnostic_records_and_no_content() {
+    const MARK: &str = "LOG-CONTENT-MARK-3c9e";
+    let d = TempDir::new();
+    let mut sp = child_spec(d.path(), "cat", &[MARK]);
+    sp.env
+        .push(("SECRET_VAR".into(), format!("secret-{MARK}").into()));
+    sp.cwd = Some(d.path().join(format!("project-{MARK}")));
+    std::fs::create_dir_all(sp.cwd.as_ref().unwrap()).unwrap();
+    let h = start_spec(sp).await;
+    let c = ShimClient::connect(d.path()).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    c.write(&format!("prompt {MARK}")).await.unwrap();
+    until(&mut s, |r| r.kind == Kind::Out).await;
+    c.note(serde_json::json!({"note": MARK})).await.unwrap();
+    c.close_stdin().await.unwrap();
+    until_exited(&mut s).await;
+    until_end(&mut s).await;
+    drop(c);
+    assert!(await_pid_exit(h.shim_pid, T).await);
+
+    let text = std::fs::read_to_string(d.path().join(wasit_shim::LOG_FILE)).unwrap();
+    assert!(!text.contains(MARK), "{text}");
+    assert!(!shim_stderr(d.path()).contains(MARK));
+    let log = shim_log(d.path());
+    let header = &log[0];
+    assert_eq!(header["diag_file"], 1);
+    assert_eq!(header["src"], "shim");
+    assert_eq!(header["pid"], h.shim_pid);
+    let records = &log[1..];
+    assert!(records
+        .iter()
+        .all(|r| r["src"] == "shim" && r["b"] == header["b"]));
+    // Sequence numbers are the sink's: strictly increasing from 1.
+    let seqs: Vec<u64> = records.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+
+    assert_eq!(events(&log, "process.start").len(), 1);
+    let start = events(&log, "shim.start");
+    assert_eq!(start.len(), 1);
+    assert_eq!(start[0]["pid"], h.shim_pid);
+    assert_eq!(start[0]["child_pid"], h.child_pid);
+    assert_eq!(start[0]["spawned_seq"], h.spawned_seq);
+    assert_eq!(start[0]["separate_run_dir"], false);
+    assert_eq!(
+        start[0]["session"],
+        d.path().file_name().unwrap().to_str().unwrap()
+    );
+    // The connection's own end (`disconnected`) may be cut off by the process exit that follows
+    // the final record, so only the attach is certain.
+    let controller = events(&log, "shim.controller");
+    assert_eq!(controller[0]["event"], "attached");
+    assert_eq!(controller[0]["from_seq"], 1);
+    let exit = events(&log, "shim.exit");
+    assert_eq!(exit.len(), 1);
+    assert_eq!(exit[0]["code"], 0);
+    assert_eq!(exit[0]["synced"], true);
+    // start comes first, exit last.
+    assert_eq!(records.last().unwrap()["ev"], "shim.exit");
+    assert!(events(&log, "diag.dropped").is_empty());
+}
+
+/// A signal sent by a controller is a record naming the signal and who sent it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signals_are_recorded_with_who_sent_them() {
+    let d = TempDir::new();
+    let h = start_child(d.path(), "sleep", &[]).await;
+    let c = ShimClient::connect(d.path()).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    next(&mut s).await; // spawned
+    c.signal(Sig::Kill).await.unwrap();
+    until_exited(&mut s).await;
+    until_end(&mut s).await;
+    drop(c);
+    assert!(await_pid_exit(h.shim_pid, T).await);
+    let log = shim_log(d.path());
+    let sig = events(&log, "shim.signal");
+    assert_eq!(sig.len(), 1, "{log:?}");
+    assert_eq!(
+        (sig[0]["sig"].as_str(), sig[0]["by"].as_str()),
+        (Some("kill"), Some("controller"))
+    );
+    let exit = events(&log, "shim.exit");
+    assert_eq!(
+        (exit[0]["signal"].as_i64(), exit[0].get("code")),
+        (Some(9), None)
+    );
+}
+
+/// Leak L2: a malformed `--env` never has its value in the readiness line, in `shim.log`, in
+/// the shim's stderr, or in the error `spawn_detached` returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_env_is_refused_without_echoing_the_value() {
+    const MARK: &str = "ENV-VALUE-MARK-77aa";
+    // The shim binary itself: its readiness line, its log, its stderr.
+    let d = TempDir::new();
+    for bad in [MARK.to_string(), format!("={MARK}")] {
+        let out = tokio::time::timeout(
+            T,
+            tokio::process::Command::new(shim_bin())
+                .arg("--dir")
+                .arg(d.path())
+                .args(["--env", &bad, "--", &child_bin(), "cat"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let ready: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(ready["ready"], false);
+        let message = ready["error"].as_str().unwrap();
+        assert!(message.contains("--env #1"), "{message}");
+        assert!(!stdout.contains(MARK) && !String::from_utf8_lossy(&out.stderr).contains(MARK));
+        let text = std::fs::read_to_string(d.path().join(wasit_shim::LOG_FILE)).unwrap();
+        assert!(!text.contains(MARK), "{text}");
+        assert!(!shim_stderr(d.path()).contains(MARK));
+        let log = shim_log(d.path());
+        let not_ready = events(&log, "shim.not_ready");
+        assert!(!not_ready.is_empty(), "{log:?}");
+        assert_eq!(not_ready.last().unwrap()["lvl"], "error");
+        assert_eq!(not_ready.last().unwrap()["error"]["code"], "not_ready");
+        // The child was never started.
+        assert!(events(&log, "shim.start").is_empty());
+    }
+
+    // Through `spawn_detached` (what the runtime does): the error returned to the caller. A
+    // value that is not UTF-8 cannot be passed on the command line as text.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let d = TempDir::new();
+        let mut value = format!("K={MARK}").into_bytes();
+        value.push(0xff);
+        let mut sp = child_spec(d.path(), "cat", &[]);
+        sp.env
+            .push(("BAD".into(), std::ffi::OsString::from_vec(value)));
+        let err = wasit_shim::spawn_detached(&sp).await.unwrap_err();
+        assert!(matches!(err, Error::Spawn(_)), "{err:?}");
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains(MARK), "{shown}");
+        let text = std::fs::read_to_string(d.path().join(wasit_shim::LOG_FILE)).unwrap();
+        assert!(!text.contains(MARK), "{text}");
+        assert!(!shim_stderr(d.path()).contains(MARK));
+        assert!(!events(&shim_log(d.path()), "shim.not_ready").is_empty());
+    }
+}
+
+/// The shim's stderr is a file of its own, cut to nothing when it is over its bound, and the
+/// diagnostics log is still a separate file with a single writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stderr_is_a_separate_bounded_file() {
+    let d = TempDir::new();
+    std::fs::write(
+        d.path().join(wasit_shim::STDERR_FILE),
+        vec![b'x'; 70 * 1024],
+    )
+    .unwrap();
+    start_child(d.path(), "print", &["x"]).await;
+    let c = ShimClient::connect(d.path()).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    until_exited(&mut s).await;
+    assert_eq!(shim_stderr(d.path()), "");
+    // Small leftovers stay.
+    std::fs::write(d.path().join(wasit_shim::STDERR_FILE), "earlier crash\n").unwrap();
+    let d2 = d.path().to_path_buf();
+    let h = start_child(&d2, "print", &["y"]).await;
+    assert!(await_pid_exit(h.shim_pid, T).await);
+    assert_eq!(shim_stderr(&d2), "earlier crash\n");
+}
+
+/// Design S23 (leak L4): session directory `0700`, journal, log and stderr files `0600`, also
+/// when an older build left them wider.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_files_are_private_to_the_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+    let d = TempDir::new();
+    let dir = d.path().join("s1");
+    let h = start_child(&dir, "cat", &[]).await;
+    let c = ShimClient::connect(&dir).await.unwrap();
+    let mut s = c.attach(1).await.unwrap();
+    c.close_stdin().await.unwrap();
+    until_exited(&mut s).await;
+    until_end(&mut s).await;
+    drop(c);
+    assert!(await_pid_exit(h.shim_pid, T).await);
+    assert_eq!(mode(&dir), 0o700);
+    for f in [
+        wasit_shim::JOURNAL_FILE,
+        wasit_shim::LOG_FILE,
+        wasit_shim::STDERR_FILE,
+        wasit_shim::LOCK_FILE,
+    ] {
+        assert_eq!(mode(&dir.join(f)), 0o600, "{f}");
+    }
+
+    // A directory and files of an older build, wider than that: the next shim tightens them.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for f in [
+        wasit_shim::JOURNAL_FILE,
+        wasit_shim::LOG_FILE,
+        wasit_shim::STDERR_FILE,
+        wasit_shim::LOCK_FILE,
+    ] {
+        std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let h = start_child(&dir, "print", &["again"]).await;
+    assert!(await_pid_exit(h.shim_pid, T).await);
+    assert_eq!(mode(&dir), 0o700);
+    for f in [
+        wasit_shim::JOURNAL_FILE,
+        wasit_shim::LOG_FILE,
+        wasit_shim::STDERR_FILE,
+        wasit_shim::LOCK_FILE,
+    ] {
+        assert_eq!(mode(&dir.join(f)), 0o600, "{f}");
+    }
+}
+
+/// A newer controller displacing the attached one is a record, in order with the attaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_replacement_is_recorded() {
+    let d = TempDir::new();
+    let h = start_child(d.path(), "cat", &[]).await;
+    let a = ShimClient::connect(d.path()).await.unwrap();
+    let mut sa = a.attach(3).await.unwrap();
+    let b = ShimClient::connect(d.path()).await.unwrap();
+    let r = tokio::time::timeout(T, sa.next()).await.unwrap();
+    assert!(matches!(r, Some(Err(Error::Replaced))), "got {r:?}");
+    let mut sb = b.attach(1).await.unwrap();
+    b.close_stdin().await.unwrap();
+    until_exited(&mut sb).await;
+    until_end(&mut sb).await;
+    assert!(await_pid_exit(h.shim_pid, T).await);
+    let log = shim_log(d.path());
+    let seen: Vec<(&str, Option<u64>)> = events(&log, "shim.controller")
+        .iter()
+        .map(|r| (r["event"].as_str().unwrap(), r["from_seq"].as_u64()))
+        .filter(|(e, _)| *e != "disconnected")
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("attached", Some(3)),
+            ("replaced", None),
+            ("attached", Some(1))
+        ]
+    );
 }

@@ -4,60 +4,15 @@
 
 mod common;
 
-use std::path::Path;
 use std::process::Stdio;
 
 use common::*;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use wasit_control::{ClientOptions, ControlClient, Hello};
 use wasit_core::{AgentEvent, Command, GateDecision};
 use wasit_fake_cli::scenario::{Scenario, Turn};
 use wasit_runtime::wire::{HostEvent, SessionEvent, SessionEventKind};
-use wasit_runtime::{ClientError, RuntimeClient};
-
-fn daemon_args(data: &Path) -> Vec<String> {
-    let mut v = vec![
-        "--data".to_string(),
-        data.to_string_lossy().into_owned(),
-        "--stop-grace-ms".into(),
-        "500".into(),
-    ];
-    for d in DRIVERS {
-        v.push("--driver-bin".into());
-        v.push(format!("{d}={}", fake().display()));
-        v.push("--driver-env".into());
-        v.push(format!("{d}=WASIT_FAKE_PERSONA={d}"));
-    }
-    v
-}
-
-async fn start_daemon(data: &Path) -> tokio::process::Child {
-    let mut child = tokio::process::Command::new(hostd())
-        .arg("serve")
-        .args(daemon_args(data))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    let out = child.stdout.take().unwrap();
-    tokio::time::timeout(T, BufReader::new(out).read_line(&mut line))
-        .await
-        .expect("daemon readiness")
-        .unwrap();
-    assert!(line.contains("\"ready\":true"), "{line:?}");
-    child
-}
-
-fn client(data: &Path) -> RuntimeClient {
-    RuntimeClient::connect_endpoint(
-        wasit_control::local_endpoint(&data.join("hostd.sock")),
-        Hello::new("test", "gui-test", "gui"),
-    )
-}
+use wasit_runtime::ClientError;
 
 async fn next_event(sub: &mut wasit_runtime::TypedSubscription<SessionEvent>) -> SessionEvent {
     match tokio::time::timeout(T, sub.next()).await {

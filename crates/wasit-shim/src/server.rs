@@ -15,7 +15,7 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncSeekExt, AsyncWriteExt, BufReader};
@@ -24,11 +24,16 @@ use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use wasit_diag::{Bytes, Code, ErrorInfo, Ms};
+
 use crate::cli::{self, Config};
+use crate::diag::{
+    self, emit, ControllerEvent, JournalStage, ReadyStage, ShimEvent, SignalBy, FSYNC_SLOW,
+};
 use crate::endpoint::{BoxRead, BoxWrite, Listener};
 use crate::platform::{self, Signaler};
 use crate::record::{now_ms, ExitInfo, Kind};
-use crate::wire::{self, ClientFrame, ServerFrame, PROTOCOL};
+use crate::wire::{self, ClientFrame, ServerFrame, Sig, PROTOCOL};
 use crate::{journal, probe, Error, JOURNAL_FILE};
 
 const FSYNC_EVERY: Duration = Duration::from_millis(1000);
@@ -40,36 +45,48 @@ const BACKLOG_MAX: usize = 64 * 1024 * 1024;
 const TERM_GRACE: Duration = Duration::from_secs(5);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
-macro_rules! log {
-    ($($a:tt)*) => {{
-        // Diagnostics only (stderr is `shim.log` when detached); nothing to do if it fails.
-        let _ignored = writeln!(io::stderr(), "[wasit-shim {}] {}", now_ms(), format_args!($($a)*));
-    }};
-}
-
 /// Process entry point of the shim. `args` are the shim's arguments **without** the program
 /// name / host subcommand (see the crate docs for the command line). Returns the process exit
 /// code. Must be called before the hosting process starts other threads that matter: on Unix
 /// the shim re-executes the current executable with the same argv (`WASIT_SHIM_ROLE=guard`), so
 /// the host must route that argv back into `run` without side effects.
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> i32 {
-    let cfg = match cli::parse(args) {
+    let args: Vec<OsString> = args.into_iter().collect();
+    let guard = platform::is_guard();
+    let cfg = match cli::parse(args.iter().cloned()) {
         Ok(c) => c,
+        // The guard's stdout and stderr are the child's pipes: its problem is journaled there.
+        // (Unreachable: the shim parsed the same arguments before starting it.)
+        Err(e) if guard => {
+            eprintln!("wasit-shim guard: {e}");
+            return 2;
+        }
         Err(e) => {
-            not_ready(&e.to_string());
+            if let Some(dir) = cli::dir_hint(&args) {
+                diag::start(dir);
+            }
+            not_ready(&e);
+            diag::finish();
             return 2;
         }
     };
-    if platform::is_guard() {
+    if guard {
         return platform::run_guard(&cfg);
     }
+    diag::start(cfg.dir.clone());
+    let code = run_shim(cfg);
+    diag::finish();
+    code
+}
+
+fn run_shim(cfg: Config) -> i32 {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
-            not_ready(&format!("cannot start runtime: {e}"));
+            not_ready(&Error::Spawn(format!("cannot start runtime: {e}")));
             return 1;
         }
     };
@@ -80,16 +97,27 @@ fn ready_line(v: serde_json::Value) {
     let mut out = io::stdout();
     let line = format!("{v}\n");
     if let Err(e) = out.write_all(line.as_bytes()).and_then(|_| out.flush()) {
-        log!("cannot write readiness line: {e}");
+        emit(ShimEvent::ReadyFailed {
+            stage: ReadyStage::WriteLine,
+            error: diag::io(&e),
+        });
     }
     if let Err(e) = platform::detach_stdout() {
-        log!("cannot detach stdout: {e}");
+        emit(ShimEvent::ReadyFailed {
+            stage: ReadyStage::DetachStdout,
+            error: diag::io(&e),
+        });
     }
 }
 
-fn not_ready(msg: &str) {
-    log!("not ready: {msg}");
-    ready_line(json!({ "ready": false, "error": msg }));
+/// Tells the launcher (readiness line) and the log why the shim cannot start. The reason is
+/// the same text in both; it never holds a value from the command line.
+fn not_ready(e: &Error) {
+    emit(ShimEvent::NotReady {
+        error: diag::ours(e),
+    });
+    diag::settle();
+    ready_line(json!({ "ready": false, "error": e.to_string() }));
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -193,9 +221,13 @@ impl Shared {
     async fn wait_backlog(&self) {
         loop {
             let mut rx = self.written.subscribe();
-            if lock(&self.journal).pending.len() <= BACKLOG_MAX {
+            let pending = lock(&self.journal).pending.len();
+            if pending <= BACKLOG_MAX {
                 return;
             }
+            emit(ShimEvent::BacklogWait {
+                bytes: Bytes(pending as u64),
+            });
             if rx.changed().await.is_err() {
                 return;
             }
@@ -227,6 +259,9 @@ impl Shared {
         match written {
             Ok(()) => Ok(seq),
             Err(e) => {
+                emit(ShimEvent::StdinFailed {
+                    error: diag::io(&e),
+                });
                 let msg = format!("write to child stdin: {e}");
                 self.note(json!({ "stdin_error": msg }));
                 Err(msg)
@@ -278,7 +313,7 @@ impl Flusher {
     async fn sync(&mut self) -> io::Result<()> {
         self.write_out().await?;
         if self.dirty {
-            self.file.sync_all().await?;
+            timed(self.file.sync_all()).await?;
             self.dirty = false;
         }
         Ok(())
@@ -289,44 +324,66 @@ impl Flusher {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let shared = self.shared.clone();
-            let res = tokio::select! {
-                _ = shared.flush_notify.notified() => self.write_out().await,
+            let failed: Option<(JournalStage, ErrorInfo, String)> = tokio::select! {
+                _ = shared.flush_notify.notified() => {
+                    self.write_out().await.err().map(|e| failure(JournalStage::Write, &e))
+                }
                 _ = tick.tick() => {
-                    if self.dirty {
+                    let r = if self.dirty {
                         self.dirty = false;
-                        self.file.sync_data().await
+                        timed(self.file.sync_data()).await
                     } else {
                         Ok(())
-                    }
+                    };
+                    r.err().map(|e| failure(JournalStage::Sync, &e))
                 }
                 req = sync_rx.recv() => match req {
                     Some(tx) => {
                         let r = self.sync().await;
-                        let failed = r.as_ref().err().map(|e| e.to_string());
-                        // The requester may have timed out; the result is also logged below.
+                        let failed = r.as_ref().err().map(|e| failure(JournalStage::Sync, e));
+                        // The requester may have timed out; the result is also reported below.
                         let _ignored = tx.send(r);
-                        match failed {
-                            Some(e) => Err(io::Error::other(e)),
-                            None => Ok(()),
-                        }
+                        failed
                     }
                     None => {
                         if let Err(e) = self.sync().await {
-                            log!("final journal sync failed: {e}");
+                            emit(ShimEvent::JournalFailed {
+                                stage: JournalStage::FinalSync,
+                                error: Some(diag::io(&e)),
+                            });
                         }
                         return;
                     }
                 },
             };
-            if let Err(e) = res {
-                log!("journal write failed: {e}");
+            if let Some((stage, error, text)) = failed {
+                emit(ShimEvent::JournalFailed {
+                    stage,
+                    error: Some(error),
+                });
                 self.shared
                     .fatal
-                    .send_replace(Some(format!("journal write failed: {e}")));
+                    .send_replace(Some(format!("journal write failed: {text}")));
                 return;
             }
         }
     }
+}
+
+/// A journal failure: what the record carries, and the text for `Shared::fatal`.
+fn failure(stage: JournalStage, e: &io::Error) -> (JournalStage, ErrorInfo, String) {
+    (stage, diag::io(e), e.to_string())
+}
+
+/// Awaits an fsync and reports it when it took longer than [`FSYNC_SLOW`].
+async fn timed(sync: impl std::future::Future<Output = io::Result<()>>) -> io::Result<()> {
+    let began = Instant::now();
+    let r = sync.await;
+    let took = began.elapsed();
+    if took > FSYNC_SLOW {
+        emit(ShimEvent::FsyncSlow { ms: Ms::of(took) });
+    }
+    r
 }
 
 /// Largest cut <= max that does not split a UTF-8 sequence (when the prefix is valid UTF-8).
@@ -559,11 +616,21 @@ async fn write_loop(
                         }
                     }
                     Ok(Err(e)) => {
-                        log!("controller write failed: {e}");
+                        emit(ShimEvent::Controller {
+                            event: ControllerEvent::WriteFailed,
+                            from_seq: None,
+                            write_timeout_ms: None,
+                            error: Some(diag::io(&e)),
+                        });
                         break;
                     }
                     Err(_) => {
-                        log!("controller did not keep up for {wt:?}; disconnecting it");
+                        emit(ShimEvent::Controller {
+                            event: ControllerEvent::SlowDropped,
+                            from_seq: None,
+                            write_timeout_ms: Some(Ms::of(wt)),
+                            error: None,
+                        });
                         break;
                     }
                 }
@@ -579,6 +646,7 @@ async fn connection(shared: Arc<Shared>, rd: BoxRead, wr: BoxWrite) {
     let (rep_tx, rep_rx) = oneshot::channel();
     let old = lock(&shared.controller).replace((id, rep_tx));
     if let Some((_, old_tx)) = old {
+        controller_event(ControllerEvent::Replaced, None);
         // The old connection may have ended on its own already.
         let _ignored = old_tx.send(());
     }
@@ -629,6 +697,7 @@ async fn connection(shared: Arc<Shared>, rd: BoxRead, wr: BoxWrite) {
         };
         let sent = match frame {
             ClientFrame::Attach { id, from_seq } => {
+                controller_event(ControllerEvent::Attached, Some(from_seq));
                 if let Some(p) = pump_task.take() {
                     p.abort();
                 }
@@ -647,7 +716,13 @@ async fn connection(shared: Arc<Shared>, rd: BoxRead, wr: BoxWrite) {
             ClientFrame::CloseStdin { id } => wq_tx.send(WReq::Close { id }).await.is_ok(),
             ClientFrame::Note { id, data } => wq_tx.send(WReq::Note { id, data }).await.is_ok(),
             ClientFrame::Signal { id, sig } => {
-                let reply = match shared.signaler.signal(sig) {
+                let delivered = shared.signaler.signal(sig);
+                emit(ShimEvent::Signal {
+                    sig: Code::st(sig.as_str()),
+                    by: SignalBy::Controller,
+                    error: delivered.as_ref().err().map(diag::io),
+                });
+                let reply = match delivered {
                     Ok(()) => {
                         let seq =
                             shared.note(json!({ "signal": sig.as_str(), "by": "controller" }));
@@ -669,6 +744,17 @@ async fn connection(shared: Arc<Shared>, rd: BoxRead, wr: BoxWrite) {
     if matches!(&*slot, Some((cid, _)) if *cid == id) {
         *slot = None;
     }
+    drop(slot);
+    controller_event(ControllerEvent::Disconnected, None);
+}
+
+fn controller_event(event: ControllerEvent, from_seq: Option<u64>) {
+    emit(ShimEvent::Controller {
+        event,
+        from_seq,
+        write_timeout_ms: None,
+        error: None,
+    });
 }
 
 async fn accept_loop(shared: Arc<Shared>, mut listener: Listener) {
@@ -682,7 +768,7 @@ async fn accept_loop(shared: Arc<Shared>, mut listener: Listener) {
                     tokio::spawn(connection(shared.clone(), rd, wr));
                 }
                 Err(e) => {
-                    log!("accept failed: {e}");
+                    emit(ShimEvent::AcceptFailed { error: diag::io(&e) });
                     // Backoff schedule on a failing accept.
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(1));
@@ -692,31 +778,40 @@ async fn accept_loop(shared: Arc<Shared>, mut listener: Listener) {
         }
     }
     if let Err(e) = listener.remove() {
-        log!("cannot remove control endpoint: {e}");
+        emit(ShimEvent::EndpointRemoveFailed {
+            error: diag::io(&e),
+        });
     }
 }
 
 #[cfg(unix)]
-async fn termination_requested() -> &'static str {
+async fn termination_requested() -> (Sig, &'static str) {
     use tokio::signal::unix::{signal, SignalKind};
     let (mut term, mut int) = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
     ) {
         (Ok(t), Ok(i)) => (t, i),
-        _ => {
-            log!("cannot install signal handlers");
+        (t, i) => {
+            for (name, failed) in [("sigterm", t.err()), ("sigint", i.err())] {
+                if let Some(e) = failed {
+                    emit(ShimEvent::SignalHandlerFailed {
+                        signal: Code::st(name),
+                        error: diag::io(&e),
+                    });
+                }
+            }
             return std::future::pending().await;
         }
     };
     tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
+        _ = term.recv() => (Sig::Term, "SIGTERM"),
+        _ = int.recv() => (Sig::Int, "SIGINT"),
     }
 }
 
 #[cfg(windows)]
-async fn termination_requested() -> &'static str {
+async fn termination_requested() -> (Sig, &'static str) {
     // A detached process has no console and receives no console control events.
     std::future::pending().await
 }
@@ -728,7 +823,10 @@ fn ignore_hangup() {
         Ok(mut s) => {
             tokio::spawn(async move { while s.recv().await.is_some() {} });
         }
-        Err(e) => log!("cannot install SIGHUP handler: {e}"),
+        Err(e) => emit(ShimEvent::SignalHandlerFailed {
+            signal: Code::st("sighup"),
+            error: diag::io(&e),
+        }),
     }
 }
 
@@ -749,7 +847,10 @@ struct Running {
 }
 
 async fn start(cfg: Config) -> Result<Running, Error> {
-    tokio::fs::create_dir_all(&cfg.dir).await?;
+    {
+        let dir = cfg.dir.clone();
+        tokio::task::spawn_blocking(move || wasit_diag::private::create_dir_all(&dir)).await??;
+    }
     let run_dir = cfg.run_dir().to_path_buf();
     let dir_guard = probe::prepare_run_dir(&run_dir).await?;
     let lock_file = probe::acquire(&run_dir).await?;
@@ -767,7 +868,9 @@ async fn start(cfg: Config) -> Result<Running, Error> {
         Ok(sp) => sp,
         Err(e) => {
             if let Err(re) = listener.remove() {
-                log!("cannot remove control endpoint: {re}");
+                emit(ShimEvent::EndpointRemoveFailed {
+                    error: diag::io(&re),
+                });
             }
             return Err(e);
         }
@@ -839,13 +942,22 @@ async fn start(cfg: Config) -> Result<Running, Error> {
 }
 
 async fn serve(cfg: Config) -> i32 {
+    let separate_run_dir = cfg.run.is_some();
+    let session = diag::session(&cfg);
     let r = match start(cfg).await {
         Ok(r) => r,
         Err(e) => {
-            not_ready(&e.to_string());
+            not_ready(&e);
             return 1;
         }
     };
+    emit(ShimEvent::Start {
+        session,
+        pid: r.shared.shim_pid,
+        child_pid: r.shared.child_pid,
+        spawned_seq: r.spawned_seq,
+        separate_run_dir,
+    });
     ready_line(json!({
         "ready": true,
         "pid": r.shared.shim_pid,
@@ -860,31 +972,44 @@ fn flatten_exit(r: Result<io::Result<ExitInfo>, tokio::task::JoinError>) -> Exit
     match r {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
-            log!("waiting for the child failed: {e}");
+            emit(ShimEvent::WaitFailed {
+                error: diag::io(&e),
+            });
             ExitInfo::default()
         }
         Err(e) => {
-            log!("child waiter failed: {e}");
+            emit(ShimEvent::WaitFailed {
+                error: diag::join(&e),
+            });
             ExitInfo::default()
         }
     }
 }
 
+/// Sends `sig` to the child's group on the shim's own account and records it.
+fn signal_child(shared: &Shared, sig: Sig) -> io::Result<()> {
+    let r = shared.signaler.signal(sig);
+    emit(ShimEvent::Signal {
+        sig: Code::st(sig.as_str()),
+        by: SignalBy::Shim,
+        error: r.as_ref().err().map(diag::io),
+    });
+    r
+}
+
 async fn stop_child(shared: &Shared, exit: &mut JoinHandle<io::Result<ExitInfo>>) -> ExitInfo {
-    if let Err(e) = shared.signaler.signal(crate::Sig::Term) {
-        log!("forwarding SIGTERM failed: {e}");
-    }
+    // A failed delivery is recorded by `signal_child`; the grace period below decides what
+    // happens next either way.
+    let _recorded = signal_child(shared, Sig::Term);
     if let Ok(r) = timeout(TERM_GRACE, &mut *exit).await {
         return flatten_exit(r);
     }
     shared.note(json!({ "shim": "child ignored SIGTERM; killing" }));
-    if let Err(e) = shared.signaler.signal(crate::Sig::Kill) {
-        log!("SIGKILL failed: {e}");
-    }
+    let _recorded = signal_child(shared, Sig::Kill);
     match timeout(TERM_GRACE, &mut *exit).await {
         Ok(r) => flatten_exit(r),
         Err(_) => {
-            log!("child did not exit after SIGKILL");
+            emit(ShimEvent::KillUnconfirmed {});
             ExitInfo::default()
         }
     }
@@ -896,7 +1021,12 @@ async fn supervise(mut r: Running) -> i32 {
     let mut code = 0;
     let exit = tokio::select! {
         res = &mut r.exit => flatten_exit(res),
-        what = termination_requested() => {
+        (sig, what) = termination_requested() => {
+            emit(ShimEvent::Signal {
+                sig: Code::st(sig.as_str()),
+                by: SignalBy::External,
+                error: None,
+            });
             shared.note(json!({ "shim": format!("received {what}; terminating child") }));
             stop_child(&shared, &mut r.exit).await
         }
@@ -915,7 +1045,10 @@ async fn supervise(mut r: Running) -> i32 {
                 Ok(Err(e)) => {
                     shared.note(json!({ "shim": format!("reading child {name} failed: {e}") }));
                 }
-                Err(e) => log!("{name} reader failed: {e}"),
+                Err(e) => emit(ShimEvent::ReaderFailed {
+                    stream: Code::st(name),
+                    error: diag::join(&e),
+                }),
             }
         }
     })
@@ -923,36 +1056,44 @@ async fn supervise(mut r: Running) -> i32 {
     if drained.is_err() {
         out_h.abort();
         err_h.abort();
+        emit(ShimEvent::DrainTimeout {
+            ms: Ms::of(shared.cfg.drain_timeout),
+        });
         shared.note(
             json!({ "shim": "stdio still open after child exit; killing leftover processes" }),
         );
-        if let Err(e) = shared.signaler.kill_all() {
-            log!("killing leftovers failed: {e}");
-        }
+        let killed = shared.signaler.kill_all();
+        emit(ShimEvent::Signal {
+            sig: Code::st(Sig::Kill.as_str()),
+            by: SignalBy::Shim,
+            error: killed.as_ref().err().map(diag::io),
+        });
     }
     match timeout(Duration::from_secs(1), shared.stdin.lock()).await {
         Ok(mut g) => drop(g.take()),
-        Err(_) => log!("stdin writer still busy at exit"),
+        Err(_) => emit(ShimEvent::StdinBusy {}),
     }
 
     let final_seq = shared.append_exited(&json!(exit));
     let (tx, rx) = oneshot::channel();
-    let synced: Result<(), String> = match r.sync_tx.send(tx).await {
-        Err(_) => Err("journal flusher is gone".into()),
+    let unsynced: Option<(JournalStage, Option<ErrorInfo>)> = match r.sync_tx.send(tx).await {
+        Err(_) => Some((JournalStage::FlusherGone, None)),
         Ok(()) => match timeout(SYNC_TIMEOUT, rx).await {
-            Err(_) => Err("timed out".into()),
-            Ok(Err(_)) => Err("flusher dropped the request".into()),
-            Ok(Ok(Err(e))) => Err(e.to_string()),
-            Ok(Ok(Ok(()))) => Ok(()),
+            Err(_) => Some((JournalStage::SyncTimeout, None)),
+            Ok(Err(_)) => Some((JournalStage::FlusherGone, None)),
+            Ok(Ok(Err(e))) => Some((JournalStage::FinalSync, Some(diag::io(&e)))),
+            Ok(Ok(Ok(()))) => None,
         },
     };
-    if let Err(e) = synced {
-        log!("final journal sync did not complete: {e}");
+    let synced = unsynced.is_none();
+    if let Some((stage, error)) = unsynced {
+        emit(ShimEvent::JournalFailed { stage, error });
         code = 1;
     }
 
     // Linger so a connected controller receives the tail: until it has received `exited`, or
     // no record has been delivered to any controller for `linger`.
+    let lingered = Instant::now();
     let mut delivered = shared.delivered.subscribe();
     while *delivered.borrow_and_update() < final_seq {
         match timeout(shared.cfg.linger, delivered.changed()).await {
@@ -960,18 +1101,27 @@ async fn supervise(mut r: Running) -> i32 {
             Ok(Err(_)) | Err(_) => break,
         }
     }
+    let linger_ms = Ms::of(lingered.elapsed());
 
     // Release liveness first so that anyone who sees the endpoint close also sees the lock free.
     if let Err(e) = r.lock.unlock() {
-        log!("unlock failed: {e}");
+        emit(ShimEvent::UnlockFailed {
+            error: diag::io(&e),
+        });
     }
     drop(r.lock);
     // Then the endpoint, then the connections: a controller that sees its stream end also sees
     // the endpoint gone (a Windows pipe name lives as long as any server-side instance).
     shared.stop_accepting.send_replace(true);
     if timeout(Duration::from_secs(1), r.accept).await.is_err() {
-        log!("accept loop did not stop in time");
+        emit(ShimEvent::AcceptNotStopped {});
     }
     shared.shutdown.send_replace(true);
+    emit(ShimEvent::Exit {
+        code: exit.code,
+        signal: exit.signal,
+        synced,
+        linger_ms,
+    });
     code
 }

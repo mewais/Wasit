@@ -23,21 +23,130 @@
 //!
 //! Keep `<dir>` short: session sockets live at `<dir>/sessions/<12 chars>/ctl.sock` and Unix
 //! socket paths are limited to ~104 bytes.
+//!
+//! Diagnostics (`wasit-diag`): once `serve` holds its lock it records typed, content-free events
+//! in `<dir>/diag/daemon.ndjson` (8 MiB, three older generations; the directory is `0700`, the
+//! file `0600`), and a panic leaves a `diag.panic` record there instead of text on stderr.
+//! `tracing` output is counted per minute, not written. Developer overrides: `WASIT_LOG=<filter>`
+//! prints plain `tracing` text (no colour) on stderr and lets a panic print its usual message
+//! too; `WASIT_DIAG_QUEUE=<n>` sets the size of the record queue.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use wasit_control::{ConnConfig, ControlServer, Endpoint, Hello, ServiceMux};
+use async_trait::async_trait;
+use serde_json::Value;
+use tracing_subscriber::prelude::*;
+use wasit_control::{
+    CallContext, ConnConfig, ControlServer, Cursor, Endpoint, EventStream, Hello, RpcError,
+    Service, ServiceMux,
+};
 use wasit_core::DriverId;
+use wasit_diag::{Code, ErrorInfo, HomePath, Ident, Ms, SinkConfig};
 use wasit_runtime::wire::ROUTES;
 use wasit_runtime::{
     Discovery, DiscoveryConfig, RuntimeConfig, RuntimeService, SessionManager, ShimLauncher,
 };
 
 const BUILD: &str = concat!("wasit-hostd/", env!("CARGO_PKG_VERSION"));
+/// The build as a diagnostics identifier (which has no `/`).
+const BUILD_ID: &str = concat!("wasit-hostd-", env!("CARGO_PKG_VERSION"));
+/// The developer override: plain `tracing` text on stderr, and the usual panic message.
+const DEV_ENV: &str = "WASIT_LOG";
+
+wasit_diag::diag_events! {
+    /// Events of the dev/test daemon (`src` `daemon`, file `diag/daemon.ndjson`).
+    enum HostdEvent {
+        /// `serve` holds its lock and its diagnostics are installed.
+        #[diag(ev = "hostd.start")]
+        Start { host: Ident, data: HomePath, socket: HomePath },
+        /// The sessions found under the data directory were adopted.
+        #[diag(ev = "hostd.adopted")]
+        Adopted { running: u32, finished: u32, errors: u32 },
+        /// One session could not be adopted (the reason is from outside this function: only its
+        /// size and fingerprint are kept).
+        #[diag(ev = "hostd.adopt_error", lvl = warn)]
+        AdoptError { session: Ident, error: ErrorInfo },
+        /// The sessions directory could not be scanned.
+        #[diag(ev = "hostd.scan_failed", lvl = error)]
+        ScanFailed { error: ErrorInfo },
+        /// The readiness line was printed.
+        #[diag(ev = "hostd.ready")]
+        Ready { pid: u32 },
+        /// The daemon stops serving (sessions keep running).
+        #[diag(ev = "hostd.shutdown")]
+        Shutdown { reason: Code },
+        /// A control request was answered; `code` is the error code of a failure (never its
+        /// message).
+        #[diag(ev = "hostd.request")]
+        Request { method: Code, ok: bool, code: Option<Code>, ms: Ms },
+        /// A subscription was opened or refused.
+        #[diag(ev = "hostd.subscribe")]
+        Subscribe { topic: Code, ok: bool, code: Option<Code> },
+    }
+}
+
+fn emit(event: HostdEvent) {
+    wasit_diag::emit(&event);
+}
+
+/// Records each control request and subscription of the wrapped service: the method, whether it
+/// succeeded, the error code and the time it took.
+struct Observed<S>(S);
+
+#[async_trait]
+impl<S: Service> Service for Observed<S> {
+    async fn call(&self, ctx: CallContext, method: &str, params: Value) -> Result<Value, RpcError> {
+        let began = Instant::now();
+        let r = self.0.call(ctx, method, params).await;
+        emit(HostdEvent::Request {
+            method: Code::new(method),
+            ok: r.is_ok(),
+            code: r.as_ref().err().map(|e| Code::new(&e.code)),
+            ms: Ms::of(began.elapsed()),
+        });
+        r
+    }
+
+    async fn subscribe(
+        &self,
+        ctx: CallContext,
+        topic: &str,
+        params: Value,
+        from: Option<Cursor>,
+    ) -> Result<EventStream, RpcError> {
+        let r = self.0.subscribe(ctx, topic, params, from).await;
+        emit(HostdEvent::Subscribe {
+            topic: Code::new(topic),
+            ok: r.is_ok(),
+            code: r.as_ref().err().map(|e| Code::new(&e.code)),
+        });
+        r
+    }
+}
+
+/// Installs the process's diagnostics sink under `<data>/diag/`, the panic hook, and records
+/// `process.start`. Called once the daemon holds its lock (a second instance must not write
+/// the first one's file).
+fn install_diagnostics(data: &std::path::Path) {
+    let cfg = SinkConfig::new(
+        Code::st("daemon"),
+        Ident::st(BUILD_ID),
+        data.join("diag"),
+        "daemon.ndjson",
+    );
+    match wasit_diag::install(cfg) {
+        Ok(()) => {
+            wasit_diag::install_panic_hook(std::env::var_os(DEV_ENV).is_some());
+            wasit_diag::announce_process();
+        }
+        // Nothing else can say it: this is the daemon's stderr (`hostd.log` when detached).
+        Err(e) => eprintln!("wasit-hostd: no diagnostics: {e}"),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -49,6 +158,11 @@ struct Args {
     handshake_ms: Option<u64>,
     stop_grace_ms: Option<u64>,
     command_ms: Option<u64>,
+    /// `--panic-test <marker>`: panic, once the diagnostics are installed, with a message that
+    /// holds the marker (the `diag_panic` test; only in builds with the `panic-test` feature,
+    /// which only the test build of this package enables).
+    #[cfg(feature = "panic-test")]
+    panic_test: Option<String>,
     /// The options exactly as given (passed on when `bridge` starts `serve`).
     raw: Vec<String>,
 }
@@ -63,6 +177,8 @@ fn parse(args: &[String]) -> Result<Args, String> {
         handshake_ms: None,
         stop_grace_ms: None,
         command_ms: None,
+        #[cfg(feature = "panic-test")]
+        panic_test: None,
         raw: args.to_vec(),
     };
     let mut data = None;
@@ -94,6 +210,8 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--handshake-timeout-ms" => a.handshake_ms = Some(num(val()?)?),
             "--stop-grace-ms" => a.stop_grace_ms = Some(num(val()?)?),
             "--command-timeout-ms" => a.command_ms = Some(num(val()?)?),
+            #[cfg(feature = "panic-test")]
+            "--panic-test" => a.panic_test = Some(val()?),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -142,7 +260,12 @@ fn runtime_config(a: &Args) -> Result<RuntimeConfig, String> {
 
 async fn serve(a: Args) -> ExitCode {
     let ep = endpoint(&a);
-    if let Err(e) = tokio::fs::create_dir_all(&a.data).await {
+    let data = a.data.clone();
+    let created = tokio::task::spawn_blocking(move || wasit_diag::private::create_dir_all(&data))
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
+    if let Err(e) = created {
         eprintln!("wasit-hostd: cannot create {}: {e}", a.data.display());
         return ExitCode::from(1);
     }
@@ -160,6 +283,17 @@ async fn serve(a: Args) -> ExitCode {
             return ExitCode::from(3);
         }
     };
+    let host_id = a.host_id.clone().unwrap_or_else(default_host_id);
+    install_diagnostics(&a.data);
+    emit(HostdEvent::Start {
+        host: Ident::new(&host_id),
+        data: HomePath::new(&a.data),
+        socket: HomePath::new(&socket_path(&a)),
+    });
+    #[cfg(feature = "panic-test")]
+    if let Some(marker) = &a.panic_test {
+        panic!("hostd panic test: {marker}");
+    }
     let discovery = Discovery::new(DiscoveryConfig::from_runtime(&cfg));
     let manager = match SessionManager::new(cfg).await {
         Ok(m) => m,
@@ -170,20 +304,31 @@ async fn serve(a: Args) -> ExitCode {
     };
     match manager.adopt_all().await {
         Ok(r) => {
-            tracing::info!(
-                running = r.running.len(),
-                finished = r.finished.len(),
-                errors = r.errors.len(),
-                "adopted sessions"
-            );
+            emit(HostdEvent::Adopted {
+                running: u32::try_from(r.running.len()).unwrap_or(u32::MAX),
+                finished: u32::try_from(r.finished.len()).unwrap_or(u32::MAX),
+                errors: u32::try_from(r.errors.len()).unwrap_or(u32::MAX),
+            });
             for (dir, e) in r.errors {
-                tracing::warn!(dir = %dir.display(), error = %e, "session not adopted");
+                emit(HostdEvent::AdoptError {
+                    session: Ident::new(
+                        &dir.file_name()
+                            .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                    ),
+                    error: ErrorInfo::foreign(Code::st("adopt"), &e),
+                });
             }
         }
-        Err(e) => tracing::error!(error = %e, "cannot scan sessions"),
+        Err(e) => emit(HostdEvent::ScanFailed {
+            error: ErrorInfo::ours(Code::st("scan"), &e),
+        }),
     }
-    let host_id = a.host_id.clone().unwrap_or_else(default_host_id);
-    let service = RuntimeService::new(manager, discovery, host_id.clone(), BUILD);
+    let service = Observed(RuntimeService::new(
+        manager,
+        discovery,
+        host_id.clone(),
+        BUILD,
+    ));
     let mux = match ServiceMux::new().with(ROUTES.iter().copied(), Arc::new(service)) {
         Ok(m) => m,
         Err(e) => {
@@ -200,19 +345,30 @@ async fn serve(a: Args) -> ExitCode {
         "{}",
         serde_json::json!({"ready": true, "pid": std::process::id(), "endpoint": format!("{ep:?}")})
     );
-    tokio::select! {
-        r = server.serve(listener) => {
-            if let Err(e) = r {
-                eprintln!("wasit-hostd: serve failed: {e}");
-                return ExitCode::from(1);
+    emit(HostdEvent::Ready {
+        pid: std::process::id(),
+    });
+    let code = tokio::select! {
+        r = server.serve(listener) => match r {
+            Ok(()) => {
+                emit(HostdEvent::Shutdown { reason: Code::st("serve_ended") });
+                ExitCode::SUCCESS
             }
-        }
+            Err(e) => {
+                eprintln!("wasit-hostd: serve failed: {e}");
+                emit(HostdEvent::Shutdown { reason: Code::st("serve_failed") });
+                ExitCode::from(1)
+            }
+        },
         what = termination() => {
-            tracing::info!("{what}: shutting down (sessions keep running)");
+            emit(HostdEvent::Shutdown { reason: Code::new(what) });
             server.shutdown(Duration::from_secs(2)).await;
+            ExitCode::SUCCESS
         }
-    }
-    ExitCode::SUCCESS
+    };
+    // Waits (bounded) for the writer to write what was recorded; the process is ending.
+    let _written = wasit_diag::shutdown();
+    code
 }
 
 fn default_host_id() -> String {
@@ -233,7 +389,7 @@ async fn termination() -> &'static str {
             _ = i.recv() => "SIGINT",
         },
         _ => {
-            tracing::error!("cannot install signal handlers");
+            eprintln!("wasit-hostd: cannot install signal handlers");
             std::future::pending().await
         }
     }
@@ -275,10 +431,13 @@ async fn start_daemon(raw: Vec<String>, data: PathBuf) -> std::io::Result<()> {
     use std::process::Stdio;
     use tokio::io::AsyncBufReadExt;
     tokio::fs::create_dir_all(&data).await?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data.join("hostd.log"))?;
+    // The daemon's stderr: crash output and developer (`WASIT_LOG`) text, never diagnostics.
+    let log = wasit_diag::private::open(&data.join("hostd.log"), |o| {
+        o.append(true);
+    })?;
+    if log.metadata()?.len() > (1 << 20) {
+        log.set_len(0)?;
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = wasit_process::detached_command(exe);
     cmd.arg("serve")
@@ -332,12 +491,20 @@ fn main() -> ExitCode {
             return usage();
         }
     };
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("WASIT_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    // `tracing` is counted into the diagnostics sink; its text goes nowhere unless a developer
+    // sets `WASIT_LOG` (then to stderr, without colour).
+    let text = std::env::var_os(DEV_ENV).map(|_| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .with_filter(
+                tracing_subscriber::EnvFilter::try_from_env(DEV_ENV)
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+    });
+    let _ = tracing_subscriber::registry()
+        .with(wasit_diag::tracing_layer())
+        .with(text)
         .try_init(); // only fails if a subscriber is already set
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

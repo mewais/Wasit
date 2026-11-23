@@ -284,3 +284,22 @@ pub async fn await_pid_exit(pid: u32, timeout: Duration) -> bool {
     .unwrap();
     r
 }
+
+/// Every line of `<dir>/shim.log` as JSON (panics on a line that is not one): the file header
+/// first, then the diagnostic records.
+pub fn shim_log(dir: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join(wasit_shim::LOG_FILE)).unwrap_or_default();
+    text.lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l:?}")))
+        .collect()
+}
+
+/// The records of `ev` in a parsed log.
+pub fn events<'a>(log: &'a [serde_json::Value], ev: &str) -> Vec<&'a serde_json::Value> {
+    log.iter().filter(|r| r["ev"] == ev).collect()
+}
+
+/// The shim's stderr file, empty when missing.
+pub fn shim_stderr(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(wasit_shim::STDERR_FILE)).unwrap_or_default()
+}

@@ -1,6 +1,6 @@
 //! Synchronous journal file helpers. Callers run them on the blocking pool.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -27,9 +27,16 @@ pub(crate) fn parse_seq(line: &[u8]) -> io::Result<u64> {
     struct SeqOnly {
         seq: u64,
     }
+    // serde's messages quote the offending value, and a journal line is session content: say
+    // only what kind of fault and where.
     serde_json::from_slice::<SeqOnly>(line)
         .map(|s| s.seq)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad record: {e}")))
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad record ({:?} at column {})", e.classify(), e.column()),
+            )
+        })
 }
 
 /// Offset of the start of the line that ends at `end` (exclusive; `end - 1` is that line's
@@ -75,12 +82,10 @@ fn complete_len(f: &mut File, len: u64) -> io::Result<u64> {
 /// Prepare an existing journal for appending: truncate a torn final line and return
 /// `(next_seq, length)`. A missing journal is created empty.
 pub(crate) fn recover(path: &Path) -> Result<(u64, u64), crate::Error> {
-    let mut f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+    // Private to the owner (design leak L4); a journal an older build left wider is tightened.
+    let mut f = wasit_diag::private::open(path, |o| {
+        o.read(true).write(true).truncate(false);
+    })?;
     let len = f.metadata()?.len();
     let good = complete_len(&mut f, len)?;
     if good != len {

@@ -10,6 +10,12 @@
 //! * **Where records go:** one sink per process ([`install`]); [`emit`] serializes, keeps the
 //!   record in a ring for live tails and hands it to one writer thread through a bounded queue.
 //!   It never waits; when the queue is full the record is dropped and counted.
+//! * **Where a file may be shared:** a short-lived process of a machine (`bridge`, `stop`,
+//!   `askpass`, a daemon that lost the lock race) appends to one shared file with
+//!   [`FileMode::SharedAppend`]; the daemon keeps it within bounds ([`RotateShared`]).
+//! * **Who may read the files:** [`private`] creates and tightens directories and files so
+//!   that only their owner can read them (Unix `0700` / `0600`); the sink's files, the shim's
+//!   and the runtime's session files all go through it.
 //! * The two decisions still open for the product owner live in `policy.rs`, one function
 //!   each.
 //!
@@ -74,6 +80,7 @@ mod json;
 mod macros;
 mod panic;
 mod policy;
+pub mod private;
 pub mod reader;
 mod ring;
 pub mod scrub;
@@ -92,7 +99,7 @@ pub use internal::SinkEvent;
 pub use panic::{install_panic_hook, PANIC_FLUSH};
 pub use reader::{Chunk, GenInfo, Source};
 pub use ring::{Filter, Record, RING};
-pub use sink::{Sink, SinkConfig, Stats, Tail, QUEUE_ENV, WRITER_THREAD};
+pub use sink::{FileMode, RotateShared, Sink, SinkConfig, Stats, Tail, QUEUE_ENV, WRITER_THREAD};
 pub use text::{DiagText, Origin};
 #[cfg(feature = "tracing")]
 pub use tracing_bridge::{tracing_layer, CountingLayer};
@@ -171,6 +178,13 @@ pub(crate) fn installed() -> Option<&'static Sink> {
 pub fn emit<E: DiagEvent>(event: &E) {
     if let Some(s) = SINK.get() {
         s.emit(event);
+    }
+}
+
+/// See [`Sink::announce_process`]; nothing without a sink.
+pub fn announce_process() {
+    if let Some(s) = SINK.get() {
+        s.announce_process();
     }
 }
 

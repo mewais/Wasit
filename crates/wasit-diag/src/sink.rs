@@ -33,6 +33,41 @@ pub const WRITER_THREAD: &str = "diag-writer";
 /// Capacity of the tail broadcast; a subscriber that falls further behind sees `Lagged`.
 const TAIL_CAPACITY: usize = 1024;
 
+/// How a sink's file is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMode {
+    /// This process is the file's only writer: records are batched, the file is rotated by
+    /// [`SinkConfig::max_bytes`] / [`SinkConfig::generations`].
+    Owned,
+    /// Short-lived processes of one machine (`bridge`, `stop`, `askpass`, a daemon that lost the
+    /// lock race) append to one shared file (`aux.ndjson`, design §6.1):
+    ///
+    /// * append-only, and **one `write` call per record** (a record is never split, nor
+    ///   batched with another, so two processes' records cannot interleave inside a line);
+    /// * the file is opened for each record, so a rotation by the daemon (a rename) is followed
+    ///   and no process keeps a rotated-away file open;
+    /// * this process never rotates it: a record is skipped, and counted as dropped, when the
+    ///   file already holds `cap` bytes (the long-lived daemon rotates it, see
+    ///   [`SinkConfig::rotate_shared`]);
+    /// * the process that finds the file empty writes the file header in the same `write` as its
+    ///   record (so every file begins with a header), and every process may do so after a
+    ///   rotation — a second header inside a file is harmless to readers.
+    ///
+    /// [`Sink::promote`] ends this mode: the promoted file belongs to this process.
+    SharedAppend { cap: u64 },
+}
+
+/// A shared file ([`FileMode::SharedAppend`]) a long-lived daemon keeps within bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotateShared {
+    /// The shared file's name in [`SinkConfig::dir`], e.g. `aux.ndjson`.
+    pub file: String,
+    /// The file is rotated when it holds more than this many bytes.
+    pub max_bytes: u64,
+    /// Rotated files kept (`<file>.1` ..= `<file>.<generations>`).
+    pub generations: u32,
+}
+
 /// Where and how a process writes its records.
 #[derive(Debug, Clone)]
 pub struct SinkConfig {
@@ -51,6 +86,13 @@ pub struct SinkConfig {
     /// Records the queue between emitters and the writer holds; beyond, records are dropped
     /// and counted.
     pub queue: usize,
+    /// How the file is used.
+    pub mode: FileMode,
+    /// The daemon's duty: keep a shared file of this directory within bounds. Checked when the
+    /// writer starts and then once a minute (a schedule, not a poll), never on the path of a
+    /// record. The shared file is rotated when over its limit; the writers of the shared file
+    /// do not rotate.
+    pub rotate_shared: Option<RotateShared>,
 }
 
 impl SinkConfig {
@@ -64,6 +106,19 @@ impl SinkConfig {
             max_bytes: 8 << 20,
             generations: 3,
             queue: 8192,
+            mode: FileMode::Owned,
+            rotate_shared: None,
+        }
+    }
+
+    /// A sink appending to a file shared with other short-lived processes of the machine
+    /// ([`FileMode::SharedAppend`]): such a process emits a handful of records, so the queue is
+    /// small.
+    pub fn shared(role: Code, build: Ident, dir: impl Into<PathBuf>, file: &str, cap: u64) -> Self {
+        SinkConfig {
+            queue: 256,
+            mode: FileMode::SharedAppend { cap },
+            ..SinkConfig::new(role, build, dir, file)
         }
     }
 }
@@ -287,6 +342,21 @@ impl Sink {
             .submit_locked(&mut st, event.ev(), event.level(), &fields, false);
         drop(st);
         IN_EMIT.with(|f| f.set(was));
+    }
+
+    /// Records `process.start` for this sink's role and build (the process calls it right after
+    /// [`install`](crate::install)).
+    pub fn announce_process(&self) {
+        use std::env::consts::{ARCH, OS};
+        self.emit(&SinkEvent::ProcessStart {
+            role: self.shared.config.role.clone(),
+            build: self.shared.config.build.clone(),
+            target: Ident::new(&format!("{ARCH}-{OS}")),
+            os: Code::st(OS),
+            arch: Code::st(ARCH),
+            os_release: None,
+            pid: std::process::id(),
+        });
     }
 
     /// Waits (at most `timeout`) until every record emitted before the call is written or

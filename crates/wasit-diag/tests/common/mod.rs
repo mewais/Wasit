@@ -99,6 +99,10 @@ impl Target for Mem {
         ))
     }
 
+    fn len_of(&mut self, name: &str) -> io::Result<Option<u64>> {
+        Ok(self.files.lock().unwrap().get(name).map(|b| b.len() as u64))
+    }
+
     fn first_line(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
         Ok(self
             .files

@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use wasit_core::content::{b64_decode, b64_encode, image_dimensions, scrub_raw, sniff_mime};
 use wasit_core::{AgentEvent, Attachment, ContentPart, GateRequest, MediaSource, PromptInput};
 
+use crate::store;
 use crate::wire::{RuntimeError, SessionId};
 
 /// Largest blob kept (a larger inline payload becomes a text note).
@@ -295,12 +296,15 @@ async fn store_blob(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Ok(());
     }
     let dir = path.parent().unwrap_or(Path::new("."));
-    tokio::fs::create_dir_all(dir).await?;
+    store::private_dir_all(dir).await?;
     // Unique temporary name: a restore and the actor may store the same blob at once.
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("{}-{n}.tmp", std::process::id()));
-    let mut f = tokio::fs::File::create(&tmp).await?;
+    let mut f = store::open_private(&tmp, |o| {
+        o.write(true).truncate(true);
+    })
+    .await?;
     f.write_all(bytes).await?;
     f.sync_all().await?;
     drop(f);
@@ -589,23 +593,21 @@ pub(crate) async fn put(
     let dir = attachments_dir(session_dir).join(&r.upload);
     let part = dir.join(".part");
     if r.offset == 0 {
-        tokio::fs::create_dir_all(&dir)
+        store::private_dir_all(&dir)
             .await
             .map_err(|e| io("create attachments dir", e))?;
     }
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(r.offset == 0)
-        .write(true)
-        .truncate(r.offset == 0)
-        .open(&part)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                invalid("unknown upload (start at offset 0)")
-            } else {
-                io("open upload", e)
-            }
-        })?;
+    let mut f = store::open_private(&part, |o| {
+        o.create(r.offset == 0).write(true).truncate(r.offset == 0);
+    })
+    .await
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            invalid("unknown upload (start at offset 0)")
+        } else {
+            io("open upload", e)
+        }
+    })?;
     let have = f.metadata().await.map_err(|e| io("stat upload", e))?.len();
     if have != r.offset {
         return Err(invalid(format!("expected offset {have}, got {}", r.offset)));

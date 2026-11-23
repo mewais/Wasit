@@ -118,7 +118,7 @@ impl SessionManager {
     /// next to pick up existing sessions. Must be called inside a tokio runtime.
     pub async fn new(cfg: RuntimeConfig) -> Result<Self, RuntimeError> {
         let sessions_dir = cfg.sessions_dir();
-        tokio::fs::create_dir_all(&sessions_dir)
+        store::private_dir_all(&sessions_dir)
             .await
             .map_err(|e| io_err(&format!("create {}", sessions_dir.display()), e))?;
         #[cfg(unix)]
@@ -234,7 +234,7 @@ impl SessionManager {
         };
         store::apply_override(cfg, &req.driver, &mut spec);
         let unsupported = desc.render_config(&req.config, &mut spec);
-        tokio::fs::create_dir_all(&dir)
+        store::private_dir_all(&dir)
             .await
             .map_err(|e| io_err(&format!("create {}", dir.display()), e))?;
         let file = SessionFile::new(
@@ -349,6 +349,11 @@ impl SessionManager {
     }
 
     async fn adopt_one(&self, id: &SessionId, dir: &Path) -> Result<bool, String> {
+        // A session an older build created may be readable by others: close it now. A failure
+        // does not stop the adoption (the user's session still shows), it is reported.
+        if let Err(e) = store::tighten_session(dir).await {
+            tracing::warn!(dir = %dir.display(), error = %e, "cannot make a session directory private");
+        }
         let file = store::read(dir).await?;
         if &file.id != id {
             return Err(format!("session.json names {} instead", file.id));

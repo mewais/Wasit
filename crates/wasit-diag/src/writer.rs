@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::internal::SinkEvent;
-use crate::reader;
-use crate::sink::{self, mono_ms, wall_ms, DropRange, Msg, Shared};
+use crate::sink::{self, mono_ms, wall_ms, DropRange, FileMode, Msg, Shared};
 use crate::value::ErrorInfo;
+use crate::{private, reader};
 
 /// Where a writer's bytes go: a directory of named files.
 pub trait Target: Send + 'static {
@@ -24,6 +24,8 @@ pub trait Target: Send + 'static {
     /// Opens `name` for appending, creating it (and its directory) when missing; returns the
     /// file and its current length.
     fn open(&mut self, name: &str) -> io::Result<(Self::File, u64)>;
+    /// The length of `name`, `None` when it does not exist.
+    fn len_of(&mut self, name: &str) -> io::Result<Option<u64>>;
     /// The first line of `name` (without the newline), `None` when it does not exist.
     fn first_line(&mut self, name: &str) -> io::Result<Option<Vec<u8>>>;
     /// Renames `from` to `to`, replacing `to`.
@@ -33,7 +35,8 @@ pub trait Target: Send + 'static {
     fn sync(&mut self, file: &mut Self::File) -> io::Result<()>;
 }
 
-/// Files in a directory. Files are created `0600` on Unix.
+/// Files in a directory. On Unix the directory is `0700` and the files `0600`, and what an older
+/// build left with wider permissions is tightened when it is opened (see [`private`]).
 pub struct FsTarget {
     dir: PathBuf,
 }
@@ -48,17 +51,20 @@ impl Target for FsTarget {
     type File = std::fs::File;
 
     fn open(&mut self, name: &str) -> io::Result<(std::fs::File, u64)> {
-        std::fs::create_dir_all(&self.dir)?;
-        let mut o = std::fs::OpenOptions::new();
-        o.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600);
-        }
-        let f = o.open(self.dir.join(name))?;
+        private::create_dir_all(&self.dir)?;
+        let f = private::open(&self.dir.join(name), |o| {
+            o.append(true);
+        })?;
         let len = f.metadata()?.len();
         Ok((f, len))
+    }
+
+    fn len_of(&mut self, name: &str) -> io::Result<Option<u64>> {
+        match std::fs::metadata(self.dir.join(name)) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn first_line(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
@@ -94,6 +100,8 @@ pub(crate) struct Writer<T: Target> {
     rx: Receiver<Msg>,
     target: T,
     name: String,
+    /// Starts as the configured mode; [`Sink::promote`](crate::Sink::promote) makes it `Owned`.
+    mode: FileMode,
     file: Option<T::File>,
     /// Bytes of the current file, including what is batched for it.
     len: u64,
@@ -132,6 +140,7 @@ impl<T: Target> Writer<T> {
     pub(crate) fn new(shared: Arc<Shared>, rx: Receiver<Msg>, target: T) -> Self {
         Writer {
             name: shared.config.file.clone(),
+            mode: shared.config.mode,
             shared,
             rx,
             target,
@@ -152,10 +161,15 @@ impl<T: Target> Writer<T> {
 
     pub(crate) fn run(mut self) {
         let _done = DoneGuard(self.shared.clone());
+        self.rotate_watched();
         // The file is opened (and its header written) before the first record is taken, so an
         // open or a write that blocks holds back no more than the queue.
-        if let Err(e) = self.open(None) {
-            self.report(&e);
+        // (A shared file is opened for each record instead, and its header written by the
+        // process that finds it empty.)
+        if self.mode == FileMode::Owned {
+            if let Err(e) = self.open(None) {
+                self.report(&e);
+            }
         }
         loop {
             self.tick();
@@ -219,14 +233,18 @@ impl<T: Target> Writer<T> {
     /// Arms the minute tick when something waits for it; queues the summaries when it is due.
     fn tick(&mut self) {
         let now = mono_ms();
-        if self.next_tick.is_none() && self.shared.periodic.load(Ordering::Acquire) {
+        let watching = self.shared.config.rotate_shared.is_some();
+        if self.next_tick.is_none() && (watching || self.shared.periodic.load(Ordering::Acquire)) {
             self.next_tick = Some((now / 60_000 + 1) * 60_000);
         }
         if self.next_tick.is_some_and(|at| now >= at) {
             self.next_tick = None;
             self.shared.periodic.store(false, Ordering::Release);
-            let mut st = self.shared.lock_state();
-            self.shared.drain_periodic(&mut st);
+            {
+                let mut st = self.shared.lock_state();
+                self.shared.drain_periodic(&mut st);
+            }
+            self.rotate_watched();
         }
     }
 
@@ -278,6 +296,10 @@ impl<T: Target> Writer<T> {
         if seq >= self.shared.promote_at.load(Ordering::Acquire) {
             self.switch();
         }
+        if let FileMode::SharedAppend { cap } = self.mode {
+            self.add_shared(seq, internal, line, cap);
+            return;
+        }
         if self.file.is_none() {
             if let Err(e) = self.open(None) {
                 self.report(&e);
@@ -304,6 +326,95 @@ impl<T: Target> Writer<T> {
         }
     }
 
+    /// [`FileMode::SharedAppend`]: the record goes to the shared file in one `write`, at once
+    /// (never batched, never buffered), or is skipped — and counted as dropped — when the file
+    /// already holds `cap` bytes. A record whose write fails is counted the same way and the
+    /// failure reported; the file is opened again for the next record.
+    fn add_shared(&mut self, seq: u64, internal: bool, line: &str, cap: u64) {
+        match self.append_shared(line, cap) {
+            Ok(true) => {
+                if !internal {
+                    self.shared.stats.written.fetch_add(1, Ordering::Relaxed);
+                }
+                self.reported.clear();
+            }
+            Ok(false) => self.skip_shared(seq, internal),
+            Err(e) => {
+                self.report(&e);
+                self.skip_shared(seq, internal);
+            }
+        }
+    }
+
+    /// A shared-file record that was not written. A user record is counted and its seq range
+    /// reported by a `diag.dropped` record once the file takes records again; a sink-internal
+    /// record (a summary or a drop count itself) is not, or a full file would make the writer
+    /// queue a drop count for every drop count it cannot write.
+    fn skip_shared(&mut self, seq: u64, internal: bool) {
+        if internal {
+            return;
+        }
+        self.shared.stats.dropped.fetch_add(1, Ordering::Relaxed);
+        let mut st = self.shared.lock_state();
+        DropRange::add(&mut st.drops, 1, seq, seq);
+    }
+
+    /// Writes `line` to the shared file; `false` when the file is over `cap` (nothing written).
+    fn append_shared(&mut self, line: &str, cap: u64) -> io::Result<bool> {
+        let (mut file, len) = self.target.open(&self.name)?;
+        if len >= cap {
+            return Ok(false);
+        }
+        let mut buf = Vec::with_capacity(line.len() + 1 + if len == 0 { 256 } else { 0 });
+        if len == 0 {
+            // A file that is empty (new, or rotated away by the daemon) starts with a header.
+            let serial = self.next_serial()?;
+            buf.extend_from_slice(self.header(serial).as_bytes());
+        }
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        file.write_all(&buf)?;
+        Ok(true)
+    }
+
+    /// The generation of a new file: one after the generation in `<file>.1`.
+    fn next_serial(&mut self) -> io::Result<u64> {
+        let older = self.target.first_line(&format!("{}.1", self.name))?;
+        Ok(older
+            .as_deref()
+            .and_then(reader::header_gen)
+            .map_or(1, |g| g + 1))
+    }
+
+    fn header(&self, serial: u64) -> String {
+        format!(
+            "{{\"diag_file\":1,\"gen\":{serial},\"b\":\"{}\",\"src\":{},\"build\":{},\"pid\":{},\"opened_t\":{}}}\n",
+            self.shared.boot,
+            crate::json::quoted(self.shared.config.role.as_str().unwrap_or("other")),
+            crate::json::quoted(self.shared.config.build.as_str().unwrap_or("other")),
+            std::process::id(),
+            wall_ms(),
+        )
+    }
+
+    /// The daemon's duty ([`SinkConfig::rotate_shared`](crate::SinkConfig::rotate_shared)):
+    /// rotate the shared file when it is over its limit. Writers that have it open for a record
+    /// at that moment finish into the rotated file; the next record opens a new one.
+    fn rotate_watched(&mut self) {
+        let Some(w) = self.shared.config.rotate_shared.clone() else {
+            return;
+        };
+        match self.target.len_of(&w.file) {
+            Ok(Some(len)) if len > w.max_bytes => {
+                if let Err(e) = self.shift_named(&w.file, w.generations) {
+                    self.report(&e);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => self.report(&e),
+        }
+    }
+
     /// Opens the current file and writes its header. `serial`: the generation of a new file
     /// after rotation; `None` to continue the existing file (or start one).
     fn open(&mut self, serial: Option<u64>) -> io::Result<()> {
@@ -322,22 +433,9 @@ impl<T: Target> Writer<T> {
                     }
                 }
             }
-            None => {
-                let older = self.target.first_line(&format!("{}.1", self.name))?;
-                older
-                    .as_deref()
-                    .and_then(reader::header_gen)
-                    .map_or(1, |g| g + 1)
-            }
+            None => self.next_serial()?,
         };
-        let header = format!(
-            "{{\"diag_file\":1,\"gen\":{serial},\"b\":\"{}\",\"src\":{},\"build\":{},\"pid\":{},\"opened_t\":{}}}\n",
-            self.shared.boot,
-            crate::json::quoted(self.shared.config.role.as_str().unwrap_or("other")),
-            crate::json::quoted(self.shared.config.build.as_str().unwrap_or("other")),
-            std::process::id(),
-            wall_ms(),
-        );
+        let header = self.header(serial);
         file.write_all(header.as_bytes())?;
         self.len = existing + header.len() as u64 + self.buf.len() as u64;
         self.has_records = existing > 0;
@@ -348,16 +446,21 @@ impl<T: Target> Writer<T> {
 
     /// `<file>.k` → `<file>.k+1` (the oldest replaced), `<file>` → `<file>.1`.
     fn shift(&mut self) -> io::Result<()> {
-        let gens = self.shared.config.generations;
+        let name = self.name.clone();
+        self.shift_named(&name, self.shared.config.generations)
+    }
+
+    /// [`Writer::shift`] for any file of the directory.
+    fn shift_named(&mut self, name: &str, gens: u32) -> io::Result<()> {
         if gens == 0 {
-            return ignore_missing(self.target.remove(&self.name));
+            return ignore_missing(self.target.remove(name));
         }
         for k in (1..gens).rev() {
-            let from = format!("{}.{k}", self.name);
-            let to = format!("{}.{}", self.name, k + 1);
+            let from = format!("{name}.{k}");
+            let to = format!("{name}.{}", k + 1);
             ignore_missing(self.target.rename(&from, &to))?;
         }
-        ignore_missing(self.target.rename(&self.name, &format!("{}.1", self.name)))
+        ignore_missing(self.target.rename(name, &format!("{name}.1")))
     }
 
     fn rotate(&mut self) {
@@ -407,6 +510,8 @@ impl<T: Target> Writer<T> {
             }
         }
         self.name = name;
+        // The promoted file is this process's own.
+        self.mode = FileMode::Owned;
         if let Err(e) = self.open(None) {
             self.report(&e);
         }

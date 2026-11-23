@@ -7,7 +7,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cli;
-use crate::{Error, LOG_FILE};
+use crate::diag::STDERR_MAX_BYTES;
+use crate::{Error, LOG_FILE, STDERR_FILE};
 
 /// Tunables passed to the shim on its command line.
 #[derive(Debug, Clone)]
@@ -188,17 +189,17 @@ pub async fn spawn_detached(spec: &ShimSpec) -> Result<ShimHandle, Error> {
             "empty environment variable name".into(),
         ));
     }
-    tokio::fs::create_dir_all(&spec.dir).await?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(spec.dir.join(LOG_FILE))?;
+    let dir = spec.dir.clone();
+    tokio::task::spawn_blocking(move || wasit_diag::private::create_dir_all(&dir)).await??;
+    // The shim writes `shim.log` itself (its diagnostics sink owns that file); its stderr is
+    // the separate crash file.
+    let stderr = open_stderr(&spec.dir).await?;
     let mut cmd = wasit_process::command(&spec.shim_program);
     cmd.args(&spec.shim_args)
         .args(spec.to_args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
         .kill_on_drop(false);
     let mut child = launch(cmd).map_err(|e| {
         Error::Spawn(format!(
@@ -233,8 +234,10 @@ pub async fn spawn_detached(spec: &ShimSpec) -> Result<ShimHandle, Error> {
         Ok(Err(e)) => return Err(e.into()),
         Ok(Ok(0)) => {
             return Err(Error::Spawn(format!(
-                "shim exited without signalling readiness; see {}",
-                spec.dir.join(LOG_FILE).display()
+                "shim exited without signalling readiness; see {} and {} in {}",
+                LOG_FILE,
+                STDERR_FILE,
+                spec.dir.display()
             )))
         }
         Ok(Ok(_)) => {}
@@ -255,6 +258,24 @@ pub async fn spawn_detached(spec: &ShimSpec) -> Result<ShimHandle, Error> {
         }),
         _ => Err(Error::Spawn(format!("incomplete readiness line {line:?}"))),
     }
+}
+
+/// Opens the shim's stderr file for appending (private to its owner), cut to nothing first when
+/// an earlier run left more than [`STDERR_MAX_BYTES`]: raw crash output is a few bytes, so
+/// the file stays small without a rotation of its own.
+async fn open_stderr(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let path = dir.join(STDERR_FILE);
+    let tighten = path.clone();
+    tokio::task::spawn_blocking(move || wasit_diag::private::tighten_file(&tighten))
+        .await
+        .map_err(std::io::Error::other)??;
+    let mut options = tokio::fs::OpenOptions::from(wasit_diag::private::file_options());
+    options.append(true);
+    let file = options.open(&path).await?;
+    if file.metadata().await?.len() > STDERR_MAX_BYTES {
+        file.set_len(0).await?;
+    }
+    Ok(file.into_std().await)
 }
 
 #[cfg(unix)]

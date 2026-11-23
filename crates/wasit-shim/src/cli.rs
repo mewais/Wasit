@@ -39,21 +39,56 @@ fn value(it: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString
 }
 
 fn number(v: &OsStr, flag: &str) -> Result<u64, Error> {
+    // The value is not echoed: an argument error is reported to the caller and logged, and
+    // nothing on the command line may reach either (it can carry secrets).
     v.to_str()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| Error::InvalidArgument(format!("{flag}: not a number: {v:?}")))
+        .ok_or_else(|| Error::InvalidArgument(format!("{flag}: not a number")))
 }
 
-pub(crate) fn split_env(kv: &OsStr) -> Result<(OsString, OsString), Error> {
+/// Splits one `--env K=V`. `n` is its position among the `--env` flags (1-based): the only
+/// thing an error says about it. The variable's value (and, where it cannot be told from the
+/// value, its name) is never echoed: the message goes to the readiness line, to `shim.log` and
+/// back to the caller, and the value may be a secret (design leak L2).
+pub(crate) fn split_env(kv: &OsStr, n: usize) -> Result<(OsString, OsString), Error> {
     let s = kv
         .to_str()
-        .ok_or_else(|| Error::InvalidArgument(format!("--env is not UTF-8: {kv:?}")))?;
+        .ok_or_else(|| Error::InvalidArgument(format!("--env #{n} is not UTF-8")))?;
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.into(), v.into())),
         _ => Err(Error::InvalidArgument(format!(
-            "--env expects K=V, got {s:?}"
+            "--env #{n} is not NAME=VALUE (no `=`, or an empty name)"
         ))),
     }
+}
+
+/// An unexpected argument as an error message shows it: a flag by name, anything else by its
+/// size (it may be a value that landed in the wrong place).
+fn describe(a: &OsStr) -> String {
+    match a.to_str() {
+        Some(s)
+            if s.starts_with("--")
+                && s.len() <= 40
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+        {
+            s.to_owned()
+        }
+        _ => format!("<{} bytes>", a.len()),
+    }
+}
+
+/// The `--dir` of an argument list, without parsing the rest: lets a shim whose arguments are
+/// invalid still write its `shim.not_ready` record where the session's log is.
+pub(crate) fn dir_hint(args: &[OsString]) -> Option<PathBuf> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.to_str() {
+            Some("--") => return None,
+            Some("--dir") => return it.next().map(PathBuf::from),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(crate) fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Config, Error> {
@@ -82,7 +117,10 @@ pub(crate) fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Config,
             Some("--dir") => dir = Some(PathBuf::from(value(&mut it, "--dir")?)),
             Some("--run") => cfg.run = Some(PathBuf::from(value(&mut it, "--run")?)),
             Some("--cwd") => cfg.cwd = Some(PathBuf::from(value(&mut it, "--cwd")?)),
-            Some("--env") => cfg.env.push(split_env(&value(&mut it, "--env")?)?),
+            Some("--env") => {
+                let kv = value(&mut it, "--env")?;
+                cfg.env.push(split_env(&kv, cfg.env.len() + 1)?);
+            }
             Some("--linger-ms") => {
                 cfg.linger =
                     Duration::from_millis(number(&value(&mut it, "--linger-ms")?, "--linger-ms")?)
@@ -108,7 +146,12 @@ pub(crate) fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Config,
                     "--drain-timeout-ms",
                 )?)
             }
-            _ => return Err(Error::InvalidArgument(format!("unexpected argument {a:?}"))),
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "unexpected argument {}",
+                    describe(&a)
+                )))
+            }
         }
     }
     cfg.dir = dir.ok_or_else(|| Error::InvalidArgument("--dir is required".into()))?;
@@ -165,5 +208,56 @@ mod tests {
         assert!(parse(os(&["--dir", "/d"])).is_err());
         assert!(parse(os(&["--dir", "/d", "--env", "noeq", "--", "p"])).is_err());
         assert!(parse(os(&["--", "p"])).is_err());
+    }
+
+    /// Leak L2: an argument error never echoes what the argument held.
+    #[test]
+    fn argument_errors_do_not_echo_values() {
+        const MARK: &str = "SECRET-MARK-8d41";
+        let bad_env = [
+            // No `=`: the whole argument may be a value.
+            MARK.to_string(),
+            // An empty name: what follows `=` is the value.
+            format!("={MARK}"),
+        ];
+        for kv in &bad_env {
+            let e = parse(os(&["--dir", "/d", "--env", kv, "--", "p"])).unwrap_err();
+            assert!(matches!(e, Error::InvalidArgument(_)));
+            assert!(!e.to_string().contains(MARK), "{e}");
+            assert!(e.to_string().contains("--env #1"), "{e}");
+        }
+        // The position counts the `--env` flags.
+        let e = parse(os(&[
+            "--dir", "/d", "--env", "A=1", "--env", MARK, "--", "p",
+        ]))
+        .unwrap_err();
+        assert!(e.to_string().contains("--env #2"), "{e}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut raw = format!("K={MARK}").into_bytes();
+            raw.push(0xff);
+            let e = split_env(&OsString::from_vec(raw), 4).unwrap_err();
+            assert!(!e.to_string().contains(MARK), "{e}");
+            assert!(e.to_string().contains("--env #4"), "{e}");
+        }
+
+        let e = parse(os(&["--dir", "/d", "--linger-ms", MARK, "--", "p"])).unwrap_err();
+        assert!(!e.to_string().contains(MARK), "{e}");
+        let e = parse(os(&["--dir", "/d", MARK, "--", "p"])).unwrap_err();
+        assert!(!e.to_string().contains(MARK), "{e}");
+        let e = parse(os(&["--dir", "/d", "--surprise", "--", "p"])).unwrap_err();
+        assert!(e.to_string().contains("--surprise"), "{e}");
+    }
+
+    #[test]
+    fn dir_hint_reads_the_directory_before_the_program() {
+        assert_eq!(
+            dir_hint(&os(&["--env", "A=b", "--dir", "/d", "--", "p"])),
+            Some(PathBuf::from("/d"))
+        );
+        assert_eq!(dir_hint(&os(&["--", "--dir", "/d"])), None);
+        assert_eq!(dir_hint(&os(&["--dir"])), None);
     }
 }

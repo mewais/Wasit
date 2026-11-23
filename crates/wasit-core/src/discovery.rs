@@ -123,6 +123,21 @@ pub enum ProbeOutput {
     },
 }
 
+impl ProbeOutput {
+    /// The kind of output, as a word: what an error message says about an output that was not
+    /// the kind a parser expected. Messages never format the output itself (`{:?}` would
+    /// embed the stdout or the file contents, which can hold anything: `~/.claude.json` holds
+    /// MCP server keys).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ProbeOutput::Exec { .. } => "command output",
+            ProbeOutput::Handshake { .. } => "handshake events",
+            ProbeOutput::Files { .. } => "a file listing",
+            ProbeOutput::File { .. } => "file contents",
+        }
+    }
+}
+
 /// A session the CLI can resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -191,7 +206,7 @@ impl DiscoveryProbe {
 pub fn read_file(out: &ProbeOutput) -> Result<Option<&str>, String> {
     match out {
         ProbeOutput::File { contents, .. } => Ok(contents.as_deref()),
-        other => Err(format!("expected file contents, got {other:?}")),
+        other => Err(format!("expected file contents, got {}", other.kind_name())),
     }
 }
 
@@ -229,7 +244,10 @@ pub fn exec_stdout(out: &ProbeOutput) -> Result<&str, String> {
             stdout,
         } => Ok(stdout),
         ProbeOutput::Exec { exit_code, .. } => Err(format!("command failed: exit {exit_code:?}")),
-        other => Err(format!("expected command output, got {other:?}")),
+        other => Err(format!(
+            "expected command output, got {}",
+            other.kind_name()
+        )),
     }
 }
 
@@ -237,7 +255,10 @@ pub fn exec_stdout(out: &ProbeOutput) -> Result<&str, String> {
 pub fn handshake_events(out: &ProbeOutput) -> Result<&[AgentEvent], String> {
     match out {
         ProbeOutput::Handshake { events } => Ok(events),
-        other => Err(format!("expected handshake events, got {other:?}")),
+        other => Err(format!(
+            "expected handshake events, got {}",
+            other.kind_name()
+        )),
     }
 }
 
@@ -245,7 +266,10 @@ pub fn handshake_events(out: &ProbeOutput) -> Result<&[AgentEvent], String> {
 pub fn listed_files(out: &ProbeOutput) -> Result<&[FileHead], String> {
     match out {
         ProbeOutput::Files { files } => Ok(files),
-        other => Err(format!("expected a file listing, got {other:?}")),
+        other => Err(format!(
+            "expected a file listing, got {}",
+            other.kind_name()
+        )),
     }
 }
 
@@ -504,6 +528,66 @@ mod config_discovery_tests {
             (md[0].name.as_str(), md[0].description.as_str()),
             ("rev", "reviews")
         );
+    }
+}
+
+#[cfg(test)]
+mod error_text_tests {
+    use super::*;
+
+    /// Leak L5: a parser handed the wrong kind of output says which kind it got, never what the
+    /// output held.
+    #[test]
+    fn a_mismatched_output_is_named_never_quoted() {
+        const MARK: &str = "PROBE-CONTENT-MARK-52fe";
+        let exec = ProbeOutput::Exec {
+            exit_code: Some(0),
+            stdout: format!("stdout {MARK}"),
+        };
+        let file = ProbeOutput::File {
+            path: format!("/home/u/{MARK}.json"),
+            contents: Some(format!("{{\"mcp\": \"{MARK}\"}}")),
+        };
+        let files = ProbeOutput::Files {
+            files: vec![FileHead {
+                path: format!("/x/{MARK}"),
+                modified_ms: 0,
+                head: vec![MARK.to_string()],
+                matching_lines: None,
+            }],
+        };
+        let handshake = ProbeOutput::Handshake { events: Vec::new() };
+
+        let errors = [
+            read_file(&exec).unwrap_err(),
+            read_file(&files).unwrap_err(),
+            exec_stdout(&file).unwrap_err(),
+            exec_stdout(&handshake).unwrap_err(),
+            handshake_events(&exec).unwrap_err(),
+            handshake_events(&file).unwrap_err(),
+            listed_files(&exec).unwrap_err(),
+            listed_files(&file).unwrap_err(),
+            models_from_handshake(&file).unwrap_err(),
+            modes_from_handshake(&files).unwrap_err(),
+        ];
+        for e in &errors {
+            assert!(!e.contains(MARK), "{e}");
+        }
+        assert_eq!(
+            read_file(&exec).unwrap_err(),
+            "expected file contents, got command output"
+        );
+        assert_eq!(
+            listed_files(&file).unwrap_err(),
+            "expected a file listing, got file contents"
+        );
+        // A failed command names only its exit code.
+        let failed = ProbeOutput::Exec {
+            exit_code: Some(3),
+            stdout: MARK.into(),
+        };
+        let e = exec_stdout(&failed).unwrap_err();
+        assert!(e.contains("exit") && !e.contains(MARK), "{e}");
     }
 }
 

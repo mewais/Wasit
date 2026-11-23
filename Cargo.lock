@@ -828,9 +828,11 @@ dependencies = [
  "wasit-codex",
  "wasit-control",
  "wasit-core",
+ "wasit-diag",
  "wasit-fake-cli",
  "wasit-opencode",
  "wasit-process",
+ "wasit-runtime",
  "wasit-shim",
 ]
 
@@ -844,6 +846,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "wasit-diag",
  "wasit-process",
  "windows-sys 0.59.0",
 ]

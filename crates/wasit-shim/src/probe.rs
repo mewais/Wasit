@@ -83,12 +83,9 @@ pub(crate) async fn prepare_run_dir(run: &Path) -> Result<Option<File>, Error> {
 /// [`probe`] may hold it for a moment.
 pub(crate) async fn acquire(dir: &Path) -> Result<File, Error> {
     let path = dir.join(LOCK_FILE);
-    let f = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
+    let f = wasit_diag::private::open(&path, |o| {
+        o.read(true).write(true).truncate(false);
+    })?;
     let mut backoff = std::time::Duration::from_millis(2);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {

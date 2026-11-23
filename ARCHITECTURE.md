@@ -355,8 +355,8 @@ reasons), never content.
   `HomePath`, `ProjectPath`, `SrcLocation`, `Option`/bounded `Vec` of those, `diag_enum!` enums,
   and newtypes registered with `diag_value!`. `String`, `&str`, paths, JSON values and
   `Debug`/`Display` output are not values. New field types and every `diag_value!` /
-  `DiagText::new` site outside `wasit-diag` are reviewed changes to an allow-list
-  (`wasit-diag/tests/value_sites.rs`).
+  `DiagText::new` / `ErrorInfo::ours` (free text from any `Display`) site outside `wasit-diag`
+  are reviewed changes to an allow-list (`wasit-diag/tests/value_sites.rs`).
 - **Per data category:** prompts, responses, thinking, tool input/output, plans, answers, gate
   free text, attachments, file contents, CLI stdout: never — sizes and counts only. CLI/peer
   error text: `ErrorInfo::foreign` (codes + length + fingerprint, no text). Secrets (host secret
@@ -369,6 +369,15 @@ reasons), never content.
   location, thread, payload kind and length; text only of a static payload.
 - **Free text** exists only as `DiagText::new(Origin, &str)`: registered secrets and project
   paths replaced, home → `~`, token-shaped runs redacted, control characters escaped, bounded.
+- **Who may read.** Session directories are `0700` and everything written in them
+  (`journal.ndjson`, `session.json`, `shim.log`, the shim's stderr file, uploads, blobs,
+  generated files) and the `diag/` directory and its files are `0600`/`0700` on Unix (nothing is
+  done on Windows); one definition (`wasit_diag::private`), applied when a file is created and,
+  for what an older build left wider, when a session is adopted or a sink opens its file.
+- **The shim's files.** `shim.log` is the shim's own diagnostics sink (NDJSON, 256 KiB, one
+  older generation); its writer thread is the only writer. The shim's stderr is a separate
+  `shim.stderr` (raw crash output, cut to nothing when over 64 KiB at the next start, never
+  exported). Neither is ever on the path of the journal, stdin or the exit sequence.
 - **Emitting never waits:** `emit` = budget check + serialize + ring push + `try_send`; a full
   queue drops and counts (`diag.dropped`). One writer thread per process owns the file:
   batched writes, no fsync per record, size rotation with generations.

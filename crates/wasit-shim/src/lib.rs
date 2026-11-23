@@ -15,6 +15,7 @@
 
 mod cli;
 mod client;
+mod diag;
 mod endpoint;
 mod error;
 mod journal;
@@ -45,8 +46,12 @@ pub use wire::Sig;
 pub const JOURNAL_FILE: &str = "journal.ndjson";
 /// File name of the liveness lock inside a session directory.
 pub const LOCK_FILE: &str = "shim.lock";
-/// File name of the shim's own diagnostic log (its stderr when started by [`spawn_detached`]).
+/// File name of the shim's own diagnostic log: NDJSON diagnostic records (`wasit-diag`) that
+/// the shim process writes itself and rotates at 256 KiB, keeping `shim.log.1`.
 pub const LOG_FILE: &str = "shim.log";
+/// File name of the shim's stderr: raw crash output of the process, a few bytes at most, never
+/// exported. [`spawn_detached`] opens it; a new shim cuts it to nothing when it is over 64 KiB.
+pub const STDERR_FILE: &str = "shim.stderr";
 
 /// Path of the control endpoint for a session directory: the Unix socket path, or the Windows
 /// named-pipe name.

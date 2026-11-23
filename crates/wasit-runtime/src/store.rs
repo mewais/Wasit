@@ -12,9 +12,16 @@
 //! ```
 //!
 //! `<run>` is [`RuntimeConfig::run_dir`] (machine-local), or `<root>` when unset.
+//!
+//! Everything in a session directory is private to the owner (design S23, leak L4): the
+//! directories are `0700` and the files `0600` on Unix (nothing is done on Windows), created so
+//! and, for what an older build left wider, tightened when the manager adopts the session
+//! ([`tighten_session`]). The helpers here are the only way the runtime creates such
+//! directories and files.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -97,8 +104,72 @@ pub(crate) async fn read(dir: &Path) -> Result<SessionFile, String> {
 pub(crate) async fn write(dir: &Path, file: &SessionFile) -> std::io::Result<()> {
     let text = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
     let tmp = dir.join(format!("{SESSION_FILE}.tmp"));
-    tokio::fs::write(&tmp, text).await?;
+    write_private(&tmp, &text).await?;
     tokio::fs::rename(&tmp, dir.join(SESSION_FILE)).await
+}
+
+/// Creates `path` and its missing parents as private directories (`0700`); an existing `path`
+/// is tightened.
+pub(crate) async fn private_dir_all(path: &Path) -> io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || wasit_diag::private::create_dir_all(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Opens a file private to its owner (`0600` when created; one that exists is tightened first),
+/// with the options `configure` sets on top of `create(true)`.
+pub(crate) async fn open_private(
+    path: &Path,
+    configure: impl FnOnce(&mut tokio::fs::OpenOptions),
+) -> io::Result<tokio::fs::File> {
+    let tighten = path.to_path_buf();
+    tokio::task::spawn_blocking(move || wasit_diag::private::tighten_file(&tighten))
+        .await
+        .map_err(io::Error::other)??;
+    let mut options = tokio::fs::OpenOptions::from(wasit_diag::private::file_options());
+    configure(&mut options);
+    options.open(path).await
+}
+
+/// Writes `bytes` to the private file `path`, replacing its contents.
+pub(crate) async fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut f = open_private(path, |o| {
+        o.write(true).truncate(true);
+    })
+    .await?;
+    f.write_all(bytes).await?;
+    f.flush().await
+}
+
+/// Tightens a session directory an older build created: the directory itself, and the files and
+/// directories directly in it (`journal.ndjson`, `session.json`, `shim.log`, `blobs/`, …). What
+/// is inside those directories is reachable only through them, so it is not walked. The first
+/// failure is returned after the rest was tried.
+pub(crate) async fn tighten_session(dir: &Path) -> io::Result<()> {
+    use wasit_diag::private::{tighten_dir, tighten_file};
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut first = tighten_dir(&dir).err();
+        for ent in std::fs::read_dir(&dir)? {
+            let ent = ent?;
+            let kind = ent.file_type()?;
+            let done = if kind.is_dir() {
+                tighten_dir(&ent.path())
+            } else if kind.is_file() {
+                tighten_file(&ent.path())
+            } else {
+                Ok(())
+            };
+            if let Err(e) = done {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Write the renderer's generated files into the session directory.
@@ -117,11 +188,11 @@ pub(crate) async fn write_generated(dir: &Path, spec: &SpawnSpec) -> Result<(), 
         }
         let path = dir.join(rel);
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
+            private_dir_all(parent)
                 .await
                 .map_err(|e| RuntimeError::Io(format!("create {}: {e}", parent.display())))?;
         }
-        tokio::fs::write(&path, &f.contents)
+        write_private(&path, f.contents.as_bytes())
             .await
             .map_err(|e| RuntimeError::Io(format!("write {}: {e}", path.display())))?;
     }

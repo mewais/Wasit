@@ -82,6 +82,16 @@ pub fn kill_pid(pid: u64) {
         .status();
 }
 
+/// `kill -SIGNAL pid` (the test needs no libc for it).
+pub fn kill_with(signal: &str, pid: u32) {
+    let st = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
 pub fn hostd() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_wasit-hostd"))
 }
@@ -109,6 +119,63 @@ pub fn fake() -> PathBuf {
         wasit_fake_cli::fake_cli_path().expect("fake CLI built")
     })
     .clone()
+}
+
+/// The options of a `wasit-hostd serve` over `data` whose sessions run the fake CLI.
+pub fn daemon_args(data: &Path) -> Vec<String> {
+    let mut v = vec![
+        "--data".to_string(),
+        data.to_string_lossy().into_owned(),
+        "--stop-grace-ms".into(),
+        "500".into(),
+    ];
+    for d in DRIVERS {
+        v.push("--driver-bin".into());
+        v.push(format!("{d}={}", fake().display()));
+        v.push("--driver-env".into());
+        v.push(format!("{d}=WASIT_FAKE_PERSONA={d}"));
+    }
+    v
+}
+
+/// `wasit-hostd serve` over `data`, not yet started: stdin closed, stdout piped (its readiness
+/// line), killed when the handle drops. The caller sets stderr, adds arguments or environment.
+pub fn daemon_command(data: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(hostd());
+    cmd.arg("serve")
+        .args(daemon_args(data))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
+/// Waits for the readiness line of a daemon started with [`daemon_command`].
+pub async fn await_ready(child: &mut tokio::process::Child) {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    let out = child.stdout.take().unwrap();
+    tokio::time::timeout(T, tokio::io::BufReader::new(out).read_line(&mut line))
+        .await
+        .expect("daemon readiness")
+        .unwrap();
+    assert!(line.contains("\"ready\":true"), "{line:?}");
+}
+
+pub async fn start_daemon(data: &Path) -> tokio::process::Child {
+    let mut child = daemon_command(data)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    await_ready(&mut child).await;
+    child
+}
+
+pub fn client(data: &Path) -> wasit_runtime::RuntimeClient {
+    wasit_runtime::RuntimeClient::connect_endpoint(
+        wasit_control::local_endpoint(&data.join("hostd.sock")),
+        wasit_control::Hello::new("test", "gui-test", "gui"),
+    )
 }
 
 pub fn timeouts() -> Timeouts {

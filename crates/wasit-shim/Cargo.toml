@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 wasit-process = { path = "../wasit-process" }
+wasit-diag = { path = "../wasit-diag", default-features = false }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

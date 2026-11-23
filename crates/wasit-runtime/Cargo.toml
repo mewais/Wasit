@@ -13,11 +13,16 @@ name = "wasit-hostd"
 path = "src/bin/wasit-hostd.rs"
 
 [features]
+# `wasit-hostd serve --panic-test <marker>`: panics with a message holding the marker once its
+# diagnostics are installed. For tests/diag_panic.rs; enabled by this package's dev-dependency
+# on itself below, so no build for use has it.
+panic-test = []
 # TypeScript definitions of the wire types (ts-rs), for GUI clients.
 ts = ["dep:ts-rs", "wasit-core/ts", "wasit-control/ts"]
 
 [dependencies]
 wasit-process = { path = "../wasit-process" }
+wasit-diag = { path = "../wasit-diag" }
 ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
 wasit-core = { path = "../wasit-core" }
 wasit-claude = { path = "../wasit-claude" }
@@ -37,5 +42,6 @@ fastrand = "2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 
 [dev-dependencies]
+wasit-runtime = { path = ".", features = ["panic-test"] }
 tempfile = "3"
 wasit-fake-cli = { path = "../wasit-fake-cli" }
