@@ -132,7 +132,6 @@ pub enum LinkState {
         /// is the person's click ([`Supervised::reconnect_now`]), and it will ask them
         /// something. `detail` is the hook's words.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        #[cfg_attr(feature = "ts", ts(optional))]
         held: bool,
     },
     /// Different protocol major and nothing can fix it automatically. Waits for
