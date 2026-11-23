@@ -131,6 +131,8 @@ pub mod codes {
     pub const IO: &str = "io";
     pub const BUSY: &str = "busy";
     pub const GATE_WITHDRAWN: &str = "gate_withdrawn";
+    pub const CONTINUE_FAILED: &str = "continue_failed";
+    pub const BAD_WORKING_DIRECTORY: &str = "bad_working_directory";
 }
 
 /// A session id: 12 characters of lowercase RFC 4648 base32 (`a-z2-7`).
@@ -300,6 +302,34 @@ pub struct ExitSummary {
     pub requested: bool,
 }
 
+/// Why a session cannot be continued ([`SessionSnapshot::not_continuable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum NotContinuable {
+    /// The process is running (or starting): there is nothing to continue.
+    NotEnded,
+    /// The snapshot is still being rebuilt from the journal (`loaded` is `false`).
+    Loading,
+    /// The agent cannot resume a conversation.
+    AgentCannotResume,
+    /// The agent has not reported a conversation id yet and none was chosen for it.
+    NoConversationId,
+    /// The agent reported a conversation id but has not saved the conversation (it saves it with
+    /// its first turn), so there is nothing to resume and the id cannot be used to start again.
+    NothingSaved,
+}
+
+/// A command the user runs in their own terminal ([`SessionSnapshot::resume_command`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ResumeCommand {
+    /// The program and its arguments; never a shell string.
+    pub argv: Vec<String>,
+    /// The directory to run it in: the session's working directory.
+    pub cwd: String,
+}
+
 /// The continuously reduced state of one session. Rebuilt exactly by replaying its journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -325,8 +355,23 @@ pub struct SessionSnapshot {
     pub generation: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// The agent's own id of the conversation, known from the session's creation when the agent
+    /// accepts an id chosen by the runtime (or the session resumes one), else once the agent
+    /// reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
+    /// A new process generation can be started now (`sessions.continue`, or a prompt sent to the
+    /// session, which continues it first). Decided by the runtime alone, from the driver's
+    /// capabilities and the session's state; clients show what it says.
+    #[serde(default)]
+    pub continuable: bool,
+    /// Why not, when `continuable` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_continuable: Option<NotContinuable>,
+    /// How the user opens this conversation in their own CLI, when the agent's storage holds it
+    /// and the driver knows a command; clients only show or copy it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command: Option<ResumeCommand>,
     /// The first prompt, truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -701,6 +746,11 @@ pub struct CreateSession {
     pub config: AgentConfig,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// The session's name: its display name exactly as `sessions.rename` would set it (trimmed,
+    /// bounded; blank is none), and, where the agent's CLI can name its own conversation when it
+    /// starts one, the conversation's title in the agent's own storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl CreateSession {
@@ -715,6 +765,7 @@ impl CreateSession {
             resume: ResumeRequest::New,
             config: AgentConfig::default(),
             labels: BTreeMap::new(),
+            name: None,
         }
     }
 }
@@ -724,6 +775,11 @@ impl CreateSession {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CreateSessionReply {
     pub id: SessionId,
+    /// The working directory as the host normalised it (`~` expanded, canonical): what the
+    /// session runs in and its snapshot reports; clients that remember project folders store
+    /// this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Config items the driver could not honour (the launch did not fail).
     #[serde(default)]
     pub unsupported: Vec<Unsupported>,
@@ -851,6 +907,16 @@ pub enum CommandError {
     /// The gate was withdrawn (the request that raised it is gone); the answer did nothing.
     #[error("the gate {request_id} is no longer needed (withdrawn)")]
     GateWithdrawn { request_id: String },
+    /// The session had ended and sending the command continues it first; the continue failed,
+    /// so nothing was journaled for the command and it was not sent.
+    #[error("the session had ended and could not be continued, so nothing was sent: {reason}")]
+    ContinueFailed {
+        reason: String,
+        /// The rule that forbids continuing, when that is why (see
+        /// [`SessionSnapshot::not_continuable`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked: Option<NotContinuable>,
+    },
 }
 
 impl CommandError {
@@ -863,6 +929,7 @@ impl CommandError {
             CommandError::Busy => codes::BUSY,
             CommandError::SessionNotFound { .. } => codes::SESSION_NOT_FOUND,
             CommandError::GateWithdrawn { .. } => codes::GATE_WITHDRAWN,
+            CommandError::ContinueFailed { .. } => codes::CONTINUE_FAILED,
         }
     }
 }
@@ -890,6 +957,9 @@ pub enum RuntimeError {
     Busy(String),
     #[error("timed out: {0}")]
     Timeout(String),
+    /// The working directory was refused (it names the path as given).
+    #[error("{0}")]
+    WorkingDirectory(String),
 }
 
 impl RuntimeError {
@@ -904,6 +974,7 @@ impl RuntimeError {
             RuntimeError::Io(_) => codes::IO,
             RuntimeError::Busy(_) => codes::BUSY,
             RuntimeError::Timeout(_) => wasit_control::codes::TIMEOUT,
+            RuntimeError::WorkingDirectory(_) => codes::BAD_WORKING_DIRECTORY,
         }
     }
 }

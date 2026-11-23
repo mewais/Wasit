@@ -20,7 +20,9 @@
 mod actor;
 mod client;
 mod config;
+mod continuation;
 mod core;
+mod cwd;
 mod diag;
 mod diag_service;
 mod discovery;

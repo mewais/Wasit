@@ -20,7 +20,8 @@ use wasit_core::{
     parse_named_version, skills_from_listing, AgentConfig, BusyPrompt, ConfigItem, ConfigItemKind,
     ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind, DiscoveryProbe,
     DriverCapabilities, DriverDescriptor, DriverId, FileInput, McpServerConfig, McpTransport,
-    ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession, SpawnSpec, Unsupported,
+    ProbeAction, ProbeOutput, PromptInput, Protocol, ResumableSession, SavesConversation,
+    SpawnSpec, Unsupported,
 };
 
 pub use protocol::{CodexProtocol, SKILL_ROOTS_OPTION};
@@ -89,6 +90,23 @@ impl DriverDescriptor for CodexDescriptor {
             embeds_bytes: false,
             ..PromptInput::images_and(FileInput::PathReference, 20 * 1024 * 1024)
         }
+    }
+
+    /// Verified with codex-cli 0.161.0: `thread/start` reports a thread id at once but writes no
+    /// rollout until a turn runs, and `thread/resume` of such a thread fails with "no rollout
+    /// found for thread id". (`thread/start` has no parameter for a caller-chosen id, so a
+    /// thread cannot be started again under its id either.)
+    fn saves_conversation(&self) -> SavesConversation {
+        SavesConversation::OnFirstTurn
+    }
+
+    /// `codex resume <id>` (codex-cli 0.161.0: "Session id (UUID) or session name").
+    fn user_resume_argv(&self, native_session_id: &str) -> Option<Vec<String>> {
+        Some(vec![
+            self.default_binary().to_string(),
+            "resume".to_string(),
+            native_session_id.to_string(),
+        ])
     }
 
     fn new_protocol(&self) -> Box<dyn Protocol> {

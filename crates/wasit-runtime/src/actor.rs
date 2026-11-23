@@ -34,14 +34,15 @@ use wasit_core::{Command, DriverDescriptor, ResumeMode, SpawnSpec};
 use wasit_shim::{Error as ShimError, Record, RecordStream, ShimClient, ShimState, Sig};
 
 use crate::config::RuntimeConfig;
-use crate::core::Core;
+use crate::continuation::{Continuation, Held};
+use crate::core::{ContinuePlan, Core};
 use crate::diag::{self, Intent};
 use crate::note::RuntimeNote;
 use crate::store::{self, SessionFile};
 use crate::stream::Subscriber;
 use crate::wire::{
-    CommandError, CommandOutcome, HistoryPage, RuntimeError, SessionEvent, SessionId,
-    SessionSnapshot, TrailPage,
+    CommandError, CommandOutcome, HistoryPage, NotContinuable, Phase, RuntimeError, SessionEvent,
+    SessionId, SessionSnapshot, TrailPage,
 };
 
 /// Bound on commands awaiting their journal round trip, and on messages deferred while the
@@ -163,6 +164,12 @@ enum Reply {
 
 struct Pending {
     reply: Reply,
+    /// The command was held behind a continue: when the process it was to run in is gone, that
+    /// is the continue's failure, and the sender is told so ([`CommandError::ContinueFailed`]).
+    continued: bool,
+    /// The shim refused the note because the process had already exited (the error it said):
+    /// the answer is how the process ended, which the journal tells.
+    note_failed: Option<String>,
     deadline: Instant,
     /// What the request is, for the records about it (commands and gate operations; a stop has
     /// none).
@@ -216,7 +223,8 @@ pub(crate) struct Actor {
     attach_token: String,
     pending: HashMap<String, Pending>,
     deferred: VecDeque<Msg>,
-    pending_continue: Option<UnitReply>,
+    /// A continue under way: who waits for it, what is held behind it.
+    continuation: Continuation,
     pending_spec: SpawnSpec,
     /// The trace id journaled with the `start` note of the first generation.
     start_trace: Option<TraceId>,
@@ -225,6 +233,46 @@ pub(crate) struct Actor {
     stop_stage: Option<(Instant, StopStage)>,
     reconnect_at: Option<Instant>,
     reconnect_attempt: u32,
+}
+
+/// Why a continue could not start.
+struct ContinueRefused {
+    error: RuntimeError,
+    /// The rule that forbids it, when that is why.
+    blocked: Option<NotContinuable>,
+}
+
+impl ContinueRefused {
+    fn state(blocked: NotContinuable, why: &str) -> Self {
+        ContinueRefused {
+            error: RuntimeError::InvalidState(why.to_string()),
+            blocked: Some(blocked),
+        }
+    }
+}
+
+/// Which commands continue an ended session before they are applied: the product rule is that
+/// a prompt (and a slash command) sent to an ended session carries on the conversation; every
+/// other command to a session without a process keeps answering "not running".
+fn continues_the_session(command: &Command) -> bool {
+    matches!(command, Command::Prompt { .. } | Command::RunSlash { .. })
+}
+
+/// How an ended phase reads in an error.
+fn describe_end(phase: &Phase) -> String {
+    match phase {
+        Phase::Failed {
+            reason,
+            stderr_tail,
+        } => match stderr_tail.last() {
+            Some(line) => format!("{reason}: {line}"),
+            None => reason.clone(),
+        },
+        Phase::Exited { code: Some(c) } => format!("it exited with code {c}"),
+        Phase::Exited { code: None } => "it exited".to_string(),
+        Phase::Lost { reason } => reason.clone(),
+        other => format!("it is {}", other.name()),
+    }
 }
 
 fn token() -> String {
@@ -353,7 +401,7 @@ impl Actor {
             attach_token: token(),
             pending: HashMap::new(),
             deferred: VecDeque::new(),
-            pending_continue: None,
+            continuation: Continuation::Idle,
             start_trace: init.start_trace,
             handshake_deadline: None,
             stop_stage: None,
@@ -413,9 +461,16 @@ impl Actor {
                     token: None,
                     attach: true,
                 });
-                if let Some(r) = self.pending_continue.take() {
-                    // The reply only means the spawn worked.
-                    let _ = r.send(Ok(())); // requester may have given up
+                // A continue that was starting has its shim now: everybody who waited for it
+                // is told, and the commands held behind it are journaled right after the
+                // attach note, in the order they arrived (the generation's `start` note follows
+                // at the boundary; the core applies them after it, as a replay does).
+                let waiting = self.continuation.attached();
+                for h in waiting.held {
+                    self.journal_command(h.command, h.reply, h.intent, true);
+                }
+                for r in waiting.stops {
+                    self.request_stop(r);
                 }
             }
             Source::Offline(stream, state) => {
@@ -427,6 +482,7 @@ impl Actor {
                 self.reconnect_attempt += 1;
                 if self.reconnect_attempt > self.cfg.timeouts.reconnect_attempts {
                     diag::lost(&self.id, &reason);
+                    // (Also ends a continue that was starting: see `lose`.)
                     self.lose(&format!("cannot reach the shim: {reason}"));
                     self.finish_loading();
                 } else {
@@ -435,11 +491,7 @@ impl Actor {
                     self.reconnect_at = Some(Instant::now() + backoff);
                 }
             }
-            Source::SpawnFailed(reason) => {
-                if let Some(r) = self.pending_continue.take() {
-                    let _ = r.send(Err(RuntimeError::Spawn(reason))); // requester may have given up
-                }
-            }
+            Source::SpawnFailed(reason) => self.fail_continue(RuntimeError::Spawn(reason)),
         }
     }
 
@@ -494,6 +546,15 @@ impl Actor {
             ));
         } else {
             let state = self.offline_state.take();
+            if self.continuation.is_starting() {
+                // The new shim had already finished when we looked for it: we never attached,
+                // so nothing could be journaled for anybody who waited; its journal (read just
+                // now) shows how it ended.
+                let how = describe_end(&self.core.snapshot().phase);
+                self.fail_continue(RuntimeError::Spawn(format!(
+                    "the new process had already ended before the runtime could attach to it ({how})"
+                )));
+            }
             if !self.core.process_ended() {
                 let reason = match state {
                     Some(ShimState::Exited(_)) => {
@@ -513,9 +574,22 @@ impl Actor {
         self.live = false;
         self.handshake_deadline = None;
         self.stop_stage = None;
+        if let Some(waiting) = self.continuation.connection_lost() {
+            // What was journaled into the new shim's window before the core saw its `spawned`
+            // record will not be applied: say so instead of waiting for the deadline.
+            let why = "the new process's shim went away before the process started";
+            for r in waiting {
+                let _ = r.send(Err(RuntimeError::Spawn(why.into()))); // requester may have given up
+            }
+            self.fail_pending(why);
+        }
     }
 
     fn lose(&mut self, reason: &str) {
+        // A continue that cannot reach its shim ends here, with everybody who waited for it.
+        self.fail_continue(RuntimeError::Spawn(format!(
+            "could not reach the new process: {reason}"
+        )));
         let events = self.core.mark_lost(reason);
         if !events.is_empty() {
             self.snapshot_dirty = true;
@@ -524,6 +598,30 @@ impl Actor {
         self.fail_pending(reason);
         self.handshake_deadline = None;
         self.stop_stage = None;
+    }
+
+    /// A continue that was starting ended without a new process the runtime can talk to: the
+    /// requests that asked for it get `error`; the commands held behind it were never journaled
+    /// and get [`CommandError::ContinueFailed`] saying why.
+    fn fail_continue(&mut self, error: RuntimeError) {
+        let waiting = self.continuation.failed();
+        for r in waiting.continues {
+            let _ = r.send(Err(error.clone())); // requester may have given up
+        }
+        for h in waiting.held {
+            self.refuse(
+                &h.intent,
+                h.reply,
+                CommandError::ContinueFailed {
+                    reason: error.to_string(),
+                    blocked: None,
+                },
+            );
+        }
+        for r in waiting.stops {
+            // There is no process: what a stop wants.
+            let _ = r.send(Ok(())); // requester may have given up
+        }
     }
 
     fn fail_pending(&mut self, reason: &str) {
@@ -552,16 +650,36 @@ impl Actor {
             crate::media::write_blob(&self.dir, id, bytes);
         }
         let resolved = out.resolved;
+        let continued = if out.spawned {
+            // The core shows the new generation now.
+            self.continuation.spawned()
+        } else {
+            Vec::new()
+        };
         if !out.events.is_empty() {
             self.publish(out.events);
         }
         // Requesters answered below see the state their request produced.
         self.publish_snapshot();
+        for r in continued {
+            // The new process is up and attached, and the snapshot shows it.
+            let _ = r.send(Ok(())); // requester may have given up
+        }
         for (tok, status) in resolved {
             if let Some(p) = self.pending.remove(&tok) {
                 match p.reply {
                     Reply::Command(r) => {
-                        let _ = r.send(status.into_result()); // requester may have given up
+                        let result = match status.into_result() {
+                            // The process the command waited for ended before it started.
+                            Err(CommandError::NotRunning { reason }) if p.continued => {
+                                Err(CommandError::ContinueFailed {
+                                    reason,
+                                    blocked: None,
+                                })
+                            }
+                            other => other,
+                        };
+                        let _ = r.send(result); // requester may have given up
                     }
                     Reply::Stop(r) => {
                         let _ = r.send(Ok(())); // requester may have given up
@@ -587,6 +705,7 @@ impl Actor {
             self.on_boundary();
         }
         if out.exited {
+            self.answer_refused_notes();
             self.handshake_deadline = None;
             self.stop_stage = None;
             self.outbox
@@ -724,8 +843,20 @@ impl Actor {
         };
         match op {
             Op::Note { token: Some(t), .. } => {
-                if let Some(p) = self.pending.remove(&t) {
-                    self.answer_not_running(p, &e.to_string());
+                if let Some(mut p) = self.pending.remove(&t) {
+                    if p.continued {
+                        // Handed to the shim of a continue, which refused: its process is gone.
+                        // How it ended is in the journal; the answer waits for that record
+                        // (unless the core has it already).
+                        if !self.continuation.is_attached() && self.core.process_ended() {
+                            self.answer_ended_before_prompt(p);
+                        } else {
+                            p.note_failed = Some(e.to_string());
+                            self.pending.insert(t, p);
+                        }
+                    } else {
+                        self.answer_not_running(p, &e.to_string());
+                    }
                 }
             }
             Op::Note { attach: true, .. } => {
@@ -874,28 +1005,15 @@ impl Actor {
             } => self.command(command, trace, reply),
             Msg::Gate { op, reply } => self.gate(op, reply),
             Msg::Stop { reply } => {
-                if !self.core.process_running() {
+                if let Some(w) = self.continuation.waiting() {
+                    // The process this stops is not there yet: the stop is journaled as soon as
+                    // its shim is attached (or answered, if it never is).
+                    w.stops.push(reply);
+                } else if !self.takes_commands() {
                     let _ = reply.send(Ok(())); // requester may have given up
-                    return;
+                } else {
+                    self.request_stop(reply);
                 }
-                if self.pending.len() >= MAX_PENDING {
-                    let _ = reply.send(Err(RuntimeError::Busy("too many pending requests".into())));
-                    return;
-                }
-                let tok = token();
-                self.push_op(Op::Note {
-                    data: RuntimeNote::Stop { token: tok.clone() }.to_value(),
-                    token: Some(tok.clone()),
-                    attach: false,
-                });
-                self.pending.insert(
-                    tok,
-                    Pending {
-                        reply: Reply::Stop(reply),
-                        deadline: Instant::now() + self.cfg.timeouts.command,
-                        intent: None,
-                    },
-                );
             }
             Msg::Continue { reply } => self.continue_session(reply),
             Msg::Rename { name, reply } => {
@@ -908,6 +1026,30 @@ impl Actor {
                 self.publish_snapshot();
             }
         }
+    }
+
+    /// Journal a stop of the running process; the reply comes when the core applies it.
+    fn request_stop(&mut self, reply: UnitReply) {
+        if self.pending.len() >= MAX_PENDING {
+            let _ = reply.send(Err(RuntimeError::Busy("too many pending requests".into())));
+            return;
+        }
+        let tok = token();
+        self.push_op(Op::Note {
+            data: RuntimeNote::Stop { token: tok.clone() }.to_value(),
+            token: Some(tok.clone()),
+            attach: false,
+        });
+        self.pending.insert(
+            tok,
+            Pending {
+                reply: Reply::Stop(reply),
+                continued: false,
+                note_failed: None,
+                deadline: Instant::now() + self.cfg.timeouts.command,
+                intent: None,
+            },
+        );
     }
 
     /// Queue a write of the actor's copy of `session.json`; `done` is answered once it is on disk.
@@ -960,11 +1102,36 @@ impl Actor {
             self.refuse(&intent, reply, CommandError::GateWithdrawn { request_id });
             return;
         }
-        if !self.core.process_running() {
-            let reason = format!("the session is {}", self.core.snapshot().phase.name());
-            self.refuse(&intent, reply, CommandError::NotRunning { reason });
+        if !self.takes_commands() {
+            if continues_the_session(&command) {
+                self.continue_for(command, reply, intent);
+            } else {
+                let reason = format!("the session is {}", self.core.snapshot().phase.name());
+                self.refuse(&intent, reply, CommandError::NotRunning { reason });
+            }
             return;
         }
+        // A prompt journaled into the window of a continue is part of that continue: if its
+        // process is gone, that is the continue's failure.
+        let continued = self.continuation.is_attached() && continues_the_session(&command);
+        self.journal_command(command, reply, intent, continued);
+    }
+
+    /// The journal takes commands for a process: the core shows one running, or the shim of a
+    /// continue is attached (its `spawned` record is the next thing the core will apply).
+    fn takes_commands(&self) -> bool {
+        self.core.process_running() || self.continuation.is_attached()
+    }
+
+    /// Journal `command` as a note; its result is delivered when the note comes back through the
+    /// journal and the core applies it, exactly as a replay will.
+    fn journal_command(
+        &mut self,
+        command: Command,
+        reply: CommandReply,
+        intent: Intent,
+        continued: bool,
+    ) {
         if self.pending.len() >= MAX_PENDING {
             self.refuse(&intent, reply, CommandError::Busy);
             return;
@@ -984,10 +1151,48 @@ impl Actor {
             tok,
             Pending {
                 reply: Reply::Command(reply),
+                continued,
+                note_failed: None,
                 deadline: Instant::now() + self.cfg.timeouts.command,
                 intent: Some(intent),
             },
         );
+    }
+
+    /// A command that continues an ended session as its first step: starts the continue unless
+    /// one is under way, and holds the command until its shim is attached. Nothing is journaled
+    /// for the command until then; if the continue cannot start, the sender gets
+    /// [`CommandError::ContinueFailed`] and the session is as it was.
+    fn continue_for(&mut self, command: Command, reply: CommandReply, intent: Intent) {
+        if self.pending.len() + self.continuation.held() >= MAX_PENDING {
+            self.refuse(&intent, reply, CommandError::Busy);
+            return;
+        }
+        if self.continuation.is_idle() {
+            if let Err(refused) = self.begin_continue() {
+                let err = if refused.blocked == Some(NotContinuable::NotEnded) {
+                    // No process is shown, but nothing has ended either (the journal has no
+                    // record of a process yet): there is nothing to continue.
+                    CommandError::NotRunning {
+                        reason: format!("the session is {}", self.core.snapshot().phase.name()),
+                    }
+                } else {
+                    CommandError::ContinueFailed {
+                        reason: refused.error.to_string(),
+                        blocked: refused.blocked,
+                    }
+                };
+                self.refuse(&intent, reply, err);
+                return;
+            }
+        }
+        if let Some(w) = self.continuation.waiting() {
+            w.held.push(Held {
+                command,
+                reply,
+                intent,
+            });
+        }
     }
 
     /// Answers a command-like request that cannot be journaled, and records that it was refused.
@@ -1000,8 +1205,15 @@ impl Actor {
     fn answer_not_running(&self, p: Pending, reason: &str) {
         match p.reply {
             Reply::Command(r) => {
-                let err = CommandError::NotRunning {
-                    reason: reason.to_string(),
+                let err = if p.continued {
+                    CommandError::ContinueFailed {
+                        reason: reason.to_string(),
+                        blocked: None,
+                    }
+                } else {
+                    CommandError::NotRunning {
+                        reason: reason.to_string(),
+                    }
                 };
                 if let Some(i) = &p.intent {
                     diag::command_refused(&self.id, i, &err);
@@ -1011,6 +1223,30 @@ impl Actor {
             Reply::Stop(r) => {
                 // The process is gone, which is what a stop wants.
                 let _ = r.send(Ok(())); // requester may have given up
+            }
+        }
+    }
+
+    /// A command held behind a continue could not be given to the new process: it ended first.
+    fn answer_ended_before_prompt(&self, p: Pending) {
+        let how = describe_end(&self.core.snapshot().phase);
+        self.answer_not_running(
+            p,
+            &format!("the new process ended before it could be given the command ({how})"),
+        );
+    }
+
+    /// The core applied the exit of a process some held command could not be given to.
+    fn answer_refused_notes(&mut self) {
+        let refused: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.note_failed.is_some())
+            .map(|(t, _)| t.clone())
+            .collect();
+        for t in refused {
+            if let Some(p) = self.pending.remove(&t) {
+                self.answer_ended_before_prompt(p);
             }
         }
     }
@@ -1085,75 +1321,127 @@ impl Actor {
             tok,
             Pending {
                 reply: Reply::Command(reply),
+                continued: false,
+                note_failed: None,
                 deadline: Instant::now() + self.cfg.timeouts.command,
                 intent: Some(intent),
             },
         );
     }
 
+    /// `sessions.continue`: the new process is up and attached when this answers `Ok`. A
+    /// continue already under way is joined, not refused.
     fn continue_session(&mut self, reply: UnitReply) {
-        if self.core.process_running() {
-            let _ = reply.send(Err(RuntimeError::InvalidState(
-                "the session is still running".into(),
-            ))); // requester may have given up
-            return;
+        match &self.continuation {
+            Continuation::Starting(_) => {
+                if let Some(w) = self.continuation.waiting() {
+                    w.continues.push(reply);
+                }
+            }
+            Continuation::Attached(_) => {
+                // The new shim is attached; the journal shows its process next.
+                let _ = self.continuation.join_attached(reply);
+            }
+            Continuation::Idle => match self.begin_continue() {
+                Ok(()) => {
+                    if let Some(w) = self.continuation.waiting() {
+                        w.continues.push(reply);
+                    }
+                }
+                Err(refused) => {
+                    let _ = reply.send(Err(refused.error)); // requester may have given up
+                }
+            },
         }
-        if self.stream_is_live && self.stream.is_some() {
-            // The previous generation's shim is only lingering to deliver records we already
-            // have (its process ended); let it go.
+    }
+
+    /// Start a new process generation of an ended session: the runtime's rule says whether it
+    /// can be, and how (resume the agent's conversation if it holds it, else start it fresh under
+    /// the id chosen for it), from the session's facts alone. On `Ok` the continuation is
+    /// `Starting` and the shim is being spawned; the caller adds who waits for it.
+    fn begin_continue(&mut self) -> Result<(), ContinueRefused> {
+        let plan = self.core.continue_plan().map_err(|blocked| {
+            let error = match blocked {
+                NotContinuable::NotEnded => {
+                    RuntimeError::InvalidState("the session is still running".into())
+                }
+                NotContinuable::Loading => {
+                    RuntimeError::InvalidState("the session is still loading".into())
+                }
+                NotContinuable::AgentCannotResume => RuntimeError::Unsupported(format!(
+                    "driver {} cannot resume sessions",
+                    self.desc.id()
+                )),
+                NotContinuable::NoConversationId => RuntimeError::InvalidState(
+                    "the CLI never reported a native session id; nothing to resume".into(),
+                ),
+                NotContinuable::NothingSaved => RuntimeError::InvalidState(
+                    "the agent has not saved this conversation yet (it saves it with its first \
+                     message), so there is nothing to resume"
+                        .into(),
+                ),
+            };
+            ContinueRefused {
+                error,
+                blocked: Some(blocked),
+            }
+        })?;
+        if self.stream.is_some() {
+            // The previous generation's journal (a lingering shim, or the file of a finished
+            // one) is only still being read for records we already have, the last of which
+            // ended its process: let it go.
             self.stream = None;
             self.drop_connection();
         }
-        if self.pending_continue.is_some() || self.source.is_some() || self.stream.is_some() {
-            let _ = reply.send(Err(RuntimeError::InvalidState(
-                "the session is already being continued".into(),
-            ))); // requester may have given up
-            return;
+        if self.source.is_some() {
+            return Err(ContinueRefused::state(
+                NotContinuable::Loading,
+                "the session is still being read",
+            ));
         }
-        if !self.desc.capabilities().resume {
-            let _ = reply.send(Err(RuntimeError::Unsupported(format!(
-                "driver {} cannot resume sessions",
-                self.desc.id()
-            )))); // requester may have given up
-            return;
-        }
-        let native = self
-            .core
-            .snapshot()
-            .native_session_id
-            .clone()
-            .or_else(|| self.file.native_session_id.clone());
-        let Some(native) = native else {
-            let _ = reply.send(Err(RuntimeError::InvalidState(
-                "the CLI never reported a native session id; nothing to resume".into(),
-            ))); // requester may have given up
-            return;
-        };
+        // One owner of the connection: a reconnect scheduled for the previous process has no
+        // process to reach any more.
+        self.reconnect_at = None;
         let mut spec = self.file.spec.clone();
-        spec.resume = ResumeMode::Resume(native);
         // The first prompt belongs to the first generation (its `start` note); a continued
         // session starts without one.
         spec.first_prompt = None;
+        match plan {
+            ContinuePlan::Resume(id) => {
+                spec.resume = ResumeMode::Resume(id);
+                spec.native_session_id = None;
+                // The conversation has its title; the user may have renamed the session since.
+                spec.name = None;
+            }
+            ContinuePlan::StartFresh(id) => {
+                // The agent never stored the conversation: it starts now, under the id chosen for
+                // it, and gets the session's name as it is today.
+                spec.resume = ResumeMode::Fresh;
+                spec.native_session_id = Some(id);
+                spec.name = self.file.display_name.clone();
+            }
+        }
         // A session created before session ids gets one now: the new generation's protocol
         // starts fresh, so its lines may differ from the old generation's.
         if spec.session_id.is_none() {
             spec.session_id = Some(self.id.to_string());
         }
-        let shim_spec = match store::shim_spec(&self.cfg, self.desc.as_ref(), &self.dir, &spec) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = reply.send(Err(e)); // requester may have given up
-                return;
-            }
-        };
+        let shim_spec =
+            store::shim_spec(&self.cfg, self.desc.as_ref(), &self.dir, &spec).map_err(|error| {
+                ContinueRefused {
+                    error,
+                    blocked: None,
+                }
+            })?;
         self.pending_spec = spec.clone();
         // The trace of the request that created the session belongs to its first generation.
         self.start_trace = None;
         self.file.spec = spec;
         self.save_file(None);
         self.reconnect_attempt = 0;
-        self.pending_continue = Some(reply);
+        self.continuation.begin();
         self.source = Some(spawn_source(shim_spec, self.core.last_seq() + 1));
+        Ok(())
     }
 
     fn subscribe(&mut self, from: Option<u64>) -> SubscribeReply {
@@ -1259,5 +1547,314 @@ async fn persist(dir: PathBuf, initial: SessionFile, mut rx: mpsc::UnboundedRece
         for w in waiters {
             let _ = w.send(result.clone()); // requester may have given up
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Every way out of a continue that is under way, with the requests waiting for it. The
+    //! actor's I/O is not involved: the test hands it the outcome of the spawn the way the run
+    //! loop does (`on_source`, `on_stream_item`).
+
+    use super::*;
+    use crate::core::{Conversation, SessionMeta};
+    use crate::wire::CommandOutcome;
+    use wasit_shim::{ExitInfo, Kind};
+
+    const U: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Best-effort removal of a scratch directory.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An actor of an ended claude session (its first process exited after a stop) with a chosen
+    /// conversation id, not loading, with no I/O under way.
+    fn ended() -> (Actor, Scratch) {
+        let dir =
+            std::env::temp_dir().join(format!("wact-{}-{}", std::process::id(), fastrand::u32(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Arc::new(RuntimeConfig::new(
+            &dir,
+            crate::config::ShimLauncher::binary("/nonexistent/wasit-shim"),
+        ));
+        let desc = wasit_claude::descriptor();
+        let id = SessionId("aaaaaaaaaaaa".into());
+        let spec = SpawnSpec {
+            native_session_id: Some(U.into()),
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            ..SpawnSpec::default()
+        };
+        let file = SessionFile::new(
+            id.clone(),
+            desc.id(),
+            0,
+            Default::default(),
+            spec,
+            Vec::new(),
+        );
+        let meta: SessionMeta = file.meta();
+        assert_eq!(meta.conversation, Conversation::Chosen(U.into()));
+        let (snapshot, _) = watch::channel(Arc::new(crate::core::blank_snapshot(
+            &meta,
+            desc.as_ref(),
+            Phase::Starting,
+            true,
+        )));
+        let mut a = Actor::new(ActorInit {
+            dir: dir.clone(),
+            desc,
+            cfg,
+            file,
+            snapshot,
+            notify: Arc::new(|_| {}),
+            start_trace: None,
+        });
+        // The initial adoption is over: the first generation ended.
+        a.source = None;
+        a.loading = false;
+        for (seq, kind, data) in [
+            (
+                1,
+                Kind::Spawned,
+                serde_json::json!({"pid": 7, "argv": ["claude"]}),
+            ),
+            (2, Kind::Exited, serde_json::json!({"code": 0})),
+        ] {
+            a.core.apply(&Record {
+                seq,
+                t: seq,
+                kind,
+                data,
+                partial: false,
+            });
+        }
+        assert!(
+            a.core.snapshot().continuable,
+            "{:?}",
+            a.core.snapshot().not_continuable
+        );
+        (a, Scratch(dir))
+    }
+
+    type Answer = oneshot::Receiver<Result<CommandOutcome, CommandError>>;
+
+    /// A prompt arrives at the actor; its eventual answer.
+    fn prompt(a: &mut Actor, text: &str) -> Answer {
+        let (reply, rx) = oneshot::channel();
+        a.on_msg(Msg::Command {
+            command: Command::prompt(text),
+            trace: None,
+            reply,
+        });
+        rx
+    }
+
+    fn explicit_continue(a: &mut Actor) -> oneshot::Receiver<Result<(), RuntimeError>> {
+        let (reply, rx) = oneshot::channel();
+        a.on_msg(Msg::Continue { reply });
+        rx
+    }
+
+    /// Nothing was journaled for anybody, and nobody waits any more.
+    fn assert_clean(a: &Actor) {
+        assert!(a.continuation.is_idle());
+        assert!(a.pending.is_empty());
+        assert!(
+            !a.outbox
+                .iter()
+                .any(|op| matches!(op, Op::Note { token: Some(_), .. })),
+            "a command note was queued"
+        );
+    }
+
+    fn continue_failed(
+        r: Result<Result<CommandOutcome, CommandError>, oneshot::error::TryRecvError>,
+    ) -> String {
+        match r {
+            Ok(Err(CommandError::ContinueFailed { reason, .. })) => reason,
+            other => panic!("expected ContinueFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompt_to_an_ended_session_starts_a_continue_and_is_held_not_journaled() {
+        let (mut a, _s) = ended();
+        let mut one = prompt(&mut a, "one");
+        let mut two = prompt(&mut a, "two");
+        // One continue, two held prompts, in order; nothing journaled, nobody answered yet.
+        assert!(a.continuation.is_starting());
+        assert_eq!(a.continuation.held(), 2);
+        assert!(a.source.is_some(), "the shim is being spawned");
+        assert!(a.pending.is_empty());
+        assert!(a.outbox.is_empty());
+        assert!(one.try_recv().is_err() && two.try_recv().is_err());
+        // The spec of the generation was decided from the facts: the conversation was never
+        // stored, so it starts fresh under the chosen id and nothing else.
+        assert_eq!(a.pending_spec.resume, ResumeMode::Fresh);
+        assert_eq!(a.pending_spec.native_session_id.as_deref(), Some(U));
+        assert!(a.pending_spec.first_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_spawn_that_fails_answers_everybody_and_journals_nothing() {
+        let (mut a, _s) = ended();
+        let mut waiter = explicit_continue(&mut a);
+        let mut one = prompt(&mut a, "one");
+        let mut two = prompt(&mut a, "two");
+        a.source = None;
+        a.on_source(Source::SpawnFailed("no such file".into()));
+        assert!(
+            matches!(waiter.try_recv(), Ok(Err(RuntimeError::Spawn(m))) if m == "no such file")
+        );
+        for rx in [&mut one, &mut two] {
+            let reason = continue_failed(rx.try_recv());
+            assert!(reason.contains("no such file"), "{reason}");
+        }
+        assert_clean(&a);
+        // The session is as it was and can be continued again.
+        assert!(a.core.snapshot().continuable);
+        let _again = prompt(&mut a, "three");
+        assert!(a.continuation.is_starting());
+    }
+
+    #[tokio::test]
+    async fn retries_that_run_out_answer_everybody_with_why() {
+        let (mut a, _s) = ended();
+        let mut waiter = explicit_continue(&mut a);
+        let mut one = prompt(&mut a, "one");
+        a.source = None;
+        let attempts = a.cfg.timeouts.reconnect_attempts;
+        for _ in 0..attempts {
+            a.on_source(Source::Retry("connect: refused".into()));
+            assert!(a.continuation.is_starting(), "still trying");
+            a.source = None;
+        }
+        assert!(waiter.try_recv().is_err() && one.try_recv().is_err());
+        a.on_source(Source::Retry("connect: refused".into()));
+        assert!(
+            matches!(waiter.try_recv(), Ok(Err(RuntimeError::Spawn(m))) if m.contains("connect: refused"))
+        );
+        let reason = continue_failed(one.try_recv());
+        assert!(reason.contains("connect: refused"), "{reason}");
+        assert_clean(&a);
+        // The session did not become lost: it is the ended session it was.
+        assert!(matches!(a.core.snapshot().phase, Phase::Exited { .. }));
+        assert!(a.core.snapshot().continuable);
+    }
+
+    #[tokio::test]
+    async fn a_new_shim_that_had_already_ended_answers_everybody_with_how_it_ended() {
+        let (mut a, s) = ended();
+        let mut waiter = explicit_continue(&mut a);
+        let mut one = prompt(&mut a, "one");
+        a.source = None;
+        // What the shim journaled before it was reached: a process that died at once.
+        let journal: String = [
+            r#"{"seq":1,"t":1,"kind":"spawned","data":{"pid":7,"argv":["claude"]}}"#,
+            r#"{"seq":2,"t":2,"kind":"exited","data":{"code":0}}"#,
+            r#"{"seq":3,"t":3,"kind":"spawned","data":{"pid":8,"argv":["claude"]}}"#,
+            r#"{"seq":4,"t":4,"kind":"err","data":"boom"}"#,
+            r#"{"seq":5,"t":5,"kind":"exited","data":{"code":2}}"#,
+        ]
+        .map(|l| format!("{l}\n"))
+        .concat();
+        std::fs::write(s.0.join("journal.ndjson"), journal).unwrap();
+        let stream = wasit_shim::read_journal(&s.0, 3).await.unwrap();
+        a.on_source(Source::Offline(
+            stream,
+            ShimState::Exited(ExitInfo {
+                code: Some(2),
+                signal: None,
+            }),
+        ));
+        // The records are read, then the stream ends.
+        while a.continuation.is_starting() {
+            let item = a.stream.as_mut().unwrap().next().await;
+            a.on_stream_item(item);
+        }
+        assert!(
+            matches!(waiter.try_recv(), Ok(Err(RuntimeError::Spawn(m))) if m.contains("code 2")),
+            "waiter"
+        );
+        let reason = continue_failed(one.try_recv());
+        assert!(reason.contains("code 2"), "{reason}");
+        assert_clean(&a);
+        // It ran and failed: the session shows that, and can be continued again.
+        assert!(matches!(a.core.snapshot().phase, Phase::Failed { .. }));
+        assert_eq!(a.core.snapshot().generation, 2);
+        assert!(a.core.snapshot().continuable);
+    }
+
+    #[tokio::test]
+    async fn only_prompts_continue_an_ended_session() {
+        let (mut a, _s) = ended();
+        let (reply, mut rx) = oneshot::channel();
+        a.on_msg(Msg::Command {
+            command: Command::Interrupt,
+            trace: None,
+            reply,
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(CommandError::NotRunning { .. }))
+        ));
+        assert!(a.continuation.is_idle() && a.source.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_to_a_session_that_cannot_be_continued_says_why_and_starts_nothing() {
+        let (mut a, _s) = ended();
+        // The agent cannot resume what it never stored (a session of an older build, no id).
+        a.core = Core::new(
+            wasit_claude::descriptor(),
+            &SessionMeta {
+                conversation: Conversation::Unknown,
+                ..a.file.meta()
+            },
+        );
+        a.core.apply(&Record {
+            seq: 1,
+            t: 1,
+            kind: Kind::Spawned,
+            data: serde_json::json!({"pid": 7}),
+            partial: false,
+        });
+        a.core.apply(&Record {
+            seq: 2,
+            t: 2,
+            kind: Kind::Exited,
+            data: serde_json::json!({"code": 0}),
+            partial: false,
+        });
+        let mut rx = prompt(&mut a, "x");
+        match rx.try_recv() {
+            Ok(Err(CommandError::ContinueFailed { reason, blocked })) => {
+                assert!(reason.contains("never reported"), "{reason}");
+                assert_eq!(blocked, Some(crate::wire::NotContinuable::NoConversationId));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_clean(&a);
+        assert!(a.source.is_none());
+    }
+
+    /// A stop that arrives while the continue is starting is not lost: it waits for the shim and
+    /// is answered with the continue's outcome.
+    #[tokio::test]
+    async fn a_stop_during_a_continue_is_answered_when_the_continue_fails() {
+        let (mut a, _s) = ended();
+        let _waiter = explicit_continue(&mut a);
+        let (reply, mut stop) = oneshot::channel();
+        a.on_msg(Msg::Stop { reply });
+        assert!(stop.try_recv().is_err(), "held, not answered yet");
+        a.source = None;
+        a.on_source(Source::SpawnFailed("gone".into()));
+        assert!(matches!(stop.try_recv(), Ok(Ok(()))));
+        assert_clean(&a);
     }
 }

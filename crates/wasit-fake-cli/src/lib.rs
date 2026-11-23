@@ -24,6 +24,7 @@ pub mod io;
 pub mod mcp;
 pub mod reference;
 pub mod scenario;
+pub mod store;
 pub mod util;
 
 use std::path::PathBuf;

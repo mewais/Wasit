@@ -230,7 +230,16 @@ pub fn main_with(args: Vec<String>) -> i32 {
     let mut cursor = Cursor::new(scenario.clone());
     match kind {
         PersonaKind::Claude => {
-            let mut p = Claude::new(&ClaudeArgs::parse(&args), &scenario);
+            let mut p = match Claude::start(&ClaudeArgs::parse(&args), &scenario) {
+                Ok(p) => p,
+                Err(refusal) => {
+                    if let Some(line) = &refusal.stdout {
+                        io.send(line);
+                    }
+                    eprintln!("{}", refusal.stderr);
+                    return 1;
+                }
+            };
             serve(&mut p, &mut io, &mut cursor);
         }
         PersonaKind::Codex => {

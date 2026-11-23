@@ -293,6 +293,12 @@ fn setup(persona: &'static str, name: &str, ins: &[Value], ref_discs: &BTreeSet<
                 .iter()
                 .find_map(|l| l.msg["session_id"].as_str().map(str::to_string))
                 .expect("session id");
+            // The recorded run resumed a conversation claude had stored: the fake needs the
+            // same to exist (a resume of one that was never stored fails, as in the real CLI).
+            sc = sc.session(SessionInfo {
+                id: sid.clone(),
+                ..SessionInfo::default()
+            });
             argv.push("--resume".into());
             argv.push(sid);
         }

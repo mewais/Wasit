@@ -13,13 +13,15 @@ Drivers and the runtime are tested against it (ARCHITECTURE.md §1 rule 10).
 
 `WASIT_FAKE_PERSONA=claude|codex|opencode|kilo` overrides detection (needed for `--version` and
 the discovery commands, which carry no protocol argv). The fake ignores flags it does not model,
-but honours claude's `--model`, `--permission-mode`, `--resume`, `--session-id` and
-`--include-partial-messages`.
+but honours claude's `--model`, `--permission-mode`, `--resume`, `--session-id`, `--continue`,
+`--name` and `--include-partial-messages`.
 
 `WASIT_FAKE_SCENARIO=<path.json>` selects the scenario (default: an empty one, which echoes every
 prompt). `WASIT_FAKE_TRANSCRIPT=<path>` appends every line in both directions as
 `{"dir":"in"|"out","msg":…}`, so a test can assert what its driver sent.
 `WASIT_FAKE_SCENARIO_JSON=<json>` passes the scenario inline (a fake on another machine).
+`WASIT_FAKE_STATE_DIR=<dir>` is the fake's "agent storage" (see below); the default is a per-user
+directory under the system temp directory, never the real CLI's home.
 `WASIT_FAKE_CONSOLE_REPORT=<path>` appends `<pid> <none|hidden|visible> <args>`: whether the
 process got a visible console window (Windows; the no-console-window tests).
 
@@ -103,6 +105,42 @@ Discovery commands (opencode / kilo persona): `--version`, `models [provider] [-
 `session list [--format json]`, answered from `models` / `sessions`. `--version` also works for
 claude and codex.
 
+## Agent storage: conversations outlive the process
+
+A conversation can be resumed by the next process only if the CLI stored it, and each real CLI
+stores at its own moment. The fake keeps files under `WASIT_FAKE_STATE_DIR` (`CLAUDE_CONFIG_DIR`
+for claude's transcripts when it is set, which is where claude discovery reads them) and follows
+what the real CLIs were observed to do. Scenario `sessions` count as conversations that already
+exist.
+
+* **claude** (2.1.293, real runs in `/tmp/marsad-lifecycle/live`; transcripts are
+  `<config>/projects/<cwd with every non-alphanumeric character as "-">/<id>.jsonl`):
+  * a conversation is stored with its first prompt (`system/init`), not before: `--session-id U`
+    and a close before any prompt leaves no file (exit 0);
+  * `--resume U` before that, or for an id never used: no `control_response`; one stdout line
+    `{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":U,
+    "errors":["No conversation found with session ID: U"],…}`, stderr `No conversation found with
+    session ID: U`, exit 1;
+  * `--resume U` finds U in whatever project it was stored (also from another directory);
+  * `--session-id U` is refused once a transcript for U exists in the working directory's
+    project (stderr `Error: Session ID U is already in use.`, exit 1, no stdout) and accepted in
+    another directory; a non-UUID is refused (stderr `Error: Invalid session ID. Must be a valid
+    UUID.`, exit 1);
+  * `--name N` announces `{"type":"system","subtype":"session_title_changed","title":N,
+    "session_id":…}` before the initialize response (also with no prompt), and the transcript
+    starts with `custom-title` and `agent-name` records when it is first written; `--resume`
+    announces the stored title again;
+  * `--continue` in a directory with no conversation starts a new one without a word (E6 of the
+    lifecycle investigation), else resumes the newest.
+* **codex** (codex-cli 0.161.0, real runs against `codex app-server`): `thread/start` reports a
+  thread id at once but writes no rollout; `thread/resume` of it fails with code -32600 `no
+  rollout found for thread id <id>`. The rollout exists from the first `turn/start`, so the fake
+  stores a thread then.
+* **opencode / kilo** (kilo 7.8.8, real run through `kilo acp`): `session/new` stores the session;
+  `session/load` of it works in the next process with no prompt in between. opencode is assumed to
+  keep every session it opens too (the driver's own comment says so); no opencode CLI was
+  available to check.
+
 ## Fidelity
 
 `reference/<persona>/*.jsonl` are real exchanges recorded from claude 2.1.326, opencode 1.19.6,
@@ -124,7 +162,14 @@ every recording against the fake and compares message structure (keys and JSON k
 `remoteControl/status/changed` line were replaced, and `tests/reference.rs` compares just the
 `turn/steer` replies of it.
 
-Known gaps: JSON key order is alphabetical, not the real CLI's order; codex `fileChange` items,
+Known gaps: the claude transcript holds only the title, user and assistant records the lifecycle
+needs (the real file also has `queue-operation`, `attachment`, `last-prompt`, `cost-state`, … lines),
+and claude's behaviour for `--resume` together with `--session-id`, `--fork-session` and `--name` on a
+resume (the fake renames) was not observed, and `/rename <name>` over stream-json (observed with
+2.1.293: a second `session_title_changed`, the transcript's title rewritten) is just a prompt to the fake; a codex thread
+persisted by `thread/name/set` without a turn (real codex writes the rollout then: observed
+with 0.161.0) is not modelled, nor is the `thread/name/set` request itself; `session list` of the
+opencode/kilo persona lists only the scenario's sessions, not the stored ones; JSON key order is alphabetical, not the real CLI's order; codex `fileChange` items,
 codex reasoning items, ACP `plan` updates (real opencode reports todos as a `todowrite` tool call,
 the ACP spec shape is emitted here) and claude `ExitPlanMode` were not captured from the real
 CLIs and follow the protocol specs; claude `rate_limit_event` and codex `warning` /

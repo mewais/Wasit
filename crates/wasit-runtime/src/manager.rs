@@ -111,6 +111,18 @@ fn lock(m: &Mutex<BTreeMap<SessionId, Entry>>) -> MutexGuard<'_, BTreeMap<Sessio
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A user-given name as stored: trimmed, bounded, `None` when blank. A name at create and a later
+/// rename are the same thing.
+fn normalise_name(name: Option<String>) -> Option<String> {
+    name.map(|n| {
+        n.trim()
+            .chars()
+            .take(DISPLAY_NAME_CHARS)
+            .collect::<String>()
+    })
+    .filter(|n| !n.is_empty())
+}
+
 fn io_err(what: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Io(format!("{what}: {e}"))
 }
@@ -192,6 +204,7 @@ impl SessionManager {
         crate::scrub::agent_config(&req.config);
         crate::scrub::session_cwd(req.cwd.as_deref());
         let cfg = &self.inner.cfg;
+        let name = normalise_name(req.name.clone());
         let desc = cfg
             .registry
             .get(&req.driver)
@@ -217,16 +230,18 @@ impl SessionManager {
                 ResumeMode::Resume(native_session_id.clone())
             }
         };
-        if let Some(cwd) = &req.cwd {
-            match tokio::fs::metadata(cwd).await {
-                Ok(m) if m.is_dir() => {}
-                _ => {
-                    return Err(RuntimeError::InvalidRequest(format!(
-                        "working directory {cwd:?} does not exist"
-                    )))
-                }
+        // The one normalisation of the project folder (see `crate::cwd`): everything below, and
+        // everything that later reads this session, uses the result.
+        let cwd = match &req.cwd {
+            Some(given) => {
+                let resolved = crate::cwd::resolve(given, cfg.home.as_deref())
+                    .await
+                    .map_err(|e| RuntimeError::WorkingDirectory(e.to_string()))?;
+                crate::scrub::session_cwd(Some(&resolved));
+                Some(resolved)
             }
-        }
+            None => None,
+        };
         let id = match &req.id {
             Some(id) => {
                 let taken = lock(&self.inner.sessions).contains_key(id)
@@ -253,8 +268,20 @@ impl SessionManager {
             },
         };
         let dir = self.session_dir(&id);
+        // A new conversation gets the id the runtime chooses when the agent accepts one: the
+        // session knows its conversation from its creation, and ending it before the first
+        // prompt loses nothing. Chosen here, journaled with the start, never drawn again.
+        let native_session_id = match &resume {
+            ResumeMode::Fresh => desc.chosen_session_id(fastrand::u128(..).to_le_bytes()),
+            ResumeMode::Continue | ResumeMode::Resume(_) => None,
+        };
         let mut spec = SpawnSpec {
-            cwd: req.cwd.clone(),
+            cwd,
+            // The agent is told the name only when this session starts the conversation: the
+            // title of a conversation that already exists (resumed, or the latest one) is the
+            // user's, and a session's name is Marsad's.
+            name: name.clone().filter(|_| resume == ResumeMode::Fresh),
+            native_session_id,
             session_dir: Some(dir.to_string_lossy().into_owned()),
             model: req.model.clone().filter(|m| !m.is_empty()),
             mode: req.mode.clone().unwrap_or_default(),
@@ -268,7 +295,7 @@ impl SessionManager {
         store::private_dir_all(&dir)
             .await
             .map_err(|e| io_err(&format!("create {}", dir.display()), e))?;
-        let file = SessionFile::new(
+        let mut file = SessionFile::new(
             id.clone(),
             req.driver.clone(),
             store::now_ms(),
@@ -276,6 +303,7 @@ impl SessionManager {
             spec,
             unsupported.clone(),
         );
+        file.display_name = name;
         let launched = async {
             store::write_generated(&dir, &file.spec).await?;
             store::write(&dir, &file)
@@ -299,8 +327,13 @@ impl SessionManager {
             Phase::Starting,
             true,
         ));
+        let cwd = file.cwd.clone();
         self.insert(id.clone(), dir, file, desc, snap, trace);
-        Ok(CreateSessionReply { id, unsupported })
+        Ok(CreateSessionReply {
+            id,
+            cwd,
+            unsupported,
+        })
     }
 
     /// Registers a session and starts its actor; `start_trace` is journaled with its `start` note.
@@ -756,16 +789,13 @@ impl SessionManager {
         self.ask(id, |reply| Msg::Continue { reply }).await?
     }
 
-    /// Set (or clear, with `None` or a blank name) the session's user-given display name.
+    /// Set (or clear, with `None` or a blank name) the session's user-given display name. Only
+    /// Marsad's name changes, never the agent's title of its conversation. Two agents could be
+    /// told (claude 2.1.293 takes `/rename <name>` as a slash command over stream-json, which
+    /// rewrites its transcript's title but is a turn of its own; codex has `thread/name/set`),
+    /// and both need a live process; neither is wired, and nothing here pretends otherwise.
     pub async fn rename(&self, id: &SessionId, name: Option<String>) -> Result<(), RuntimeError> {
-        let name = name
-            .map(|n| {
-                n.trim()
-                    .chars()
-                    .take(DISPLAY_NAME_CHARS)
-                    .collect::<String>()
-            })
-            .filter(|n| !n.is_empty());
+        let name = normalise_name(name);
         self.ask(id, |reply| Msg::Rename { name, reply }).await?
     }
 

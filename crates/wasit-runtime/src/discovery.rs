@@ -45,6 +45,8 @@ pub struct DiscoveryConfig {
     pub max_concurrent_probes: usize,
     /// Discovered modes are shared here with the sessions (see [`crate::config::ModeHints`]).
     pub mode_hints: crate::config::ModeHints,
+    /// What a leading `~` of a project folder stands for (see [`crate::RuntimeConfig::home`]).
+    pub home: Option<PathBuf>,
 }
 
 impl DiscoveryConfig {
@@ -59,6 +61,7 @@ impl DiscoveryConfig {
             max_output: 4 * 1024 * 1024,
             max_concurrent_probes: 4,
             mode_hints: Default::default(),
+            home: None,
         }
     }
 
@@ -68,6 +71,7 @@ impl DiscoveryConfig {
         d.overrides = cfg.overrides.clone();
         d.commands = cfg.commands.clone();
         d.mode_hints = cfg.mode_hints.clone();
+        d.home = cfg.home.clone();
         d
     }
 }
@@ -328,39 +332,40 @@ impl Discovery {
             return;
         };
         let path_s = path.to_string_lossy().into_owned();
-        // A folder that is not there (a half-typed path, a deleted project) has nothing to
-        // discover: say so at once instead of starting the CLI's probes for it.
-        if let Some(project) = &key.0 {
-            let is_dir = tokio::fs::metadata(project)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            if !is_dir {
-                let error = format!("project folder {project:?} does not exist");
-                // What the folder cannot change (version, models, modes) comes from the
-                // host-wide inventory when it has one.
-                let global = lock(&self.inner.state)
-                    .entries
-                    .get(&(None, key.1.clone()))
-                    .cloned();
-                self.finish(&key, |e| {
-                    e.command = command.clone();
-                    e.warning = None;
-                    e.installed = true;
-                    e.binary_path = Some(path_s.clone());
-                    e.error = Some(error);
-                    e.refreshed_at_ms = now_ms();
-                    e.probes = vec![];
-                    e.version = global.as_ref().and_then(|g| g.version.clone());
-                    e.models = global
-                        .as_ref()
-                        .map(|g| g.models.clone())
-                        .unwrap_or_default();
-                    e.modes = global.as_ref().map(|g| g.modes.clone()).unwrap_or_default();
-                    e.sessions.clear();
-                    e.config.clear();
-                });
-                return;
+        // The folder the probes run in is the one a session started there would run in
+        // ([`crate::cwd`]). One that is not there (a half-typed path, a deleted project) has
+        // nothing to discover: say so at once instead of starting the CLI's probes for it.
+        let mut project = key.0.clone();
+        if let Some(given) = &key.0 {
+            match crate::cwd::resolve(given, cfg.home.as_deref()).await {
+                Ok(resolved) => project = Some(resolved),
+                Err(e) => {
+                    let error = e.to_string();
+                    // What the folder cannot change (version, models, modes) comes from the
+                    // host-wide inventory when it has one.
+                    let global = lock(&self.inner.state)
+                        .entries
+                        .get(&(None, key.1.clone()))
+                        .cloned();
+                    self.finish(&key, |e| {
+                        e.command = command.clone();
+                        e.warning = None;
+                        e.installed = true;
+                        e.binary_path = Some(path_s.clone());
+                        e.error = Some(error);
+                        e.refreshed_at_ms = now_ms();
+                        e.probes = vec![];
+                        e.version = global.as_ref().and_then(|g| g.version.clone());
+                        e.models = global
+                            .as_ref()
+                            .map(|g| g.models.clone())
+                            .unwrap_or_default();
+                        e.modes = global.as_ref().map(|g| g.modes.clone()).unwrap_or_default();
+                        e.sessions.clear();
+                        e.config.clear();
+                    });
+                    return;
+                }
             }
         }
         self.update(&key, |e| {
@@ -390,7 +395,7 @@ impl Discovery {
             // A driver override or a host variable may point the CLI at another home.
             home,
             env,
-            project: key.0.clone(),
+            project,
         };
         let probes = desc.discovery(&ctx);
         let runs = probes.iter().map(|p| {

@@ -105,6 +105,24 @@ pub struct SpawnSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_prompt: Option<String>,
 
+    /// The native conversation id this session has, or will have, when it is known before the CLI
+    /// reports one: the id the runtime chose for a fresh conversation
+    /// ([`DriverDescriptor::chosen_session_id`](crate::DriverDescriptor::chosen_session_id); a
+    /// driver passes it only with [`ResumeMode::Fresh`]: the conversation starts under that id).
+    /// For [`ResumeMode::Resume`] the id is the one resumed and this stays `None`: read
+    /// [`SpawnSpec::known_native_id`]. Journaled with the generation's `start` note, so a replay
+    /// does not choose again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+
+    /// The name the user gave the session. A driver whose CLI can name its own conversation when
+    /// it starts one passes it then (claude `--name`); otherwise it is only Marsad's display
+    /// name. Only set for a generation that starts the conversation, never for one that resumes
+    /// it (the conversation already has its title, and the user may have renamed the session
+    /// since).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
     /// The runtime's id of this session (random, unique per host), set by the runtime for the
     /// sessions it starts. Drivers derive ids that must never repeat across sessions from it
     /// (claude: the `uuid` of each user message). `None` in specs written before it existed:
@@ -124,6 +142,15 @@ impl SpawnSpec {
             .filter(|p| !p.is_empty())
             .map(Command::prompt);
         (spec, first)
+    }
+
+    /// The native conversation id known before the CLI reports one: the one being resumed, else
+    /// the one the runtime chose for a fresh conversation.
+    pub fn known_native_id(&self) -> Option<&str> {
+        match &self.resume {
+            ResumeMode::Resume(id) => Some(id),
+            _ => self.native_session_id.as_deref(),
+        }
     }
 
     /// The binary to execute: `bin` if set, else `default`.

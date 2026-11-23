@@ -41,16 +41,16 @@ use std::sync::Arc;
 
 use wasit_control::TraceId;
 use wasit_core::{
-    AgentEvent, Command, DriverDescriptor, DriverError, Encoded, InputDropReason, InputId,
-    Protocol, ResumeMode, SpawnSpec, Step,
+    AgentEvent, Command, DriverCapabilities, DriverDescriptor, DriverError, Encoded,
+    InputDropReason, InputId, Protocol, ResumeMode, SavesConversation, SpawnSpec, Step,
 };
 use wasit_shim::{Kind, Record};
 
 use crate::note::{classify, NoteKind, RuntimeNote};
 use crate::wire::{
     event_cursor, synthetic_cursor, AnomalyKind, CommandStatus, ExitSummary, GateClearing,
-    NoticeCode, PendingGate, Phase, PhaseCause, SessionEvent, SessionEventKind, SessionSnapshot,
-    StartResume, SubagentInfo, TurnInfo, TurnOutcome,
+    NotContinuable, NoticeCode, PendingGate, Phase, PhaseCause, ResumeCommand, SessionEvent,
+    SessionEventKind, SessionSnapshot, StartResume, SubagentInfo, TurnInfo, TurnOutcome,
 };
 
 /// Bounded diagnostics.
@@ -68,6 +68,107 @@ const MAX_OPEN_INPUTS: usize = 4096;
 /// Cap on prompt texts kept for the turn that will run them (`TurnInfo::prompt`).
 const MAX_PROMPT_TEXTS: usize = 64;
 
+/// What the runtime knows about the agent's own conversation of a session: its id, and whether
+/// the agent's storage holds the conversation. Derived only from the session's creation and the
+/// journal (the `start` notes and the events), so a replay reaches the same answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Conversation {
+    /// No id is known: the agent reports its own, and has not yet.
+    Unknown,
+    /// The runtime chose this id for a conversation that is not started yet: starting fresh under
+    /// it works, resuming it does not.
+    Chosen(String),
+    /// The agent reported this id but has not saved the conversation yet
+    /// ([`SavesConversation::OnFirstTurn`]): it can be neither resumed nor started again.
+    Unsaved(String),
+    /// The agent's storage holds the conversation: it can be resumed.
+    Saved(String),
+}
+
+impl Conversation {
+    pub(crate) fn id(&self) -> Option<&str> {
+        match self {
+            Conversation::Unknown => None,
+            Conversation::Chosen(id) | Conversation::Unsaved(id) | Conversation::Saved(id) => {
+                Some(id)
+            }
+        }
+    }
+
+    /// What a spec says before the agent has said anything: a resumed conversation exists, a
+    /// chosen one does not yet.
+    pub(crate) fn of_spec(spec: &SpawnSpec) -> Conversation {
+        match (&spec.resume, &spec.native_session_id) {
+            (ResumeMode::Resume(id), _) => Conversation::Saved(id.clone()),
+            (_, Some(id)) => Conversation::Chosen(id.clone()),
+            _ => Conversation::Unknown,
+        }
+    }
+}
+
+/// A fact of an event about the agent's storage of the conversation ([`Core::reduce`]).
+enum SavedFact {
+    /// The agent reported the conversation's id.
+    Reported(String),
+    /// A turn started.
+    TurnStarted,
+}
+use SavedFact::{Reported, TurnStarted};
+
+/// How to start the next process generation of an ended session ([`Core::continue_plan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContinuePlan {
+    /// The agent holds the conversation: resume it.
+    Resume(String),
+    /// It does not hold it yet: start it fresh under the id chosen for it.
+    StartFresh(String),
+}
+
+/// Whether a session can be continued, from the facts alone: the one place the rule lives.
+pub(crate) fn continue_verdict(
+    caps: &DriverCapabilities,
+    phase: &Phase,
+    loaded: bool,
+    conversation: &Conversation,
+) -> Result<(), NotContinuable> {
+    if !loaded {
+        return Err(NotContinuable::Loading);
+    }
+    if phase.is_live() {
+        return Err(NotContinuable::NotEnded);
+    }
+    if !caps.resume {
+        return Err(NotContinuable::AgentCannotResume);
+    }
+    match conversation {
+        Conversation::Unknown => Err(NotContinuable::NoConversationId),
+        Conversation::Unsaved(_) => Err(NotContinuable::NothingSaved),
+        Conversation::Chosen(_) | Conversation::Saved(_) => Ok(()),
+    }
+}
+
+/// Fills the snapshot's conversation facts (id, `continuable`, `resume_command`) from `conversation`, the
+/// snapshot's phase and `desc`.
+fn apply_conversation(snap: &mut SessionSnapshot, desc: &dyn DriverDescriptor, c: &Conversation) {
+    if let Some(id) = c.id() {
+        if snap.native_session_id.as_deref() != Some(id) {
+            snap.native_session_id = Some(id.to_string());
+        }
+    }
+    let verdict = continue_verdict(&snap.capabilities, &snap.phase, snap.loaded, c);
+    snap.continuable = verdict.is_ok();
+    snap.not_continuable = verdict.err();
+    snap.resume_command = match (c, &snap.cwd) {
+        (Conversation::Saved(id), Some(cwd)) => {
+            desc.user_resume_argv(id).map(|argv| ResumeCommand {
+                argv,
+                cwd: cwd.clone(),
+            })
+        }
+        _ => None,
+    };
+}
+
 /// Static facts about a session.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMeta {
@@ -79,6 +180,9 @@ pub(crate) struct SessionMeta {
     pub display_name: Option<String>,
     /// The command the CLI is started as instead of the driver's default binary.
     pub command: Option<String>,
+    /// What the session's spec says about the agent's conversation before the agent says
+    /// anything ([`Conversation::of_spec`]).
+    pub conversation: Conversation,
 }
 
 /// An empty snapshot for `meta` in `phase`.
@@ -89,7 +193,7 @@ pub(crate) fn blank_snapshot(
     loaded: bool,
 ) -> SessionSnapshot {
     let caps = desc.capabilities();
-    SessionSnapshot {
+    let mut snap = SessionSnapshot {
         id: meta.id.clone(),
         driver: meta.driver.clone(),
         cwd: meta.cwd.clone(),
@@ -102,6 +206,9 @@ pub(crate) fn blank_snapshot(
         generation: 0,
         pid: None,
         native_session_id: None,
+        continuable: false,
+        not_continuable: None,
+        resume_command: None,
         title: None,
         display_name: meta.display_name.clone(),
         cli_version: None,
@@ -125,7 +232,9 @@ pub(crate) fn blank_snapshot(
         stderr_tail: Vec::new(),
         cursor: 0,
         loaded,
-    }
+    };
+    apply_conversation(&mut snap, desc, &meta.conversation);
+    snap
 }
 
 /// Something received before the generation's `start` note.
@@ -204,6 +313,9 @@ impl Emitter {
 pub(crate) struct Core {
     desc: Arc<dyn DriverDescriptor>,
     snap: SessionSnapshot,
+    /// The agent's conversation (see [`Conversation`]); `snap` shows it.
+    conversation: Conversation,
+    saves: SavesConversation,
     gen: Gen,
     owed: VecDeque<Owed>,
     /// Inputs some of whose lines are owed, oldest first.
@@ -287,6 +399,8 @@ impl Core {
     pub(crate) fn new(desc: Arc<dyn DriverDescriptor>, meta: &SessionMeta) -> Self {
         let snap = blank_snapshot(meta, desc.as_ref(), Phase::Starting, true);
         Core {
+            saves: desc.saves_conversation(),
+            conversation: meta.conversation.clone(),
             desc,
             snap,
             gen: Gen::None,
@@ -362,6 +476,35 @@ impl Core {
 
     pub(crate) fn stop_requested(&self) -> bool {
         self.stop_requested
+    }
+
+    /// How to start the next generation of an ended session, or why it cannot be continued.
+    /// Decided from the same facts as the snapshot's `continuable`.
+    pub(crate) fn continue_plan(&self) -> Result<ContinuePlan, NotContinuable> {
+        continue_verdict(
+            &self.snap.capabilities,
+            &self.snap.phase,
+            self.snap.loaded,
+            &self.conversation,
+        )?;
+        match &self.conversation {
+            Conversation::Saved(id) => Ok(ContinuePlan::Resume(id.clone())),
+            Conversation::Chosen(id) => Ok(ContinuePlan::StartFresh(id.clone())),
+            // `continue_verdict` refused these.
+            Conversation::Unknown | Conversation::Unsaved(_) => {
+                Err(NotContinuable::NoConversationId)
+            }
+        }
+    }
+
+    /// The facts the conversation (and so `continuable`) depends on changed.
+    fn conversation_is(&mut self, c: Conversation) {
+        self.conversation = c;
+        self.refresh_conversation();
+    }
+
+    fn refresh_conversation(&mut self) {
+        apply_conversation(&mut self.snap, self.desc.as_ref(), &self.conversation);
     }
 
     // ── input ───────────────────────────────────────────────────────────────
@@ -450,6 +593,7 @@ impl Core {
         let t = self.snap.last_activity_ms;
         let phase = self.compute_phase();
         self.snap.phase = phase.clone();
+        self.refresh_conversation();
         self.snap.cursor = slot;
         self.anomaly_reported = false;
         kinds.push(SessionEventKind::Lost {
@@ -528,6 +672,16 @@ impl Core {
         let info = rec.exit_info().unwrap_or_default();
         if let Gen::Awaiting(buf) = std::mem::replace(&mut self.gen, Gen::Exited) {
             // Commands journaled before a `start` that never came: the process ended first.
+            let how = match (info.code, info.signal) {
+                (Some(c), _) => format!("exit code {c}"),
+                (None, Some(sig)) => format!("signal {sig}"),
+                (None, None) => "unknown status".to_string(),
+            };
+            let said = self
+                .stderr_tail
+                .back()
+                .map(|l| format!(": {l}"))
+                .unwrap_or_default();
             for b in buf {
                 if let Buffered::Command {
                     token,
@@ -537,7 +691,7 @@ impl Core {
                 } = b
                 {
                     let status = CommandStatus::NotRunning {
-                        reason: "the process ended before it started".into(),
+                        reason: format!("the process ended before it started ({how}{said})"),
                     };
                     em.push(SessionEventKind::Input {
                         input,
@@ -772,6 +926,19 @@ impl Core {
             first_input: first.as_ref().map(|_| input),
             trace: trace.clone(),
         });
+        // What this generation was started with tells what the conversation is: a resumed one is
+        // saved; an id chosen for a fresh one is the session's id until the agent reports its own
+        // (it never replaces what is already known).
+        let started = Conversation::of_spec(&spec);
+        let adopt = match (&self.conversation, &started) {
+            (_, Conversation::Unknown) => false,
+            (c, Conversation::Saved(_)) => *c != started,
+            (Conversation::Unknown, _) => true,
+            _ => false,
+        };
+        if adopt {
+            self.conversation_is(started);
+        }
         let mut p = self.desc.new_protocol();
         let step = p.start(&spec);
         self.gen = Gen::Running(p);
@@ -1148,6 +1315,7 @@ impl Core {
     fn reduce(&mut self, event: &AgentEvent, cursor: u64, t: u64) {
         let s = &mut self.snap;
         let mut cause = None;
+        let mut saved: Option<SavedFact> = None;
         match event {
             AgentEvent::SessionInit {
                 native_session_id,
@@ -1158,8 +1326,9 @@ impl Core {
                 cli_version,
                 ..
             } => {
-                if native_session_id.is_some() {
-                    s.native_session_id = native_session_id.clone();
+                if let Some(id) = native_session_id {
+                    s.native_session_id = Some(id.clone());
+                    saved = Some(Reported(id.clone()));
                 }
                 if model.is_some() {
                     s.model = model.clone();
@@ -1181,6 +1350,7 @@ impl Core {
                 native_turn_id,
                 input,
             } => {
+                saved = Some(TurnStarted);
                 let prompt = input.and_then(|i| take_text(&mut self.prompt_texts, i));
                 s.turn = Some(TurnInfo {
                     started_at_ms: t,
@@ -1348,6 +1518,25 @@ impl Core {
             | AgentEvent::Unknown { .. } => {}
         }
         self.causes.extend(cause);
+        match saved {
+            Some(Reported(id)) => {
+                let c = match (&self.conversation, self.saves) {
+                    (_, SavesConversation::WhenReported) => Conversation::Saved(id),
+                    (Conversation::Saved(had), _) if *had == id => Conversation::Saved(id),
+                    _ => Conversation::Unsaved(id),
+                };
+                if c != self.conversation {
+                    self.conversation_is(c);
+                }
+            }
+            Some(TurnStarted) => {
+                if let Conversation::Unsaved(id) = &self.conversation {
+                    let c = Conversation::Saved(id.clone());
+                    self.conversation_is(c);
+                }
+            }
+            None => {}
+        }
     }
 
     fn clear_live_state(&mut self) {
@@ -1453,6 +1642,8 @@ impl Core {
             self.anomaly_reported = false;
             let cause = self.cause_for(&phase);
             em.push(SessionEventKind::Phase { phase, cause });
+            // `continuable` follows the phase.
+            self.refresh_conversation();
         }
         if let Some(last) = em.events.last() {
             self.snap.cursor = last.cursor;
@@ -1476,6 +1667,7 @@ mod tests {
             created_at_ms: 0,
             display_name: None,
             command: None,
+            conversation: Conversation::Unknown,
         }
     }
 
@@ -2033,6 +2225,8 @@ mod tests {
     /// Drives a core like the live actor (records in, the shim's `in` echo for writes when
     /// asked), keeping the journal so a replay can be compared.
     struct Sim {
+        desc: Arc<dyn DriverDescriptor>,
+        meta: SessionMeta,
         core: Core,
         j: J,
         events: Vec<SessionEvent>,
@@ -2040,8 +2234,14 @@ mod tests {
 
     impl Sim {
         fn new() -> Self {
+            Sim::of(wasit_claude::descriptor(), meta())
+        }
+
+        fn of(desc: Arc<dyn DriverDescriptor>, meta: SessionMeta) -> Self {
             Sim {
-                core: Core::new(wasit_claude::descriptor(), &meta()),
+                core: Core::new(desc.clone(), &meta),
+                desc,
+                meta,
                 j: J::new(),
                 events: vec![],
             }
@@ -2095,7 +2295,7 @@ mod tests {
 
         /// A fresh core over the same journal publishes exactly the same events and state.
         fn assert_replay_exact(&self) {
-            let mut replay = Core::new(wasit_claude::descriptor(), &meta());
+            let mut replay = Core::new(self.desc.clone(), &self.meta);
             let mut events = vec![];
             for r in &self.j.recs {
                 events.extend(replay.apply(r).events);
@@ -2619,6 +2819,377 @@ mod tests {
             })
             .count();
         assert_eq!(prompts, 1);
+        sim.assert_replay_exact();
+    }
+
+    // ── the agent's conversation: its id from creation, what can be continued ──
+
+    /// What a driver says about how its CLI keeps conversations, over claude's wire.
+    struct Variant {
+        inner: Arc<dyn DriverDescriptor>,
+        resume: bool,
+        saves: SavesConversation,
+    }
+
+    impl wasit_core::ConfigRenderer for Variant {
+        fn render_config(
+            &self,
+            c: &wasit_core::AgentConfig,
+            s: &mut SpawnSpec,
+        ) -> Vec<wasit_core::Unsupported> {
+            self.inner.render_config(c, s)
+        }
+    }
+
+    impl DriverDescriptor for Variant {
+        fn id(&self) -> wasit_core::DriverId {
+            self.inner.id()
+        }
+        fn display_name(&self) -> &str {
+            self.inner.display_name()
+        }
+        fn default_binary(&self) -> &str {
+            self.inner.default_binary()
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<String> {
+            self.inner.argv(spec)
+        }
+        fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
+            self.inner.env(spec)
+        }
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                resume: self.resume,
+                ..self.inner.capabilities()
+            }
+        }
+        fn saves_conversation(&self) -> SavesConversation {
+            self.saves
+        }
+        fn new_protocol(&self) -> Box<dyn Protocol> {
+            self.inner.new_protocol()
+        }
+        fn discovery(&self, ctx: &wasit_core::DiscoveryContext) -> Vec<wasit_core::DiscoveryProbe> {
+            self.inner.discovery(ctx)
+        }
+    }
+
+    const U: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
+
+    fn init_line(id: &str) -> String {
+        json!({"type":"system","subtype":"init","session_id":id,"model":"haiku","cwd":"/w",
+               "tools":[],"mcp_servers":[],"slash_commands":[],"permissionMode":"default",
+               "claude_code_version":"2.1.293"})
+        .to_string()
+    }
+
+    fn meta_with(conversation: Conversation) -> SessionMeta {
+        SessionMeta {
+            conversation,
+            cwd: Some("/w".into()),
+            ..meta()
+        }
+    }
+
+    impl Sim {
+        /// A generation: `spawned`, a `start` note for `spec`, then (when given) the agent's
+        /// init line; then a requested stop and the exit.
+        fn generation(&mut self, spec: SpawnSpec, reports: Option<&str>) {
+            self.feed(Kind::Spawned, json!({"pid": 7, "argv": ["claude"]}));
+            self.note(RuntimeNote::Start {
+                spec: Box::new(spec),
+                trace: None,
+            });
+            self.feed(Kind::Out, json!(INIT_OK));
+            if let Some(id) = reports {
+                self.command(Command::prompt("hi"));
+                self.feed(Kind::Out, json!(init_line(id)));
+            }
+            self.note(RuntimeNote::Stop { token: "s".into() });
+            self.feed(Kind::Exited, json!({"code": 0}));
+        }
+
+        fn snap(&self) -> &SessionSnapshot {
+            self.core.snapshot()
+        }
+    }
+
+    fn chosen_spec() -> SpawnSpec {
+        SpawnSpec {
+            native_session_id: Some(U.into()),
+            ..SpawnSpec::default()
+        }
+    }
+
+    /// A session created under a chosen id knows its conversation from the start; ended before
+    /// the agent stored anything it is continued by starting the conversation again under the
+    /// same id, not by resuming it (which the agent would refuse).
+    #[test]
+    fn a_chosen_id_is_known_from_creation_and_a_continue_before_the_first_prompt_starts_fresh() {
+        let mut sim = Sim::of(
+            wasit_claude::descriptor(),
+            meta_with(Conversation::Chosen(U.into())),
+        );
+        assert_eq!(sim.snap().native_session_id.as_deref(), Some(U));
+        assert!(!sim.snap().continuable);
+        assert_eq!(sim.snap().not_continuable, Some(NotContinuable::NotEnded));
+        assert_eq!(
+            sim.snap().resume_command,
+            None,
+            "nothing the user could resume yet"
+        );
+        sim.generation(chosen_spec(), None);
+        assert_eq!(sim.snap().phase, Phase::Exited { code: Some(0) });
+        assert_eq!(sim.snap().native_session_id.as_deref(), Some(U));
+        assert!(sim.snap().continuable, "{:?}", sim.snap().not_continuable);
+        assert_eq!(sim.snap().not_continuable, None);
+        assert_eq!(sim.snap().resume_command, None);
+        assert_eq!(
+            sim.core.continue_plan(),
+            Ok(ContinuePlan::StartFresh(U.into()))
+        );
+        sim.assert_replay_exact();
+    }
+
+    /// Once the agent reported the conversation, a continue resumes it; the user's own command
+    /// for it appears with the session's directory.
+    #[test]
+    fn after_the_agent_reports_the_conversation_a_continue_resumes_it() {
+        let mut sim = Sim::of(
+            wasit_claude::descriptor(),
+            meta_with(Conversation::Chosen(U.into())),
+        );
+        sim.generation(chosen_spec(), Some(U));
+        assert!(sim.snap().continuable);
+        assert_eq!(sim.core.continue_plan(), Ok(ContinuePlan::Resume(U.into())));
+        let cmd = sim.snap().resume_command.clone().unwrap();
+        assert_eq!(cmd.argv, ["claude", "--resume", U]);
+        assert_eq!(cmd.cwd, "/w");
+        // The next generation resumes (its start note says so) and ends: still resumable.
+        sim.generation(
+            SpawnSpec {
+                resume: ResumeMode::Resume(U.into()),
+                ..SpawnSpec::default()
+            },
+            None,
+        );
+        assert_eq!(sim.core.continue_plan(), Ok(ContinuePlan::Resume(U.into())));
+        assert_eq!(sim.snap().generation, 2);
+        sim.assert_replay_exact();
+    }
+
+    /// A session created by resuming X records X at create and can be continued (by resuming X)
+    /// even if its first process ended before the agent said anything.
+    #[test]
+    fn a_session_created_by_resuming_records_the_resumed_id() {
+        let mut sim = Sim::of(
+            wasit_claude::descriptor(),
+            meta_with(Conversation::Saved("X".into())),
+        );
+        assert_eq!(sim.snap().native_session_id.as_deref(), Some("X"));
+        sim.feed(Kind::Spawned, json!({"pid": 7}));
+        sim.feed(Kind::Exited, json!({"code": 1}));
+        assert!(matches!(sim.snap().phase, Phase::Failed { .. }));
+        assert_eq!(
+            sim.core.continue_plan(),
+            Ok(ContinuePlan::Resume("X".into()))
+        );
+        sim.assert_replay_exact();
+    }
+
+    /// A session of an older build has no chosen id: until the agent reported one there is
+    /// nothing to continue; it says so, and after the report it can be.
+    #[test]
+    fn a_session_without_an_id_cannot_be_continued_until_the_agent_reported_one() {
+        let mut sim = Sim::of(wasit_claude::descriptor(), meta_with(Conversation::Unknown));
+        assert_eq!(sim.snap().native_session_id, None);
+        sim.generation(SpawnSpec::default(), None);
+        assert!(!sim.snap().continuable);
+        assert_eq!(
+            sim.snap().not_continuable,
+            Some(NotContinuable::NoConversationId)
+        );
+        assert_eq!(
+            sim.core.continue_plan(),
+            Err(NotContinuable::NoConversationId)
+        );
+        sim.generation(SpawnSpec::default(), Some(U));
+        assert!(sim.snap().continuable);
+        assert_eq!(sim.snap().native_session_id.as_deref(), Some(U));
+        assert_eq!(sim.core.continue_plan(), Ok(ContinuePlan::Resume(U.into())));
+        sim.assert_replay_exact();
+    }
+
+    /// An agent that opens a thread (and reports its id) but writes nothing until the first turn
+    /// cannot resume it before then, and cannot start it again under its id either.
+    #[test]
+    fn a_conversation_the_agent_has_not_saved_cannot_be_continued_until_a_turn_ran() {
+        let desc: Arc<dyn DriverDescriptor> = Arc::new(Variant {
+            inner: wasit_claude::descriptor(),
+            resume: true,
+            saves: SavesConversation::OnFirstTurn,
+        });
+        let mut sim = Sim::of(desc, meta_with(Conversation::Unknown));
+        sim.feed(Kind::Spawned, json!({"pid": 7}));
+        sim.note(RuntimeNote::Start {
+            spec: Box::new(SpawnSpec::default()),
+            trace: None,
+        });
+        sim.feed(Kind::Out, json!(INIT_OK));
+        // The agent reports the thread's id; nothing is stored yet.
+        sim.feed(Kind::Out, json!(init_line(U)));
+        sim.note(RuntimeNote::Stop { token: "s".into() });
+        sim.feed(Kind::Exited, json!({"code": 0}));
+        assert_eq!(sim.snap().native_session_id.as_deref(), Some(U));
+        assert!(!sim.snap().continuable);
+        assert_eq!(
+            sim.snap().not_continuable,
+            Some(NotContinuable::NothingSaved)
+        );
+        assert_eq!(sim.snap().resume_command, None);
+        // A turn starts in the next generation: the conversation is stored from then on.
+        sim.feed(Kind::Spawned, json!({"pid": 8}));
+        sim.note(RuntimeNote::Start {
+            spec: Box::new(SpawnSpec::default()),
+            trace: None,
+        });
+        sim.feed(Kind::Out, json!(INIT_OK));
+        sim.command(Command::prompt("go"));
+        sim.feed(Kind::Out, json!(init_line(U)));
+        sim.note(RuntimeNote::Stop { token: "s2".into() });
+        sim.feed(Kind::Exited, json!({"code": 0}));
+        assert!(sim.snap().continuable, "{:?}", sim.snap().not_continuable);
+        assert_eq!(sim.core.continue_plan(), Ok(ContinuePlan::Resume(U.into())));
+        sim.assert_replay_exact();
+    }
+
+    #[test]
+    fn an_agent_that_cannot_resume_says_so() {
+        let desc: Arc<dyn DriverDescriptor> = Arc::new(Variant {
+            inner: wasit_claude::descriptor(),
+            resume: false,
+            saves: SavesConversation::WhenReported,
+        });
+        let mut sim = Sim::of(desc, meta_with(Conversation::Chosen(U.into())));
+        sim.generation(chosen_spec(), Some(U));
+        assert!(!sim.snap().continuable);
+        assert_eq!(
+            sim.snap().not_continuable,
+            Some(NotContinuable::AgentCannotResume)
+        );
+        assert_eq!(
+            sim.core.continue_plan(),
+            Err(NotContinuable::AgentCannotResume)
+        );
+    }
+
+    /// While a finished session's snapshot is rebuilt from its journal nothing is claimed.
+    #[test]
+    fn a_snapshot_still_loading_is_not_continuable_for_that_reason() {
+        let m = meta_with(Conversation::Saved(U.into()));
+        let snap = blank_snapshot(
+            &m,
+            wasit_claude::descriptor().as_ref(),
+            Phase::Exited { code: Some(0) },
+            false,
+        );
+        assert_eq!(snap.native_session_id.as_deref(), Some(U));
+        assert!(!snap.continuable);
+        assert_eq!(snap.not_continuable, Some(NotContinuable::Loading));
+        let snap = blank_snapshot(
+            &m,
+            wasit_claude::descriptor().as_ref(),
+            Phase::Exited { code: Some(0) },
+            true,
+        );
+        assert!(snap.continuable);
+    }
+
+    /// A lost session (its shim vanished) can be continued like an exited one, and the answer
+    /// follows the phase at once.
+    #[test]
+    fn a_lost_session_is_continuable_and_continuable_follows_the_phase() {
+        let mut sim = Sim::of(
+            wasit_claude::descriptor(),
+            meta_with(Conversation::Chosen(U.into())),
+        );
+        sim.feed(Kind::Spawned, json!({"pid": 7}));
+        sim.note(RuntimeNote::Start {
+            spec: Box::new(chosen_spec()),
+            trace: None,
+        });
+        assert!(!sim.snap().continuable);
+        let lost = sim.core.mark_lost("the shim is gone");
+        assert!(!lost.is_empty());
+        assert!(matches!(sim.snap().phase, Phase::Lost { .. }));
+        assert!(sim.snap().continuable);
+        assert_eq!(
+            sim.core.continue_plan(),
+            Ok(ContinuePlan::StartFresh(U.into()))
+        );
+    }
+
+    /// What a continue with prompts waiting journals: the new generation's `spawned`, the
+    /// prompts as `command` notes (the actor writes them right after attaching), then the `start`
+    /// note. They are applied right after the start, in the order journaled, as ordinary inputs
+    /// of that generation (queued until the agent is ready), living and replayed alike.
+    #[test]
+    fn prompts_journaled_before_a_continued_generations_start_are_its_first_inputs_in_order() {
+        let mut sim = Sim::of(
+            wasit_claude::descriptor(),
+            meta_with(Conversation::Chosen(U.into())),
+        );
+        sim.generation(chosen_spec(), Some(U));
+        let before = sim.events.len();
+        sim.feed(
+            Kind::Spawned,
+            json!({"pid": 8, "argv": ["claude", "--resume", U]}),
+        );
+        let (first, out1) = sim.command(Command::prompt("one"));
+        assert!(
+            out1.events.is_empty(),
+            "held until the start: {:?}",
+            out1.events
+        );
+        let (second, _) = sim.command(Command::prompt("two"));
+        assert!(first < second);
+        let out = sim.note(RuntimeNote::Start {
+            spec: Box::new(SpawnSpec {
+                resume: ResumeMode::Resume(U.into()),
+                ..SpawnSpec::default()
+            }),
+            trace: None,
+        });
+        assert!(out.started);
+        let inputs: Vec<(InputId, CommandStatus)> = sim.events[before..]
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Input {
+                    input,
+                    command: Command::Prompt { .. },
+                    status,
+                    ..
+                } => Some((*input, status.clone())),
+                _ => None,
+            })
+            .collect();
+        // Both are queued by the driver until its handshake is done, in order, once each.
+        assert_eq!(
+            inputs,
+            [
+                (first, CommandStatus::Queued),
+                (second, CommandStatus::Queued)
+            ]
+        );
+        // The agent's handshake completes: the prompts go out one after the other.
+        sim.feed(Kind::Out, json!(INIT_OK));
+        assert_eq!(sim.snap().generation, 2);
+        assert!(sim.snap().phase.is_live());
+        let kinds = sim.kinds();
+        assert!(
+            kinds.iter().any(|k| *k == format!("input_sent:{first}")),
+            "{kinds:?}"
+        );
         sim.assert_replay_exact();
     }
 }
