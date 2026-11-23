@@ -22,12 +22,16 @@
 //!    exist), starting from the captured environment, stdin closed, between markers, with
 //!    their own deadline; the environment they leave is taken (PATH entries and variables of
 //!    the capture they dropped are kept, after theirs). The lines reach the shell in a variable
-//!    and run with `eval` (POSIX shells and fish; another login shell, csh, …, runs them with
-//!    `/bin/sh`); the shell parses them first (`-n`), so a syntax error is reported with the
-//!    shell's message and nothing runs. Windows: PowerShell
-//!    (`-NoProfile`) in the captured environment; its `$env:` changes are taken. A setup that
-//!    fails is reported ([`SetupReport`]); one that did not finish (deadline, ended the
-//!    shell) leaves the captured environment.
+//!    and run with `eval` (POSIX shells and fish); the shell parses them first (`-n`), so a
+//!    syntax error is reported with the shell's message and nothing runs. csh and tcsh cannot
+//!    `eval` several lines and have no reliable `-n`, so they run the lines in their own syntax
+//!    from a private file (`source`d by the same `-c` shell that sources the login files like
+//!    the capture does, so aliases such as `module` exist); only tcsh is asked to read the file
+//!    first (`-n`), and that finds lexical errors only: the report says nothing was checked
+//!    where that is true. Any other login shell (nu, elvish, xonsh, pwsh) runs the lines with
+//!    `/bin/sh`. Windows: PowerShell (`-NoProfile`) in the captured environment; its `$env:`
+//!    changes are taken. A setup that fails is reported ([`SetupReport`]); one that did not
+//!    finish (deadline, ended the shell) leaves the captured environment.
 //! 3. **variables** ([`HostEnvConfig::vars`]) — set as given (no expansion), over the above.
 //! 4. **agent commands** ([`HostEnvConfig::commands`]) — installed in [`AgentCommands`], which
 //!    discovery and session launches read.
@@ -75,6 +79,9 @@ pub struct CaptureOptions {
     pub login_deadline: Duration,
     /// Deadline of the setup commands (a `module load` on a busy cluster takes seconds).
     pub setup_deadline: Duration,
+    /// A private (owner-only) directory for the file a csh/tcsh setup is `source`d from
+    /// (`None`: the machine's runtime directory for `wasit`, see [`crate::machine::runtime_dir`]).
+    pub scratch_dir: Option<PathBuf>,
 }
 
 impl Default for CaptureOptions {
@@ -84,6 +91,7 @@ impl Default for CaptureOptions {
             interactive_deadline: Duration::from_secs(6),
             login_deadline: Duration::from_secs(4),
             setup_deadline: Duration::from_secs(30),
+            scratch_dir: None,
         }
     }
 }
@@ -388,16 +396,20 @@ struct Ran {
     code: Option<i32>,
     /// The deadline passed and the process (group) was killed.
     timed_out: bool,
+    /// stderr was the same pipe as stdout (`out` holds both, in order; `err` is empty).
+    merged: bool,
 }
 
 /// Run `program args…` with stdin closed and a deadline, in `env` (else this process's own
 /// environment). On the deadline the process group (Unix) or process is killed and what it
-/// printed so far is returned.
+/// printed so far is returned. `merge_stderr` (Unix): the process's stderr is its stdout (one
+/// pipe, so the two stay in order whatever the shell's own redirection syntax is).
 async fn run_bounded(
     program: &std::path::Path,
     args: &[String],
     env: Option<&[(String, String)]>,
     deadline: Duration,
+    merge_stderr: bool,
 ) -> Result<Ran, String> {
     use std::process::Stdio;
     let mut cmd = wasit_process::command_inheriting(program);
@@ -413,9 +425,28 @@ async fn run_bounded(
     // one would be stopped by SIGTTOU), and a process group to kill at the deadline.
     #[cfg(unix)]
     wasit_process::new_session(&mut cmd);
+    #[cfg(unix)]
+    let mut merged = None;
+    #[cfg(unix)]
+    if merge_stderr {
+        let pipe_err =
+            |e: std::io::Error| format!("cannot make a pipe for {}: {e}", program.display());
+        let (r, w) = std::io::pipe().map_err(pipe_err)?;
+        let w2 = w.try_clone().map_err(pipe_err)?;
+        cmd.stdout(w).stderr(w2);
+        merged = Some(
+            tokio::net::unix::pipe::Receiver::from_owned_fd(std::os::fd::OwnedFd::from(r))
+                .map_err(pipe_err)?,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = merge_stderr;
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", program.display()))?;
+    // The command holds the write ends of a merged pipe: drop them, or the reader never sees
+    // the end of the stream.
+    drop(cmd);
     let pid = child.id();
     let out = Arc::new(Mutex::new(Vec::new()));
     let err = Arc::new(Mutex::new(Vec::new()));
@@ -433,6 +464,19 @@ async fn run_bounded(
                 .extend_from_slice(&buf[..n]);
         }
     };
+    #[cfg(unix)]
+    let is_merged = merged.is_some();
+    #[cfg(not(unix))]
+    let is_merged = false;
+    #[cfg(unix)]
+    let so = match merged {
+        Some(r) => Some(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        None => child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+    };
+    #[cfg(not(unix))]
     let so = child
         .stdout
         .take()
@@ -469,6 +513,7 @@ async fn run_bounded(
         err: text(&err),
         code,
         timed_out,
+        merged: is_merged,
     })
 }
 
@@ -516,9 +561,9 @@ enum Family {
     Posix,
     /// fish: like a POSIX shell on the command line; setup lines are fish.
     Fish,
-    /// csh / tcsh: `-l` must be the only argument (tcsh refuses `-l -c`), so a `-c` shell
-    /// (which reads `.cshrc`/`.tcshrc`) sources the login files itself; setup lines run with
-    /// `/bin/sh`.
+    /// csh / tcsh / bsd-csh: `-l` must be the only argument (tcsh refuses `-l -c`), so a `-c`
+    /// shell (which reads `.cshrc`/`.tcshrc`) sources the login files itself; setup lines are
+    /// csh and run in that same shell, from a file.
     Csh,
     /// nu, elvish, xonsh, pwsh: captured like a POSIX shell; setup lines run with `/bin/sh`.
     Foreign,
@@ -533,12 +578,19 @@ impl Family {
             .unwrap_or_default()
         {
             "fish" => Family::Fish,
-            "csh" | "tcsh" => Family::Csh,
+            "csh" | "tcsh" | "bsd-csh" => Family::Csh,
             "nu" | "elvish" | "xonsh" | "pwsh" => Family::Foreign,
             _ => Family::Posix,
         }
     }
 }
+
+/// What a csh-family `-c` shell runs before anything else to be a login shell (`-l` cannot be
+/// combined with `-c`): the capture and the setup share it, so the setup sees what the capture
+/// saw.
+#[cfg(unix)]
+const CSH_LOGIN: &str =
+    "if ( -r /etc/csh.login ) source /etc/csh.login; if ( -r ~/.login ) source ~/.login; ";
 
 #[cfg(unix)]
 async fn capture_unix(
@@ -557,13 +609,7 @@ async fn capture_unix(
     let attempts = match Family::of(&shell) {
         Family::Csh => vec![(
             EnvSource::LoginShell,
-            vec![
-                "-c".to_string(),
-                format!(
-                    "if ( -r /etc/csh.login ) source /etc/csh.login; \
-                     if ( -r ~/.login ) source ~/.login; {script}"
-                ),
-            ],
+            vec!["-c".to_string(), format!("{CSH_LOGIN}{script}")],
             opts.login_deadline,
         )],
         _ => vec![
@@ -581,7 +627,7 @@ async fn capture_unix(
     };
     for (source, args, deadline) in attempts {
         let what = format!("{} {}", shell.display(), args[..args.len() - 2].join(" "));
-        match run_bounded(&shell, &args, None, deadline).await {
+        match run_bounded(&shell, &args, None, deadline, false).await {
             Ok(r) if r.timed_out => notes.push(format!(
                 "`{what}` did not finish within {} s",
                 deadline.as_secs_f32()
@@ -635,7 +681,7 @@ $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $
         script,
     ];
     let ps = PathBuf::from("powershell.exe");
-    match run_bounded(&ps, &args, None, opts.interactive_deadline).await {
+    match run_bounded(&ps, &args, None, opts.interactive_deadline, false).await {
         Ok(r) if r.timed_out => notes.push(format!(
             "powershell did not finish within {} s",
             opts.interactive_deadline.as_secs_f32()
@@ -708,7 +754,11 @@ impl Markers {
                 "the shell did not run the commands (exit status {})",
                 code_text(r.code)
             )));
-            rep.output = err_tail;
+            rep.output = if r.merged {
+                tail_lines(&r.out, SETUP_TAIL_LINES, SETUP_TAIL_BYTES)
+            } else {
+                err_tail
+            };
             return (None, rep);
         };
         let after = &r.out[b + self.begin.len()..];
@@ -789,8 +839,9 @@ async fn run_setup(
                 f = m.env_end
             ),
         ),
+        Family::Csh => return run_csh_setup(opts, captured, &login, setup, &m).await,
         // Not POSIX shells: the lines run with `/bin/sh` (in the captured environment).
-        Family::Csh | Family::Foreign => (PathBuf::from("/bin/sh"), &[][..], posix_script(&m)),
+        Family::Foreign => (PathBuf::from("/bin/sh"), &[][..], posix_script(&m)),
         Family::Posix => (login.clone(), mode, posix_script(&m)),
     };
     // The shell first parses the lines without running them (`-n`; fish too): what a shell does
@@ -799,7 +850,15 @@ async fn run_setup(
     // left to the run itself.
     {
         let check = ["-n".to_string(), "-c".to_string(), setup.to_string()];
-        match run_bounded(&shell, &check, Some(&captured.vars), opts.setup_deadline).await {
+        match run_bounded(
+            &shell,
+            &check,
+            Some(&captured.vars),
+            opts.setup_deadline,
+            false,
+        )
+        .await
+        {
             Ok(r) if r.code == Some(0) => {}
             Ok(r) => {
                 let mut rep = start_failed(
@@ -835,11 +894,186 @@ async fn run_setup(
     // a syntax error in them is their own output and exit status, not the wrapper's.
     let mut env = captured.vars.clone();
     env.push((SETUP_VAR.into(), setup.into()));
-    match run_bounded(&shell, &args, Some(&env), opts.setup_deadline).await {
+    match run_bounded(&shell, &args, Some(&env), opts.setup_deadline, false).await {
         Ok(r) => m.read(&r, what, opts.setup_deadline),
         Err(e) => (None, start_failed(what, e)),
     }
 }
+
+/// What a failed csh-family report adds: these shells cannot check commands without running
+/// them (tcsh finds lexical errors only), so commands before the error have already run.
+#[cfg(unix)]
+const CSH_UNCHECKED: &str =
+    "csh-family shells cannot check commands without running them: those before the error already ran";
+
+/// Set by the last line of the setup file: when the shell did not get there, the commands
+/// stopped early (a runtime error ends a sourced file in tcsh and the whole shell in csh;
+/// `exit` returns from `source`).
+#[cfg(unix)]
+const SETUP_DONE_VAR: &str = "__WASIT_SETUP_DONE";
+
+/// A file of setup lines, owner-only, removed when dropped (success, failure, deadline or the
+/// future being dropped alike).
+#[cfg(unix)]
+struct ScratchFile(PathBuf);
+
+#[cfg(unix)]
+impl ScratchFile {
+    async fn create(dir: &std::path::Path, text: &[u8]) -> std::io::Result<ScratchFile> {
+        use tokio::io::AsyncWriteExt;
+        let path = dir.join(format!("setup-{}.csh", nonce()));
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .await?;
+        let file = ScratchFile(path);
+        f.write_all(text).await?;
+        f.flush().await?;
+        Ok(file)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.0.display(), "cannot remove the setup file: {e}");
+            }
+        }
+    }
+}
+
+/// Run the setup commands of a csh-family login shell in that shell (see the module docs): the
+/// lines go to a private file that the `-c` shell `source`s after the login files, its
+/// `$status` is the outcome, stderr is merged at the process level.
+#[cfg(unix)]
+async fn run_csh_setup(
+    opts: &CaptureOptions,
+    captured: &Captured,
+    shell: &std::path::Path,
+    setup: &str,
+    m: &Markers,
+) -> (Option<Vec<(String, String)>>, SetupReport) {
+    let what = shell.display().to_string();
+    let dir = match crate::machine::runtime_dir("wasit", opts.scratch_dir.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                None,
+                start_failed(
+                    what,
+                    format!("no private directory for the setup commands: {e}"),
+                ),
+            )
+        }
+    };
+    // The last two lines run only when everything before them did: the status of the last
+    // command is kept (`source` itself would return the status of these lines), then the flag.
+    let text = format!("{setup}\nset __wasit_status = $status\nsetenv {SETUP_DONE_VAR} 1\n");
+    let file = match ScratchFile::create(&dir, text.as_bytes()).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                None,
+                start_failed(what, format!("cannot write the setup commands: {e}")),
+            )
+        }
+    };
+    // Only tcsh can read the lines without running them (`-n`, and only for lexical errors:
+    // quotes, parentheses); csh reports false failures there. Which one this is, only the shell
+    // knows (`csh` may be either), so it is asked; if it cannot say, nothing is checked.
+    let probe = ["-f".to_string(), "-c".into(), "echo $?tcsh".into()];
+    let is_tcsh = matches!(
+        run_bounded(shell, &probe, Some(&captured.vars), opts.setup_deadline, false).await,
+        Ok(r) if r.code == Some(0) && r.out.trim() == "1"
+    );
+    if is_tcsh {
+        let check = ["-f".to_string(), "-n".into(), file.0.display().to_string()];
+        match run_bounded(
+            shell,
+            &check,
+            Some(&captured.vars),
+            opts.setup_deadline,
+            false,
+        )
+        .await
+        {
+            Ok(r) if r.code == Some(0) => {}
+            Ok(r) => {
+                let mut rep = start_failed(
+                    format!("{what} -n"),
+                    if r.timed_out {
+                        format!(
+                            "did not finish within {} s",
+                            opts.setup_deadline.as_secs_f32()
+                        )
+                    } else {
+                        "tcsh could not read the commands (see the output); nothing was run".into()
+                    },
+                );
+                rep.exit_code = r.code;
+                rep.output = tail_lines(
+                    &format!("{}\n{}", r.out, r.err),
+                    SETUP_TAIL_LINES,
+                    SETUP_TAIL_BYTES,
+                );
+                return (None, rep);
+            }
+            Err(e) => return (None, start_failed(what, e)),
+        }
+    }
+    let script = format!(
+        "{CSH_LOGIN}printf '\\n%s\\n' '{b}'; set __wasit_status = ''; source \"${SETUP_FILE_VAR}\"; \
+         set __wasit_rc = $status; if ( \"$__wasit_status\" != '' ) set __wasit_rc = \"$__wasit_status\"; \
+         unsetenv {SETUP_FILE_VAR}; \
+         printf '\\n%s %s\\n' '{e}' \"$__wasit_rc\"; env -0 || env; printf '\\n%s\\n' '{f}'",
+        b = m.begin,
+        e = m.end,
+        f = m.env_end
+    );
+    let mut env = captured.vars.clone();
+    env.push((SETUP_FILE_VAR.into(), file.0.display().to_string()));
+    let args = ["-c".to_string(), script];
+    let ran = run_bounded(shell, &args, Some(&env), opts.setup_deadline, true).await;
+    drop(file);
+    match ran {
+        Ok(r) => {
+            let (mut vars, mut rep) = m.read(&r, what, opts.setup_deadline);
+            if let Some(v) = vars.as_mut() {
+                let done = v.iter().any(|(k, _)| k == SETUP_DONE_VAR);
+                v.retain(|(k, _)| k != SETUP_DONE_VAR);
+                if !done {
+                    // The file stopped before its end: like a setup that ended a POSIX shell,
+                    // it leaves the login environment.
+                    vars = None;
+                    rep.ok = false;
+                    rep.applied = false;
+                    rep.error = Some(format!(
+                        "the commands stopped before their end, at an error or an `exit` \
+                         (exit status {}; see the output)",
+                        code_text(rep.exit_code)
+                    ));
+                }
+            }
+            if !rep.ok && !r.timed_out && r.out.contains(&m.begin) {
+                if let Some(e) = rep.error.as_mut() {
+                    e.push_str("; ");
+                    e.push_str(CSH_UNCHECKED);
+                }
+            }
+            (vars, rep)
+        }
+        Err(e) => (None, start_failed(what, e)),
+    }
+}
+
+/// The variable that carries the path of the csh setup file into the shell (removed before its
+/// environment is read).
+#[cfg(unix)]
+const SETUP_FILE_VAR: &str = "__WASIT_SETUP_FILE";
 
 /// The variable that carries the setup lines into the shell (removed before its environment is
 /// read).
@@ -890,7 +1124,7 @@ $__o.Write("`n{f}`n")"#,
     ];
     let what = "powershell -NoProfile".to_string();
     let ps = PathBuf::from("powershell.exe");
-    match run_bounded(&ps, &args, Some(&captured.vars), opts.setup_deadline).await {
+    match run_bounded(&ps, &args, Some(&captured.vars), opts.setup_deadline, false).await {
         Ok(r) => m.read(&r, what, opts.setup_deadline),
         Err(e) => (None, start_failed(what, e)),
     }
@@ -934,6 +1168,18 @@ mod tests {
                 ("ONLY".into(), "o".into()),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_families_by_file_name() {
+        let f = |p: &str| Family::of(std::path::Path::new(p));
+        for csh in ["/bin/csh", "/usr/bin/tcsh", "/usr/bin/bsd-csh"] {
+            assert_eq!(f(csh), Family::Csh, "{csh}");
+        }
+        assert_eq!(f("/usr/bin/fish"), Family::Fish);
+        assert_eq!(f("/usr/bin/xonsh"), Family::Foreign);
+        assert_eq!(f("/bin/zsh"), Family::Posix);
     }
 
     #[test]
