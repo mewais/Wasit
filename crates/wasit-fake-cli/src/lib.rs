@@ -5,6 +5,7 @@
 //! * The binary is `wasit-fake-cli`; see the crate README for the scenario format.
 //! * [`scenario`] has the serde types and a builder for writing scenarios from tests.
 //! * [`fake_cli_path`] locates the built binary from another crate's tests.
+//! * [`harness`] ends the daemons and shims a test started (the cleanup of every test harness).
 //!
 //! # Using the binary from another crate
 //!
@@ -20,6 +21,7 @@ pub mod claude;
 pub mod cli;
 pub mod codex;
 pub mod engine;
+pub mod harness;
 pub mod io;
 pub mod mcp;
 pub mod reference;

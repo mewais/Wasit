@@ -40,24 +40,9 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        // Kill CLI processes still running (their shims then exit) before removing the dir.
-        if let Ok(rd) = std::fs::read_dir(self.0.join("sessions")) {
-            for ent in rd.flatten() {
-                let Ok(text) = std::fs::read_to_string(ent.path().join("journal.ndjson")) else {
-                    continue;
-                };
-                for line in text.lines() {
-                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                        continue;
-                    };
-                    if v["kind"] == "spawned" {
-                        if let Some(pid) = v["data"]["pid"].as_u64() {
-                            kill_pid(pid);
-                        }
-                    }
-                }
-            }
-        }
+        // Daemons and session shims (with their CLIs) started anywhere below this directory
+        // outlive their starters on purpose: end them before their files go.
+        wasit_fake_cli::harness::stop_all_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
