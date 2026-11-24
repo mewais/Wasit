@@ -1879,3 +1879,116 @@ fn compact_and_run_shell_are_unsupported() {
         })
     );
 }
+
+// ── fork and compact ──────────────────────────────────────────────────────────
+
+/// A fork is `--resume <source> --fork-session`, after the stream-json flags (claude 2.1.x:
+/// `--fork-session` creates a new session ID when resuming). Never `--session-id` with it.
+#[test]
+fn fork_argv_is_resume_then_fork_session_after_the_stream_json_flags() {
+    let d = ClaudeDescriptor;
+    let argv = d.argv(&SpawnSpec {
+        resume: ResumeMode::Fork("parent-id".into()),
+        ..SpawnSpec::default()
+    });
+    let at = argv
+        .iter()
+        .position(|a| a == "--resume")
+        .expect("--resume present");
+    assert_eq!(
+        argv[at..at + 3],
+        ["--resume", "parent-id", "--fork-session"]
+    );
+    let output = argv.iter().position(|a| a == "--output-format").unwrap();
+    assert!(output < at, "stream-json flags come first: {argv:?}");
+    assert!(!argv.contains(&"--session-id".to_string()));
+    assert!(d.capabilities().fork);
+}
+
+/// `/compact` is a slash command: `Command::Compact` writes it when the session lists `compact`,
+/// and is `Unsupported` when it does not (the capability is the static ceiling).
+#[test]
+fn compact_encodes_to_slash_compact_when_the_session_lists_it() {
+    let mut p = ClaudeProtocol::new();
+    p.start(&SpawnSpec::default());
+    p.on_line(
+        r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"commands":[{"name":"compact","description":"Compact"},{"name":"review"}]}}}"#,
+    );
+    let step = sent(p.encode(InputId(7), Command::Compact));
+    let w = writes(&step);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0]["message"]["content"][0]["text"], "/compact");
+    assert_eq!(w[0]["type"], "user");
+}
+
+#[test]
+fn compact_is_unsupported_when_the_session_does_not_list_it() {
+    let (mut p, _) = ready(); // lists `review` only
+    assert_eq!(
+        p.encode(InputId(7), Command::Compact),
+        Err(wasit_core::DriverError::Unsupported {
+            operation: "compact".into()
+        })
+    );
+}
+
+/// `compact` in the `system/init` list counts too (a session that reports its commands there).
+#[test]
+fn compact_listed_by_system_init_is_encoded() {
+    let mut p = ClaudeProtocol::new();
+    p.start(&SpawnSpec::default());
+    p.on_line(INIT_OK);
+    p.on_line(
+        r#"{"type":"system","subtype":"init","session_id":"s1","model":"m","cwd":"/p","tools":[],"mcp_servers":[],"permissionMode":"default","claude_code_version":"2.1.293","slash_commands":["compact"]}"#,
+    );
+    // The init opened a turn: like a prompt, `/compact` waits for its `result`.
+    assert_eq!(
+        p.encode(InputId(9), Command::Compact).unwrap(),
+        Encoded::Queued
+    );
+    let step = p.on_line(RESULT_OK);
+    assert_eq!(
+        writes(&step)[0]["message"]["content"][0]["text"],
+        "/compact"
+    );
+}
+
+/// A compact asked for during the handshake waits for the listing: it is written when the
+/// session lists `compact`, and dropped with a reason when it does not.
+#[test]
+fn compact_during_the_handshake_is_decided_by_the_listing() {
+    let mut p = ClaudeProtocol::new();
+    p.start(&SpawnSpec::default());
+    assert_eq!(
+        p.encode(InputId(3), Command::Compact).unwrap(),
+        Encoded::Queued
+    );
+    let step = p.on_line(
+        r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"commands":[{"name":"compact"}]}}}"#,
+    );
+    assert!(step
+        .events
+        .contains(&AgentEvent::InputSent { input: InputId(3) }));
+    assert_eq!(
+        writes(&step)[0]["message"]["content"][0]["text"],
+        "/compact"
+    );
+
+    let mut p = ClaudeProtocol::new();
+    p.start(&SpawnSpec::default());
+    p.encode(InputId(4), Command::Compact).unwrap();
+    let step = p.on_line(INIT_OK);
+    assert!(
+        step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::InputDropped {
+                input: InputId(4),
+                reason: wasit_core::InputDropReason::Unencodable,
+                error: Some(e),
+            } if e.contains("compact")
+        )),
+        "{:?}",
+        step.events
+    );
+    assert!(step.write.is_empty());
+}

@@ -13,7 +13,7 @@ Drivers and the runtime are tested against it (ARCHITECTURE.md §1 rule 10).
 
 `WASIT_FAKE_PERSONA=claude|codex|opencode|kilo` overrides detection (needed for `--version` and
 the discovery commands, which carry no protocol argv). The fake ignores flags it does not model,
-but honours claude's `--model`, `--permission-mode`, `--resume`, `--session-id`, `--continue`,
+but honours claude's `--model`, `--permission-mode`, `--resume`, `--fork-session` (a new id and a new transcript, the resumed one untouched; the copy holds no earlier history), `--session-id`, `--continue`,
 `--name` and `--include-partial-messages`.
 
 `WASIT_FAKE_SCENARIO=<path.json>` selects the scenario (default: an empty one, which echoes every

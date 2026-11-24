@@ -94,9 +94,13 @@ impl DriverDescriptor for ClaudeDescriptor {
             }
             ResumeMode::Continue => argv.push("--continue".to_string()),
             ResumeMode::Resume(id) => argv.extend(["--resume".to_string(), id.clone()]),
-            // Not produced before the fork capability is implemented; until then a fork starts
-            // with no conversation flags (never `--resume`, which would write to the source).
-            ResumeMode::Fork(_) => {}
+            // `--fork-session` makes the resumed conversation's copy the session: the CLI reports
+            // the copy's new id in `system/init`, and the source is not written.
+            ResumeMode::Fork(id) => argv.extend([
+                "--resume".to_string(),
+                id.clone(),
+                "--fork-session".to_string(),
+            ]),
         }
         // Writes the title into claude's own transcript (`custom-title`, `agent-name`; verified
         // with 2.1.293 in this mode).
@@ -128,8 +132,11 @@ impl DriverDescriptor for ClaudeDescriptor {
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
             stop_task: true,
             earlier_history: HistoryDelivery::Storage,
-            fork: false,
-            compact: false,
+            fork: true,
+            // The ceiling: claude compacts only when its session lists `/compact`, which the
+            // protocol checks per session (capabilities are static per descriptor). See
+            // `ClaudeProtocol::encode` for `Command::Compact`.
+            compact: true,
             run_shell: false,
         }
     }

@@ -27,6 +27,9 @@ pub struct ClaudeArgs {
     pub session_id: Option<String>,
     /// `--continue`: the most recent conversation of the working directory.
     pub continue_latest: bool,
+    /// `--fork-session` (with `--resume`): the session is a new conversation that copies the
+    /// resumed one, under a new id; the resumed one is not written.
+    pub fork_session: bool,
     /// `--name`: the conversation's title.
     pub name: Option<String>,
     pub partial_messages: bool,
@@ -47,6 +50,11 @@ impl ClaudeArgs {
                 "--name" | "-n" => a.name = next,
                 "--continue" | "-c" => {
                     a.continue_latest = true;
+                    i += 1;
+                    continue;
+                }
+                "--fork-session" => {
+                    a.fork_session = true;
                     i += 1;
                     continue;
                 }
@@ -261,7 +269,12 @@ impl Claude {
                 }
             }
         }
-        let name_unsaved = (resumed.is_none()).then(|| args.name.clone()).flatten();
+        // A fork is a conversation of its own: its transcript is a new file, the resumed one's
+        // is never written, and its title is not stored until its first prompt.
+        let fork = args.fork_session && resumed.is_some();
+        let name_unsaved = (resumed.is_none() || fork)
+            .then(|| args.name.clone())
+            .flatten();
         let mut c = Claude::new(
             &ClaudeArgs {
                 resume: resumed,
@@ -270,19 +283,22 @@ impl Claude {
             scenario,
         );
         c.title = title;
-        c.transcript = resumed_path;
+        c.transcript = if fork { None } else { resumed_path };
         c.project_dir = project_dir;
         c.name_unsaved = name_unsaved;
         Ok(c)
     }
 
     fn new(args: &ClaudeArgs, scenario: &Scenario) -> Claude {
-        let session_id = args
-            .resume
-            .clone()
-            .or_else(|| args.session_id.clone())
-            .or_else(|| scenario.session_id.clone())
-            .unwrap_or_else(uuid);
+        let session_id = if args.fork_session && args.resume.is_some() {
+            uuid()
+        } else {
+            args.resume
+                .clone()
+                .or_else(|| args.session_id.clone())
+                .or_else(|| scenario.session_id.clone())
+                .unwrap_or_else(uuid)
+        };
         let model = args
             .model
             .clone()

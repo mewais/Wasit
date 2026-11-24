@@ -177,6 +177,9 @@ pub struct ClaudeProtocol {
     tool_names: HashMap<String, String>,
     last_usage_message: Option<String>,
     context_window: Option<u64>,
+    /// The session's reported slash commands include `compact` (from the `initialize` response or
+    /// `system/init`): `Command::Compact` runs `/compact` only then.
+    compact_listed: bool,
 }
 
 impl Default for ClaudeProtocol {
@@ -208,6 +211,7 @@ impl ClaudeProtocol {
             tool_names: HashMap::new(),
             last_usage_message: None,
             context_window: None,
+            compact_listed: false,
         }
     }
 
@@ -241,12 +245,12 @@ impl ClaudeProtocol {
                 cmd,
                 Command::Prompt { .. }
                     | Command::RunSlash { .. }
+                    | Command::Compact
                     | Command::SetModel { .. }
                     | Command::SetMode { .. }
             ),
             Phase::Ready => {
-                matches!(cmd, Command::Prompt { .. } | Command::RunSlash { .. })
-                    && (self.prompt_blocked() || !self.queue.is_empty())
+                is_turn_command(cmd) && (self.prompt_blocked() || !self.queue.is_empty())
             }
             Phase::Closed => false,
         }
@@ -378,9 +382,22 @@ impl ClaudeProtocol {
                     ..Step::default()
                 })
             }
-            Command::Compact => Err(DriverError::Unsupported {
-                operation: "compact".into(),
-            }),
+            // Claude has no compact command of its own: `/compact` is a slash command the session
+            // lists, or nothing.
+            Command::Compact => {
+                if !self.compact_listed {
+                    return Err(DriverError::Unsupported {
+                        operation: "compact".into(),
+                    });
+                }
+                self.encode_now(
+                    input,
+                    Command::RunSlash {
+                        name: "compact".into(),
+                        args: String::new(),
+                    },
+                )
+            }
             Command::RunShell { .. } => Err(DriverError::Unsupported {
                 operation: "run_shell".into(),
             }),
@@ -426,7 +443,7 @@ impl ClaudeProtocol {
     fn drop_queued_prompts(&mut self, reason: InputDropReason) -> Vec<AgentEvent> {
         let (prompts, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.queue)
             .into_iter()
-            .partition(|(_, c)| matches!(c, Command::Prompt { .. } | Command::RunSlash { .. }));
+            .partition(|(_, c)| is_turn_command(c));
         self.queue = rest;
         prompts
             .into_iter()
@@ -597,11 +614,29 @@ impl ClaudeProtocol {
     }
 
     /// Send queued commands that may go now, in order.
+    /// Records whether the slash commands the CLI reported now include `compact`.
+    fn note_listing(&mut self, events: &[AgentEvent]) {
+        for e in events {
+            let names: Option<Vec<&str>> = match e {
+                AgentEvent::SlashCommandsUpdated { commands } => {
+                    Some(commands.iter().map(|c| c.name.as_str()).collect())
+                }
+                AgentEvent::SessionInit { slash_commands, .. } => {
+                    Some(slash_commands.iter().map(|c| c.name.as_str()).collect())
+                }
+                _ => None,
+            };
+            if let Some(names) = names {
+                self.compact_listed = names.contains(&"compact");
+            }
+        }
+    }
+
     fn drain(&mut self) -> Step {
         let mut step = Step::default();
         while let Some((_, cmd)) = self.queue.front() {
-            let is_prompt = matches!(cmd, Command::Prompt { .. } | Command::RunSlash { .. });
-            if self.phase != Phase::Ready || (is_prompt && self.prompt_blocked()) {
+            let is_turn = is_turn_command(cmd);
+            if self.phase != Phase::Ready || (is_turn && self.prompt_blocked()) {
                 break;
             }
             let (input, cmd) = self.queue.pop_front().expect("front exists");
@@ -660,6 +695,7 @@ impl ClaudeProtocol {
             let mut step = Step::default();
             if ok {
                 step.events.extend(init_response_events(&payload));
+                self.note_listing(&step.events);
             } else {
                 step.events.push(AgentEvent::CommandRejected {
                     command: "initialize".into(),
@@ -811,6 +847,7 @@ impl ClaudeProtocol {
         {
             self.lifecycle_capable = true;
         }
+        self.note_listing(&out);
         // Whatever the CLI had not said about our write, it has begun working since.
         self.unobserved_write = false;
         if !self.turn_open {
@@ -1104,6 +1141,14 @@ impl Protocol for ClaudeProtocol {
         }
         self.encode_now(input, cmd).map(Encoded::Sent)
     }
+}
+
+/// Commands that start a turn of their own, so they wait for the running turn (and the handshake).
+fn is_turn_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Prompt { .. } | Command::RunSlash { .. } | Command::Compact
+    )
 }
 
 fn events(events: Vec<AgentEvent>) -> Step {

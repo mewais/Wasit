@@ -731,6 +731,52 @@ fn transcript(state: &std::path::Path, cwd: &std::path::Path, id: &str) -> std::
         .join(format!("{id}.jsonl"))
 }
 
+/// `--resume <id> --fork-session` (claude 2.1.x): the session is a new conversation under a new
+/// id that copies the resumed one, and the resumed conversation's transcript is not written.
+#[test]
+fn claude_fork_session_reports_a_new_id_and_leaves_the_source_alone() {
+    let (state, cwd) = (common::scratch_dir(), common::scratch_dir());
+    let (state, cwd) = (state.as_ref(), cwd.as_ref());
+    let mut parent = claude_run(state, cwd, &["--session-id", CONVERSATION], Some("hello"));
+    assert_eq!(exit_code(&mut parent), Some(0));
+    let source_before = std::fs::read(transcript(state, cwd, CONVERSATION)).unwrap();
+
+    let mut f = Fake::spawn_in(
+        &[
+            CLAUDE_ARGV.as_slice(),
+            &["--resume", CONVERSATION, "--fork-session"],
+        ]
+        .concat(),
+        Some("claude"),
+        &Scenario::default(),
+        Some(state),
+        Some(cwd),
+    );
+    f.send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
+    f.recv_until(|m| m["type"] == "control_response");
+    f.send(&json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"again"}]}}));
+    let msgs = f.recv_until(|m| m["type"] == "result");
+    let init = msgs
+        .iter()
+        .find(|m| m["type"] == "system" && m["subtype"] == "init")
+        .expect("the forked session's system/init");
+    let child = init["session_id"].as_str().unwrap().to_string();
+    assert_ne!(child, CONVERSATION, "a fork has an id of its own");
+    assert!(is_uuid_text(&child), "{child}");
+    assert!(transcript(state, cwd, &child).is_file());
+    assert_eq!(
+        std::fs::read(transcript(state, cwd, CONVERSATION)).unwrap(),
+        source_before,
+        "the source conversation is not written by a fork"
+    );
+    f.close_stdin();
+    assert_eq!(exit_code(&mut f), Some(0));
+}
+
+fn is_uuid_text(s: &str) -> bool {
+    s.len() == 36 && s.split('-').map(str::len).eq([8, 4, 4, 4, 12])
+}
+
 fn exit_code(f: &mut Fake) -> Option<i32> {
     f.wait_exit().and_then(|s| s.code())
 }
