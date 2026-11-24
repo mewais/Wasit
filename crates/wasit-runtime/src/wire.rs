@@ -1277,6 +1277,8 @@ fn default_tool_output_cap() -> u32 {
 /// a best-effort basis; the reply of the finished export ([`ExportEvent::Done`]) counts them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Renamed in the TypeScript: Marsad's diagnostics export has the same name and would overwrite it.
+#[cfg_attr(feature = "ts", ts(rename = "SessionExportRequest"))]
 pub struct ExportRequest {
     pub session: SessionId,
     /// The formats to write: each at most once, at least one.
@@ -1298,6 +1300,8 @@ pub struct ExportRequest {
 /// [`topics::session_export`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Renamed in the TypeScript: Marsad's diagnostics export has the same name and would overwrite it.
+#[cfg_attr(feature = "ts", ts(rename = "SessionExportStarted"))]
 pub struct ExportStarted {
     pub export_id: String,
 }

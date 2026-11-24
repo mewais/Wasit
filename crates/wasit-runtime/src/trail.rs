@@ -262,10 +262,10 @@ wasit_diag::diag_data! {
         /// Context was compacted.
         #[diag(ev = "agent.compaction")]
         AgentCompaction {
-            pre_tokens: u64,
+            ; pre_tokens: u64,
             post_tokens: u64,
-            duration_ms: u64
-            ; trigger: Code
+            duration_ms: u64,
+            trigger: Code
         },
         /// The provider reported a rate-limit status.
         #[diag(ev = "agent.rate_limited")]
@@ -639,10 +639,11 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
         AgentEvent::Notice { message } => TrailEntry::AgentNotice {
             error: ErrorInfo::foreign(Code::st("notice"), message),
         },
+        // Absent figures stay absent: inventing `0` would read as a real measurement.
         AgentEvent::Compaction { info } => TrailEntry::AgentCompaction {
-            pre_tokens: info.pre_tokens.unwrap_or(0),
-            post_tokens: info.post_tokens.unwrap_or(0),
-            duration_ms: info.duration_ms.unwrap_or(0),
+            pre_tokens: info.pre_tokens,
+            post_tokens: info.post_tokens,
+            duration_ms: info.duration_ms,
             trigger: info.trigger.as_deref().and_then(non_empty).map(Code::new),
         },
         AgentEvent::RateLimitNotice { info } => TrailEntry::AgentRateLimited {
@@ -1067,9 +1068,9 @@ mod tests {
             },
             TrailEntry::AgentNotice { error: err() },
             TrailEntry::AgentCompaction {
-                pre_tokens: 1,
-                post_tokens: 2,
-                duration_ms: 3,
+                pre_tokens: Some(1),
+                post_tokens: Some(2),
+                duration_ms: Some(3),
                 trigger: Some(code()),
             },
             TrailEntry::AgentRateLimited {
@@ -1153,6 +1154,54 @@ mod tests {
             }
         );
         assert!(!serde_json::to_string(&entry).unwrap().contains("SECRET"));
+    }
+
+    /// A compaction the CLI reported without figures records no figure: no `0` is invented, and
+    /// the absent keys are left out of the wire form.
+    #[test]
+    fn an_unreported_compaction_figure_is_absent_never_zero() {
+        let event = AgentEvent::Compaction {
+            info: wasit_core::CompactionInfo {
+                trigger: Some("auto".into()),
+                ..Default::default()
+            },
+        };
+        let entry = project_agent(&event).unwrap();
+        assert_eq!(
+            entry,
+            TrailEntry::AgentCompaction {
+                pre_tokens: None,
+                post_tokens: None,
+                duration_ms: None,
+                trigger: Some(Code::st("auto")),
+            }
+        );
+        let v = serde_json::to_value(&entry).unwrap();
+        for key in ["pre_tokens", "post_tokens", "duration_ms"] {
+            assert!(v.get(key).is_none(), "{key} must be absent: {v}");
+        }
+        assert_eq!(serde_json::from_value::<TrailEntry>(v).unwrap(), entry);
+    }
+
+    /// Trail records written before the figures became optional carry numbers; they still parse.
+    #[test]
+    fn a_compaction_recorded_with_numbers_still_parses() {
+        let old = serde_json::json!({
+            "ev": "agent.compaction",
+            "pre_tokens": 100,
+            "post_tokens": 40,
+            "duration_ms": 7,
+            "trigger": "manual",
+        });
+        assert_eq!(
+            serde_json::from_value::<TrailEntry>(old).unwrap(),
+            TrailEntry::AgentCompaction {
+                pre_tokens: Some(100),
+                post_tokens: Some(40),
+                duration_ms: Some(7),
+                trigger: Some(Code::st("manual")),
+            }
+        );
     }
 
     /// Every variant serializes to exactly its declared fields: the declaration, the samples and
