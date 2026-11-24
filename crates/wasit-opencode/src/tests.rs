@@ -1231,6 +1231,92 @@ fn replayed_calls_leave_no_state_behind() {
     );
 }
 
+/// A live `usage_update` for the session, as kilo sends it before each prompt's result.
+fn cost_update(p: &mut AcpProtocol, update: &str) {
+    p.on_line(&format!(
+        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{update}}}}}"#
+    ));
+}
+
+/// Sends `text` as input `input`, answers it with `answer` (a full JSON-RPC response body with
+/// `ID` standing for the request id), and returns the cost of the `TurnCompleted` it produced.
+fn finish_turn(p: &mut AcpProtocol, input: u64, text: &str, answer: &str) -> f64 {
+    let step = sent(p.encode(InputId(input), Command::prompt(text)));
+    let id = w(&step)[0]["id"].clone();
+    let step = p.on_line(&answer.replace("ID", &id.to_string()));
+    step.events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::TurnCompleted { usage, .. } => Some(usage.cost_usd),
+            _ => None,
+        })
+        .expect("a TurnCompleted")
+}
+
+const END_TURN: &str = r#"{"jsonrpc":"2.0","id":ID,"result":{"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":2}}}"#;
+
+/// The session cost reported by `usage_update` reaches the turn's `TurnCompleted`: the prompt
+/// result carries no cost of its own.
+#[test]
+fn usage_update_cost_reaches_turn_completed() {
+    let mut p = ready();
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.25,"currency":"USD"}}"#,
+    );
+    assert_eq!(finish_turn(&mut p, 1, "a", END_TURN), 0.25);
+}
+
+/// The reported cost is cumulative for the session (kilo's `usage.ts` sums every assistant
+/// message's cost), so a second turn reports the new total, not the turn's own share, and a
+/// turn with no update of its own still reports the total.
+#[test]
+fn two_turns_report_the_cumulative_session_cost() {
+    let mut p = ready();
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.25,"currency":"USD"}}"#,
+    );
+    assert_eq!(finish_turn(&mut p, 1, "a", END_TURN), 0.25);
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":80,"size":200,"cost":{"amount":0.4,"currency":"USD"}}"#,
+    );
+    assert_eq!(finish_turn(&mut p, 2, "b", END_TURN), 0.4);
+    assert_eq!(finish_turn(&mut p, 3, "c", END_TURN), 0.4);
+}
+
+/// A zero, absent or non-USD cost does not erase the cost already known for the session.
+#[test]
+fn zero_or_absent_cost_keeps_the_known_cost() {
+    let mut p = ready();
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.25,"currency":"USD"}}"#,
+    );
+    assert_eq!(finish_turn(&mut p, 1, "a", END_TURN), 0.25);
+    for update in [
+        r#"{"sessionUpdate":"usage_update","used":60,"size":200,"cost":{"amount":0,"currency":"USD"}}"#,
+        r#"{"sessionUpdate":"usage_update","used":60,"size":200}"#,
+        r#"{"sessionUpdate":"usage_update","used":60,"size":200,"cost":{"amount":9,"currency":"EUR"}}"#,
+    ] {
+        cost_update(&mut p, update);
+        assert_eq!(finish_turn(&mut p, 2, "b", END_TURN), 0.25, "{update}");
+    }
+}
+
+/// A turn that fails still reports the session's known cost, not zero.
+#[test]
+fn failed_turn_keeps_the_known_cost() {
+    let mut p = ready();
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.25,"currency":"USD"}}"#,
+    );
+    let failed = r#"{"jsonrpc":"2.0","id":ID,"error":{"code":-32603,"message":"boom"}}"#;
+    assert_eq!(finish_turn(&mut p, 1, "a", failed), 0.25);
+}
+
 /// A replayed usage report and plan are the past's: they are not shown, and cost nothing.
 #[test]
 fn replayed_usage_and_plan_are_not_shown() {

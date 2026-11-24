@@ -114,6 +114,10 @@ pub struct AcpProtocol {
     /// `promptCapabilities` from `initialize`.
     prompt_image: bool,
     prompt_embedded: bool,
+    /// The session's cost in USD as the CLI last reported it. ACP `usage_update.cost` is
+    /// cumulative for the whole session (kilo sums every assistant message's cost), and the
+    /// prompt result carries no cost, so every `TurnCompleted` reports this value.
+    session_cost: Option<f64>,
 }
 
 impl AcpProtocol {
@@ -141,6 +145,7 @@ impl AcpProtocol {
             prompt_image: false,
             prompt_embedded: false,
             subagents_started: HashSet::new(),
+            session_cost: None,
         }
     }
 
@@ -477,7 +482,7 @@ impl AcpProtocol {
                     end_reason: Some(EndReason::ExecutionError),
                     was_interrupted: false,
                     num_turns: 0,
-                    usage: Usage::default(),
+                    usage: self.turn_usage(&Value::Null),
                     per_model: HashMap::new(),
                     reply: Some(message),
                     origin: None,
@@ -528,19 +533,26 @@ impl AcpProtocol {
             end_reason,
             was_interrupted: cancelled,
             num_turns: 0,
-            usage: Usage {
-                input_tokens: u(&usage, "inputTokens"),
-                output_tokens: u(&usage, "outputTokens"),
-                cache_read_tokens: u(&usage, "cachedReadTokens"),
-                cache_creation_tokens: u(&usage, "cachedWriteTokens"),
-                cost_usd: 0.0,
-            },
+            usage: self.turn_usage(&usage),
             per_model: HashMap::new(),
             reply: None,
             origin: None,
         });
         step.extend(self.drain());
         step
+    }
+
+    /// A turn's usage: the tokens of `tokens` (a prompt result's `usage`, or `Null`) and the
+    /// session's cost as last reported. Every `TurnCompleted` is cumulative, so a turn that
+    /// reports no cost of its own keeps the known one rather than reporting zero.
+    fn turn_usage(&self, tokens: &Value) -> Usage {
+        Usage {
+            input_tokens: u(tokens, "inputTokens"),
+            output_tokens: u(tokens, "outputTokens"),
+            cache_read_tokens: u(tokens, "cachedReadTokens"),
+            cache_creation_tokens: u(tokens, "cachedWriteTokens"),
+            cost_usd: self.session_cost.unwrap_or(0.0),
+        }
     }
 
     /// Events for a changed `configOptions` set (only what changed).
@@ -690,16 +702,14 @@ impl AcpProtocol {
             "tool_call" => self.on_tool_call(update),
             "tool_call_update" => self.on_tool_update(update),
             "usage_update" => {
-                let cost = update.get("cost").cloned().unwrap_or(Value::Null);
-                let cost_usd = if s(&cost, "currency") == "USD" {
-                    cost.get("amount").and_then(Value::as_f64).unwrap_or(0.0)
-                } else {
-                    0.0
-                };
+                let reported = reported_cost(update);
+                if let Some(cost) = reported {
+                    self.session_cost = Some(cost);
+                }
                 let size = u(update, "size");
                 vec![AgentEvent::UsageUpdate {
                     usage: Usage {
-                        cost_usd,
+                        cost_usd: reported.unwrap_or(0.0),
                         ..Usage::default()
                     },
                     context_pct: (size > 0)
@@ -992,6 +1002,19 @@ impl Protocol for AcpProtocol {
 }
 
 /// The events of an agent message / thought chunk (the same live and in a replayed history).
+/// The session cost a `usage_update` reports, in USD, when it reports a positive one. Zero,
+/// absent and non-USD costs are not reports: the cost is cumulative, so a zero never supersedes
+/// a cost already known.
+fn reported_cost(update: &Value) -> Option<f64> {
+    let cost = update.get("cost")?;
+    if s(cost, "currency") != "USD" {
+        return None;
+    }
+    cost.get("amount")
+        .and_then(Value::as_f64)
+        .filter(|amount| *amount > 0.0)
+}
+
 fn chunk_events(kind: &str, update: &Value) -> Vec<AgentEvent> {
     let message_id = opt_s(update, "messageId");
     if kind == "agent_thought_chunk" {
