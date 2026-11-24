@@ -82,6 +82,8 @@ enum Req {
     Compact,
     /// `review/start` (the `/review` slash command).
     Review,
+    /// `thread/shellCommand` (the `!` command the user ran from the client).
+    RunShell,
     /// `turn/start` for this input.
     TurnStart(InputId),
     /// `turn/steer` for this input.
@@ -102,6 +104,7 @@ impl Req {
             Req::CollabList => "collaborationMode/list",
             Req::Compact => "compact",
             Req::Review => "review",
+            Req::RunShell => "run_shell",
             Req::ModeAtStart | Req::SetMode => "set_mode",
             Req::TurnStart(_) | Req::Steer(_) => "prompt",
             Req::Interrupt => "interrupt",
@@ -463,10 +466,20 @@ impl CodexProtocol {
                 let line = self.compact_request();
                 step.write.push(line);
             }
-            Command::RunShell { .. } => {
-                return Err(DriverError::Unsupported {
-                    operation: "run_shell".into(),
-                })
+            Command::RunShell { line, timeout_ms } => {
+                // The command runs in the thread's context, so there must be a thread to run it in.
+                if self.thread_id.is_none() {
+                    return Err(DriverError::Invalid {
+                        detail: "run_shell needs a thread, and the session has none yet".into(),
+                    });
+                }
+                // Without `timeoutMs` codex applies its own default (one hour).
+                let mut params = json!({"threadId": self.thread(), "command": line});
+                if let Some(ms) = timeout_ms {
+                    params["timeoutMs"] = json!(ms);
+                }
+                let line = self.request(Req::RunShell, "thread/shellCommand", params);
+                step.write.push(line);
             }
             Command::Interrupt => return Ok(self.interrupt()),
             Command::SetModel { model } => {
@@ -705,7 +718,8 @@ impl CodexProtocol {
             | Req::SetModel
             | Req::SetMode
             | Req::Compact
-            | Req::Review => Step::default(),
+            | Req::Review
+            | Req::RunShell => Step::default(),
         }
     }
 
@@ -1095,7 +1109,16 @@ fn tool_started(item: &Value, id: &str) -> Option<AgentEvent> {
     let ty = s(item, "type");
     let (name, input) = match ty {
         "userMessage" | "agentMessage" | "reasoning" | "plan" | "contextCompaction" => return None,
-        "commandExecution" => (s(item, "command").to_string(), Value::Null),
+        "commandExecution" => {
+            // A `!` command the user ran (`source` userShell) is a tool row like the agent's, with
+            // its input saying so: the item is the only place codex marks it as the user's.
+            let input = if s(item, "source") == "userShell" {
+                json!({"source": "userShell"})
+            } else {
+                Value::Null
+            };
+            (s(item, "command").to_string(), input)
+        }
         "fileChange" => (
             "apply_patch".to_string(),
             item.get("changes").cloned().unwrap_or(Value::Null),

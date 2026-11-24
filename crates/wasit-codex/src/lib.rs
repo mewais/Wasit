@@ -84,7 +84,7 @@ impl DriverDescriptor for CodexDescriptor {
             earlier_history: HistoryDelivery::Wire,
             fork: true,
             compact: true,
-            run_shell: false,
+            run_shell: true,
         }
     }
 

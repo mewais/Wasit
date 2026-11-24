@@ -1391,20 +1391,123 @@ fn a_huge_first_prompt_becomes_a_bounded_title() {
 }
 
 #[test]
-fn run_shell_is_unsupported() {
+fn run_shell_request_without_timeout_is_exactly_thread_and_command() {
     let mut p = ready();
+    let s = sent(p.encode(
+        InputId(131),
+        Command::RunShell {
+            line: "ls -la | wc -l".into(),
+            timeout_ms: None,
+        },
+    ));
+    let lines = w(&s);
+    assert_eq!(lines.len(), 1);
     assert_eq!(
-        p.encode(
-            InputId(131),
-            Command::RunShell {
-                line: "ls".into(),
-                timeout_ms: Some(1000)
-            }
-        ),
-        Err(DriverError::Unsupported {
-            operation: "run_shell".into()
-        })
+        lines[0],
+        json!({"jsonrpc":"2.0","id":lines[0]["id"],"method":"thread/shellCommand",
+               "params":{"threadId":"t1","command":"ls -la | wc -l"}})
     );
+    assert!(lines[0]["params"].get("timeoutMs").is_none());
+}
+
+#[test]
+fn run_shell_request_with_timeout_carries_timeout_ms() {
+    let mut p = ready();
+    let s = sent(p.encode(
+        InputId(132),
+        Command::RunShell {
+            line: "make".into(),
+            timeout_ms: Some(5000),
+        },
+    ));
+    let lines = w(&s);
+    assert_eq!(
+        lines[0],
+        json!({"jsonrpc":"2.0","id":lines[0]["id"],"method":"thread/shellCommand",
+               "params":{"threadId":"t1","command":"make","timeoutMs":5000}})
+    );
+}
+
+#[test]
+fn run_shell_is_refused_before_the_thread_exists() {
+    // Before `initialize` and before the thread open: nothing is written, nothing is queued.
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec::default());
+    let cmd = || Command::RunShell {
+        line: "ls".into(),
+        timeout_ms: None,
+    };
+    assert!(matches!(
+        p.encode(InputId(133), cmd()),
+        Err(DriverError::Invalid { detail }) if detail.contains("has none yet")
+    ));
+    p.on_line(r#"{"id":1,"result":{"userAgent":"x"}}"#);
+    assert!(matches!(
+        p.encode(InputId(134), cmd()),
+        Err(DriverError::Invalid { .. })
+    ));
+}
+
+#[test]
+fn run_shell_rejection_is_reported_as_a_command_rejection() {
+    let mut p = ready();
+    let s = sent(p.encode(
+        InputId(135),
+        Command::RunShell {
+            line: "ls".into(),
+            timeout_ms: None,
+        },
+    ));
+    let id = w(&s)[0]["id"].clone();
+    let ev = p
+        .on_line(&format!(
+            r#"{{"id":{id},"error":{{"code":-32600,"message":"no shell"}}}}"#
+        ))
+        .events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::CommandRejected {
+            command: "run_shell".into(),
+            message: "no shell".into()
+        }]
+    );
+}
+
+#[test]
+fn user_shell_command_item_is_a_tool_row_marked_as_the_users() {
+    let mut p = ready();
+    let ev = p.on_line(r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"u1","command":"make","source":"userShell"}}}"#).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::ToolCallStarted {
+            name: "make".into(),
+            call_id: "u1".into(),
+            input: json!({"source": "userShell"}),
+            is_subagent: false,
+            subagent_model: None,
+        }]
+    );
+    let ev = p.on_line(r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"u1","status":"completed","exitCode":0,"aggregatedOutput":"built\n","source":"userShell"}}}"#).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::ToolCallFinished {
+            call_id: "u1".into(),
+            name: "make".into(),
+            ok: true,
+            result: Some(json!("built\n")),
+            parts: vec![]
+        }]
+    );
+}
+
+#[test]
+fn agent_command_item_is_not_marked_as_the_users() {
+    let mut p = ready();
+    let ev = p.on_line(r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"a1","command":"ls","source":"agent"}}}"#).events;
+    assert!(matches!(
+        &ev[0],
+        AgentEvent::ToolCallStarted { input, .. } if *input == serde_json::Value::Null
+    ));
 }
 
 // ── fork, compact, slash commands ───────────────────────────────────────────
@@ -1427,7 +1530,7 @@ fn codex_reports_fork_compact_and_slash_capabilities() {
     assert!(caps.fork);
     assert!(caps.compact);
     assert!(caps.slash_commands);
-    assert!(!caps.run_shell);
+    assert!(caps.run_shell);
 }
 
 #[test]
