@@ -890,6 +890,7 @@ mod tests {
             display_name: None,
             command: None,
             conversation: Conversation::Unknown,
+            forked_from: None,
         };
         blank_snapshot(&meta, desc.as_ref(), Phase::Starting, true)
     }

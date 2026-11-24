@@ -35,6 +35,7 @@ fn meta(driver: &str, spec: &SpawnSpec) -> SessionMeta {
         display_name: None,
         command: None,
         conversation: Conversation::of_spec(spec),
+        forked_from: None,
     }
 }
 

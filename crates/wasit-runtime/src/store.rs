@@ -25,12 +25,12 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use wasit_core::{DriverDescriptor, DriverId, SpawnSpec, Unsupported};
+use wasit_core::{AgentConfig, DriverDescriptor, DriverId, SpawnSpec, Unsupported};
 use wasit_shim::ShimSpec;
 
 use crate::config::RuntimeConfig;
 use crate::core::{Conversation, SessionMeta};
-use crate::wire::{RuntimeError, SessionId};
+use crate::wire::{ForkedFrom, RuntimeError, SessionId};
 
 pub(crate) const SESSION_FILE: &str = "session.json";
 const VERSION: u32 = 1;
@@ -62,6 +62,13 @@ pub(crate) struct SessionFile {
     /// journaled the first `start` note, which carries it from then on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earlier: Option<crate::note::EarlierPlan>,
+    /// The agent configuration the session was created with. A fork starts with it.
+    #[serde(default, skip_serializing_if = "is_default_config")]
+    pub config: AgentConfig,
+    /// The session and conversation this one forked from (`sessions.fork`), set at creation and
+    /// never changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ForkedFrom>,
 }
 
 impl SessionFile {
@@ -85,6 +92,8 @@ impl SessionFile {
             unsupported,
             display_name: None,
             earlier: None,
+            config: AgentConfig::default(),
+            forked_from: None,
         }
     }
 
@@ -98,8 +107,15 @@ impl SessionFile {
             display_name: self.display_name.clone(),
             command: self.spec.bin.clone(),
             conversation: Conversation::of_spec(&self.spec),
+            forked_from: self.forked_from.clone(),
         }
     }
+}
+
+/// A configuration that is the default one: not written (a session file without it reads the
+/// same).
+fn is_default_config(c: &AgentConfig) -> bool {
+    *c == AgentConfig::default()
 }
 
 pub(crate) async fn read(dir: &Path) -> Result<SessionFile, String> {

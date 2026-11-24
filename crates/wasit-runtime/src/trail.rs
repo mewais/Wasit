@@ -369,6 +369,7 @@ pub fn project(event: &SessionEvent) -> Option<TrailEntry> {
                 StartResume::Fresh => "fresh",
                 StartResume::Continue => "continue",
                 StartResume::Resume => "resume",
+                StartResume::Fork => "fork",
             }),
             resume_id: resume_id.as_deref().map(Ident::new),
             model: model.as_deref().map(Ident::new),
@@ -1595,6 +1596,7 @@ mod tests {
             (StartResume::Fresh, "fresh"),
             (StartResume::Continue, "continue"),
             (StartResume::Resume, "resume"),
+            (StartResume::Fork, "fork"),
         ] {
             let e = ev(SessionEventKind::Started {
                 generation: 1,

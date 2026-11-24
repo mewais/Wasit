@@ -19,8 +19,9 @@ use crate::store::now_ms;
 use crate::stream::StreamEnd;
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandReply, CommandRequest, ConfigureEnvironment,
-    CreateSession, DriverSummary, EnvironmentTest, HistoryRequest, HostInfo, InventoryRequest,
-    RefreshRequest, RenameSession, RuntimeError, SessionId, SessionList, SessionRef, TrailRequest,
+    CreateSession, CreateSessionReply, DriverSummary, EnvironmentTest, ForkSession, HistoryRequest,
+    HostInfo, InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionId,
+    SessionList, SessionRef, TrailRequest,
 };
 
 /// How long `host.environment.test` waits for discovery after the setup ran (a test then
@@ -228,6 +229,14 @@ impl Service for RuntimeService {
                     env.register_secrets();
                 }
                 ok(m.create_traced(r, ctx.trace).await.map_err(runtime_err)?)
+            }
+            methods::SESSIONS_FORK => {
+                let r: ForkSession = params(p)?;
+                let reply: CreateSessionReply = m
+                    .fork(&r.parent, r.name, ctx.trace)
+                    .await
+                    .map_err(runtime_err)?;
+                ok(reply)
             }
             methods::SESSIONS_CONTINUE => {
                 let r: SessionRef = params(p)?;

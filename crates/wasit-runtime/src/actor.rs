@@ -1304,6 +1304,8 @@ impl Actor {
             Command::SetMode { .. } => !caps.set_mode,
             Command::RunSlash { .. } => !caps.slash_commands,
             Command::StopTask { .. } => !caps.stop_task,
+            Command::Compact => !caps.compact,
+            Command::RunShell { .. } => !caps.run_shell,
             _ => false,
         };
         if unsupported {
@@ -1314,6 +1316,12 @@ impl Actor {
                     operation: command.name().to_string(),
                 },
             );
+            return;
+        }
+        // Compacting rewrites the context a running turn reads: it waits for the session to be
+        // idle, as a fork does.
+        if matches!(command, Command::Compact) && self.core.snapshot().phase.is_busy() {
+            self.refuse(&intent, reply, CommandError::Busy);
             return;
         }
         if matches!(command, Command::Shutdown) {

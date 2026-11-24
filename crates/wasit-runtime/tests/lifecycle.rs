@@ -525,25 +525,31 @@ async fn claude_slash_command_to_an_ended_session_continues_it() {
     mgr.stop(&id).await.unwrap();
 }
 
-/// A driver with no slash commands refuses one as it always did, ended session or not.
+/// A command the driver does not have is refused as unsupported, ended session or not, and does
+/// not continue the session. claude has no shell command (`run_shell` is false).
 #[tokio::test]
 async fn a_command_the_driver_does_not_have_is_unsupported_not_a_continue() {
     let d = TempDir::new();
     let mgr = manager(d.path()).await;
-    let id = idle(&mgr, d.path(), "codex").await;
+    let id = idle(&mgr, d.path(), "claude").await;
     turn(&mgr, &id, "one").await;
     end(&mgr, &id).await;
     let e = mgr
         .command(
             &id,
-            Command::RunSlash {
-                name: "x".into(),
-                args: String::new(),
+            Command::RunShell {
+                line: "ls".into(),
+                timeout_ms: None,
             },
         )
         .await
         .unwrap_err();
-    assert!(matches!(e, CommandError::Unsupported { .. }), "{e:?}");
+    assert_eq!(
+        e,
+        CommandError::Unsupported {
+            operation: "run_shell".into()
+        }
+    );
     assert_eq!(mgr.snapshot(&id).unwrap().generation, 1);
 }
 

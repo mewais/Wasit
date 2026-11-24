@@ -195,6 +195,8 @@ pub(crate) struct SessionMeta {
     /// What the session's spec says about the agent's conversation before the agent says
     /// anything ([`Conversation::of_spec`]).
     pub conversation: Conversation,
+    /// The session this one was forked from (see [`crate::wire::ForkedFrom`]).
+    pub forked_from: Option<crate::wire::ForkedFrom>,
 }
 
 /// An empty snapshot for `meta` in `phase`.
@@ -223,6 +225,7 @@ pub(crate) fn blank_snapshot(
         resume_command: None,
         title: None,
         display_name: meta.display_name.clone(),
+        forked_from: meta.forked_from.clone(),
         cli_version: None,
         model: None,
         mode: None,
@@ -1137,9 +1140,7 @@ impl Core {
             ResumeMode::Fresh => (StartResume::Fresh, None),
             ResumeMode::Continue => (StartResume::Continue, None),
             ResumeMode::Resume(id) => (StartResume::Resume, Some(id.clone())),
-            // Not produced before the fork capability is wired (its start mode gets its own
-            // record then); until then a fork is reported as the new conversation it becomes.
-            ResumeMode::Fork(_) => (StartResume::Fresh, None),
+            ResumeMode::Fork(id) => (StartResume::Fork, Some(id.clone())),
         };
         em.push(SessionEventKind::Started {
             generation: self.snap.generation,
@@ -2309,6 +2310,7 @@ mod tests {
             display_name: None,
             command: None,
             conversation: Conversation::Unknown,
+            forked_from: None,
         }
     }
 

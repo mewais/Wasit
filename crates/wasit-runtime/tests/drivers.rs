@@ -380,9 +380,38 @@ async fn slash(driver: &str) {
 async fn claude_slash() {
     slash("claude").await
 }
+/// codex runs `/compact` and `/review` itself and reports exactly those two; a name it does not run
+/// is refused as unsupported, nothing is sent for it.
 #[tokio::test]
-async fn codex_slash_is_unsupported() {
-    slash("codex").await
+async fn codex_slash_reports_compact_and_review_and_refuses_unknown_names() {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let id = create_idle(&mgr, d.path(), "codex", &Scenario::default()).await;
+    let snap = wait_snapshot(&mgr, &id, "slash commands", |s| {
+        !s.slash_commands.is_empty()
+    })
+    .await;
+    let names: Vec<&str> = snap
+        .slash_commands
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["compact", "review"]);
+    let r = mgr
+        .command(
+            &id,
+            Command::RunSlash {
+                name: "nope".into(),
+                args: String::new(),
+            },
+        )
+        .await;
+    assert_eq!(
+        r,
+        Err(CommandError::Unsupported {
+            operation: "run_slash /nope".into()
+        })
+    );
 }
 #[tokio::test]
 async fn opencode_slash() {

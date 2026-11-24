@@ -16,9 +16,9 @@ use wasit_core::{Command, DriverId};
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandOutcome, CommandReply, CommandRequest,
     CreateSession, CreateSessionReply, DiagChunk, DiagReadRequest, DiagSources, DiagTailEvent,
-    DiagTailParams, HistoryPage, HistoryRequest, HistoryScope, HostEvent, HostInfo, InventoryReply,
-    InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent, SessionId,
-    SessionList, SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
+    DiagTailParams, ForkSession, HistoryPage, HistoryRequest, HistoryScope, HostEvent, HostInfo,
+    InventoryReply, InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent,
+    SessionId, SessionList, SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
 };
 
 /// A failed client call.
@@ -242,6 +242,22 @@ impl RuntimeClient {
 
     pub async fn create(&self, req: CreateSession) -> Result<CreateSessionReply, ClientError> {
         self.call(methods::SESSIONS_CREATE, req).await
+    }
+
+    /// `sessions.fork`: a new session copying `parent`'s conversation (see [`ForkSession`]).
+    pub async fn fork(
+        &self,
+        parent: &SessionId,
+        name: Option<String>,
+    ) -> Result<CreateSessionReply, ClientError> {
+        self.call(
+            methods::SESSIONS_FORK,
+            ForkSession {
+                parent: parent.clone(),
+                name,
+            },
+        )
+        .await
     }
 
     pub async fn continue_session(&self, id: &SessionId) -> Result<(), ClientError> {

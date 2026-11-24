@@ -34,9 +34,9 @@ use crate::store::{self, SessionFile};
 use crate::stream::EventStream;
 use crate::subscribe::Feed;
 use crate::wire::{
-    page_budget, CommandError, CommandOutcome, CreateSession, CreateSessionReply, HistoryPage,
-    HistoryRequest, HistoryScope, HostEvent, Phase, ResumeRequest, RuntimeError, SessionEvent,
-    SessionId, SessionSnapshot, TrailPage, TrailRequest,
+    page_budget, CommandError, CommandOutcome, CreateSession, CreateSessionReply, ForkedFrom,
+    HistoryPage, HistoryRequest, HistoryScope, HostEvent, Phase, ResumeRequest, RuntimeError,
+    SessionEvent, SessionId, SessionSnapshot, TrailPage, TrailRequest,
 };
 
 /// Bound on a user-given display name.
@@ -142,6 +142,47 @@ fn normalise_name(name: Option<String>) -> Option<String> {
             .collect::<String>()
     })
     .filter(|n| !n.is_empty())
+}
+
+/// The conversation a fork of a session copies, or why it cannot be forked now. The rules, in
+/// order: the driver can fork; the session's state is known; it is not busy (starting, working,
+/// or waiting for a human); it has completed a turn (a conversation the agent has not stored
+/// yet cannot be copied); the agent has reported the conversation's id.
+fn fork_source(
+    snap: &SessionSnapshot,
+    desc: &dyn DriverDescriptor,
+) -> Result<String, RuntimeError> {
+    if !desc.capabilities().fork {
+        return Err(RuntimeError::Unsupported(format!(
+            "driver {} cannot fork a conversation",
+            snap.driver
+        )));
+    }
+    if !snap.loaded {
+        return Err(RuntimeError::InvalidState(format!(
+            "session {} is still loading; fork it when its history is loaded",
+            snap.id
+        )));
+    }
+    if snap.phase.is_busy() {
+        return Err(RuntimeError::Busy(format!(
+            "session {} is {}; fork it when it is idle",
+            snap.id,
+            snap.phase.name()
+        )));
+    }
+    if snap.turns_completed == 0 {
+        return Err(RuntimeError::InvalidState(format!(
+            "session {} has no completed turn to fork",
+            snap.id
+        )));
+    }
+    snap.native_session_id.clone().ok_or_else(|| {
+        RuntimeError::InvalidState(format!(
+            "session {} has no conversation id to fork yet",
+            snap.id
+        ))
+    })
 }
 
 fn io_err(what: &str, e: impl std::fmt::Display) -> RuntimeError {
@@ -303,6 +344,56 @@ impl SessionManager {
         req: CreateSession,
         trace: Option<TraceId>,
     ) -> Result<CreateSessionReply, RuntimeError> {
+        self.launch(req, trace, None).await
+    }
+
+    /// `sessions.fork`: a new session that copies the conversation of `parent`, with the parent's
+    /// driver, working directory and agent configuration, under the name `name` (when given).
+    /// The parent is only read: its journal and event log are not touched. Refused when the
+    /// parent cannot be forked now (see [`fork_source`]).
+    pub async fn fork(
+        &self,
+        parent: &SessionId,
+        name: Option<String>,
+        trace: Option<TraceId>,
+    ) -> Result<CreateSessionReply, RuntimeError> {
+        let (req, lineage) = {
+            let map = lock(&self.inner.sessions);
+            let e = map
+                .get(parent)
+                .ok_or_else(|| RuntimeError::SessionNotFound(parent.to_string()))?;
+            let snap = e.snapshot.borrow().clone();
+            let native_session_id = fork_source(&snap, e.desc.as_ref())?;
+            let req = CreateSession {
+                driver: snap.driver.clone(),
+                id: None,
+                cwd: snap.cwd.clone(),
+                model: e.file.spec.model.clone(),
+                mode: Some(e.file.spec.mode.clone()).filter(|m| !m.is_empty()),
+                first_prompt: None,
+                resume: ResumeRequest::New,
+                config: e.file.config.clone(),
+                labels: BTreeMap::new(),
+                name,
+            };
+            let lineage = ForkedFrom {
+                session: parent.clone(),
+                native_session_id,
+            };
+            (req, lineage)
+        };
+        self.launch(req, trace, Some(lineage)).await
+    }
+
+    /// Creates and launches a session: the one place sessions are made, for `sessions.create`
+    /// (`fork` is `None`) and `sessions.fork` (`fork` is the parent's lineage, which makes the
+    /// session resume it as [`ResumeMode::Fork`]).
+    async fn launch(
+        &self,
+        req: CreateSession,
+        trace: Option<TraceId>,
+        fork: Option<ForkedFrom>,
+    ) -> Result<CreateSessionReply, RuntimeError> {
         // First, before anything is awaited, journaled, logged or spawned: from here on no text
         // recorded by this process can hold the session's secrets or its directory.
         crate::scrub::agent_config(&req.config);
@@ -313,9 +404,10 @@ impl SessionManager {
             .registry
             .get(&req.driver)
             .map_err(|_| RuntimeError::UnknownDriver(req.driver.to_string()))?;
-        let resume = match &req.resume {
-            ResumeRequest::New => ResumeMode::Fresh,
-            ResumeRequest::Latest => {
+        let resume = match (&fork, &req.resume) {
+            (Some(lineage), _) => ResumeMode::Fork(lineage.native_session_id.clone()),
+            (None, ResumeRequest::New) => ResumeMode::Fresh,
+            (None, ResumeRequest::Latest) => {
                 if !desc.capabilities().continue_latest {
                     return Err(RuntimeError::Unsupported(format!(
                         "driver {} cannot continue its most recent session",
@@ -324,7 +416,7 @@ impl SessionManager {
                 }
                 ResumeMode::Continue
             }
-            ResumeRequest::Resume { native_session_id } => {
+            (None, ResumeRequest::Resume { native_session_id }) => {
                 if !desc.capabilities().resume {
                     return Err(RuntimeError::Unsupported(format!(
                         "driver {} cannot resume sessions",
@@ -441,6 +533,8 @@ impl SessionManager {
         );
         file.display_name = name;
         file.earlier = earlier;
+        file.config = req.config.clone();
+        file.forked_from = fork;
         let launched = async {
             store::write_generated(&dir, &file.spec).await?;
             store::write(&dir, &file)

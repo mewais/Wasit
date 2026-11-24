@@ -17,6 +17,7 @@
 //! | [`methods::HOST_ENVIRONMENT_TEST`] | [`ConfigureEnvironment`] | [`EnvironmentTest`] (applied again, setup re-run, agents re-detected) |
 //! | [`methods::SESSIONS_LIST`] | — | [`SessionList`] |
 //! | [`methods::SESSIONS_CREATE`] | [`CreateSession`] | [`CreateSessionReply`] |
+//! | [`methods::SESSIONS_FORK`] | [`ForkSession`] | [`CreateSessionReply`] (the new session; its snapshot names the parent in `forked_from`) |
 //! | [`methods::SESSIONS_CONTINUE`] | [`SessionRef`] | [`Ack`] |
 //! | [`methods::SESSIONS_STOP`] | [`SessionRef`] | [`Ack`] |
 //! | [`methods::SESSIONS_DELETE`] | [`SessionRef`] | [`Ack`] |
@@ -66,6 +67,7 @@ pub mod methods {
     pub const DRIVERS_REFRESH: &str = "drivers.refresh";
     pub const SESSIONS_LIST: &str = "sessions.list";
     pub const SESSIONS_CREATE: &str = "sessions.create";
+    pub const SESSIONS_FORK: &str = "sessions.fork";
     pub const SESSIONS_CONTINUE: &str = "sessions.continue";
     pub const SESSIONS_STOP: &str = "sessions.stop";
     pub const SESSIONS_DELETE: &str = "sessions.delete";
@@ -214,6 +216,12 @@ impl Phase {
             self,
             Phase::Starting | Phase::Idle | Phase::Working | Phase::NeedsYou
         )
+    }
+
+    /// A process is starting or a turn, a background task or a gate holds it: what a fork or a
+    /// compaction must not interrupt. Decided from the phase alone.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Phase::Starting | Phase::Working | Phase::NeedsYou)
     }
 
     /// Short name (`"starting"`, `"idle"`, …).
@@ -618,6 +626,21 @@ pub struct SessionSnapshot {
     /// What the session knows of the conversation before it (see [`EarlierHistory`]).
     #[serde(default)]
     pub earlier: EarlierHistory,
+    /// The session this one forked from ([`ForkedFrom`]); `None` for a session that started its
+    /// own conversation or resumed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ForkedFrom>,
+}
+
+/// The lineage of a forked session: the session it was forked from and the conversation it
+/// copied. Set once, when the fork is created; kept in the session's `session.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ForkedFrom {
+    /// The parent session.
+    pub session: SessionId,
+    /// The parent's native conversation id (the one the fork copied).
+    pub native_session_id: String,
 }
 
 // ── Session events ──────────────────────────────────────────────────────────
@@ -779,6 +802,9 @@ pub enum StartResume {
     Continue,
     /// A conversation by its native id.
     Resume,
+    /// A new conversation that copies the one the `resume_id` of the start names; that one is
+    /// left unchanged ([`wasit_core::ResumeMode::Fork`]).
+    Fork,
 }
 
 /// A fact the runtime noticed that does not fit the session's state.
@@ -977,7 +1003,21 @@ impl CreateSession {
     }
 }
 
-/// Result of `sessions.create`.
+/// `sessions.fork`: a new session that copies the conversation of `parent`, with the parent's
+/// driver, working directory and agent configuration. The parent is never changed. Refused with
+/// [`RuntimeError::Unsupported`] when its driver cannot fork, [`RuntimeError::Busy`] while it is
+/// starting or working, and [`RuntimeError::InvalidState`] when it has no completed turn or no
+/// conversation id yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ForkSession {
+    pub parent: SessionId,
+    /// The new session's name (as `sessions.rename` would set it); blank is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Result of `sessions.create` (and of `sessions.fork`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CreateSessionReply {
