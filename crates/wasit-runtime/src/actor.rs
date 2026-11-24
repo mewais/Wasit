@@ -37,6 +37,7 @@ use crate::config::RuntimeConfig;
 use crate::continuation::{Continuation, Held};
 use crate::core::{ContinuePlan, Core};
 use crate::diag::{self, Intent};
+use crate::eventlog::EventLog;
 use crate::history::ImportMsg;
 use crate::note::{EarlierPlan, RuntimeNote};
 use crate::store::{self, SessionFile};
@@ -151,6 +152,7 @@ pub(crate) struct ActorInit {
     /// The trace id of the request that creates the session: journaled with its `start` note
     /// (`None` for a session adopted or restarted).
     pub start_trace: Option<TraceId>,
+    pub event_log: Option<EventLog>,
 }
 
 enum Op {
@@ -213,6 +215,9 @@ pub(crate) struct Actor {
     file_tx: mpsc::UnboundedSender<Persist>,
     /// The `session.json` writer; ends once `file_tx` is dropped and its last write is done.
     writer: Option<tokio::task::JoinHandle<()>>,
+    /// Event log writer; ends once the log channel closes.
+    log_writer: Option<tokio::task::JoinHandle<()>>,
+    event_log: Option<EventLog>,
     snapshot_tx: watch::Sender<Arc<SessionSnapshot>>,
     notify: SnapshotNotify,
     snapshot_dirty: bool,
@@ -405,6 +410,10 @@ impl Actor {
         self.writer.take()
     }
 
+    pub(crate) fn take_log_writer(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.log_writer.take()
+    }
+
     pub(crate) fn new(init: ActorInit) -> Self {
         let meta = init.file.meta();
         let core = Core::for_session(
@@ -416,6 +425,8 @@ impl Actor {
         let writer = tokio::spawn(persist(init.dir.clone(), init.file.clone(), file_rx));
         let source = adopt_source(init.dir.clone(), init.cfg.session_run_dir(&init.dir), 1);
         let start_earlier = init.file.earlier.clone();
+        let mut event_log = init.event_log;
+        let log_writer = event_log.as_mut().and_then(|l| l.take_writer());
         Actor {
             id: meta.id,
             dir: init.dir,
@@ -426,6 +437,8 @@ impl Actor {
             file: init.file,
             file_tx,
             writer: Some(writer),
+            log_writer,
+            event_log,
             snapshot_tx: init.snapshot,
             notify: init.notify,
             snapshot_dirty: true,
@@ -601,7 +614,7 @@ impl Actor {
                 // The old shim is gone (its connection closed after it let go of the lock and
                 // the endpoint name): the continue that waited for that can start its shim.
                 if let Some(spec) = self.spawn_after_close.take() {
-                    self.source = Some(spawn_source(spec, self.core.last_seq() + 1));
+                    self.source = Some(self.new_shim_source(spec));
                 }
                 return;
             }
@@ -662,6 +675,7 @@ impl Actor {
         let events = self.core.mark_lost(reason);
         if !events.is_empty() {
             self.snapshot_dirty = true;
+            self.append_log(&events, &[]);
             self.publish(events);
         }
         self.fail_pending(reason);
@@ -708,6 +722,8 @@ impl Actor {
         }
         self.loading = false;
         self.snapshot_dirty = true;
+        // Handled here, in arrival order and before any later record, so that their notes are
+        // queued before the next `pump_ops` (see `run`).
         let deferred: Vec<Msg> = self.deferred.drain(..).collect();
         for m in deferred {
             self.on_msg(m);
@@ -729,6 +745,7 @@ impl Actor {
         } else {
             Vec::new()
         };
+        self.append_log(&out.events, &out.earlier);
         if !out.events.is_empty() {
             self.publish(out.events);
         }
@@ -786,6 +803,7 @@ impl Actor {
             self.outbox
                 .retain(|op| matches!(op, Op::Note { token: Some(_), .. }));
             self.finish_loading();
+            self.seal_log(rec.seq);
         }
         if !self.core.handshake_pending() {
             self.handshake_deadline = None;
@@ -947,6 +965,32 @@ impl Actor {
         let snap = Arc::new(self.core.snapshot().clone());
         self.snapshot_tx.send_replace(snap.clone());
         (self.notify)(&snap);
+    }
+
+    fn append_log(&mut self, events: &[SessionEvent], earlier: &[SessionEvent]) {
+        if events.is_empty() && earlier.is_empty() {
+            return;
+        }
+        if let Some(log) = self.event_log.as_ref() {
+            if let Err(e) = log.append(events.to_vec(), earlier.to_vec()) {
+                diag::persist_failed(&self.id, &e);
+                self.event_log = None;
+            }
+        }
+    }
+
+    fn seal_log(&mut self, last_seq: u64) {
+        let Some(log) = self.event_log.as_ref() else {
+            return;
+        };
+        let snapshot = self.core.snapshot().clone();
+        let journal_len = std::fs::metadata(self.dir.join("journal.ndjson"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if let Err(e) = log.seal(snapshot, journal_len, last_seq) {
+            diag::persist_failed(&self.id, &e);
+            self.event_log = None;
+        }
     }
 
     // ── shim requests ───────────────────────────────────────────────────────
@@ -1649,9 +1693,46 @@ impl Actor {
         if old_shim_closing {
             self.spawn_after_close = Some(shim_spec);
         } else {
-            self.source = Some(spawn_source(shim_spec, self.core.last_seq() + 1));
+            self.source = Some(self.new_shim_source(shim_spec));
         }
         Ok(())
+    }
+
+    /// The source that spawns a new process generation's shim. The event log was sealed when
+    /// the previous generation exited; it is unsealed before the new shim can grow the journal.
+    /// The wait is part of the source future, polled by `run` like any other source, so the
+    /// actor keeps handling records and messages while the log writer works.
+    fn new_shim_source(&mut self, spec: wasit_shim::ShimSpec) -> BoxFuture<'static, Source> {
+        let from = self.core.last_seq() + 1;
+        let unsealed = match self.event_log.as_ref().map(EventLog::unseal_notify) {
+            None => None,
+            Some(Ok(rx)) => Some(rx),
+            Some(Err(e)) => {
+                // The writer is gone: the log is rebuilt at the next start.
+                diag::persist_failed(&self.id, &e);
+                self.event_log = None;
+                None
+            }
+        };
+        let id = self.id.clone();
+        async move {
+            if let Some(rx) = unsealed {
+                // A failed unseal leaves the log `Failed` (rebuilt at the next start), and a
+                // stale seal no longer matches the journal's length once the shim writes: the
+                // new generation is not held back by it.
+                let res = rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "log writer stopped",
+                    ))
+                });
+                if let Err(e) = res {
+                    diag::persist_failed(&id, &e);
+                }
+            }
+            spawn_source(spec, from).await
+        }
+        .boxed()
     }
 
     fn subscribe(&mut self, from: Option<u64>) -> SubscribeReply {
@@ -1829,6 +1910,7 @@ mod tests {
             snapshot,
             notify: Arc::new(|_| {}),
             start_trace: None,
+            event_log: None,
         });
         // The initial adoption is over: the first generation ended.
         a.source = None;

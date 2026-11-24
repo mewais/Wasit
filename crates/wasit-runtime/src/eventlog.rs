@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use wasit_shim::journal::sorted_ndjson;
 
@@ -35,6 +35,7 @@ pub struct EventLog {
     state: watch::Receiver<LogState>,
     written: watch::Receiver<u64>,
     submitted: Arc<AtomicU64>,
+    writer: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -48,7 +49,9 @@ enum LogMsg {
         journal_len: u64,
         last_seq: u64,
     },
-    Unseal,
+    Unseal {
+        done: Option<oneshot::Sender<io::Result<()>>>,
+    },
     Reset,
 }
 
@@ -123,7 +126,7 @@ impl EventLog {
             written_count: outcome.written,
             submitted: submitted.clone(),
         };
-        tokio::spawn(writer.run(rx));
+        let join = tokio::spawn(writer.run(rx));
 
         Ok(EventLog {
             paths,
@@ -131,6 +134,7 @@ impl EventLog {
             state,
             written,
             submitted,
+            writer: Some(join),
         })
     }
 
@@ -148,6 +152,10 @@ impl EventLog {
 
     pub fn submitted(&self) -> u64 {
         self.submitted.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_writer(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.writer.take()
     }
 
     pub fn append(&self, events: Vec<SessionEvent>, earlier: Vec<SessionEvent>) -> io::Result<()> {
@@ -173,7 +181,16 @@ impl EventLog {
     }
 
     pub fn unseal(&self) -> io::Result<()> {
-        self.send(LogMsg::Unseal)
+        self.send(LogMsg::Unseal { done: None })
+    }
+
+    /// Queues an unseal and returns where its outcome arrives, without waiting for it: the
+    /// caller (the session actor) must keep processing records meanwhile. Messages are handled
+    /// in order, so appends queued after this one land in an unsealed log.
+    pub fn unseal_notify(&self) -> io::Result<oneshot::Receiver<io::Result<()>>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(LogMsg::Unseal { done: Some(tx) })?;
+        Ok(rx)
     }
 
     pub fn reset(&self) -> io::Result<()> {
@@ -304,7 +321,17 @@ impl LogWriter {
                     journal_len,
                     last_seq,
                 } => self.seal(*snapshot, journal_len, last_seq).await,
-                LogMsg::Unseal => self.unseal().await,
+                LogMsg::Unseal { done } => {
+                    let res = self.unseal().await;
+                    if let Some(done) = done {
+                        let _ = done.send(
+                            res.as_ref()
+                                .map(|_| ())
+                                .map_err(|e| io::Error::new(e.kind(), e.to_string())),
+                        );
+                    }
+                    res
+                }
                 LogMsg::Reset => self.reset().await,
             };
             if let Err(e) = res {

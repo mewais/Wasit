@@ -67,6 +67,8 @@ struct ActorHandle {
     task: JoinHandle<()>,
     /// The actor's `session.json` writer (ends after the actor).
     writer: Option<JoinHandle<()>>,
+    /// The actor's event log writer (ends after the actor).
+    log_writer: Option<JoinHandle<()>>,
 }
 
 struct Entry {
@@ -84,6 +86,10 @@ struct Inner {
     feed: Arc<HostFeed>,
     feed_task: JoinHandle<()>,
     replays: Arc<Semaphore>,
+    /// Serializes restarting a session's actor (which awaits its loader and opens its event
+    /// log with the entry left in the map) against other restarts and against `delete`: two
+    /// writers must never own one log, and a directory is never removed under a restart.
+    restarts: tokio::sync::Mutex<()>,
 }
 
 impl Drop for Inner {
@@ -159,6 +165,7 @@ impl SessionManager {
                 feed,
                 feed_task,
                 replays: Arc::new(Semaphore::new(REPLAY_CONCURRENCY)),
+                restarts: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -362,7 +369,7 @@ impl SessionManager {
             true,
         ));
         let cwd = file.cwd.clone();
-        self.insert(id.clone(), dir, file, desc, snap, trace);
+        self.insert(id.clone(), dir, file, desc, snap, trace).await;
         Ok(CreateSessionReply {
             id,
             cwd,
@@ -371,7 +378,7 @@ impl SessionManager {
     }
 
     /// Registers a session and starts its actor; `start_trace` is journaled with its `start` note.
-    fn insert(
+    async fn insert(
         &self,
         id: SessionId,
         dir: PathBuf,
@@ -381,6 +388,8 @@ impl SessionManager {
         start_trace: Option<TraceId>,
     ) {
         let (snapshot, _) = watch::channel(snap.clone());
+        // Not in the map yet: nothing else can open this log meanwhile.
+        let event_log = self.open_log(&dir).await;
         let mut entry = Entry {
             dir,
             file,
@@ -389,12 +398,29 @@ impl SessionManager {
             actor: None,
             loader: None,
         };
-        entry.actor = Some(self.start_actor(&entry, start_trace));
+        entry.actor = Some(self.start_actor(&entry, start_trace, event_log));
         lock(&self.inner.sessions).insert(id, entry);
         self.inner.feed.upsert(snap);
     }
 
-    fn start_actor(&self, e: &Entry, start_trace: Option<TraceId>) -> ActorHandle {
+    /// The session's derived event log; `None` (the actor runs without one) if it cannot be
+    /// opened. The caller guarantees no other writer has it open.
+    async fn open_log(&self, dir: &Path) -> Option<crate::eventlog::EventLog> {
+        let journal_len = tokio::fs::metadata(dir.join("journal.ndjson"))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        crate::eventlog::EventLog::open(dir, self.inner.cfg.derivation.clone(), journal_len, None)
+            .await
+            .ok()
+    }
+
+    fn start_actor(
+        &self,
+        e: &Entry,
+        start_trace: Option<TraceId>,
+        event_log: Option<crate::eventlog::EventLog>,
+    ) -> ActorHandle {
         let feed = self.inner.feed.clone();
         let mut actor = Actor::new(ActorInit {
             dir: e.dir.clone(),
@@ -404,11 +430,18 @@ impl SessionManager {
             snapshot: e.snapshot.clone(),
             notify: Arc::new(move |s| feed.upsert(s.clone())),
             start_trace,
+            event_log,
         });
         let writer = actor.take_writer();
+        let log_writer = actor.take_log_writer();
         let (tx, rx) = mpsc::channel(MAILBOX);
         let task = tokio::spawn(actor.run(rx));
-        ActorHandle { tx, task, writer }
+        ActorHandle {
+            tx,
+            task,
+            writer,
+            log_writer,
+        }
     }
 
     /// Scan the data directory and adopt every session not yet known: attach actors to live
@@ -473,7 +506,8 @@ impl SessionManager {
         let meta = file.meta();
         if state == ShimState::Running {
             let snap = Arc::new(blank_snapshot(&meta, desc.as_ref(), Phase::Starting, false));
-            self.insert(id.clone(), dir.to_path_buf(), file, desc, snap, None);
+            self.insert(id.clone(), dir.to_path_buf(), file, desc, snap, None)
+                .await;
             return Ok(true);
         }
         let phase = match state {
@@ -648,23 +682,51 @@ impl SessionManager {
     // ── actor plumbing ──────────────────────────────────────────────────────
 
     /// The actor's mailbox, starting the actor if the session had none.
-    fn mailbox(&self, id: &SessionId) -> Result<mpsc::Sender<Msg>, RuntimeError> {
+    async fn mailbox(&self, id: &SessionId) -> Result<mpsc::Sender<Msg>, RuntimeError> {
+        if let Some(tx) = self.running_mailbox(id)? {
+            return Ok(tx);
+        }
+        let _restart = self.inner.restarts.lock().await;
+        // Another request may have restarted it while this one waited.
+        if let Some(tx) = self.running_mailbox(id)? {
+            return Ok(tx);
+        }
+        // The entry stays in the map (readers, `list`, a concurrent `mailbox` all still see
+        // it); only its loader is taken, and it must be gone before the log is opened: it may
+        // be writing the same derived files.
+        let (dir, loader) = {
+            let mut map = lock(&self.inner.sessions);
+            let e = map
+                .get_mut(id)
+                .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+            (e.dir.clone(), e.loader.take())
+        };
+        if let Some(l) = loader {
+            l.abort();
+            let _ = l.await; // cancelled or finished: either way it no longer runs
+        }
+        let event_log = self.open_log(&dir).await;
         let mut map = lock(&self.inner.sessions);
+        // `delete` holds `restarts` too, so the entry is still there.
         let e = map
             .get_mut(id)
             .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
-        if let Some(a) = &e.actor {
-            if !a.task.is_finished() {
-                return Ok(a.tx.clone());
-            }
-        }
-        if let Some(l) = e.loader.take() {
-            l.abort();
-        }
-        let handle = self.start_actor(e, None);
+        let handle = self.start_actor(e, None, event_log);
         let tx = handle.tx.clone();
         e.actor = Some(handle);
         Ok(tx)
+    }
+
+    /// The mailbox of the session's actor if it runs; `None` if it must be (re)started.
+    fn running_mailbox(&self, id: &SessionId) -> Result<Option<mpsc::Sender<Msg>>, RuntimeError> {
+        let map = lock(&self.inner.sessions);
+        let e = map
+            .get(id)
+            .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+        Ok(match &e.actor {
+            Some(a) if !a.task.is_finished() => Some(a.tx.clone()),
+            _ => None,
+        })
     }
 
     async fn ask<T>(
@@ -672,7 +734,7 @@ impl SessionManager {
         id: &SessionId,
         make: impl FnOnce(oneshot::Sender<T>) -> Msg,
     ) -> Result<T, RuntimeError> {
-        let tx = self.mailbox(id)?;
+        let tx = self.mailbox(id).await?;
         let (rtx, rrx) = oneshot::channel();
         let t = &self.inner.cfg.timeouts;
         match tokio::time::timeout(t.mailbox, tx.send(make(rtx))).await {
@@ -883,6 +945,8 @@ impl SessionManager {
                 )));
             }
         }
+        // Not while a restart awaits this session's loader or opens its log.
+        let _restart = self.inner.restarts.lock().await;
         let entry = lock(&self.inner.sessions).remove(id);
         let Some(mut entry) = entry else {
             return Err(RuntimeError::SessionNotFound(id.to_string()));
@@ -897,6 +961,9 @@ impl SessionManager {
             let _ = a.task.await;
             if let Some(w) = a.writer {
                 // The writer ends once the actor (its sender) is gone; a panic is logged by tokio.
+                let _ = w.await;
+            }
+            if let Some(w) = a.log_writer {
                 let _ = w.await;
             }
         }

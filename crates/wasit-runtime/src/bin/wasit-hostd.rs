@@ -473,7 +473,8 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let Some(cmd) = args.next() else {
         return usage();
@@ -482,7 +483,9 @@ fn main() -> ExitCode {
         // Before anything else: the shim builds its own runtime, and its guard re-exec comes
         // back through here with the same argv.
         let rest: Vec<OsString> = args.collect();
-        let code = wasit_shim::run(rest);
+        let code = std::thread::spawn(move || wasit_shim::run(rest))
+            .join()
+            .unwrap_or(1);
         return ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
     let rest: Vec<String> = match args.map(|a| a.into_string()).collect() {
@@ -514,19 +517,9 @@ fn main() -> ExitCode {
         .with(wasit_diag::tracing_layer())
         .with(text)
         .try_init(); // only fails if a subscriber is already set
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("wasit-hostd: cannot start the runtime: {e}");
-            return ExitCode::from(1);
-        }
-    };
     match cmd.to_str() {
-        Some("serve") => rt.block_on(serve(parsed)),
-        Some("bridge") => rt.block_on(bridge(parsed)),
+        Some("serve") => serve(parsed).await,
+        Some("bridge") => bridge(parsed).await,
         _ => usage(),
     }
 }
