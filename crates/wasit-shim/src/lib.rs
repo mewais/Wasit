@@ -18,7 +18,7 @@ mod client;
 mod diag;
 mod endpoint;
 mod error;
-mod journal;
+pub mod journal;
 mod probe;
 mod record;
 mod server;

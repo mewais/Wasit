@@ -11,28 +11,35 @@ const CHUNK: usize = 64 * 1024;
 /// Extract `seq` from one journal line. Fast path for the shim's own layout (`{"seq":N,`),
 /// full parse otherwise.
 pub(crate) fn parse_seq(line: &[u8]) -> io::Result<u64> {
-    parse_key(line, b"{\"seq\":").ok_or_else(|| {
-        #[derive(serde::Deserialize)]
-        struct SeqOnly {
-            seq: u64,
-        }
-        // serde's messages quote the offending value, and a journal line is session content: say
-        // only what kind of fault and where.
-        serde_json::from_slice::<SeqOnly>(line)
-            .map(|s| s.seq)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bad record ({:?} at column {})", e.classify(), e.column()),
-                )
-            })
-            .unwrap_err()
+    parse_numeric_key(line, b"{\"seq\":")
+}
+
+/// Parse the leading integer after `prefix`, falling back to a full JSON parse when the prefix
+/// is not at the start (journals written by older builds).
+fn parse_numeric_key(line: &[u8], prefix: &[u8]) -> io::Result<u64> {
+    if let Some(n) = parse_key_fast(line, prefix) {
+        return Ok(n);
+    }
+    let key = key_name(prefix)?;
+    let v: serde_json::Value = serde_json::from_slice(line).map_err(json_err)?;
+    v.get(&key).and_then(|v| v.as_u64()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("record has no {key} field"),
+        )
     })
+}
+
+fn json_err(e: serde_json::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("bad record ({:?} at column {})", e.classify(), e.column()),
+    )
 }
 
 /// Parse a leading unsigned integer right after `prefix`. Returns `None` when the prefix is
 /// missing, there are no digits, or the first non-digit is not `,`.
-fn parse_key(line: &[u8], prefix: &[u8]) -> Option<u64> {
+fn parse_key_fast(line: &[u8], prefix: &[u8]) -> Option<u64> {
     let rest = line.strip_prefix(prefix)?;
     let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
     if digits == 0 || rest.get(digits) != Some(&b',') {
@@ -41,6 +48,30 @@ fn parse_key(line: &[u8], prefix: &[u8]) -> Option<u64> {
     std::str::from_utf8(&rest[..digits])
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+}
+
+fn key_name(prefix: &[u8]) -> io::Result<String> {
+    let rest = prefix.strip_prefix(b"{\"").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "key prefix must start with {\"",
+        )
+    })?;
+    let end = rest.iter().position(|&b| b == b'"').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "key prefix missing closing quote",
+        )
+    })?;
+    if rest.get(end + 1) != Some(&b':') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "key prefix must end with \"<key>:\"",
+        ));
+    }
+    Ok(std::str::from_utf8(&rest[..end])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "key prefix not UTF-8"))?
+        .to_string())
 }
 
 /// Offset of the start of the line that ends at `end` (exclusive; `end - 1` is that line's
@@ -166,17 +197,10 @@ pub mod sorted_ndjson {
 
     use super::{line_at, next_line_start, CHUNK};
 
-    /// Parse a leading unsigned integer right after `prefix`. Returns `None` when the prefix is
-    /// missing, there are no digits, or the first non-digit is not `,`.
-    pub fn parse_key(line: &[u8], prefix: &[u8]) -> Option<u64> {
-        let rest = line.strip_prefix(prefix)?;
-        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-        if digits == 0 || rest.get(digits) != Some(&b',') {
-            return None;
-        }
-        std::str::from_utf8(&rest[..digits])
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
+    /// Parse a leading unsigned integer right after `prefix`. Fast path for the common ordering,
+    /// full JSON parse otherwise.
+    pub fn parse_key(line: &[u8], prefix: &[u8]) -> io::Result<u64> {
+        super::parse_numeric_key(line, prefix)
     }
 
     /// Byte offset of the first line whose key is `>= from_key` within the first `limit` bytes
@@ -205,13 +229,7 @@ pub mod sorted_ndjson {
             if end == probe {
                 break; // EOF inside the limit: file shorter than claimed
             }
-            if parse_key(&line, key_prefix).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "sorted_ndjson: line has no expected key prefix",
-                )
-            })? < from_key
-            {
+            if parse_key(&line, key_prefix)? < from_key {
                 lo = end;
             } else {
                 hi = probe;
@@ -311,10 +329,23 @@ pub mod sorted_ndjson {
 
         #[test]
         fn parse_key_rejects_bad_lines() {
-            assert_eq!(parse_key(b"{\"cursor\":12,}", b"{\"cursor\":"), Some(12));
-            assert_eq!(parse_key(b"{\"cursor\":12}", b"{\"cursor\":"), None);
-            assert_eq!(parse_key(b"{\"seq\":3,}", b"{\"cursor\":"), None);
-            assert_eq!(parse_key(b"{\"cursor\":abc,}", b"{\"cursor\":"), None);
+            assert_eq!(parse_key(b"{\"cursor\":12,}", b"{\"cursor\":").unwrap(), 12);
+            // With the fallback, reordered keys parse too.
+            assert_eq!(parse_key(b"{\"cursor\":12}", b"{\"cursor\":").unwrap(), 12);
+            assert!(parse_key(b"{\"seq\":3,}", b"{\"cursor\":").is_err());
+            assert!(parse_key(b"{\"cursor\":abc,}", b"{\"cursor\":").is_err());
+        }
+
+        #[test]
+        fn parse_key_reads_reordered_keys() {
+            assert_eq!(
+                parse_key(b"{\"t\":1,\"cursor\":9}", b"{\"cursor\":").unwrap(),
+                9
+            );
+            assert_eq!(
+                parse_key(b"{\"kind\":\"a\",\"seq\":42,\"t\":1}", b"{\"seq\":").unwrap(),
+                42
+            );
         }
     }
 }

@@ -29,6 +29,8 @@ mod diag;
 mod diag_service;
 mod discovery;
 pub mod environment;
+#[allow(dead_code)] // R2: event log not yet wired to actor/manager
+mod eventlog;
 mod history;
 mod host;
 pub mod machine;
