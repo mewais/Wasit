@@ -11,32 +11,36 @@ const CHUNK: usize = 64 * 1024;
 /// Extract `seq` from one journal line. Fast path for the shim's own layout (`{"seq":N,`),
 /// full parse otherwise.
 pub(crate) fn parse_seq(line: &[u8]) -> io::Result<u64> {
-    const PREFIX: &[u8] = b"{\"seq\":";
-    if let Some(rest) = line.strip_prefix(PREFIX) {
-        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-        if digits > 0 && rest.get(digits) == Some(&b',') {
-            if let Some(n) = std::str::from_utf8(&rest[..digits])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                return Ok(n);
-            }
+    parse_key(line, b"{\"seq\":").ok_or_else(|| {
+        #[derive(serde::Deserialize)]
+        struct SeqOnly {
+            seq: u64,
         }
+        // serde's messages quote the offending value, and a journal line is session content: say
+        // only what kind of fault and where.
+        serde_json::from_slice::<SeqOnly>(line)
+            .map(|s| s.seq)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad record ({:?} at column {})", e.classify(), e.column()),
+                )
+            })
+            .unwrap_err()
+    })
+}
+
+/// Parse a leading unsigned integer right after `prefix`. Returns `None` when the prefix is
+/// missing, there are no digits, or the first non-digit is not `,`.
+fn parse_key(line: &[u8], prefix: &[u8]) -> Option<u64> {
+    let rest = line.strip_prefix(prefix)?;
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || rest.get(digits) != Some(&b',') {
+        return None;
     }
-    #[derive(serde::Deserialize)]
-    struct SeqOnly {
-        seq: u64,
-    }
-    // serde's messages quote the offending value, and a journal line is session content: say
-    // only what kind of fault and where.
-    serde_json::from_slice::<SeqOnly>(line)
-        .map(|s| s.seq)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad record ({:?} at column {})", e.classify(), e.column()),
-            )
-        })
+    std::str::from_utf8(&rest[..digits])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Offset of the start of the line that ends at `end` (exclusive; `end - 1` is that line's
@@ -147,26 +151,170 @@ fn next_line_start(r: &mut BufReader<File>, pos: u64) -> io::Result<u64> {
 /// (which must end on a line boundary), by binary search over line starts. Returns `limit`
 /// when every record is older. Callers still filter by seq while reading forward.
 pub(crate) fn seek_to_seq(path: &Path, from_seq: u64, limit: u64) -> io::Result<u64> {
-    if from_seq <= 1 || limit == 0 {
-        return Ok(0);
-    }
-    let mut r = BufReader::with_capacity(CHUNK, File::open(path)?);
-    // Invariant: every record before `lo` has seq < from_seq; `hi` is a line start whose record
-    // has seq >= from_seq, or `limit`.
-    let (mut lo, mut hi) = (0u64, limit);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let s = next_line_start(&mut r, mid)?;
-        let probe = if s >= hi { lo } else { s };
-        let (line, end) = line_at(&mut r, probe)?;
-        if end == probe {
-            break; // EOF inside the limit: file shorter than claimed
+    sorted_ndjson::seek_sorted(path, b"{\"seq\":", from_seq, limit)
+}
+
+/// General helpers for seeking inside an NDJSON file whose lines start with a numeric key.
+///
+/// The file is treated as a sequence of newline-terminated lines; each line is expected to
+/// begin with `key_prefix` followed by a decimal integer and a comma (e.g. `{"seq":12,` or
+/// `{"cursor":34,`). Seeking is by binary search over line starts, so it is O(log lines) I/O.
+pub mod sorted_ndjson {
+    use std::fs::File;
+    use std::io::{self, BufReader};
+    use std::path::Path;
+
+    use super::{line_at, next_line_start, CHUNK};
+
+    /// Parse a leading unsigned integer right after `prefix`. Returns `None` when the prefix is
+    /// missing, there are no digits, or the first non-digit is not `,`.
+    pub fn parse_key(line: &[u8], prefix: &[u8]) -> Option<u64> {
+        let rest = line.strip_prefix(prefix)?;
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 || rest.get(digits) != Some(&b',') {
+            return None;
         }
-        if parse_seq(&line)? < from_seq {
-            lo = end;
-        } else {
-            hi = probe;
+        std::str::from_utf8(&rest[..digits])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    }
+
+    /// Byte offset of the first line whose key is `>= from_key` within the first `limit` bytes
+    /// (which must end on a line boundary), by binary search over line starts. Returns `limit`
+    /// when every line's key is smaller. Callers still filter by key while reading forward.
+    ///
+    /// `key_prefix` is the literal bytes that begin every line, e.g. `b"{\"seq\":"`.
+    pub fn seek_sorted(
+        path: &Path,
+        key_prefix: &[u8],
+        from_key: u64,
+        limit: u64,
+    ) -> io::Result<u64> {
+        if from_key <= 1 || limit == 0 {
+            return Ok(0);
+        }
+        let mut r = BufReader::with_capacity(CHUNK, File::open(path)?);
+        // Invariant: every line before `lo` has key < from_key; `hi` is a line start whose key
+        // is >= from_key, or `limit`.
+        let (mut lo, mut hi) = (0u64, limit);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = next_line_start(&mut r, mid)?;
+            let probe = if s >= hi { lo } else { s };
+            let (line, end) = line_at(&mut r, probe)?;
+            if end == probe {
+                break; // EOF inside the limit: file shorter than claimed
+            }
+            if parse_key(&line, key_prefix).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sorted_ndjson: line has no expected key prefix",
+                )
+            })? < from_key
+            {
+                lo = end;
+            } else {
+                hi = probe;
+            }
+        }
+        Ok(lo.min(limit))
+    }
+
+    /// Position just after the last `\n` in the first `len` bytes (0 if none). Exported so
+    /// callers can compute the searchable prefix of a file that may have a torn tail.
+    #[allow(dead_code)]
+    pub fn complete_len(f: &mut File, len: u64) -> io::Result<u64> {
+        super::complete_len(f, len)
+    }
+
+    /// Offset of the start of the line that ends at `end` (exclusive). Scans backwards.
+    #[allow(dead_code)]
+    pub fn line_start_before(f: &mut File, end: u64) -> io::Result<u64> {
+        super::line_start_before(f, end)
+    }
+
+    /// Read `end - start` bytes from `f` starting at `start`.
+    #[allow(dead_code)]
+    pub fn read_range(f: &mut File, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        super::read_range(f, start, end)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write;
+
+        fn write_lines(path: &Path, lines: &[&str]) {
+            let mut f = File::create(path).unwrap();
+            for line in lines {
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+
+        fn temp_dir() -> (std::path::PathBuf, std::path::PathBuf) {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("wst-sorted-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("log.ndjson");
+            (dir, path)
+        }
+
+        #[test]
+        fn seek_sorted_finds_cursor_prefix() {
+            let (dir, path) = temp_dir();
+            write_lines(
+                &path,
+                &[
+                    r#"{"cursor":1,"t":1,"kind":"a"}"#,
+                    r#"{"cursor":2,"t":2,"kind":"b"}"#,
+                    r#"{"cursor":5,"t":5,"kind":"c"}"#,
+                    r#"{"cursor":6,"t":6,"kind":"d"}"#,
+                ],
+            );
+            let len = std::fs::metadata(&path).unwrap().len();
+            let start = seek_sorted(&path, b"{\"cursor\":", 2, len).unwrap();
+            let rest = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                &rest[start as usize..],
+                r#"{"cursor":2,"t":2,"kind":"b"}
+{"cursor":5,"t":5,"kind":"c"}
+{"cursor":6,"t":6,"kind":"d"}
+"#
+            );
+            assert_eq!(seek_sorted(&path, b"{\"cursor\":", 7, len).unwrap(), len);
+            assert_eq!(seek_sorted(&path, b"{\"cursor\":", 1, len).unwrap(), 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn seek_sorted_with_seq_prefix_still_works() {
+            let (dir, path) = temp_dir();
+            write_lines(
+                &path,
+                &[
+                    r#"{"seq":1,"t":1,"kind":"a"}"#,
+                    r#"{"seq":10,"t":10,"kind":"b"}"#,
+                    r#"{"seq":20,"t":20,"kind":"c"}"#,
+                ],
+            );
+            let len = std::fs::metadata(&path).unwrap().len();
+            let start = seek_sorted(&path, b"{\"seq\":", 11, len).unwrap();
+            let rest = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                &rest[start as usize..],
+                r#"{"seq":20,"t":20,"kind":"c"}
+"#
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn parse_key_rejects_bad_lines() {
+            assert_eq!(parse_key(b"{\"cursor\":12,}", b"{\"cursor\":"), Some(12));
+            assert_eq!(parse_key(b"{\"cursor\":12}", b"{\"cursor\":"), None);
+            assert_eq!(parse_key(b"{\"seq\":3,}", b"{\"cursor\":"), None);
+            assert_eq!(parse_key(b"{\"cursor\":abc,}", b"{\"cursor\":"), None);
         }
     }
-    Ok(lo.min(limit))
 }
