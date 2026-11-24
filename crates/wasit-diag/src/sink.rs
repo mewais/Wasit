@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 use crate::event::{Admit, Budget, DiagEvent, Fields, Level};
 use crate::internal::SinkEvent;
 use crate::json;
+use crate::private;
 use crate::reader::{self, Chunk, Source};
 use crate::ring::{Record, Ring};
 use crate::value::{Code, Ident};
@@ -75,7 +76,7 @@ pub struct SinkConfig {
     pub role: Code,
     /// The build written in each file header.
     pub build: Ident,
-    /// The directory of the files (created by the writer thread when missing).
+    /// The directory of the files: created when the sink starts (private, see [`Sink::start`]).
     pub dir: PathBuf,
     /// The current file's name, e.g. `daemon.ndjson`; rotated files are `<file>.1` … .
     pub file: String,
@@ -270,7 +271,14 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Sink {
     /// A sink writing files under `config.dir`.
+    ///
+    /// The directory and the current file are made private before this returns, not when the
+    /// writer thread first opens the file: a process that ends before its writer has written
+    /// anything (a daemon stopped at once) must not leave an older build's wider modes behind.
     pub fn start(config: SinkConfig) -> std::io::Result<Sink> {
+        plain_name(&config.file)?;
+        private::create_dir_all(&config.dir)?;
+        private::tighten_file(&config.dir.join(&config.file))?;
         let target = FsTarget::new(config.dir.clone());
         Sink::start_with(config, target)
     }

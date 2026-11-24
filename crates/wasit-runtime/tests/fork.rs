@@ -236,12 +236,68 @@ async fn fork_starts_a_session_resuming_the_parent_conversation_with_its_lineage
     );
 }
 
+/// The seq of the last journal record in `bytes` (0 when there is none).
+fn last_seq(bytes: &[u8]) -> u64 {
+    let text = std::str::from_utf8(bytes).expect("journal is UTF-8");
+    text.lines()
+        .last()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("record")["seq"].as_u64())
+        .map(|s| s.expect("seq"))
+        .unwrap_or(0)
+}
+
+/// Asserts that `after` is `before` plus whole records the parent itself appended: `before` is
+/// an exact prefix of `after`, the appended bytes are complete lines, and none of them mentions
+/// a string of `child` (the child's ids, the fork's prompt).
+fn assert_only_parent_appends(name: &str, before: &[u8], after: &[u8], child: &[&str]) {
+    assert!(
+        after.starts_with(before),
+        "{name}: the bytes from before the fork are not a prefix of the bytes after it"
+    );
+    let appended = &after[before.len()..];
+    assert!(
+        appended.is_empty() || appended.ends_with(b"\n"),
+        "{name}: the appended bytes end in a partial record"
+    );
+    let text = String::from_utf8_lossy(appended);
+    for needle in child {
+        assert!(
+            !text.contains(needle),
+            "{name}: an appended record mentions the child ({needle}): {text}"
+        );
+    }
+}
+
+/// Like [`assert_only_parent_appends`] for the journal, where every appended record also carries
+/// the next seq: the parent's shim numbers its own records without a gap, so an appended record
+/// it did not write shows as a seq that does not follow.
+fn assert_journal_appends_are_sequential(before: &[u8], after: &[u8]) {
+    let appended = &after[before.len()..];
+    let mut seq = last_seq(before);
+    for line in String::from_utf8_lossy(appended).lines() {
+        let rec: serde_json::Value = serde_json::from_str(line).expect("appended record");
+        seq += 1;
+        assert_eq!(
+            rec["seq"].as_u64(),
+            Some(seq),
+            "journal: an appended record does not continue the parent's seq: {line}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn fork_leaves_the_parents_journal_and_log_byte_identical() {
     let d = TempDir::new();
     let mgr = manager(d.path()).await;
     let parent = idle(&mgr, d.path(), "claude", &Scenario::default()).await;
     turn(&mgr, &parent, "hello").await;
+    // A live parent's shim keeps journaling after the turn is reported done (its command
+    // lifecycle records follow the turn), so comparing bytes against a live parent races with
+    // those writes. Stop the parent and let its log writer finish: the journal and log are then
+    // final, and any change the fork made would show. (The live parent is covered by
+    // `fork_of_a_live_parent_only_appends_the_parents_own_records`.)
+    mgr.stop(&parent).await.unwrap();
+    mgr.close_log(&parent).await.unwrap();
     // The parent's log is what a reader sees: build it before the fork, then compare.
     let before_events = events(&mgr, &parent).await;
     let before = parent_bytes(d.path(), &parent);
@@ -261,6 +317,60 @@ async fn fork_leaves_the_parents_journal_and_log_byte_identical() {
         "parent files changed"
     );
     assert_eq!(events(&mgr, &parent).await, before_events);
+    let after_snap = mgr.snapshot(&parent).unwrap();
+    assert_eq!(after_snap.phase, before_snap.phase);
+    assert_eq!(after_snap.turns_completed, before_snap.turns_completed);
+    assert_eq!(after_snap.native_session_id, before_snap.native_session_id);
+}
+
+#[tokio::test]
+async fn fork_of_a_live_parent_only_appends_the_parents_own_records() {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let parent = idle(&mgr, d.path(), "claude", &Scenario::default()).await;
+    turn(&mgr, &parent, "hello").await;
+    // The parent stays live and idle: its shim may still append its own records after the turn.
+    // Whatever it appends, the bytes read before the fork must remain an exact prefix.
+    let before_events = events(&mgr, &parent).await;
+    let before = parent_bytes(d.path(), &parent);
+    let before_snap = mgr.snapshot(&parent).unwrap();
+    assert!(
+        before.iter().any(|(_, b)| !b.is_empty()),
+        "the parent has bytes"
+    );
+
+    let child = mgr.fork(&parent, None, None).await.unwrap().id;
+    wait_phase(&mgr, &child, "idle").await;
+    turn(&mgr, &child, "in the fork").await;
+    let child_native = mgr
+        .snapshot(&child)
+        .unwrap()
+        .native_session_id
+        .expect("child native id");
+
+    let after = parent_bytes(d.path(), &parent);
+    let child_names = [child.as_str(), child_native.as_str(), "in the fork", "fork"];
+    for ((name, b), (name_after, a)) in before.iter().zip(after.iter()) {
+        assert_eq!(name, name_after);
+        assert_only_parent_appends(name, b, a, &child_names);
+    }
+    let journal = |files: &[(String, Vec<u8>)]| {
+        files
+            .iter()
+            .find(|(n, _)| n == "journal.ndjson")
+            .unwrap()
+            .1
+            .clone()
+    };
+    assert_journal_appends_are_sequential(&journal(&before), &journal(&after));
+
+    // The derived log is a prefix too: the events read before are still the first ones.
+    let after_events = events(&mgr, &parent).await;
+    assert!(
+        after_events.len() >= before_events.len()
+            && after_events[..before_events.len()] == before_events[..],
+        "the parent's events read before the fork are not a prefix of those read after it"
+    );
     let after_snap = mgr.snapshot(&parent).unwrap();
     assert_eq!(after_snap.phase, before_snap.phase);
     assert_eq!(after_snap.turns_completed, before_snap.turns_completed);
