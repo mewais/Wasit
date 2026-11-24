@@ -86,6 +86,7 @@ pub(crate) enum Msg {
         from: Option<u64>,
         reply: oneshot::Sender<SubscribeReply>,
     },
+    #[allow(dead_code)] // R3c removes: pages are served from the event log
     History {
         before: Option<u64>,
         limit: usize,
@@ -96,6 +97,7 @@ pub(crate) enum Msg {
         reply: oneshot::Sender<Local<HistoryPage>>,
     },
     /// The same window of the session's trail.
+    #[allow(dead_code)] // R3c removes: pages are served from the event log
     Trail {
         before: Option<u64>,
         limit: usize,
@@ -742,6 +744,7 @@ impl Actor {
         }
         self.loading = false;
         self.snapshot_dirty = true;
+        self.mark_log_ready();
         // Handled here, in arrival order and before any later record, so that their notes are
         // queued before the next `pump_ops` (see `run`).
         let deferred: Vec<Msg> = self.deferred.drain(..).collect();
@@ -756,6 +759,18 @@ impl Actor {
             if self.continuation.is_idle() && self.spawn_after_close.is_none() {
                 self.seal_log(seq);
             }
+        }
+    }
+
+    /// Declares the event log complete: the actor has applied the journal up to its end, so
+    /// everything the log must hold is in it or queued ahead of this message. Readers wait for it.
+    fn mark_log_ready(&mut self) {
+        let Some(log) = self.event_log.as_ref() else {
+            return;
+        };
+        if let Err(e) = log.mark_ready() {
+            diag::persist_failed(&self.id, &e);
+            self.event_log = None;
         }
     }
 

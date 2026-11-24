@@ -1036,6 +1036,23 @@ pub struct HistoryRequest {
     /// arrived): render them above the live transcript, in cursor order among themselves.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub earlier: bool,
+    /// Byte budget of the page, see [`page_budget`]. A page stops once it has read this many
+    /// bytes of the log, after at least one item, so it may exceed the budget by one event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u32>,
+}
+
+/// Byte budget of a history or trail page when the request names none.
+pub const DEFAULT_PAGE_BYTES: u32 = 1 << 20;
+/// Largest byte budget a page may ask for; larger requests are clamped to it.
+pub const MAX_PAGE_BYTES: u32 = 4 << 20;
+
+/// The byte budget of a page: the request's (clamped to `1..=MAX_PAGE_BYTES`), or
+/// [`DEFAULT_PAGE_BYTES`] when it names none.
+pub fn page_budget(requested: Option<u32>) -> u64 {
+    requested
+        .unwrap_or(DEFAULT_PAGE_BYTES)
+        .clamp(1, MAX_PAGE_BYTES) as u64
 }
 
 /// Which events a history page holds. The cursors are the same whatever the scope (a scoped page
@@ -1101,6 +1118,9 @@ pub struct TrailRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<u64>,
     pub limit: u32,
+    /// Byte budget of the page, see [`page_budget`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u32>,
 }
 
 /// One entry of a session's trail with the cursor and journal time of the event it was

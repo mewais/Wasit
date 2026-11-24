@@ -18,6 +18,7 @@ use crate::wire::{SessionEvent, SessionSnapshot};
 
 const FORMAT: u32 = 1;
 const META_FILE: &str = "meta.json";
+const LOCK_FILE: &str = "writer.lock";
 const EVENTS_FILE: &str = "events.ndjson";
 const EARLIER_FILE: &str = "earlier.ndjson";
 const CURSOR_PREFIX: &[u8] = b"{\"cursor\":";
@@ -38,6 +39,74 @@ pub struct EventLog {
     writer: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// A read-side handle on a log: pages are served from it without owning the writer.
+#[derive(Clone)]
+pub struct LogView {
+    paths: Paths,
+    state: watch::Receiver<LogState>,
+    written: watch::Receiver<u64>,
+    submitted: Arc<AtomicU64>,
+}
+
+/// Which of the log's two files a page is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogFile {
+    /// The session's own events, in cursor order.
+    Events,
+    /// The conversation's earlier history items, in cursor order.
+    Earlier,
+}
+
+fn writer_gone() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "log writer stopped")
+}
+
+impl LogView {
+    /// Waits until the log is complete (not `Building`) and every record submitted before this
+    /// call is on disk, event-driven by the log's watches. Fails when the log failed or its
+    /// writer has stopped.
+    pub(crate) async fn settled(&self) -> io::Result<()> {
+        let target = self.submitted.load(Ordering::Relaxed);
+        let mut state = self.state.clone();
+        let current = match state.wait_for(|s| !matches!(s, LogState::Building)).await {
+            Ok(s) => (*s).clone(),
+            Err(_) => return Err(writer_gone()),
+        };
+        if let LogState::Failed(reason) = current {
+            return Err(io::Error::other(reason));
+        }
+        let mut written = self.written.clone();
+        written
+            .wait_for(|w| *w >= target)
+            .await
+            .map_err(|_| writer_gone())?;
+        Ok(())
+    }
+
+    /// The last `limit` items `pick` makes of the records of `file` with `cursor < before`
+    /// (all when `None`), oldest first, and whether older records exist. Reading stops once
+    /// `max_bytes` of the log have been scanned and at least one item is held, so a page is at
+    /// most `max_bytes` plus one record. Callers settle the log first.
+    pub(crate) async fn page<T: Send + 'static>(
+        &self,
+        file: LogFile,
+        before: Option<u64>,
+        limit: usize,
+        max_bytes: u64,
+        pick: impl FnMut(SessionEvent) -> Option<T> + Send + 'static,
+    ) -> io::Result<(Vec<T>, bool)> {
+        let path = match file {
+            LogFile::Events => self.paths.events.clone(),
+            LogFile::Earlier => self.paths.earlier.clone(),
+        };
+        tokio::task::spawn_blocking(move || {
+            page_back_blocking(path, before, limit, max_bytes, pick)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+}
+
 #[derive(Debug)]
 enum LogMsg {
     Append {
@@ -52,6 +121,9 @@ enum LogMsg {
     Unseal {
         done: Option<oneshot::Sender<io::Result<()>>>,
     },
+    /// The owner has caught up with the journal: an unsealed log is complete from now on.
+    Ready,
+    Fail(String),
     Reset,
 }
 
@@ -95,6 +167,7 @@ struct RecoverOutcome {
     meta: Meta,
     state: LogState,
     written: u64,
+    lock: std::fs::File,
 }
 
 impl EventLog {
@@ -109,7 +182,12 @@ impl EventLog {
         let outcome = tokio::task::spawn_blocking({
             let paths = paths.clone();
             let build = build.clone();
-            move || recover(&paths, &build, journal_len, last_seq)
+            move || {
+                // Before anything is read or truncated: a writer that is still draining (a
+                // manager dropped a moment ago) must finish first, or two writers interleave.
+                let lock = acquire_writer(&paths)?;
+                recover(&paths, &build, journal_len, last_seq, lock)
+            }
         })
         .await
         .expect("spawn_blocking panicked")?;
@@ -125,6 +203,7 @@ impl EventLog {
             written: written_tx,
             written_count: outcome.written,
             submitted: submitted.clone(),
+            _lock: outcome.lock,
         };
         let join = tokio::spawn(writer.run(rx));
 
@@ -152,6 +231,15 @@ impl EventLog {
 
     pub fn submitted(&self) -> u64 {
         self.submitted.load(Ordering::Relaxed)
+    }
+
+    pub fn view(&self) -> LogView {
+        LogView {
+            paths: self.paths.clone(),
+            state: self.state.clone(),
+            written: self.written.clone(),
+            submitted: self.submitted.clone(),
+        }
     }
 
     pub(crate) fn take_writer(&mut self) -> Option<tokio::task::JoinHandle<()>> {
@@ -198,6 +286,17 @@ impl EventLog {
         self.send(LogMsg::Reset)
     }
 
+    /// Marks an unsealed log complete: its owner has caught up with the journal.
+    pub fn mark_ready(&self) -> io::Result<()> {
+        self.send(LogMsg::Ready)
+    }
+
+    /// Marks the log failed: reads answer with the reason until the next start rebuilds it.
+    pub fn fail(&self, reason: String) -> io::Result<()> {
+        self.send(LogMsg::Fail(reason))
+    }
+
+    #[cfg(test)]
     pub async fn page_back<F>(
         &self,
         before: Option<u64>,
@@ -208,16 +307,15 @@ impl EventLog {
     where
         F: Fn(&SessionEvent) -> bool + Send + Sync + 'static,
     {
-        if let LogState::Failed(reason) = self.state.borrow().clone() {
-            return Err(io::Error::other(reason));
-        }
-        let path = self.paths.events.clone();
-        let max_bytes = max_bytes.unwrap_or(u64::MAX);
-        tokio::task::spawn_blocking(move || {
-            page_back_blocking(path, before, limit, max_bytes, filter)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        self.view()
+            .page(
+                LogFile::Events,
+                before,
+                limit,
+                max_bytes.unwrap_or(u64::MAX),
+                move |e| filter(&e).then_some(e),
+            )
+            .await
     }
 
     pub fn stream_between(
@@ -309,6 +407,9 @@ struct LogWriter {
     written: watch::Sender<u64>,
     written_count: u64,
     submitted: Arc<AtomicU64>,
+    /// Exclusive lock on the log directory, held for the writer's life: the next writer of this
+    /// log waits for it (see [`acquire_writer`]).
+    _lock: std::fs::File,
 }
 
 impl LogWriter {
@@ -332,6 +433,13 @@ impl LogWriter {
                     }
                     res
                 }
+                LogMsg::Ready => {
+                    if matches!(*self.state.borrow(), LogState::Building) {
+                        let _ = self.state.send_replace(LogState::Ready);
+                    }
+                    Ok(())
+                }
+                LogMsg::Fail(reason) => Err(io::Error::other(reason)),
                 LogMsg::Reset => self.reset().await,
             };
             if let Err(e) = res {
@@ -432,19 +540,30 @@ impl LogWriter {
     }
 }
 
+/// Takes the log's writer role: blocks until the previous writer (if any) has finished, then
+/// holds an exclusive lock on the log until the returned file is dropped.
+fn acquire_writer(paths: &Paths) -> io::Result<std::fs::File> {
+    std::fs::create_dir_all(&paths.dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(paths.dir.join(LOCK_FILE))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 fn recover(
     paths: &Paths,
     build: &str,
     journal_len: u64,
     last_seq: Option<u64>,
+    lock: std::fs::File,
 ) -> io::Result<RecoverOutcome> {
-    std::fs::create_dir_all(&paths.dir)?;
-    let mut state = LogState::Ready;
     let mut wrote_meta = false;
     let mut meta = match read_meta(&paths.meta)? {
         Some(m) => m,
         None => {
-            state = LogState::Building;
             wrote_meta = true;
             Meta {
                 format: FORMAT,
@@ -460,14 +579,18 @@ fn recover(
             build: build.to_string(),
             seal: None,
         };
-        state = LogState::Building;
         wrote_meta = true;
     }
     let events_written = recover_file(&paths.events, last_seq)?;
     let earlier_written = recover_file(&paths.earlier, last_seq)?;
+    // Only a seal that matches the journal makes a log complete. Any other log is a partial
+    // derivation until its owner (the actor catching up, or an offline build) marks it ready:
+    // reads must not see a prefix as the whole.
+    let mut state = LogState::Building;
     if let Some(seal) = meta.seal.as_ref() {
-        if seal.journal_len != journal_len {
-            state = LogState::Building;
+        if seal.journal_len == journal_len {
+            state = LogState::Ready;
+        } else {
             meta.seal = None;
             wrote_meta = true;
         }
@@ -479,6 +602,7 @@ fn recover(
         meta,
         state,
         written: events_written + earlier_written,
+        lock,
     })
 }
 
@@ -598,16 +722,13 @@ async fn append_lines(path: &Path, events: &[SessionEvent]) -> io::Result<()> {
     f.flush().await
 }
 
-fn page_back_blocking<F>(
+fn page_back_blocking<T>(
     path: PathBuf,
     before: Option<u64>,
     limit: usize,
     max_bytes: u64,
-    filter: F,
-) -> io::Result<(Vec<SessionEvent>, bool)>
-where
-    F: Fn(&SessionEvent) -> bool,
-{
+    mut pick: impl FnMut(SessionEvent) -> Option<T>,
+) -> io::Result<(Vec<T>, bool)> {
     let mut file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
@@ -627,8 +748,8 @@ where
         end = start;
         bytes += (line.len() + 1) as u64;
         let event: SessionEvent = serde_json::from_slice(&line).map_err(json_err)?;
-        if filter(&event) {
-            items.push(event);
+        if let Some(item) = pick(event) {
+            items.push(item);
             if items.len() >= limit || (bytes >= max_bytes && !items.is_empty()) {
                 break;
             }

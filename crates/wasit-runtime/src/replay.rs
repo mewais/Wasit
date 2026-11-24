@@ -1,11 +1,10 @@
 //! Offline, deterministic replays of a session journal with a fresh [`Core`]: snapshots of
-//! sessions without a live actor, history pages older than an actor's in-memory tail, and the
-//! evicted prefix of an old-cursor subscription.
+//! sessions without a live actor, the build of a session's event log when no actor owns it, and
+//! the evicted prefix of an old-cursor subscription. Pages of history and the trail are read
+//! from the event log instead (see [`crate::eventlog`]).
 //!
 //! Cost: a replay reads the journal from seq 1 (protocol state depends on everything before)
-//! and runs the pure core over it — O(journal size) CPU and I/O, O(page size) memory. Live
-//! sessions answer most requests from their in-memory tail; replays only serve what fell out
-//! of it.
+//! and runs the pure core over it — O(journal size) CPU and I/O, O(page size) memory.
 
 use std::collections::VecDeque;
 use std::io;
@@ -84,8 +83,7 @@ pub(crate) async fn snapshot(
 }
 
 /// Build an event log from the journal, appending only cursors beyond the current log and sealing
-/// it when complete. Used both offline and by the actor.
-#[allow(dead_code)] // R2: wiring into actor/manager follows in the next increment
+/// it when complete. Used by the manager for logs no actor owns.
 pub(crate) async fn build(
     dir: &Path,
     run_dir: &Path,
@@ -177,6 +175,7 @@ pub(crate) async fn last_cursor(paths: &crate::eventlog::Paths) -> io::Result<u6
 /// and whether older ones exist. One replay serves every kind of page: history picks the events
 /// themselves, the trail their projection.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // R3c removes: pages are served from the event log
 async fn window<T>(
     dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
@@ -209,6 +208,7 @@ async fn window<T>(
 /// The last `limit` events with `cursor < before`; with `earlier`, the last `limit` items of the
 /// conversation's earlier history instead.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // R3c removes: pages are served from the event log
 pub(crate) async fn history(
     dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
@@ -227,6 +227,7 @@ pub(crate) async fn history(
 }
 
 /// The last `limit` trail entries with `cursor < before`: the projection of the same replay.
+#[allow(dead_code)] // R3c removes: pages are served from the event log
 pub(crate) async fn trail(
     dir: &Path,
     desc: Arc<dyn DriverDescriptor>,

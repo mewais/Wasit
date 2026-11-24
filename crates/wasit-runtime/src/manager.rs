@@ -3,13 +3,15 @@
 //! It creates sessions (render config → `session.json` → spawn shim → start actor), re-adopts
 //! them on start ([`SessionManager::adopt_all`]: live shims get an actor that rebuilds state by
 //! replaying the journal; finished sessions get a snapshot from an offline replay and an actor
-//! only when someone needs one), and routes every request to the session's actor. No lock is
-//! held across an await; every wait is bounded.
+//! only when someone needs one), and routes commands to the session's actor. History and trail
+//! pages are read from the session's event log, never through the actor and never by replaying
+//! the journal. No lock is held across an await; every wait is bounded.
 //!
 //! Dropping the manager stops its actors (not the sessions: shims keep running and a new
 //! manager re-adopts them).
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -17,21 +19,22 @@ use futures::stream::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinHandle;
 use wasit_control::TraceId;
-use wasit_core::{DriverDescriptor, ResumeMode, SpawnSpec};
+use wasit_core::{DriverDescriptor, ResumeMode, SessionMode, SpawnSpec};
 use wasit_shim::ShimState;
 
-use crate::actor::{Actor, ActorInit, GateOp, Local, Msg};
+use crate::actor::{Actor, ActorInit, GateOp, Msg};
 use crate::config::RuntimeConfig;
-use crate::core::blank_snapshot;
+use crate::core::{blank_snapshot, SessionMeta};
 use crate::diag::{self, Intent};
+use crate::eventlog::{EventLog, LogFile, LogState, LogView};
 use crate::host::HostFeed;
 use crate::replay;
 use crate::store::{self, SessionFile};
 use crate::stream::{live, EventStream, StreamEnd};
 use crate::wire::{
-    CommandError, CommandOutcome, CreateSession, CreateSessionReply, HistoryPage, HistoryScope,
-    HostEvent, Phase, ResumeRequest, RuntimeError, SessionEvent, SessionId, SessionSnapshot,
-    TrailPage,
+    page_budget, CommandError, CommandOutcome, CreateSession, CreateSessionReply, HistoryPage,
+    HistoryRequest, HistoryScope, HostEvent, Phase, ResumeRequest, RuntimeError, SessionEvent,
+    SessionId, SessionSnapshot, TrailPage, TrailRequest,
 };
 
 /// Bound on a user-given display name.
@@ -78,6 +81,13 @@ struct Entry {
     snapshot: watch::Sender<Arc<SessionSnapshot>>,
     actor: Option<ActorHandle>,
     loader: Option<JoinHandle<()>>,
+    /// Where reads of the session's event log go: the actor's log while it runs, else the log
+    /// the manager opened for reads (see [`SessionManager::log_view`]).
+    log: Option<LogView>,
+    /// The offline build of a log no actor owns; it holds the log's writer until it is done.
+    log_task: Option<JoinHandle<()>>,
+    /// The writer task of the log opened for reads (ends after `log_task` releases the log).
+    log_writer: Option<JoinHandle<()>>,
 }
 
 struct Inner {
@@ -102,6 +112,9 @@ impl Drop for Inner {
             }
             if let Some(l) = e.loader.take() {
                 l.abort();
+            }
+            if let Some(b) = e.log_task.take() {
+                b.abort();
             }
         }
     }
@@ -132,6 +145,46 @@ fn normalise_name(name: Option<String>) -> Option<String> {
 
 fn io_err(what: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Io(format!("{what}: {e}"))
+}
+
+/// Stops offline tasks that own derived files (their loader, an offline log build), then waits
+/// for the log writers they handed their logs to: once this returns, nothing else writes the
+/// session's derived files, and a new log may be opened.
+async fn stop_derived(tasks: Vec<JoinHandle<()>>, writers: Vec<JoinHandle<()>>) {
+    for t in &tasks {
+        t.abort();
+    }
+    for t in tasks {
+        // Cancelled or finished: either way it no longer runs.
+        let _ = t.await;
+    }
+    for w in writers {
+        // Ends once its log is dropped by the (now stopped) owner and the queue is drained.
+        let _ = w.await;
+    }
+}
+
+/// The offline owner of a session's log when no actor runs: builds the log from the journal
+/// unless it is sealed, then drops it, which lets its writer finish after the last record.
+async fn build_log(
+    log: EventLog,
+    id: SessionId,
+    dir: PathBuf,
+    run_dir: PathBuf,
+    desc: Arc<dyn DriverDescriptor>,
+    meta: SessionMeta,
+    hints: Vec<SessionMode>,
+) {
+    let sealed = matches!(*log.state().borrow(), LogState::Ready);
+    if sealed {
+        return;
+    }
+    if let Err(e) = replay::build(&dir, &run_dir, desc, &meta, &hints, &log).await {
+        let err = io::Error::other(e);
+        diag::persist_failed(&id, &err);
+        // Reads answer with the failure instead of waiting for a build that stopped.
+        let _ = log.fail(err.to_string());
+    }
 }
 
 impl SessionManager {
@@ -397,6 +450,9 @@ impl SessionManager {
             snapshot,
             actor: None,
             loader: None,
+            log: event_log.as_ref().map(EventLog::view),
+            log_task: None,
+            log_writer: None,
         };
         entry.actor = Some(self.start_actor(&entry, start_trace, event_log));
         lock(&self.inner.sessions).insert(id, entry);
@@ -564,6 +620,9 @@ impl SessionManager {
                 snapshot: tx,
                 actor: None,
                 loader: Some(loader),
+                log: None,
+                log_task: None,
+                log_writer: None,
             },
         );
         self.inner.feed.upsert(snap);
@@ -692,25 +751,37 @@ impl SessionManager {
             return Ok(tx);
         }
         // The entry stays in the map (readers, `list`, a concurrent `mailbox` all still see
-        // it); only its loader is taken, and it must be gone before the log is opened: it may
-        // be writing the same derived files.
-        let (dir, loader) = {
+        // it). The offline owners of its derived files, and the writer of the finished actor's
+        // log, must be gone before the log is opened: they may be writing the same files.
+        let (dir, tasks, writers) = {
             let mut map = lock(&self.inner.sessions);
             let e = map
                 .get_mut(id)
                 .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
-            (e.dir.clone(), e.loader.take())
+            let mut writers: Vec<JoinHandle<()>> = e
+                .actor
+                .take()
+                .and_then(|a| a.log_writer)
+                .into_iter()
+                .collect();
+            writers.extend(e.log_writer.take());
+            let tasks: Vec<JoinHandle<()>> = e
+                .loader
+                .take()
+                .into_iter()
+                .chain(e.log_task.take())
+                .collect();
+            e.log = None;
+            (e.dir.clone(), tasks, writers)
         };
-        if let Some(l) = loader {
-            l.abort();
-            let _ = l.await; // cancelled or finished: either way it no longer runs
-        }
+        stop_derived(tasks, writers).await;
         let event_log = self.open_log(&dir).await;
         let mut map = lock(&self.inner.sessions);
         // `delete` holds `restarts` too, so the entry is still there.
         let e = map
             .get_mut(id)
             .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+        e.log = event_log.as_ref().map(EventLog::view);
         let handle = self.start_actor(e, None, event_log);
         let tx = handle.tx.clone();
         e.actor = Some(handle);
@@ -967,11 +1038,14 @@ impl SessionManager {
                 let _ = w.await;
             }
         }
-        if let Some(l) = entry.loader.take() {
-            l.abort();
-            // Cancelled or finished: either way it no longer runs.
-            let _ = l.await;
-        }
+        let tasks: Vec<JoinHandle<()>> = entry
+            .loader
+            .take()
+            .into_iter()
+            .chain(entry.log_task.take())
+            .collect();
+        let writers: Vec<JoinHandle<()>> = entry.log_writer.take().into_iter().collect();
+        stop_derived(tasks, writers).await;
         self.inner.feed.remove(id);
         let run = self.inner.cfg.session_run_dir_for_spawn(&entry.dir);
         if run != entry.dir {
@@ -1051,13 +1125,13 @@ impl SessionManager {
         limit: usize,
         scope: HistoryScope,
     ) -> Result<HistoryPage, RuntimeError> {
-        self.history_page(id, before, limit, scope, false).await
+        self.history_page(id, before, limit, scope, false, None)
+            .await
     }
 
     /// The last `limit` items of the conversation's *earlier* history (the part of the transcript
     /// before the session's own events: `wasit_core::AgentEvent::History` items) with
-    /// `cursor < before`, oldest first, restricted to `scope` by what the items hold. Always
-    /// read from the journal.
+    /// `cursor < before`, oldest first, restricted to `scope` by what the items hold.
     pub async fn earlier_scoped(
         &self,
         id: &SessionId,
@@ -1065,7 +1139,21 @@ impl SessionManager {
         limit: usize,
         scope: HistoryScope,
     ) -> Result<HistoryPage, RuntimeError> {
-        self.history_page(id, before, limit, scope, true).await
+        self.history_page(id, before, limit, scope, true, None)
+            .await
+    }
+
+    /// `session.history` as requested on the wire, including its byte budget.
+    pub async fn history_request(&self, r: HistoryRequest) -> Result<HistoryPage, RuntimeError> {
+        self.history_page(
+            &r.id,
+            r.before,
+            r.limit as usize,
+            r.scope,
+            r.earlier,
+            r.max_bytes,
+        )
+        .await
     }
 
     async fn history_page(
@@ -1075,79 +1163,148 @@ impl SessionManager {
         limit: usize,
         scope: HistoryScope,
         earlier: bool,
+        max_bytes: Option<u32>,
     ) -> Result<HistoryPage, RuntimeError> {
-        let limit = limit.clamp(1, MAX_HISTORY_PAGE);
-        let (has_actor, dir, desc, meta) = {
-            let map = lock(&self.inner.sessions);
-            let e = map
-                .get(id)
-                .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
-            (
-                e.actor.as_ref().is_some_and(|a| !a.task.is_finished()),
-                e.dir.clone(),
-                e.desc.clone(),
-                e.file.meta(),
-            )
+        let file = if earlier {
+            LogFile::Earlier
+        } else {
+            LogFile::Events
         };
-        if has_actor {
-            if let Local::Page(p) = self
-                .ask(id, |reply| Msg::History {
-                    before,
-                    limit,
-                    scope: scope.clone(),
-                    earlier,
-                    reply,
-                })
-                .await?
-            {
-                return Ok(p);
-            }
-        }
-        let hints = self.inner.cfg.mode_hints.get(&meta.driver);
-        replay::history(&dir, desc, &meta, before, limit, scope, earlier, &hints)
-            .await
-            .map_err(RuntimeError::Io)
+        let limit = limit.clamp(1, MAX_HISTORY_PAGE);
+        let (events, has_more) = self
+            .log_page(id, file, before, limit, max_bytes, move |e| {
+                scope.admits(&e).then_some(e)
+            })
+            .await?;
+        Ok(HistoryPage { events, has_more })
     }
 
     /// The last `limit` entries of the session's trail with `cursor < before` (all when
     /// `None`), oldest first: the content-free projection of the events `history` returns
-    /// ([`crate::trail`]), from the actor's memory when it holds them, else from a replay of the
-    /// journal.
+    /// ([`crate::trail`]), read from the event log.
     pub async fn trail_page(
         &self,
         id: &SessionId,
         before: Option<u64>,
         limit: usize,
     ) -> Result<TrailPage, RuntimeError> {
+        self.trail_bytes(id, before, limit, None).await
+    }
+
+    /// `session.trail.page` as requested on the wire, including its byte budget.
+    pub async fn trail_request(&self, r: TrailRequest) -> Result<TrailPage, RuntimeError> {
+        self.trail_bytes(&r.id, r.before, r.limit as usize, r.max_bytes)
+            .await
+    }
+
+    async fn trail_bytes(
+        &self,
+        id: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+        max_bytes: Option<u32>,
+    ) -> Result<TrailPage, RuntimeError> {
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
-        let (has_actor, dir, desc, meta) = {
+        let (entries, has_more) = self
+            .log_page(id, LogFile::Events, before, limit, max_bytes, |e| {
+                crate::trail::item(&e)
+            })
+            .await?;
+        Ok(TrailPage { entries, has_more })
+    }
+
+    /// One page of a session's event log: the items `pick` makes of the records of `file` with
+    /// `cursor < before`, read once the log has settled. Reads never go through the actor's
+    /// mailbox and never replay the journal, and they never start an actor.
+    async fn log_page<T: Send + 'static>(
+        &self,
+        id: &SessionId,
+        file: LogFile,
+        before: Option<u64>,
+        limit: usize,
+        max_bytes: Option<u32>,
+        pick: impl FnMut(SessionEvent) -> Option<T> + Send + 'static,
+    ) -> Result<(Vec<T>, bool), RuntimeError> {
+        let view = self.log_view(id).await?;
+        let budget = page_budget(max_bytes);
+        let read = async {
+            view.settled().await?;
+            view.page(file, before, limit, budget, pick).await
+        };
+        match tokio::time::timeout(self.inner.cfg.timeouts.command, read).await {
+            Err(_) => Err(RuntimeError::Timeout(format!(
+                "session {id}'s event log is not ready"
+            ))),
+            Ok(r) => r.map_err(|e| io_err(&format!("read the event log of session {id}"), e)),
+        }
+    }
+
+    /// The event log a read is served from. A session with a running actor reads the actor's
+    /// log. Otherwise the log the session has (its last actor's, or one opened for reads) is
+    /// used; a session with none gets one opened here, with no actor started. An unsealed log
+    /// is completed by an offline build that reads wait for.
+    async fn log_view(&self, id: &SessionId) -> Result<LogView, RuntimeError> {
+        if let Some(v) = self.known_log(id)? {
+            return Ok(v);
+        }
+        // One opener at a time: the restarts lock keeps two writers off one log.
+        let _restart = self.inner.restarts.lock().await;
+        let (dir, desc, meta, has_actor) = {
             let map = lock(&self.inner.sessions);
             let e = map
                 .get(id)
                 .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+            if let Some(v) = &e.log {
+                return Ok(v.clone());
+            }
             (
-                e.actor.as_ref().is_some_and(|a| !a.task.is_finished()),
                 e.dir.clone(),
                 e.desc.clone(),
                 e.file.meta(),
+                e.actor.as_ref().is_some_and(|a| !a.task.is_finished()),
             )
         };
         if has_actor {
-            if let Local::Page(p) = self
-                .ask(id, |reply| Msg::Trail {
-                    before,
-                    limit,
-                    reply,
-                })
-                .await?
-            {
-                return Ok(p);
+            return Err(RuntimeError::Io(format!("session {id} has no event log")));
+        }
+        let mut log = self.open_log(&dir).await.ok_or_else(|| {
+            RuntimeError::Io(format!("cannot open the event log of session {id}"))
+        })?;
+        let view = log.view();
+        let writer = log.take_writer();
+        let hints = self.inner.cfg.mode_hints.get(&meta.driver);
+        let run_dir = self.inner.cfg.session_run_dir(&dir);
+        let build = tokio::spawn(build_log(log, id.clone(), dir, run_dir, desc, meta, hints));
+        let mut map = lock(&self.inner.sessions);
+        match map.get_mut(id) {
+            Some(e) => {
+                e.log = Some(view.clone());
+                e.log_task = Some(build);
+                e.log_writer = writer;
+                Ok(view)
+            }
+            None => {
+                build.abort();
+                Err(RuntimeError::SessionNotFound(id.to_string()))
             }
         }
-        let hints = self.inner.cfg.mode_hints.get(&meta.driver);
-        replay::trail(&dir, desc, &meta, before, limit, &hints)
-            .await
-            .map_err(RuntimeError::Io)
+    }
+
+    /// The session's log view if it has one.
+    fn known_log(&self, id: &SessionId) -> Result<Option<LogView>, RuntimeError> {
+        let map = lock(&self.inner.sessions);
+        let e = map
+            .get(id)
+            .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+        Ok(e.log.clone())
+    }
+
+    /// Test support: whether the session has a running actor (reads must not start one).
+    #[doc(hidden)]
+    pub fn actor_running(&self, id: &SessionId) -> bool {
+        lock(&self.inner.sessions)
+            .get(id)
+            .is_some_and(|e| e.actor.as_ref().is_some_and(|a| !a.task.is_finished()))
     }
 
     /// Subscribe to a session's events strictly after `from` (from the beginning when `None`),

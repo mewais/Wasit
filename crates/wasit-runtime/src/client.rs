@@ -303,17 +303,21 @@ impl RuntimeClient {
         limit: u32,
         scope: HistoryScope,
     ) -> Result<HistoryPage, ClientError> {
-        self.call(
-            methods::SESSION_HISTORY,
-            HistoryRequest {
-                id: id.clone(),
-                before,
-                limit,
-                scope,
-                earlier: false,
-            },
-        )
+        self.history_request(HistoryRequest {
+            id: id.clone(),
+            before,
+            limit,
+            scope,
+            earlier: false,
+            max_bytes: None,
+        })
         .await
+    }
+
+    /// `session.history` as requested: the page's options, including its byte budget
+    /// (`max_bytes`, see `wire::page_budget`).
+    pub async fn history_request(&self, req: HistoryRequest) -> Result<HistoryPage, ClientError> {
+        self.call(methods::SESSION_HISTORY, req).await
     }
 
     /// The conversation's *earlier* history ([`wasit_core::AgentEvent::History`] items), the last
@@ -326,16 +330,14 @@ impl RuntimeClient {
         limit: u32,
         scope: HistoryScope,
     ) -> Result<HistoryPage, ClientError> {
-        self.call(
-            methods::SESSION_HISTORY,
-            HistoryRequest {
-                id: id.clone(),
-                before,
-                limit,
-                scope,
-                earlier: true,
-            },
-        )
+        self.history_request(HistoryRequest {
+            id: id.clone(),
+            before,
+            limit,
+            scope,
+            earlier: true,
+            max_bytes: None,
+        })
         .await
     }
 
@@ -347,15 +349,18 @@ impl RuntimeClient {
         before: Option<u64>,
         limit: u32,
     ) -> Result<TrailPage, ClientError> {
-        self.call(
-            methods::SESSION_TRAIL_PAGE,
-            TrailRequest {
-                id: id.clone(),
-                before,
-                limit,
-            },
-        )
+        self.trail_request(TrailRequest {
+            id: id.clone(),
+            before,
+            limit,
+            max_bytes: None,
+        })
         .await
+    }
+
+    /// `session.trail.page` as requested: the page's options, including its byte budget.
+    pub async fn trail_request(&self, req: TrailRequest) -> Result<TrailPage, ClientError> {
+        self.call(methods::SESSION_TRAIL_PAGE, req).await
     }
 
     pub async fn command(

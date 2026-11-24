@@ -255,20 +255,11 @@ impl Service for RuntimeService {
             }
             methods::SESSION_HISTORY => {
                 let r: HistoryRequest = params(p)?;
-                let page = if r.earlier {
-                    m.earlier_scoped(&r.id, r.before, r.limit as usize, r.scope)
-                        .await
-                } else {
-                    m.history_scoped(&r.id, r.before, r.limit as usize, r.scope)
-                        .await
-                };
-                ok(page.map_err(runtime_err)?)
+                ok(m.history_request(r).await.map_err(runtime_err)?)
             }
             methods::SESSION_TRAIL_PAGE => {
                 let r: TrailRequest = params(p)?;
-                ok(m.trail_page(&r.id, r.before, r.limit as usize)
-                    .await
-                    .map_err(runtime_err)?)
+                ok(m.trail_request(r).await.map_err(runtime_err)?)
             }
             methods::SESSION_COMMAND => {
                 let r: CommandRequest = params(p)?;
