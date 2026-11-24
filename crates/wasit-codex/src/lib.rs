@@ -70,7 +70,7 @@ impl DriverDescriptor for CodexDescriptor {
             interrupt: true,
             set_model: true,
             set_mode: true,
-            slash_commands: false,
+            slash_commands: true,
             permission_gates: true,
             questions: true,
             plan_gate: false,
@@ -82,8 +82,8 @@ impl DriverDescriptor for CodexDescriptor {
             prompt_while_busy: BusyPrompt::Steered,
             stop_task: false,
             earlier_history: HistoryDelivery::Wire,
-            fork: false,
-            compact: false,
+            fork: true,
+            compact: true,
             run_shell: false,
         }
     }

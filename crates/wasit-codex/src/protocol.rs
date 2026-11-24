@@ -5,8 +5,10 @@
 //! - Codex omits `"jsonrpc"` on its own lines; we include it on ours.
 //! - Handshake: `initialize` (with `capabilities.experimentalApi`, required for
 //!   `collaborationMode/list`) → wait for the response → `initialized`
-//!   notification → `model/list` → `thread/start` | `thread/resume`
-//!   (for `ResumeMode::Continue`: `thread/list {cwd, limit:1}` first). Codex
+//!   notification → `model/list` → `thread/start` | `thread/resume` | `thread/fork`
+//!   (for `ResumeMode::Continue`: `thread/list {cwd, limit:1}` first; for `ResumeMode::Fork`:
+//!   `thread/fork {threadId, excludeTurns: true}`, and the copy's `forkedFromId` must name the
+//!   parent or the session ends). Codex
 //!   drops a `thread/start` sent before the `initialize` response.
 //! - The `thread/start|resume` result carries `thread.id`, `model`, `cwd` →
 //!   [`AgentEvent::SessionInit`]; then `collaborationMode/list` → modes. A `thread/resume`
@@ -28,6 +30,10 @@
 //!   notification, whichever arrives first (0.169.1 and 0.161.0 send the result first); a
 //!   `turn/start` error before either is `Refused` (and ends the turn as `ExecutionError`).
 //! - Interrupt: `turn/interrupt {threadId, turnId}` with the tracked turn id.
+//! - Compaction: `thread/compact/start {threadId}`; it runs as a turn and completes with an
+//!   `item/completed` of a `contextCompaction` item (`thread/compacted` is deprecated and ignored).
+//! - Review (`/review`): `review/start {threadId, delivery: "inline", target}`, the target
+//!   `uncommittedChanges` or `custom {instructions}`; it runs as a turn.
 //! - Model / collaboration mode: `thread/settings/update`, confirmed by
 //!   `thread/settings/updated`.
 //! - Gates are server→client requests (`item/commandExecution/requestApproval`,
@@ -47,7 +53,7 @@ use wasit_core::{
     AgentEvent, Attachment, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
     GateChoice, GateChoiceKind, GateRequest, InputDropReason, InputId, MediaSource, ModelInfo,
     OutLine, PlanEntry, Protocol, QuestionAnswer, QuestionOption, QuestionPrompt, ResumeMode,
-    SessionMode, SpawnSpec, Step, Usage,
+    SessionMode, SlashCommandInfo, SpawnSpec, Step, Usage,
 };
 
 /// `protocol_options` key holding skill roots (a JSON array of absolute
@@ -72,6 +78,10 @@ enum Req {
     ThreadOpen,
     CollabList,
     ModeAtStart,
+    /// `thread/compact/start` (a manual compaction of the thread's context).
+    Compact,
+    /// `review/start` (the `/review` slash command).
+    Review,
     /// `turn/start` for this input.
     TurnStart(InputId),
     /// `turn/steer` for this input.
@@ -90,6 +100,8 @@ impl Req {
             Req::ThreadList => "thread/list",
             Req::ThreadOpen => "thread/start",
             Req::CollabList => "collaborationMode/list",
+            Req::Compact => "compact",
+            Req::Review => "review",
             Req::ModeAtStart | Req::SetMode => "set_mode",
             Req::TurnStart(_) | Req::Steer(_) => "prompt",
             Req::Interrupt => "interrupt",
@@ -141,6 +153,9 @@ pub struct CodexProtocol {
     /// The open request in flight is a `thread/resume`: its result carries the thread's earlier
     /// turns.
     resuming: bool,
+    /// A compaction this host asked for (`/compact`, [`Command::Compact`]) is not yet reported:
+    /// the next `contextCompaction` item is that one, not one codex started by itself.
+    compact_requested: bool,
 }
 
 impl Default for CodexProtocol {
@@ -168,6 +183,7 @@ impl CodexProtocol {
             tools: HashMap::new(),
             total_usage: Usage::default(),
             resuming: false,
+            compact_requested: false,
         }
     }
 
@@ -203,19 +219,7 @@ impl CodexProtocol {
                 json!({"cwd": cwd, "limit": 1}),
             ),
             ResumeMode::Fresh => self.thread_start(),
-            // Nothing asks for a fork before the fork capability is implemented: start a new
-            // conversation and say so, rather than resuming (and so writing to) the source.
-            ResumeMode::Fork(_) => {
-                let open = self.thread_start();
-                return Step {
-                    events: vec![AgentEvent::CommandRejected {
-                        command: "fork".into(),
-                        message: "forking is not supported yet; started a new conversation".into(),
-                    }],
-                    write: vec![open],
-                    ..Step::default()
-                };
-            }
+            ResumeMode::Fork(parent) => self.thread_fork(&parent),
         };
         write.push(open);
         Step {
@@ -238,6 +242,17 @@ impl CodexProtocol {
         self.request(Req::ThreadOpen, "thread/start", params)
     }
 
+    /// `thread/fork` without the parent's turns: the copy is checked against the parent in
+    /// [`Self::on_thread_open`]. The source thread is never written to.
+    fn thread_fork(&mut self, parent: &str) -> OutLine {
+        self.resuming = false;
+        self.request(
+            Req::ThreadOpen,
+            "thread/fork",
+            json!({"threadId": parent, "excludeTurns": true}),
+        )
+    }
+
     fn thread_resume(&mut self, id: &str) -> OutLine {
         let mut params = json!({"threadId": id, "cwd": self.spec.cwd_or_dot()});
         if let Some(m) = self.spec.model.as_deref().filter(|m| !m.is_empty()) {
@@ -249,6 +264,26 @@ impl CodexProtocol {
 
     fn on_thread_open(&mut self, result: &Value) -> Step {
         let thread = result.get("thread").cloned().unwrap_or(Value::Null);
+        if let ResumeMode::Fork(parent) = &self.spec.resume {
+            // A copy of another thread would be the source's history under a new id: refuse it,
+            // and end the session rather than run on a conversation that is not the one asked for.
+            let from = opt_s(&thread, "forkedFromId");
+            if from.as_deref() != Some(parent.as_str()) {
+                self.phase = Phase::Closed;
+                return Step {
+                    events: vec![AgentEvent::CommandRejected {
+                        command: "fork".into(),
+                        message: format!(
+                            "codex opened thread {} forked from {}, not from {parent}",
+                            opt_s(&thread, "id").unwrap_or_default(),
+                            from.unwrap_or_else(|| "no thread".into()),
+                        ),
+                    }],
+                    close_stdin: true,
+                    ..Step::default()
+                };
+            }
+        }
         self.thread_id = opt_s(&thread, "id");
         self.model = opt_s(result, "model").or_else(|| opt_s(&thread, "model"));
         // What the agent says happened before, ahead of the event that opens the session: it is
@@ -296,18 +331,40 @@ impl CodexProtocol {
     // ── commands ────────────────────────────────────────────────────────────
 
     fn must_queue(&self, cmd: &Command) -> bool {
+        // Commands that address the thread: they wait for it, and for the queue ahead of them.
+        let thread_cmd = match cmd {
+            Command::Compact => true,
+            Command::RunSlash { name, .. } => slash_supported(name),
+            _ => false,
+        };
         match self.phase {
-            Phase::New | Phase::Handshaking => matches!(
-                cmd,
-                Command::Prompt { .. } | Command::SetModel { .. } | Command::SetMode { .. }
-            ),
-            // A prompt can be steered only once the running turn's id is known.
-            Phase::Ready => {
-                matches!(cmd, Command::Prompt { .. })
-                    && ((self.turn_pending && self.active_turn.is_none()) || !self.queue.is_empty())
+            Phase::New | Phase::Handshaking => {
+                thread_cmd
+                    || matches!(
+                        cmd,
+                        Command::Prompt { .. } | Command::SetModel { .. } | Command::SetMode { .. }
+                    )
             }
+            // A prompt can be steered only once the running turn's id is known.
+            Phase::Ready => match cmd {
+                Command::Prompt { .. } => {
+                    (self.turn_pending && self.active_turn.is_none()) || !self.queue.is_empty()
+                }
+                _ => thread_cmd && !self.queue.is_empty(),
+            },
             Phase::Closed => false,
         }
+    }
+
+    /// `thread/compact/start`: codex compacts the thread's context (reported by the
+    /// `contextCompaction` item when it completes).
+    fn compact_request(&mut self) -> OutLine {
+        self.compact_requested = true;
+        self.request(
+            Req::Compact,
+            "thread/compact/start",
+            json!({"threadId": self.thread()}),
+        )
     }
 
     fn encode_now(&mut self, input: InputId, cmd: Command) -> Result<Step, DriverError> {
@@ -336,10 +393,35 @@ impl CodexProtocol {
                 };
                 step.write.push(line);
             }
-            Command::RunSlash { .. } => {
-                return Err(DriverError::Unsupported {
-                    operation: "run_slash (codex app-server has no slash commands)".into(),
-                })
+            Command::RunSlash { name, args } => {
+                let line = match name.as_str() {
+                    "compact" if args.trim().is_empty() => self.compact_request(),
+                    "compact" => {
+                        return Err(DriverError::Invalid {
+                            detail: "/compact takes no arguments".into(),
+                        })
+                    }
+                    // Without arguments: the working tree's changes; with them: the text is the
+                    // review's instructions.
+                    "review" => {
+                        let target = if args.trim().is_empty() {
+                            json!({"type": "uncommittedChanges"})
+                        } else {
+                            json!({"type": "custom", "instructions": args})
+                        };
+                        self.request(
+                            Req::Review,
+                            "review/start",
+                            json!({"threadId": self.thread(), "delivery": "inline", "target": target}),
+                        )
+                    }
+                    _ => {
+                        return Err(DriverError::Unsupported {
+                            operation: format!("run_slash /{name}"),
+                        })
+                    }
+                };
+                step.write.push(line);
             }
             Command::AnswerGate {
                 request_id,
@@ -378,9 +460,8 @@ impl CodexProtocol {
                 })
             }
             Command::Compact => {
-                return Err(DriverError::Unsupported {
-                    operation: "compact".into(),
-                })
+                let line = self.compact_request();
+                step.write.push(line);
             }
             Command::RunShell { .. } => {
                 return Err(DriverError::Unsupported {
@@ -589,10 +670,17 @@ impl CodexProtocol {
                             .collect()
                     })
                     .unwrap_or_default();
-                events(vec![AgentEvent::ModesUpdated {
-                    available_modes: modes,
-                    current_mode: self.mode.clone(),
-                }])
+                // Last of the handshake's reports: the slash commands are fixed, so they are sent
+                // with the modes rather than ahead of the session that the open step reports.
+                events(vec![
+                    AgentEvent::ModesUpdated {
+                        available_modes: modes,
+                        current_mode: self.mode.clone(),
+                    },
+                    AgentEvent::SlashCommandsUpdated {
+                        commands: slash_commands(),
+                    },
+                ])
             }
             // The CLI took the prompt as a turn (its `turn/started` may come before or after).
             Req::TurnStart(input) => {
@@ -611,9 +699,13 @@ impl CodexProtocol {
             }]),
             // Confirmed by notifications (`thread/settings/updated`,
             // `turn/completed`) or nothing to report.
-            Req::SkillRoots | Req::ModeAtStart | Req::Interrupt | Req::SetModel | Req::SetMode => {
-                Step::default()
-            }
+            Req::SkillRoots
+            | Req::ModeAtStart
+            | Req::Interrupt
+            | Req::SetModel
+            | Req::SetMode
+            | Req::Compact
+            | Req::Review => Step::default(),
         }
     }
 
@@ -623,6 +715,10 @@ impl CodexProtocol {
                 raw: json!({"id": id, "error": {"message": message}}),
             }]);
         };
+        if req == Req::Compact {
+            // Nothing was compacted on our request: the next compaction is codex's own.
+            self.compact_requested = false;
+        }
         match req {
             Req::TurnStart(input) => {
                 self.turn_pending = false;
@@ -873,7 +969,10 @@ impl CodexProtocol {
             | "item/fileChange/outputDelta"
             | "turn/diff/updated"
             | "mcpServer/startupStatus/updated"
-            | "skills/changed" => Step::default(),
+            | "skills/changed"
+            // Deprecated by codex in favour of the `contextCompaction` item, which carries the
+            // same event.
+            | "thread/compacted" => Step::default(),
             _ => events(vec![AgentEvent::Unknown {
                 raw: json!({"method": method, "params": params}),
             }]),
@@ -905,6 +1004,7 @@ impl CodexProtocol {
         self.active_turn = None;
         self.turn_pending = false;
         self.interrupt_wanted = false;
+        self.compact_requested = false;
         self.tools.clear();
         let mut step = Step::default();
         for g in std::mem::take(&mut self.gates) {
@@ -943,8 +1043,17 @@ impl CodexProtocol {
     fn on_item_completed(&mut self, params: &Value) -> Vec<AgentEvent> {
         let item = params.get("item").cloned().unwrap_or(Value::Null);
         if s(&item, "type") == "contextCompaction" {
+            // Codex's item says nothing of what started it: it is ours when we asked for it.
+            let trigger = if std::mem::take(&mut self.compact_requested) {
+                "manual"
+            } else {
+                "auto"
+            };
             return vec![AgentEvent::Compaction {
-                info: CompactionInfo::default(),
+                info: CompactionInfo {
+                    trigger: Some(trigger.into()),
+                    ..CompactionInfo::default()
+                },
             }];
         }
         let Some(id) = opt_s(&item, "id") else {
@@ -955,6 +1064,28 @@ impl CodexProtocol {
         };
         vec![tool_finished(&item, id, name)]
     }
+}
+
+/// The slash commands this driver reports at the handshake. Both are run by codex's own
+/// requests (see [`CodexProtocol::encode_now`]); codex has no command list of its own to ask.
+fn slash_commands() -> Vec<SlashCommandInfo> {
+    vec![
+        SlashCommandInfo {
+            name: "compact".into(),
+            description: "Compact the conversation".into(),
+            argument_hint: String::new(),
+        },
+        SlashCommandInfo {
+            name: "review".into(),
+            description: "Review changes".into(),
+            argument_hint: "[instructions]".into(),
+        },
+    ]
+}
+
+/// Whether [`slash_commands`] lists `name`.
+fn slash_supported(name: &str) -> bool {
+    matches!(name, "compact" | "review")
 }
 
 /// The tool call an item starts (`None` for the item types that are not tool calls: messages,
@@ -1319,9 +1450,6 @@ impl Protocol for CodexProtocol {
     fn encode(&mut self, input: InputId, cmd: Command) -> Result<Encoded, DriverError> {
         if self.phase == Phase::Closed {
             return Err(DriverError::Shutdown);
-        }
-        if matches!(cmd, Command::RunSlash { .. }) {
-            return self.encode_now(input, cmd).map(Encoded::Sent);
         }
         if matches!(cmd, Command::Interrupt) && self.phase != Phase::Ready {
             // Nothing is running yet: what the interrupt clears is the queued prompts.

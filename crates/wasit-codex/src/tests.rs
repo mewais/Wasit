@@ -1,8 +1,9 @@
 use super::*;
 use serde_json::json;
 use wasit_core::{
-    AgentEvent, Command, DriverError, Encoded, EndReason, GateDecision, GateRequest,
-    InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, Step,
+    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateDecision,
+    GateRequest, InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, SlashCommandInfo,
+    Step,
 };
 
 fn w(step: &Step) -> Vec<Value> {
@@ -1390,14 +1391,8 @@ fn a_huge_first_prompt_becomes_a_bounded_title() {
 }
 
 #[test]
-fn compact_and_run_shell_are_unsupported() {
+fn run_shell_is_unsupported() {
     let mut p = ready();
-    assert_eq!(
-        p.encode(InputId(130), Command::Compact),
-        Err(DriverError::Unsupported {
-            operation: "compact".into()
-        })
-    );
     assert_eq!(
         p.encode(
             InputId(131),
@@ -1410,4 +1405,249 @@ fn compact_and_run_shell_are_unsupported() {
             operation: "run_shell".into()
         })
     );
+}
+
+// ── fork, compact, slash commands ───────────────────────────────────────────
+
+/// A protocol started with `resume`, past `initialize`: the next request is the thread open.
+fn opening(resume: ResumeMode) -> CodexProtocol {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        cwd: Some("/c".into()),
+        resume,
+        ..SpawnSpec::default()
+    });
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    p
+}
+
+#[test]
+fn codex_reports_fork_compact_and_slash_capabilities() {
+    let caps = CodexDescriptor.capabilities();
+    assert!(caps.fork);
+    assert!(caps.compact);
+    assert!(caps.slash_commands);
+    assert!(!caps.run_shell);
+}
+
+#[test]
+fn fork_opens_a_thread_forked_from_the_parent() {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        cwd: Some("/c".into()),
+        resume: ResumeMode::Fork("parent".into()),
+        ..SpawnSpec::default()
+    });
+    // The fork request is exactly the schema's ThreadForkParams, and no thread/start is sent.
+    let lines = w(&p.on_line(r#"{"id":1,"result":{}}"#));
+    let open = lines
+        .iter()
+        .find(|l| l["method"] != "initialized" && l["method"] != "model/list")
+        .unwrap();
+    assert_eq!(
+        *open,
+        json!({"jsonrpc":"2.0","id":3,"method":"thread/fork","params":{"threadId":"parent","excludeTurns":true}})
+    );
+    assert!(!lines.iter().any(|l| l["method"] == "thread/start"));
+    let step = p.on_line(
+        r#"{"id":3,"result":{"thread":{"id":"child","forkedFromId":"parent"},"model":"m","cwd":"/c"}}"#,
+    );
+    assert!(matches!(
+        &step.events[0],
+        AgentEvent::SessionInit { native_session_id: Some(t), .. } if t == "child"
+    ));
+    assert!(!step.close_stdin);
+}
+
+#[test]
+fn fork_of_another_thread_is_a_driver_error() {
+    for result in [
+        r#"{"id":3,"result":{"thread":{"id":"child","forkedFromId":"other"},"model":"m","cwd":"/c"}}"#,
+        r#"{"id":3,"result":{"thread":{"id":"child"},"model":"m","cwd":"/c"}}"#,
+    ] {
+        let mut p = opening(ResumeMode::Fork("parent".into()));
+        p.on_line(r#"{"id":2,"result":{"data":[]}}"#);
+        let step = p.on_line(result);
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandRejected { command, .. } if command == "fork"
+            )),
+            "{result}"
+        );
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionInit { .. })));
+        assert!(step.close_stdin);
+    }
+}
+
+#[test]
+fn compact_request_and_manual_completion() {
+    let mut p = ready();
+    let s = sent(p.encode(InputId(140), Command::Compact));
+    let lines = w(&s);
+    assert_eq!(lines[0]["method"], "thread/compact/start");
+    assert_eq!(
+        lines[0],
+        json!({"jsonrpc":"2.0","id":lines[0]["id"],"method":"thread/compact/start","params":{"threadId":"t1"}})
+    );
+    let ev = p
+        .on_line(r#"{"method":"item/completed","params":{"threadId":"t1","turnId":"u1","completedAtMs":1,"item":{"type":"contextCompaction","id":"c1"}}}"#)
+        .events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::Compaction {
+            info: CompactionInfo {
+                trigger: Some("manual".into()),
+                ..CompactionInfo::default()
+            }
+        }]
+    );
+}
+
+#[test]
+fn compaction_without_a_request_is_automatic() {
+    let mut p = ready();
+    let ev = p
+        .on_line(r#"{"method":"item/completed","params":{"threadId":"t1","turnId":"u1","completedAtMs":1,"item":{"type":"contextCompaction","id":"c2"}}}"#)
+        .events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::Compaction {
+            info: CompactionInfo {
+                trigger: Some("auto".into()),
+                ..CompactionInfo::default()
+            }
+        }]
+    );
+}
+
+#[test]
+fn deprecated_thread_compacted_is_ignored() {
+    let mut p = ready();
+    let step =
+        p.on_line(r#"{"method":"thread/compacted","params":{"threadId":"t1","turnId":"u1"}}"#);
+    assert!(step.is_empty());
+}
+
+#[test]
+fn handshake_reports_compact_and_review_slash_commands() {
+    let mut p = opening(ResumeMode::Fresh);
+    p.on_line(r#"{"id":2,"result":{"data":[]}}"#);
+    p.on_line(r#"{"id":3,"result":{"thread":{"id":"t1"},"model":"m","cwd":"/c"}}"#);
+    let step = p.on_line(r#"{"id":4,"result":{"data":[]}}"#);
+    let commands = step
+        .events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SlashCommandsUpdated { commands } => Some(commands.clone()),
+            _ => None,
+        })
+        .expect("slash commands are reported at the handshake");
+    assert_eq!(
+        commands,
+        vec![
+            SlashCommandInfo {
+                name: "compact".into(),
+                description: "Compact the conversation".into(),
+                argument_hint: String::new(),
+            },
+            SlashCommandInfo {
+                name: "review".into(),
+                description: "Review changes".into(),
+                argument_hint: "[instructions]".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn run_slash_compact_and_review_map_to_requests() {
+    let mut p = ready();
+    let s = sent(p.encode(
+        InputId(141),
+        Command::RunSlash {
+            name: "compact".into(),
+            args: String::new(),
+        },
+    ));
+    assert_eq!(w(&s)[0]["method"], "thread/compact/start");
+    assert_eq!(w(&s)[0]["params"], json!({"threadId":"t1"}));
+
+    let s = sent(p.encode(
+        InputId(142),
+        Command::RunSlash {
+            name: "review".into(),
+            args: String::new(),
+        },
+    ));
+    let line = &w(&s)[0];
+    assert_eq!(line["method"], "review/start");
+    assert_eq!(
+        line["params"],
+        json!({"threadId":"t1","delivery":"inline","target":{"type":"uncommittedChanges"}})
+    );
+
+    let s = sent(p.encode(
+        InputId(143),
+        Command::RunSlash {
+            name: "review".into(),
+            args: "focus on the parser".into(),
+        },
+    ));
+    assert_eq!(w(&s)[0]["method"], "review/start");
+    assert_eq!(
+        w(&s)[0]["params"],
+        json!({"threadId":"t1","delivery":"inline","target":{"type":"custom","instructions":"focus on the parser"}})
+    );
+}
+
+#[test]
+fn unknown_slash_command_is_unsupported() {
+    let mut p = ready();
+    assert_eq!(
+        p.encode(
+            InputId(144),
+            Command::RunSlash {
+                name: "foo".into(),
+                args: String::new()
+            }
+        ),
+        Err(DriverError::Unsupported {
+            operation: "run_slash /foo".into()
+        })
+    );
+    // Also before the handshake: refused at once, not queued.
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec::default());
+    assert!(p
+        .encode(
+            InputId(145),
+            Command::RunSlash {
+                name: "foo".into(),
+                args: String::new()
+            }
+        )
+        .is_err());
+}
+
+#[test]
+fn compact_before_the_handshake_waits_for_the_thread() {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        cwd: Some("/c".into()),
+        ..SpawnSpec::default()
+    });
+    assert_eq!(
+        p.encode(InputId(146), Command::Compact).unwrap(),
+        Encoded::Queued
+    );
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    p.on_line(r#"{"id":2,"result":{"data":[]}}"#);
+    let step = p.on_line(r#"{"id":3,"result":{"thread":{"id":"t1"},"model":"m","cwd":"/c"}}"#);
+    assert!(w(&step)
+        .iter()
+        .any(|l| l["method"] == "thread/compact/start" && l["params"] == json!({"threadId":"t1"})));
 }
