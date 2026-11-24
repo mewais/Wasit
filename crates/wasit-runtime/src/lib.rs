@@ -40,8 +40,11 @@ mod note;
 mod replay;
 mod scrub;
 mod service;
+#[doc(hidden)]
+pub mod stats;
 mod store;
 mod stream;
+mod subscribe;
 pub mod trail;
 pub mod wire;
 
@@ -111,7 +114,7 @@ pub mod testing {
         if let Some(w) = writer {
             w.await.map_err(|e| format!("log writer: {e}"))?;
         }
-        built
+        built.map(|_| ())
     }
 }
 

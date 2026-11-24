@@ -2,10 +2,11 @@
 //!
 //! It creates sessions (render config → `session.json` → spawn shim → start actor), re-adopts
 //! them on start ([`SessionManager::adopt_all`]: live shims get an actor that rebuilds state by
-//! replaying the journal; finished sessions get a snapshot from an offline replay and an actor
-//! only when someone needs one), and routes commands to the session's actor. History and trail
-//! pages are read from the session's event log, never through the actor and never by replaying
-//! the journal. No lock is held across an await; every wait is bounded.
+//! replaying the journal; finished sessions take their snapshot from their sealed event log, or
+//! from an offline build of it, and get an actor only when a command needs one), and routes
+//! commands to the session's actor. History and trail pages and subscription backlogs are read
+//! from the session's event log, never through the actor's memory and never by replaying the
+//! journal, and reads never start an actor. No lock is held across an await.
 //!
 //! Dropping the manager stops its actors (not the sessions: shims keep running and a new
 //! manager re-adopts them).
@@ -13,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use futures::stream::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
@@ -26,11 +27,12 @@ use crate::actor::{Actor, ActorInit, GateOp, Msg};
 use crate::config::RuntimeConfig;
 use crate::core::{blank_snapshot, SessionMeta};
 use crate::diag::{self, Intent};
-use crate::eventlog::{EventLog, LogFile, LogState, LogView};
+use crate::eventlog::{EventLog, LogFile, LogView};
 use crate::host::HostFeed;
 use crate::replay;
 use crate::store::{self, SessionFile};
-use crate::stream::{live, EventStream, StreamEnd};
+use crate::stream::EventStream;
+use crate::subscribe::Feed;
 use crate::wire::{
     page_budget, CommandError, CommandOutcome, CreateSession, CreateSessionReply, HistoryPage,
     HistoryRequest, HistoryScope, HostEvent, Phase, ResumeRequest, RuntimeError, SessionEvent,
@@ -41,7 +43,7 @@ use crate::wire::{
 const DISPLAY_NAME_CHARS: usize = 200;
 /// Mailbox capacity of a session actor.
 const MAILBOX: usize = 64;
-/// Concurrent offline replays (snapshots of finished sessions) during adoption.
+/// Concurrent offline replays (event log builds, blob lookups).
 const REPLAY_CONCURRENCY: usize = 4;
 /// Upper bound of a history page.
 pub const MAX_HISTORY_PAGE: usize = 2000;
@@ -80,7 +82,9 @@ struct Entry {
     desc: Arc<dyn DriverDescriptor>,
     snapshot: watch::Sender<Arc<SessionSnapshot>>,
     actor: Option<ActorHandle>,
-    loader: Option<JoinHandle<()>>,
+    /// Counts the actors started for the session, bumped under the map lock together with
+    /// `actor`: a subscription that found no actor waits for it to change.
+    started: watch::Sender<u64>,
     /// Where reads of the session's event log go: the actor's log while it runs, else the log
     /// the manager opened for reads (see [`SessionManager::log_view`]).
     log: Option<LogView>,
@@ -109,9 +113,6 @@ impl Drop for Inner {
         for e in sessions.values_mut() {
             if let Some(a) = e.actor.take() {
                 a.task.abort();
-            }
-            if let Some(l) = e.loader.take() {
-                l.abort();
             }
             if let Some(b) = e.log_task.take() {
                 b.abort();
@@ -147,7 +148,7 @@ fn io_err(what: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Io(format!("{what}: {e}"))
 }
 
-/// Stops offline tasks that own derived files (their loader, an offline log build), then waits
+/// Stops offline tasks that own derived files (an offline log build), then waits
 /// for the log writers they handed their logs to: once this returns, nothing else writes the
 /// session's derived files, and a new log may be opened.
 async fn stop_derived(tasks: Vec<JoinHandle<()>>, writers: Vec<JoinHandle<()>>) {
@@ -165,25 +166,67 @@ async fn stop_derived(tasks: Vec<JoinHandle<()>>, writers: Vec<JoinHandle<()>>) 
 }
 
 /// The offline owner of a session's log when no actor runs: builds the log from the journal
-/// unless it is sealed, then drops it, which lets its writer finish after the last record.
-async fn build_log(
-    log: EventLog,
+/// unless it is sealed (one of [`REPLAY_CONCURRENCY`] at a time), publishes the snapshot the
+/// build arrives at, then drops the log, which lets its writer finish after the last record.
+struct OfflineBuild {
     id: SessionId,
     dir: PathBuf,
     run_dir: PathBuf,
     desc: Arc<dyn DriverDescriptor>,
     meta: SessionMeta,
     hints: Vec<SessionMode>,
-) {
-    let sealed = matches!(*log.state().borrow(), LogState::Ready);
-    if sealed {
-        return;
+    permits: Arc<Semaphore>,
+    snapshot: watch::Sender<Arc<SessionSnapshot>>,
+    feed: Arc<HostFeed>,
+}
+
+impl OfflineBuild {
+    async fn run(self, log: EventLog) {
+        if let Some(sealed) = log.sealed_snapshot() {
+            // Sealed by a writer that finished after the adoption looked (or by a build): the
+            // seal's snapshot is the session's.
+            let snap = Arc::new(sealed.clone());
+            self.snapshot.send_replace(snap.clone());
+            self.feed.upsert(snap);
+            return;
+        }
+        // The semaphore is never closed.
+        let Ok(_permit) = self.permits.acquire_owned().await else {
+            return;
+        };
+        let built = replay::build(
+            &self.dir,
+            &self.run_dir,
+            self.desc,
+            &self.meta,
+            &self.hints,
+            &log,
+        )
+        .await;
+        match built {
+            Ok(snap) => {
+                let snap = Arc::new(snap);
+                self.snapshot.send_replace(snap.clone());
+                self.feed.upsert(snap);
+            }
+            Err(e) => {
+                let err = io::Error::other(e);
+                diag::persist_failed(&self.id, &err);
+                diag::snapshot_failed(&self.id, &err.to_string());
+                // Reads answer with the failure instead of waiting for a build that stopped.
+                let _ = log.fail(err.to_string());
+            }
+        }
     }
-    if let Err(e) = replay::build(&dir, &run_dir, desc, &meta, &hints, &log).await {
-        let err = io::Error::other(e);
-        diag::persist_failed(&id, &err);
-        // Reads answer with the failure instead of waiting for a build that stopped.
-        let _ = log.fail(err.to_string());
+}
+
+/// A [`SessionManager`] that does not keep it alive (held by subscriptions while they wait).
+#[derive(Clone)]
+pub(crate) struct WeakManager(Weak<Inner>);
+
+impl WeakManager {
+    pub(crate) fn upgrade(&self) -> Option<SessionManager> {
+        self.0.upgrade().map(|inner| SessionManager { inner })
     }
 }
 
@@ -449,12 +492,13 @@ impl SessionManager {
             desc,
             snapshot,
             actor: None,
-            loader: None,
+            started: watch::channel(0).0,
             log: event_log.as_ref().map(EventLog::view),
             log_task: None,
             log_writer: None,
         };
-        entry.actor = Some(self.start_actor(&entry, start_trace, event_log));
+        let handle = self.start_actor(&entry, start_trace, event_log);
+        entry.attach(handle);
         lock(&self.inner.sessions).insert(id, entry);
         self.inner.feed.upsert(snap);
     }
@@ -491,6 +535,7 @@ impl SessionManager {
         let writer = actor.take_writer();
         let log_writer = actor.take_log_writer();
         let (tx, rx) = mpsc::channel(MAILBOX);
+        crate::stats::actor_started();
         let task = tokio::spawn(actor.run(rx));
         ActorHandle {
             tx,
@@ -509,6 +554,7 @@ impl SessionManager {
             .await
             .map_err(|e| io_err(&format!("read {}", sessions_dir.display()), e))?;
         let mut report = AdoptReport::default();
+        let mut found = Vec::new();
         loop {
             let ent = match rd.next_entry().await {
                 Ok(Some(e)) => e,
@@ -523,6 +569,20 @@ impl SessionManager {
             if lock(&self.inner.sessions).contains_key(&id) {
                 continue;
             }
+            // Newest first: offline builds queue for their permits in adoption order, so the
+            // sessions a user most likely opens next are ready first. "Newest" is the last write
+            // to the journal (the session directory when there is none).
+            let modified = match tokio::fs::metadata(dir.join("journal.ndjson")).await {
+                Ok(m) => m.modified().ok(),
+                Err(_) => tokio::fs::metadata(&dir)
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok()),
+            };
+            found.push((modified, id, dir));
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, id, dir) in found {
             match self.adopt_one(&id, &dir).await {
                 Ok(true) => report.running.push(id),
                 Ok(false) => report.finished.push(id),
@@ -580,36 +640,59 @@ impl SessionManager {
                 reason: "the shim is gone and the journal has no exit record".into(),
             },
         };
+        let journal_len = tokio::fs::metadata(dir.join("journal.ndjson"))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let derivation = &self.inner.cfg.derivation;
+        if let Some(sealed) = crate::eventlog::sealed_snapshot(dir, derivation, journal_len).await {
+            // The log was sealed at the journal's present length: its snapshot is the session's,
+            // with no replay and no log opened (the first read opens it).
+            let snap = Arc::new(sealed);
+            let (snapshot, _) = watch::channel(snap.clone());
+            lock(&self.inner.sessions).insert(
+                id.clone(),
+                Entry {
+                    dir: dir.to_path_buf(),
+                    file,
+                    desc,
+                    snapshot,
+                    actor: None,
+                    started: watch::channel(0).0,
+                    log: None,
+                    log_task: None,
+                    log_writer: None,
+                },
+            );
+            self.inner.feed.upsert(snap);
+            return Ok(false);
+        }
+        // Not sealed (or sealed under another build, or for a shorter journal): the snapshot
+        // shown meanwhile is a placeholder until the offline build of the log replaces it.
         let snap = Arc::new(blank_snapshot(&meta, desc.as_ref(), phase, false));
-        let (tx, loader) = {
-            let watch_tx = {
-                let (snapshot, _) = watch::channel(snap.clone());
-                snapshot
-            };
-            let dir2 = dir.to_path_buf();
-            let run2 = run.clone();
-            let desc2 = desc.clone();
-            let feed = self.inner.feed.clone();
-            let permits = self.inner.replays.clone();
-            let w = watch_tx.clone();
-            let sid = id.clone();
-            let hints = self.inner.cfg.mode_hints.get(&meta.driver);
-            let meta_clone = meta.clone();
-            let loader = tokio::spawn(async move {
-                // The semaphore is never closed.
-                let Ok(_permit) = permits.acquire_owned().await else {
-                    return;
+        let (snapshot, _) = watch::channel(snap.clone());
+        // Not in the map yet: nothing else can open this log meanwhile.
+        let (log, log_task, log_writer) = match self.open_log(dir).await {
+            Some(mut log) => {
+                let view = log.view();
+                let writer = log.take_writer();
+                let build = OfflineBuild {
+                    id: id.clone(),
+                    dir: dir.to_path_buf(),
+                    run_dir: run,
+                    desc: desc.clone(),
+                    meta: meta.clone(),
+                    hints: self.inner.cfg.mode_hints.get(&meta.driver),
+                    permits: self.inner.replays.clone(),
+                    snapshot: snapshot.clone(),
+                    feed: self.inner.feed.clone(),
                 };
-                match replay::snapshot(&dir2, &run2, desc2, &meta_clone, &hints).await {
-                    Ok(s) => {
-                        let s = Arc::new(s);
-                        w.send_replace(s.clone());
-                        feed.upsert(s);
-                    }
-                    Err(e) => diag::snapshot_failed(&sid, &e),
-                }
-            });
-            (watch_tx, loader)
+                (Some(view), Some(tokio::spawn(build.run(log))), writer)
+            }
+            None => {
+                diag::snapshot_failed(id, "cannot open the event log");
+                (None, None, None)
+            }
         };
         lock(&self.inner.sessions).insert(
             id.clone(),
@@ -617,12 +700,12 @@ impl SessionManager {
                 dir: dir.to_path_buf(),
                 file,
                 desc,
-                snapshot: tx,
+                snapshot,
                 actor: None,
-                loader: Some(loader),
-                log: None,
-                log_task: None,
-                log_writer: None,
+                started: watch::channel(0).0,
+                log,
+                log_task,
+                log_writer,
             },
         );
         self.inner.feed.upsert(snap);
@@ -765,12 +848,7 @@ impl SessionManager {
                 .into_iter()
                 .collect();
             writers.extend(e.log_writer.take());
-            let tasks: Vec<JoinHandle<()>> = e
-                .loader
-                .take()
-                .into_iter()
-                .chain(e.log_task.take())
-                .collect();
+            let tasks: Vec<JoinHandle<()>> = e.log_task.take().into_iter().collect();
             e.log = None;
             (e.dir.clone(), tasks, writers)
         };
@@ -784,7 +862,7 @@ impl SessionManager {
         e.log = event_log.as_ref().map(EventLog::view);
         let handle = self.start_actor(e, None, event_log);
         let tx = handle.tx.clone();
-        e.actor = Some(handle);
+        e.attach(handle);
         Ok(tx)
     }
 
@@ -1038,12 +1116,7 @@ impl SessionManager {
                 let _ = w.await;
             }
         }
-        let tasks: Vec<JoinHandle<()>> = entry
-            .loader
-            .take()
-            .into_iter()
-            .chain(entry.log_task.take())
-            .collect();
+        let tasks: Vec<JoinHandle<()>> = entry.log_task.take().into_iter().collect();
         let writers: Vec<JoinHandle<()>> = entry.log_writer.take().into_iter().collect();
         stop_derived(tasks, writers).await;
         self.inner.feed.remove(id);
@@ -1243,13 +1316,13 @@ impl SessionManager {
     /// log. Otherwise the log the session has (its last actor's, or one opened for reads) is
     /// used; a session with none gets one opened here, with no actor started. An unsealed log
     /// is completed by an offline build that reads wait for.
-    async fn log_view(&self, id: &SessionId) -> Result<LogView, RuntimeError> {
+    pub(crate) async fn log_view(&self, id: &SessionId) -> Result<LogView, RuntimeError> {
         if let Some(v) = self.known_log(id)? {
             return Ok(v);
         }
         // One opener at a time: the restarts lock keeps two writers off one log.
         let _restart = self.inner.restarts.lock().await;
-        let (dir, desc, meta, has_actor) = {
+        let (dir, desc, meta, has_actor, snapshot) = {
             let map = lock(&self.inner.sessions);
             let e = map
                 .get(id)
@@ -1262,6 +1335,7 @@ impl SessionManager {
                 e.desc.clone(),
                 e.file.meta(),
                 e.actor.as_ref().is_some_and(|a| !a.task.is_finished()),
+                e.snapshot.clone(),
             )
         };
         if has_actor {
@@ -1272,9 +1346,18 @@ impl SessionManager {
         })?;
         let view = log.view();
         let writer = log.take_writer();
-        let hints = self.inner.cfg.mode_hints.get(&meta.driver);
-        let run_dir = self.inner.cfg.session_run_dir(&dir);
-        let build = tokio::spawn(build_log(log, id.clone(), dir, run_dir, desc, meta, hints));
+        let build = OfflineBuild {
+            id: id.clone(),
+            run_dir: self.inner.cfg.session_run_dir(&dir),
+            dir,
+            desc,
+            hints: self.inner.cfg.mode_hints.get(&meta.driver),
+            meta,
+            permits: self.inner.replays.clone(),
+            snapshot,
+            feed: self.inner.feed.clone(),
+        };
+        let build = tokio::spawn(build.run(log));
         let mut map = lock(&self.inner.sessions);
         match map.get_mut(id) {
             Some(e) => {
@@ -1308,38 +1391,47 @@ impl SessionManager {
     }
 
     /// Subscribe to a session's events strictly after `from` (from the beginning when `None`),
-    /// then live. Gap- and duplicate-free; ends with `Err(Lagged)` if the subscriber falls
-    /// behind, and when the session is deleted.
+    /// then live, across the session's ends and continues ([`crate::subscribe`]). Gap- and
+    /// duplicate-free, in journal order; ends with `Err(Lagged)` if the subscriber falls behind
+    /// a running actor, and when the session is deleted or the manager dropped. Never starts an
+    /// actor.
     pub async fn subscribe(
         &self,
         id: &SessionId,
         from: Option<u64>,
     ) -> Result<SessionEventStream, RuntimeError> {
-        let r = self.ask(id, |reply| Msg::Subscribe { from, reply }).await?;
-        let (dir, desc, meta) = {
-            let map = lock(&self.inner.sessions);
-            let e = map
-                .get(id)
-                .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
-            (e.dir.clone(), e.desc.clone(), e.file.meta())
-        };
-        let head = match r.replay_below {
-            Some(below) => {
-                let hints = self.inner.cfg.mode_hints.get(&meta.driver);
-                let rx = replay::events_between(dir, desc, meta, from, below, hints);
-                futures::stream::unfold(rx, |mut rx| async move {
-                    rx.recv()
-                        .await
-                        .map(|item| (item.map_err(StreamEnd::Error), rx))
-                })
-                .boxed()
-            }
-            None => futures::stream::empty().boxed(),
-        };
+        let feed = Feed::start(WeakManager(Arc::downgrade(&self.inner)), id.clone(), from).await?;
         Ok(EventStream::new(
-            head.chain(futures::stream::iter(r.backlog.into_iter().map(Ok)))
-                .chain(live(r.live, r.lagged))
-                .boxed(),
+            futures::stream::unfold(feed, |mut feed| async move {
+                feed.next().await.map(|item| (item, feed))
+            })
+            .boxed(),
         ))
+    }
+
+    /// Where a subscription attaches now, taken under one lock: the session's actor-start
+    /// counter (marked seen) and its running actor's mailbox, if it has one.
+    pub(crate) fn attach_point(
+        &self,
+        id: &SessionId,
+    ) -> Result<(watch::Receiver<u64>, Option<mpsc::Sender<Msg>>), RuntimeError> {
+        let map = lock(&self.inner.sessions);
+        let e = map
+            .get(id)
+            .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?;
+        let actor = match &e.actor {
+            Some(a) if !a.task.is_finished() => Some(a.tx.clone()),
+            _ => None,
+        };
+        Ok((e.started.subscribe(), actor))
+    }
+}
+
+impl Entry {
+    /// Installs a started actor and counts the start, in one step under the map lock (or before
+    /// the entry is in the map): a subscription that saw no actor is woken by the count.
+    fn attach(&mut self, handle: ActorHandle) {
+        self.actor = Some(handle);
+        self.started.send_modify(|n| *n += 1);
     }
 }

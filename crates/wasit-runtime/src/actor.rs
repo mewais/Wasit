@@ -3,8 +3,9 @@
 //!
 //! Inputs: journal records from the shim (attached from the last applied seq; seq 1 on start, so
 //! state is rebuilt by replay) and messages from a bounded mailbox. Outputs: [`SessionEvent`]s
-//! (an in-memory tail ring + per-subscriber bounded queues; a subscriber that falls behind is
-//! dropped and told `Lagged`), the reduced snapshot (a `watch`), and replies to requesters.
+//! (appended to the event log, then offered to per-subscriber bounded queues; a subscriber that
+//! falls behind is dropped and told `Lagged`), the reduced snapshot (a `watch`), and replies to
+//! requesters. Backlogs and pages are read from the event log, never kept in memory here.
 //!
 //! Every shim request (notes, writes, signals) goes through an ordered outbox executed one at a
 //! time *inside* the actor's `select!`, so the actor keeps draining journal records while a
@@ -37,14 +38,14 @@ use crate::config::RuntimeConfig;
 use crate::continuation::{Continuation, Held};
 use crate::core::{ContinuePlan, Core};
 use crate::diag::{self, Intent};
-use crate::eventlog::EventLog;
+use crate::eventlog::{EventLog, LogView};
 use crate::history::ImportMsg;
 use crate::note::{EarlierPlan, RuntimeNote};
 use crate::store::{self, SessionFile};
 use crate::stream::Subscriber;
 use crate::wire::{
-    CommandError, CommandOutcome, HistoryPage, HistoryScope, NotContinuable, Phase, RuntimeError,
-    SessionEvent, SessionId, SessionSnapshot, TrailPage,
+    CommandError, CommandOutcome, NotContinuable, Phase, RuntimeError, SessionEvent, SessionId,
+    SessionSnapshot,
 };
 
 /// Bound on commands awaiting their journal round trip, and on messages deferred while the
@@ -82,26 +83,9 @@ pub(crate) enum Msg {
         name: Option<String>,
         reply: UnitReply,
     },
+    /// Registers a live subscriber; the reply says how far the actor has published.
     Subscribe {
-        from: Option<u64>,
         reply: oneshot::Sender<SubscribeReply>,
-    },
-    #[allow(dead_code)] // R3c removes: pages are served from the event log
-    History {
-        before: Option<u64>,
-        limit: usize,
-        scope: HistoryScope,
-        /// The conversation's earlier history instead of the session's own events: never in
-        /// memory, always a replay of the journal.
-        earlier: bool,
-        reply: oneshot::Sender<Local<HistoryPage>>,
-    },
-    /// The same window of the session's trail.
-    #[allow(dead_code)] // R3c removes: pages are served from the event log
-    Trail {
-        before: Option<u64>,
-        limit: usize,
-        reply: oneshot::Sender<Local<TrailPage>>,
     },
 }
 
@@ -126,18 +110,17 @@ impl GateOp {
 
 /// A live subscription handed out by the actor.
 pub(crate) struct SubscribeReply {
-    /// Events with cursor in `(from, replay_below)` were evicted from memory and must be
-    /// replayed from the journal first (`None` = nothing to replay).
-    pub replay_below: Option<u64>,
-    pub backlog: Vec<SessionEvent>,
+    /// The cursor of the last event published before the subscriber was registered (0: none).
+    /// Every event at or below it is in the event log or queued for it (appended before it is
+    /// published); `live` gets the events published after it.
+    pub through: u64,
+    /// The number of records the event log had been given at registration: once its written
+    /// count reaches this, every event up to `through` is on disk.
+    pub submitted: u64,
+    /// The actor's event log (`None`: it has none, so events up to `through` cannot be read).
+    pub log: Option<LogView>,
     pub live: mpsc::Receiver<SessionEvent>,
     pub lagged: Arc<AtomicBool>,
-}
-
-/// A page served from memory, or "replay the journal".
-pub(crate) enum Local<P> {
-    Page(P),
-    Replay,
 }
 
 /// Called after the snapshot changed.
@@ -224,8 +207,8 @@ pub(crate) struct Actor {
     notify: SnapshotNotify,
     snapshot_dirty: bool,
 
-    ring: VecDeque<SessionEvent>,
-    evicted_max: Option<u64>,
+    /// The cursor of the last event published (0: none yet).
+    last_published: u64,
     subs: Vec<Subscriber<SessionEvent>>,
 
     source: Option<BoxFuture<'static, Source>>,
@@ -450,8 +433,7 @@ impl Actor {
             snapshot_tx: init.snapshot,
             notify: init.notify,
             snapshot_dirty: true,
-            ring: VecDeque::new(),
-            evicted_max: None,
+            last_published: 0,
             subs: Vec::new(),
             source: Some(source),
             stream: None,
@@ -991,13 +973,8 @@ impl Actor {
         for e in &events {
             self.subs.retain(|s| s.offer(e.clone()));
         }
-        for e in events {
-            self.ring.push_back(e);
-        }
-        while self.ring.len() > self.cfg.event_tail.max(1) {
-            if let Some(old) = self.ring.pop_front() {
-                self.evicted_max = Some(old.cursor);
-            }
+        if let Some(max) = events.iter().map(|e| e.cursor).max() {
+            self.last_published = self.last_published.max(max);
         }
     }
 
@@ -1238,34 +1215,8 @@ impl Actor {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Subscribe { from, reply } => {
-                let r = self.subscribe(from);
-                let _ = reply.send(r); // requester may have given up
-            }
-            Msg::History {
-                before,
-                limit,
-                scope,
-                earlier,
-                reply,
-            } => {
-                let r = if self.loading || earlier {
-                    Local::Replay
-                } else {
-                    self.history(before, limit, &scope)
-                };
-                let _ = reply.send(r); // requester may have given up
-            }
-            Msg::Trail {
-                before,
-                limit,
-                reply,
-            } => {
-                let r = if self.loading {
-                    Local::Replay
-                } else {
-                    self.trail(before, limit)
-                };
+            Msg::Subscribe { reply } => {
+                let r = self.subscribe();
                 let _ = reply.send(r); // requester may have given up
             }
             m if self.loading => {
@@ -1582,7 +1533,7 @@ impl Actor {
                 let _ = reply.send(Err(RuntimeError::Busy("session is loading".into())));
                 // requester may have given up
             }
-            Msg::Subscribe { .. } | Msg::History { .. } | Msg::Trail { .. } => {}
+            Msg::Subscribe { .. } => {}
         }
     }
 
@@ -1793,78 +1744,18 @@ impl Actor {
         .boxed()
     }
 
-    fn subscribe(&mut self, from: Option<u64>) -> SubscribeReply {
+    /// Registers a live subscriber at the actor's current position (see [`SubscribeReply`]).
+    fn subscribe(&mut self) -> SubscribeReply {
         let (sub, rx) = Subscriber::new(self.cfg.subscriber_queue);
         let lagged = sub.lagged.clone();
-        let after = from.unwrap_or(0);
-        let replay_below = match (self.evicted_max, from) {
-            (None, _) => None,
-            (Some(ev), Some(c)) if c >= ev => None,
-            (Some(_), _) => Some(self.ring.front().map(|e| e.cursor).unwrap_or(u64::MAX)),
-        };
-        let backlog: Vec<SessionEvent> = self
-            .ring
-            .iter()
-            .filter(|e| from.is_none() || e.cursor > after)
-            .cloned()
-            .collect();
         self.subs.push(sub);
         SubscribeReply {
-            replay_below,
-            backlog,
+            through: self.last_published,
+            submitted: self.event_log.as_ref().map_or(0, EventLog::submitted),
+            log: self.event_log.as_ref().map(EventLog::view),
             live: rx,
             lagged,
         }
-    }
-
-    fn history(
-        &self,
-        before: Option<u64>,
-        limit: usize,
-        scope: &HistoryScope,
-    ) -> Local<HistoryPage> {
-        let below: Vec<&SessionEvent> = self
-            .ring
-            .iter()
-            .filter(|e| before.is_none_or(|b| e.cursor < b))
-            .filter(|e| scope.admits(e))
-            .collect();
-        match last_window(below, limit, self.evicted_max.is_none()) {
-            Some((events, has_more)) => Local::Page(HistoryPage {
-                events: events.into_iter().cloned().collect(),
-                has_more,
-            }),
-            None => Local::Replay,
-        }
-    }
-
-    /// The same window of the trail: the projection of the events in memory, the way a replay
-    /// projects them ([`crate::trail::item`]).
-    fn trail(&self, before: Option<u64>, limit: usize) -> Local<TrailPage> {
-        let below: Vec<crate::wire::TrailItem> = self
-            .ring
-            .iter()
-            .filter(|e| before.is_none_or(|b| e.cursor < b))
-            .filter_map(crate::trail::item)
-            .collect();
-        match last_window(below, limit, self.evicted_max.is_none()) {
-            Some((entries, has_more)) => Local::Page(TrailPage { entries, has_more }),
-            None => Local::Replay,
-        }
-    }
-}
-
-/// The last `limit` of `items` (oldest first) and whether older ones may exist, when memory can
-/// answer: `items` fill the window, or nothing was ever evicted from it (`complete`). `None`:
-/// the page reaches back past what memory holds; replay the journal.
-fn last_window<T>(mut items: Vec<T>, limit: usize, complete: bool) -> Option<(Vec<T>, bool)> {
-    if items.len() >= limit {
-        let start = items.len() - limit;
-        Some((items.split_off(start), start > 0 || !complete))
-    } else if complete {
-        Some((items, false))
-    } else {
-        None
     }
 }
 

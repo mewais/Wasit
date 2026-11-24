@@ -154,8 +154,6 @@ pub struct RuntimeConfig {
     pub overrides: BTreeMap<DriverId, DriverOverride>,
     /// Per-host agent commands (shared with discovery and the host environment stage).
     pub commands: AgentCommands,
-    /// In-memory tail of events kept per session for subscribers and history.
-    pub event_tail: usize,
     /// Per-subscriber queue; a subscriber that falls this far behind is dropped (`Lagged`).
     pub subscriber_queue: usize,
     /// Filled by a [`crate::Discovery`] made with [`crate::DiscoveryConfig::from_runtime`].
@@ -181,7 +179,6 @@ impl RuntimeConfig {
             shim: ShimOptions::default(),
             overrides: BTreeMap::new(),
             commands: AgentCommands::default(),
-            event_tail: 2048,
             subscriber_queue: 1024,
             mode_hints: ModeHints::default(),
             derivation: "dev".into(),

@@ -37,6 +37,8 @@ pub struct EventLog {
     written: watch::Receiver<u64>,
     submitted: Arc<AtomicU64>,
     writer: Option<tokio::task::JoinHandle<()>>,
+    /// The snapshot of the seal the log was opened with, when that seal is valid.
+    sealed: Option<Box<SessionSnapshot>>,
 }
 
 /// A read-side handle on a log: pages are served from it without owning the writer.
@@ -81,6 +83,47 @@ impl LogView {
             .await
             .map_err(|_| writer_gone())?;
         Ok(())
+    }
+
+    /// Waits, event-driven, until the writer has put `target` records on disk (a count the
+    /// actor sampled from [`EventLog::submitted`]). Unlike [`Self::settled`] it does not wait
+    /// for the log to be complete: a log the actor is still catching up holds every record up
+    /// to what the actor has published. Fails when the log failed, or its writer stopped short.
+    pub(crate) async fn caught_up(&self, target: u64) -> io::Result<()> {
+        let mut state = self.state.clone();
+        let mut written = self.written.clone();
+        loop {
+            if let LogState::Failed(reason) = &*state.borrow_and_update() {
+                return Err(io::Error::other(reason.clone()));
+            }
+            if *written.borrow_and_update() >= target {
+                return Ok(());
+            }
+            tokio::select! {
+                r = state.changed() => {
+                    if r.is_err() && *written.borrow() < target {
+                        return Err(writer_gone());
+                    }
+                }
+                r = written.changed() => {
+                    if r.is_err() && *written.borrow() < target {
+                        return Err(writer_gone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// The events of the log with `after < cursor` (all when `after` is `None`) and, with
+    /// `through`, `cursor <= through`, in cursor order, read by a task of its own into a bounded
+    /// channel (it stops when the receiver goes away). Only complete records present when the
+    /// read starts are streamed.
+    pub(crate) fn stream(
+        &self,
+        after: Option<u64>,
+        through: Option<u64>,
+    ) -> mpsc::Receiver<io::Result<SessionEvent>> {
+        stream_events(self.paths.events.clone(), after, through)
     }
 
     /// The last `limit` items `pick` makes of the records of `file` with `cursor < before`
@@ -192,6 +235,10 @@ impl EventLog {
         .await
         .expect("spawn_blocking panicked")?;
 
+        let sealed = match outcome.state {
+            LogState::Ready => outcome.meta.seal.as_ref().map(|s| s.snapshot.clone()),
+            _ => None,
+        };
         let submitted = Arc::new(AtomicU64::new(outcome.written));
         let (state_tx, state) = watch::channel(outcome.state.clone());
         let (written_tx, written) = watch::channel(outcome.written);
@@ -214,7 +261,13 @@ impl EventLog {
             written,
             submitted,
             writer: Some(join),
+            sealed,
         })
+    }
+
+    /// The session snapshot the log was sealed with, if it was opened sealed (complete).
+    pub(crate) fn sealed_snapshot(&self) -> Option<&SessionSnapshot> {
+        self.sealed.as_deref()
     }
 
     pub fn state(&self) -> watch::Receiver<LogState> {
@@ -318,79 +371,13 @@ impl EventLog {
             .await
     }
 
+    #[cfg(test)]
     pub fn stream_between(
         &self,
         after: Option<u64>,
         below: u64,
     ) -> mpsc::Receiver<io::Result<SessionEvent>> {
-        let path = self.paths.events.clone();
-        let (tx, rx) = mpsc::channel(256);
-        tokio::spawn(async move {
-            let start = tokio::task::spawn_blocking({
-                let path = path.clone();
-                move || stream_start(&path, after)
-            })
-            .await;
-            let (start, good) = match start {
-                Ok(Ok(bounds)) => bounds,
-                Ok(Err(e)) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(io::Error::other(e.to_string()))).await;
-                    return;
-                }
-            };
-            let mut file = match OpenOptions::new().read(true).open(&path).await {
-                Ok(f) => f,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-            if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-            let mut reader = BufReader::new(file);
-            let mut buf = String::new();
-            let mut offset = start;
-            loop {
-                buf.clear();
-                let n = match reader.read_line(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => n as u64,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-                offset += n;
-                if offset > good {
-                    break;
-                }
-                if buf.is_empty() {
-                    continue;
-                }
-                let event: SessionEvent =
-                    match serde_json::from_slice(buf.trim_end_matches('\n').as_bytes()) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            let _ = tx.send(Err(json_err(e))).await;
-                            return;
-                        }
-                    };
-                if event.cursor >= below {
-                    break;
-                }
-                if after.is_none_or(|a| event.cursor > a) && tx.send(Ok(event)).await.is_err() {
-                    return;
-                }
-            }
-        });
-        rx
+        stream_events(self.paths.events.clone(), after, below.checked_sub(1))
     }
 
     fn send(&self, msg: LogMsg) -> io::Result<()> {
@@ -398,6 +385,97 @@ impl EventLog {
             .send(msg)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "log writer stopped"))
     }
+}
+
+/// See [`LogView::stream`].
+fn stream_events(
+    path: PathBuf,
+    after: Option<u64>,
+    through: Option<u64>,
+) -> mpsc::Receiver<io::Result<SessionEvent>> {
+    let (tx, rx) = mpsc::channel(256);
+    tokio::spawn(async move {
+        let start = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || stream_start(&path, after)
+        })
+        .await;
+        let (start, good) = match start {
+            Ok(Ok(bounds)) => bounds,
+            Ok(Err(e)) => {
+                let _ = tx.send(Err(e)).await; // the reader may be gone
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(Err(io::Error::other(e.to_string()))).await; // the reader may be gone
+                return;
+            }
+        };
+        let mut file = match OpenOptions::new().read(true).open(&path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await; // the reader may be gone
+                return;
+            }
+        };
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            let _ = tx.send(Err(e)).await; // the reader may be gone
+            return;
+        }
+        let mut reader = BufReader::new(file);
+        let mut buf = String::new();
+        let mut offset = start;
+        loop {
+            buf.clear();
+            let n = match reader.read_line(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n as u64,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await; // the reader may be gone
+                    return;
+                }
+            };
+            offset += n;
+            if offset > good {
+                break;
+            }
+            crate::stats::log_bytes_read(n);
+            let event: SessionEvent =
+                match serde_json::from_slice(buf.trim_end_matches('\n').as_bytes()) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let _ = tx.send(Err(json_err(e))).await; // the reader may be gone
+                        return;
+                    }
+                };
+            if through.is_some_and(|t| event.cursor > t) {
+                break;
+            }
+            if after.is_none_or(|a| event.cursor > a) && tx.send(Ok(event)).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// The snapshot a sealed log holds for a finished session, read from `meta.json` alone: `None`
+/// unless the log was written under `build` and sealed at `journal_len` bytes of the journal.
+/// Takes no lock and changes nothing; a writer that opens the log later recovers it as usual.
+pub(crate) async fn sealed_snapshot(
+    session_dir: &Path,
+    build: &str,
+    journal_len: u64,
+) -> Option<SessionSnapshot> {
+    let path = Paths::new(session_dir).meta;
+    let bytes = fs::read(&path).await.ok()?;
+    let meta: Meta = serde_json::from_slice(&bytes).ok()?;
+    if meta.format != FORMAT || meta.build != build {
+        return None;
+    }
+    let seal = meta.seal?;
+    (seal.journal_len == journal_len).then_some(*seal.snapshot)
 }
 
 struct LogWriter {
@@ -581,8 +659,6 @@ fn recover(
         };
         wrote_meta = true;
     }
-    let events_written = recover_file(&paths.events, last_seq)?;
-    let earlier_written = recover_file(&paths.earlier, last_seq)?;
     // Only a seal that matches the journal makes a log complete. Any other log is a partial
     // derivation until its owner (the actor catching up, or an offline build) marks it ready:
     // reads must not see a prefix as the whole.
@@ -590,11 +666,20 @@ fn recover(
     if let Some(seal) = meta.seal.as_ref() {
         if seal.journal_len == journal_len {
             state = LogState::Ready;
+        } else if seal.journal_len > journal_len {
+            // The journal is shorter than the one the log was sealed for: it was replaced or
+            // rewritten, so the log derives from something that no longer exists, and an
+            // offline build (which only appends beyond the log's last cursor) would keep it.
+            reset_files(paths)?;
+            meta.seal = None;
+            wrote_meta = true;
         } else {
             meta.seal = None;
             wrote_meta = true;
         }
     }
+    let events_written = recover_file(&paths.events, last_seq)?;
+    let earlier_written = recover_file(&paths.earlier, last_seq)?;
     if wrote_meta {
         write_meta(&paths.meta, &meta)?;
     }
@@ -747,6 +832,7 @@ fn page_back_blocking<T>(
         let line = sorted_ndjson::read_range(&mut file, start, end - 1)?;
         end = start;
         bytes += (line.len() + 1) as u64;
+        crate::stats::log_bytes_read((line.len() + 1) as u64);
         let event: SessionEvent = serde_json::from_slice(&line).map_err(json_err)?;
         if let Some(item) = pick(event) {
             items.push(item);

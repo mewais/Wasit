@@ -474,13 +474,12 @@ async fn trail_after_a_restart(driver: &str) {
     let finished = trail(&mgr, &id).await;
     drop(mgr);
 
-    // A manager whose memory holds three events answers from the journal alone.
-    let mut cfg = config(d.path(), timeouts());
-    cfg.event_tail = 3;
-    let small = SessionManager::new(cfg).await.unwrap();
-    small.adopt_all().await.unwrap();
-    wait_snapshot(&small, &id, "replayed", |s| s.loaded).await;
-    assert_eq!(trail(&small, &id).await, finished);
+    // A new manager answers from the session's event log (open_cost.rs proves such reads start
+    // no actor; here the shim may still be up at adoption, so one may run).
+    let fresh = manager(d.path()).await;
+    fresh.adopt_all().await.unwrap();
+    wait_snapshot(&fresh, &id, "adopted", |s| s.loaded).await;
+    assert_eq!(trail(&fresh, &id).await, finished);
 }
 
 per_driver!(trail_after_a_restart =>
@@ -515,20 +514,18 @@ async fn walk(mgr: &SessionManager, id: &SessionId, limit: usize) -> (Vec<Value>
 }
 
 /// `session.trail.page` semantics: the last `limit` entries before a cursor, oldest first,
-/// `has_more` while older ones exist; and the pages are the same from a memory that holds three
-/// events (the journal is replayed) as from one that holds everything.
+/// `has_more` while older ones exist; and the pages are the same from the log the running actor
+/// writes as from the log a new manager adopts.
 #[tokio::test]
-async fn trail_pages_walk_back_to_the_start_from_memory_and_from_a_replay() {
+async fn trail_pages_walk_back_to_the_start_from_the_actor_log_and_the_adopted_log() {
     let d = TempDir::new();
     let sc = Scenario::builder()
         .turn(Turn::builder().say("one").usage(1, 1))
         .turn(Turn::builder().say("two").usage(1, 1))
         .turn(Turn::builder().say("three").usage(1, 1))
         .build();
-    let mut cfg = config(d.path(), timeouts());
-    cfg.event_tail = 3;
     let (id, small_full) = {
-        let small = SessionManager::new(cfg).await.unwrap();
+        let small = manager(d.path()).await;
         let id = create_idle(&small, d.path(), "claude", &sc).await;
         let mut s = small.subscribe(&id, None).await.unwrap();
         for p in ["a", "bb", "ccc"] {
@@ -539,7 +536,7 @@ async fn trail_pages_walk_back_to_the_start_from_memory_and_from_a_replay() {
         let full = trail(&small, &id).await;
         assert!(full.len() > 12, "{full:#?}");
         for limit in [1, 4, 7, 2000] {
-            // Served from a replay (three events of memory), walked back to the start.
+            // Served from the running actor's log, walked back to the start.
             let (walked, more) = walk(&small, &id, limit).await;
             assert_eq!(walked, full, "limit {limit}");
             assert_eq!(more.last(), Some(&false));
@@ -574,7 +571,7 @@ async fn trail_pages_walk_back_to_the_start_from_memory_and_from_a_replay() {
         );
         (id, full)
     };
-    // The same session, adopted by a manager whose memory holds the whole journal.
+    // The same session, adopted by a new manager: its pages come from the adopted log.
     let big = manager(d.path()).await;
     big.adopt_all().await.unwrap();
     wait_snapshot(&big, &id, "replayed", |s| {

@@ -437,11 +437,11 @@ async fn the_first_prompt_is_applied_once_across_continue_and_readoption() {
 }
 
 #[tokio::test]
-async fn history_pages_match_the_full_stream_with_a_tiny_tail() {
+async fn history_pages_match_the_full_stream() {
     let d = TempDir::new();
-    let mut cfg = config(d.path(), timeouts());
-    cfg.event_tail = 8;
-    let mgr = SessionManager::new(cfg).await.unwrap();
+    let mgr = SessionManager::new(config(d.path(), timeouts()))
+        .await
+        .unwrap();
     let mut b = Scenario::builder();
     for i in 0..5 {
         b = b.turn(Turn::builder().say_chunked(format!("reply number {i} with words"), 4));
@@ -460,8 +460,8 @@ async fn history_pages_match_the_full_stream_with_a_tiny_tail() {
         until(&mut s, is_turn_completed).await;
     }
     wait_phase(&mgr, &id, "idle").await;
-    // The reference: a fresh subscriber from the beginning (journal replay for the evicted
-    // prefix, then the in-memory tail, then live).
+    // The reference: a fresh subscriber from the beginning (the actor's event log up to what
+    // it had published, then live).
     let mut all = mgr.subscribe(&id, None).await.unwrap();
     let cursor = mgr.snapshot(&id).unwrap().cursor;
     let reference = until(&mut all, |e| e.cursor >= cursor).await;
@@ -482,7 +482,7 @@ async fn history_pages_match_the_full_stream_with_a_tiny_tail() {
         }
     }
     assert_eq!(pages, reference);
-    // A page fully inside the tail and one straddling it agree with the reference too.
+    // Pages that end at an arbitrary cursor agree with the reference too.
     let mid = reference[reference.len() - 3].cursor;
     let p = mgr.history(&id, Some(mid), 5).await.unwrap();
     let i = reference.iter().position(|e| e.cursor == mid).unwrap();
