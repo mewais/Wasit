@@ -239,6 +239,12 @@ pub(crate) struct Actor {
     attach_token: String,
     pending: HashMap<String, Pending>,
     deferred: VecDeque<Msg>,
+    /// The seq of an exit record applied while loading: sealed by `finish_loading`, once the
+    /// deferred messages (which may start a new generation) have been handled.
+    seal_when_loaded: Option<u64>,
+    /// The cursor of the last event already in the event log: replaying the journal on start
+    /// re-derives those events, and only the ones beyond this are appended.
+    log_cursor: u64,
     /// A continue under way: who waits for it, what is held behind it.
     continuation: Continuation,
     pending_spec: SpawnSpec,
@@ -457,6 +463,8 @@ impl Actor {
             attach_token: token(),
             pending: HashMap::new(),
             deferred: VecDeque::new(),
+            seal_when_loaded: None,
+            log_cursor: 0,
             continuation: Continuation::Idle,
             start_trace: init.start_trace,
             start_earlier,
@@ -473,6 +481,18 @@ impl Actor {
     }
 
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<Msg>) {
+        // WHY: the actor replays the journal from its first record, so the events of the
+        // records the log already holds come again; they must not be appended twice. Same rule
+        // as the offline build (`replay::build`): only events beyond the log's last cursor.
+        if let Some(log) = self.event_log.as_ref() {
+            match crate::replay::last_cursor(&log.paths()).await {
+                Ok(c) => self.log_cursor = c,
+                Err(e) => {
+                    diag::persist_failed(&self.id, &e);
+                    self.event_log = None;
+                }
+            }
+        }
         loop {
             self.pump_ops();
             self.publish_snapshot();
@@ -728,6 +748,15 @@ impl Actor {
         for m in deferred {
             self.on_msg(m);
         }
+        // Only now is it known whether a continue is under way: a deferred Continue has
+        // started (or is starting) the next generation, which unseals the log before its shim
+        // can grow the journal. Sealing then would land after that unseal and leave the log
+        // sealed while live.
+        if let Some(seq) = self.seal_when_loaded.take() {
+            if self.continuation.is_idle() && self.spawn_after_close.is_none() {
+                self.seal_log(seq);
+            }
+        }
     }
 
     fn on_record(&mut self, rec: Record) {
@@ -802,8 +831,14 @@ impl Actor {
             self.stop_stage = None;
             self.outbox
                 .retain(|op| matches!(op, Op::Note { token: Some(_), .. }));
+            // While loading, the seal waits for `finish_loading` (see there); a live exit seals
+            // at once.
+            if self.loading {
+                self.seal_when_loaded = Some(rec.seq);
+            } else {
+                self.seal_log(rec.seq);
+            }
             self.finish_loading();
-            self.seal_log(rec.seq);
         }
         if !self.core.handshake_pending() {
             self.handshake_deadline = None;
@@ -968,11 +1003,19 @@ impl Actor {
     }
 
     fn append_log(&mut self, events: &[SessionEvent], earlier: &[SessionEvent]) {
+        let skip = self.log_cursor;
+        let events: Vec<SessionEvent> =
+            events.iter().filter(|e| e.cursor > skip).cloned().collect();
+        let earlier: Vec<SessionEvent> = earlier
+            .iter()
+            .filter(|e| e.cursor > skip)
+            .cloned()
+            .collect();
         if events.is_empty() && earlier.is_empty() {
             return;
         }
         if let Some(log) = self.event_log.as_ref() {
-            if let Err(e) = log.append(events.to_vec(), earlier.to_vec()) {
+            if let Err(e) = log.append(events, earlier) {
                 diag::persist_failed(&self.id, &e);
                 self.event_log = None;
             }

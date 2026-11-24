@@ -986,6 +986,48 @@ impl SessionManager {
             .map_err(|e| io_err(&format!("remove {}", entry.dir.display()), e))
     }
 
+    /// Test support: once the session has exited, stop its actor and wait until its event log
+    /// writer has finished, so every record the exit caused (including the seal) is on disk.
+    /// The seal is queued before the exit's phase is published, so waiting for a non-live phase
+    /// is enough. The actor restarts with the next request.
+    #[doc(hidden)]
+    pub async fn close_log(&self, id: &SessionId) -> Result<(), RuntimeError> {
+        let mut watch = self.watch(id)?;
+        let waited = tokio::time::timeout(
+            self.inner.cfg.timeouts.delete,
+            watch.wait_for(|s| !s.phase.is_live()),
+        )
+        .await;
+        match waited {
+            Err(_) => return Err(RuntimeError::Timeout(format!("session {id} did not exit"))),
+            // The guard is dropped here, before any await below.
+            Ok(r) => r
+                .map(|_| ())
+                .map_err(|_| RuntimeError::SessionNotFound(id.to_string()))?,
+        }
+        // Not while a restart opens this session's log.
+        let _restart = self.inner.restarts.lock().await;
+        let actor = {
+            let mut map = lock(&self.inner.sessions);
+            map.get_mut(id)
+                .ok_or_else(|| RuntimeError::SessionNotFound(id.to_string()))?
+                .actor
+                .take()
+        };
+        // Aborting drops the actor, and with it the log's sender: the writer drains its queue
+        // (the seal included) and ends.
+        let Some(a) = actor else {
+            return Ok(());
+        };
+        a.task.abort();
+        // Cancelled or finished: either way it no longer runs.
+        let _ = a.task.await;
+        if let Some(w) = a.log_writer {
+            let _ = w.await;
+        }
+        Ok(())
+    }
+
     // ── events ──────────────────────────────────────────────────────────────
 
     /// The last `limit` events with `cursor < before` (all when `None`), oldest first.

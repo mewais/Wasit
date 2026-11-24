@@ -146,7 +146,7 @@ pub(crate) async fn build(
         .map_err(|e| e.to_string())
 }
 
-async fn last_cursor(paths: &crate::eventlog::Paths) -> io::Result<u64> {
+pub(crate) async fn last_cursor(paths: &crate::eventlog::Paths) -> io::Result<u64> {
     async fn read(path: &Path) -> io::Result<u64> {
         let f = match OpenOptions::new().read(true).open(path).await {
             Ok(f) => f,

@@ -76,6 +76,45 @@ pub fn default_registry() -> DriverRegistry {
     r
 }
 
+/// Test support for the derived event log (not part of the API).
+#[doc(hidden)]
+pub mod testing {
+    use std::path::Path;
+
+    use crate::config::RuntimeConfig;
+    use crate::eventlog::EventLog;
+
+    /// Rebuilds the derived event log of the session in `session_dir` offline, into
+    /// `out_dir/derived/`, keyed like the runtime keys its own logs (`cfg.derivation`). Returns
+    /// once the log is sealed and its writer has finished.
+    pub async fn build_event_log(
+        cfg: &RuntimeConfig,
+        session_dir: &Path,
+        out_dir: &Path,
+    ) -> Result<(), String> {
+        let file = crate::store::read(session_dir).await?;
+        let desc = cfg.registry.get(&file.driver).map_err(|e| e.to_string())?;
+        let meta = file.meta();
+        let hints = cfg.mode_hints.get(&meta.driver);
+        let run_dir = cfg.session_run_dir(session_dir);
+        let journal_len = tokio::fs::metadata(session_dir.join("journal.ndjson"))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut log = EventLog::open(out_dir, cfg.derivation.clone(), journal_len, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let built = crate::replay::build(session_dir, &run_dir, desc, &meta, &hints, &log).await;
+        // Dropping the log closes its queue; the writer then finishes every queued write.
+        let writer = log.take_writer();
+        drop(log);
+        if let Some(w) = writer {
+            w.await.map_err(|e| format!("log writer: {e}"))?;
+        }
+        built
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
