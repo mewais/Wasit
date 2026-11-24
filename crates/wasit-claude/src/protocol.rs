@@ -179,6 +179,9 @@ pub struct ClaudeProtocol {
     /// The file edits of each tool call not yet finished, attached to its result.
     tool_diffs: HashMap<String, Vec<ContentPart>>,
     last_usage_message: Option<String>,
+    /// The process's cumulative usage as the last `result` reported it (the baseline of the next
+    /// turn's usage). A new process starts again from zero.
+    counted_usage: Usage,
     context_window: Option<u64>,
     /// The session's reported slash commands include `compact` (from the `initialize` response or
     /// `system/init`): `Command::Compact` runs `/compact` only then.
@@ -214,6 +217,7 @@ impl ClaudeProtocol {
             tool_names: HashMap::new(),
             tool_diffs: HashMap::new(),
             last_usage_message: None,
+            counted_usage: Usage::default(),
             context_window: None,
             compact_listed: false,
         }
@@ -1051,6 +1055,20 @@ impl ClaudeProtocol {
             .get("total_cost_usd")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        // `modelUsage` and `total_cost_usd` are the process's running totals: this turn is what
+        // they grew by since the previous result. A result that carries neither has no usage to
+        // report, and does not move the baseline.
+        let has_usage =
+            v.get("modelUsage").is_some_and(Value::is_object) || v.get("total_cost_usd").is_some();
+        let turn_usage = if has_usage {
+            let turn = usage.since(&self.counted_usage);
+            self.counted_usage = usage.clone();
+            turn
+        } else {
+            // The session's usage stays what the process last reported.
+            usage = self.counted_usage.clone();
+            None
+        };
         let reply = opt_s(v, "result").or_else(|| {
             v.get("errors")
                 .and_then(Value::as_array)
@@ -1097,6 +1115,7 @@ impl ClaudeProtocol {
             was_interrupted: interrupted,
             num_turns: u(v, "num_turns"),
             usage,
+            turn_usage,
             per_model,
             reply,
             origin: turn_origin(v),

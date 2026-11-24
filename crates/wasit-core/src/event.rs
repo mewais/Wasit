@@ -196,6 +196,28 @@ pub struct Usage {
     pub cost_usd: f64,
 }
 
+impl Usage {
+    /// What was used between two readings of the same cumulative counter: `self - earlier`,
+    /// field by field. `None` when any field went backwards: the counter was restarted (a new
+    /// CLI process or thread), so the difference is not a usage and must not be reported as one.
+    pub fn since(&self, earlier: &Usage) -> Option<Usage> {
+        if self.cost_usd < earlier.cost_usd {
+            return None;
+        }
+        Some(Usage {
+            input_tokens: self.input_tokens.checked_sub(earlier.input_tokens)?,
+            output_tokens: self.output_tokens.checked_sub(earlier.output_tokens)?,
+            cache_read_tokens: self
+                .cache_read_tokens
+                .checked_sub(earlier.cache_read_tokens)?,
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .checked_sub(earlier.cache_creation_tokens)?,
+            cost_usd: self.cost_usd - earlier.cost_usd,
+        })
+    }
+}
+
 /// Per-model usage row (claude `result.modelUsage`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -910,10 +932,24 @@ pub enum AgentEvent {
         /// Agent loop iterations (claude `num_turns`; `0` when unknown).
         #[serde(default)]
         num_turns: u64,
-        /// Cumulative session usage up to this turn, when the CLI reports it
-        /// (claude `result`, codex last `thread/tokenUsage/updated` total,
-        /// ACP prompt-result usage).
+        /// Cumulative usage up to this turn, on the basis each CLI counts from (the basis is the
+        /// same across restarts only where noted):
+        /// - claude: the sums of `result.modelUsage` and `total_cost_usd`, counted from the start
+        ///   of the CLI process (a resumed process starts again from zero).
+        /// - codex: the thread's `total` of the last `thread/tokenUsage/updated`, counted over the
+        ///   thread's whole life (a resumed thread keeps its earlier total). Codex reports no cost,
+        ///   so `cost_usd` is `0.0`.
+        /// - ACP: tokens summed over the prompt results of the CLI process (a prompt's own
+        ///   `usage` is per prompt, not a running total); `cost_usd` is the session's cost as the
+        ///   last `usage_update` reported it (cumulative for the session).
         usage: Usage,
+        /// What this turn alone used: its own tokens and cost. `None` when the driver cannot
+        /// tell (no usage in the turn's report, or a baseline it does not know, e.g. the turn
+        /// after a resume it did not see the counters of). Never negative: a counter that goes
+        /// backwards (a new process or thread) yields `None`, not a difference. Summed over the
+        /// turns of one counter basis it equals that basis's `usage`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_usage: Option<Usage>,
         /// Per-model breakdown (claude only).
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         per_model: HashMap<String, ModelUsage>,
@@ -1466,5 +1502,58 @@ mod b0_shape_tests {
         assert_eq!(v["output_truncated"], true);
         assert!(v.get("exit_code").is_none() && v.get("cwd").is_none());
         assert_eq!(serde_json::from_value::<AgentEvent>(v).unwrap(), killed);
+    }
+}
+
+#[cfg(test)]
+mod turn_usage_tests {
+    use super::*;
+
+    fn u(input: u64, output: u64, cost: f64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cost_usd: cost,
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn since_is_the_growth_of_a_running_total() {
+        let d = u(30, 12, 0.6).since(&u(10, 5, 0.25)).unwrap();
+        assert_eq!((d.input_tokens, d.output_tokens), (20, 7));
+        assert!((d.cost_usd - 0.35).abs() < 1e-9);
+        assert_eq!(u(4, 2, 0.1).since(&u(4, 2, 0.1)), Some(Usage::default()));
+    }
+
+    /// A counter that went backwards was restarted: no difference is reported, in any field.
+    #[test]
+    fn since_is_none_when_any_counter_went_backwards() {
+        assert_eq!(u(9, 9, 1.0).since(&u(10, 5, 1.0)), None);
+        assert_eq!(u(10, 5, 0.2).since(&u(10, 5, 0.3)), None);
+        let mut cache = u(10, 5, 0.0);
+        cache.cache_read_tokens = 1;
+        let mut earlier = u(10, 5, 0.0);
+        earlier.cache_read_tokens = 2;
+        assert_eq!(cache.since(&earlier), None);
+    }
+
+    /// Unknown turn usage is omitted from the wire, and an absent field reads back as `None`.
+    #[test]
+    fn turn_usage_is_omitted_when_unknown() {
+        let event = AgentEvent::TurnCompleted {
+            end_reason: None,
+            was_interrupted: false,
+            num_turns: 0,
+            usage: u(1, 1, 0.0),
+            turn_usage: None,
+            per_model: HashMap::new(),
+            reply: None,
+            origin: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("turn_usage").is_none(), "{json}");
+        let back: AgentEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, event);
     }
 }

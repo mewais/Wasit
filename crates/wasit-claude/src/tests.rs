@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 use wasit_core::{
     AgentEvent, Command, ContentPart, Encoded, EndReason, GateDecision, GateRequest, InputId,
-    McpServerConfig, McpTransport, PluginRef, QuestionAnswer, SkillRef, Step, TurnTrigger,
+    McpServerConfig, McpTransport, PluginRef, QuestionAnswer, SkillRef, Step, TurnTrigger, Usage,
 };
 
 /// `system/init`, printed at the start of every turn.
@@ -2051,4 +2051,199 @@ fn a_failed_edit_carries_no_diff() {
     assert!(
         matches!(&ev[0], AgentEvent::ToolCallFinished { ok: false, parts, .. } if parts.is_empty())
     );
+}
+
+/// The `usage` and `turn_usage` of the turn a `result` line ends.
+fn finished_turn(p: &mut ClaudeProtocol, result: &str) -> (Usage, Option<Usage>) {
+    p.on_line(TURN_INIT);
+    let ev = p.on_line(result).events;
+    match ev
+        .iter()
+        .find(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+    {
+        Some(AgentEvent::TurnCompleted {
+            usage, turn_usage, ..
+        }) => (usage.clone(), turn_usage.clone()),
+        _ => panic!("no TurnCompleted in {ev:?}"),
+    }
+}
+
+/// A `result` whose `modelUsage` and `total_cost_usd` are the process's running totals.
+fn cumulative_result(
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: f64,
+) -> String {
+    json!({
+        "type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "result": "hi",
+        "total_cost_usd": cost,
+        "modelUsage": {"m": {
+            "inputTokens": input, "outputTokens": output,
+            "cacheReadInputTokens": cache_read, "cacheCreationInputTokens": cache_write,
+            "costUSD": cost,
+        }},
+    })
+    .to_string()
+}
+
+fn sum(a: &Usage, b: &Usage) -> Usage {
+    Usage {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        cache_read_tokens: a.cache_read_tokens + b.cache_read_tokens,
+        cache_creation_tokens: a.cache_creation_tokens + b.cache_creation_tokens,
+        cost_usd: a.cost_usd + b.cost_usd,
+    }
+}
+
+fn assert_usage_eq(got: &Usage, want: &Usage) {
+    assert_eq!(
+        (
+            got.input_tokens,
+            got.output_tokens,
+            got.cache_read_tokens,
+            got.cache_creation_tokens
+        ),
+        (
+            want.input_tokens,
+            want.output_tokens,
+            want.cache_read_tokens,
+            want.cache_creation_tokens
+        ),
+        "tokens"
+    );
+    assert!(
+        (got.cost_usd - want.cost_usd).abs() < 1e-9,
+        "cost {} != {}",
+        got.cost_usd,
+        want.cost_usd
+    );
+}
+
+/// Claude's `result` counters are the process's running totals: each turn's own usage is what
+/// they grew by, and the turns add up to the cumulative `usage`.
+#[test]
+fn turn_usage_is_each_turns_own_and_sums_to_the_cumulative_usage() {
+    let (mut p, _) = ready();
+    let (u1, t1) = finished_turn(&mut p, &cumulative_result(10, 5, 100, 20, 0.25));
+    assert_usage_eq(
+        &u1,
+        &Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 100,
+            cache_creation_tokens: 20,
+            cost_usd: 0.25,
+        },
+    );
+    assert_usage_eq(t1.as_ref().expect("turn 1 usage"), &u1);
+    let (u2, t2) = finished_turn(&mut p, &cumulative_result(30, 12, 250, 50, 0.6));
+    assert_usage_eq(
+        &u2,
+        &Usage {
+            input_tokens: 30,
+            output_tokens: 12,
+            cache_read_tokens: 250,
+            cache_creation_tokens: 50,
+            cost_usd: 0.6,
+        },
+    );
+    let t2 = t2.expect("turn 2 usage");
+    assert_usage_eq(
+        &t2,
+        &Usage {
+            input_tokens: 20,
+            output_tokens: 7,
+            cache_read_tokens: 150,
+            cache_creation_tokens: 30,
+            cost_usd: 0.35,
+        },
+    );
+    assert_usage_eq(&sum(t1.as_ref().unwrap(), &t2), &u2);
+}
+
+/// A new CLI process counts from zero: its first turn is its own usage, never a difference from
+/// the old process's totals. A counter that goes backwards inside one process is not a usage.
+#[test]
+fn a_new_process_or_a_counter_going_backwards_never_gives_negative_turn_usage() {
+    let (mut old, _) = ready();
+    finished_turn(&mut old, &cumulative_result(1000, 500, 9000, 100, 5.0));
+    let (mut restarted, _) = ready();
+    let (u, t) = finished_turn(&mut restarted, &cumulative_result(10, 5, 100, 20, 0.25));
+    assert_usage_eq(&t.expect("a new process reports its own turn"), &u);
+
+    let (mut p, _) = ready();
+    finished_turn(&mut p, &cumulative_result(10, 5, 0, 0, 0.1));
+    let (_, t) = finished_turn(&mut p, &cumulative_result(4, 2, 0, 0, 0.05));
+    assert_eq!(t, None, "totals went backwards: unknown, not negative");
+    // The next turn is measured from the totals just reported.
+    let (_, t) = finished_turn(&mut p, &cumulative_result(6, 3, 0, 0, 0.15));
+    assert_usage_eq(
+        &t.expect("measured from the last report"),
+        &Usage {
+            input_tokens: 2,
+            output_tokens: 1,
+            cost_usd: 0.1,
+            ..Usage::default()
+        },
+    );
+}
+
+/// A `result` that reports no usage has no turn usage, and does not move the baseline for the
+/// turns after it.
+#[test]
+fn a_result_without_usage_gives_no_turn_usage_and_keeps_the_baseline() {
+    let (mut p, _) = ready();
+    finished_turn(&mut p, &cumulative_result(10, 5, 0, 0, 0.25));
+    let (usage, t) = finished_turn(
+        &mut p,
+        r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"hi"}"#,
+    );
+    assert_eq!(t, None);
+    assert_usage_eq(
+        &usage,
+        &Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cost_usd: 0.25,
+            ..Usage::default()
+        },
+    );
+    let (_, t) = finished_turn(&mut p, &cumulative_result(30, 12, 0, 0, 0.6));
+    assert_usage_eq(
+        &t.expect("measured from the last reported totals"),
+        &Usage {
+            input_tokens: 20,
+            output_tokens: 7,
+            cost_usd: 0.35,
+            ..Usage::default()
+        },
+    );
+}
+
+/// Three `result` frames of one recorded CLI process (`agent-turn-prompt.ndjson`, real counters):
+/// each turn's usage is what the process's totals grew by, and the turns sum to the last total.
+#[test]
+fn recorded_process_turns_sum_to_its_last_cumulative_usage() {
+    let recorded = include_str!("../tests/fixtures/agent-turn-prompt.ndjson");
+    let results: Vec<String> = recorded
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|d| d.get("out").and_then(Value::as_str).map(str::to_owned))
+        .filter(|o| o.contains(r#""type":"result""#))
+        .collect();
+    assert_eq!(results.len(), 3, "the recording's three results");
+    let (mut p, _) = ready();
+    let mut turns = Vec::new();
+    let mut last = Usage::default();
+    for line in &results {
+        let (usage, turn) = finished_turn(&mut p, line);
+        turns.push(turn.expect("every recorded result carries usage"));
+        last = usage;
+    }
+    let total = turns.iter().fold(Usage::default(), |acc, t| sum(&acc, t));
+    assert_usage_eq(&total, &last);
+    assert!(turns.iter().all(|t| t.cost_usd >= 0.0));
 }

@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 use wasit_core::{
     AgentEvent, Command, ContentPart, DriverError, Encoded, EndReason, GateDecision, GateRequest,
-    InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, Step,
+    InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, Step, Usage,
 };
 
 fn w(step: &Step) -> Vec<Value> {
@@ -1410,4 +1410,151 @@ fn acp_diff_blocks_become_diff_parts_of_the_result() {
     assert!(
         matches!(&ev[0], AgentEvent::ToolCallFinished { ok: false, parts, .. } if parts.is_empty())
     );
+}
+
+/// The `usage` and `turn_usage` of the `TurnCompleted` of a finished prompt.
+fn finished(p: &mut AcpProtocol, input: u64, text: &str, answer: &str) -> (Usage, Option<Usage>) {
+    let step = sent(p.encode(InputId(input), Command::prompt(text)));
+    let id = w(&step)[0]["id"].clone();
+    let step = p.on_line(&answer.replace("ID", &id.to_string()));
+    match step
+        .events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+    {
+        Some(AgentEvent::TurnCompleted {
+            usage, turn_usage, ..
+        }) => (usage.clone(), turn_usage.clone()),
+        _ => panic!("no TurnCompleted in {:?}", step.events),
+    }
+}
+
+/// A prompt result with its own per-prompt tokens (kilo's `usage` of a prompt result is that
+/// prompt's, not a running total).
+fn prompt_tokens_result(input: u64, output: u64, cached: u64) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":ID,"result":{{"stopReason":"end_turn","usage":{{"inputTokens":{input},"outputTokens":{output},"cachedReadTokens":{cached}}}}}}}"#
+    )
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+/// Each prompt's tokens are its own and its cost is what the session cost grew by during it;
+/// the cumulative `usage` is the sum of the prompts' tokens and the session's cost.
+#[test]
+fn turn_usage_is_each_prompts_own_and_sums_to_the_cumulative_usage() {
+    let mut p = ready();
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.25,"currency":"USD"}}"#,
+    );
+    let (u1, t1) = finished(&mut p, 1, "a", &prompt_tokens_result(10, 2, 5));
+    assert_eq!(
+        (u1.input_tokens, u1.output_tokens, u1.cache_read_tokens),
+        (10, 2, 5)
+    );
+    let t1 = t1.expect("turn 1 usage");
+    assert_eq!(
+        (t1.input_tokens, t1.output_tokens, t1.cache_read_tokens),
+        (10, 2, 5)
+    );
+    assert!(close(t1.cost_usd, 0.25));
+
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":80,"size":200,"cost":{"amount":0.4,"currency":"USD"}}"#,
+    );
+    let (u2, t2) = finished(&mut p, 2, "b", &prompt_tokens_result(20, 3, 7));
+    let t2 = t2.expect("turn 2 usage");
+    assert_eq!(
+        (t2.input_tokens, t2.output_tokens, t2.cache_read_tokens),
+        (20, 3, 7)
+    );
+    assert!(close(t2.cost_usd, 0.15), "{}", t2.cost_usd);
+    assert_eq!(
+        (u2.input_tokens, u2.output_tokens, u2.cache_read_tokens),
+        (30, 5, 12)
+    );
+    assert!(close(u2.cost_usd, 0.4));
+    assert_eq!(t1.input_tokens + t2.input_tokens, u2.input_tokens);
+    assert_eq!(t1.output_tokens + t2.output_tokens, u2.output_tokens);
+    assert!(close(t1.cost_usd + t2.cost_usd, u2.cost_usd));
+}
+
+/// A loaded session's cost before its first turn is not known from here, so that turn's cost,
+/// and with it its usage, is unknown. The turn after it is counted from the cost then known.
+#[test]
+fn a_loaded_session_has_no_turn_usage_until_its_cost_baseline_is_known() {
+    let mut p = loading(SpawnSpec::default());
+    p.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_old","configOptions":[]}}"#);
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.25,"currency":"USD"}}"#,
+    );
+    let (u1, t1) = finished(&mut p, 1, "a", &prompt_tokens_result(10, 2, 5));
+    assert_eq!(t1, None);
+    assert!(close(u1.cost_usd, 0.25));
+    assert_eq!(u1.input_tokens, 10);
+
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":80,"size":200,"cost":{"amount":0.4,"currency":"USD"}}"#,
+    );
+    let (_, t2) = finished(&mut p, 2, "b", &prompt_tokens_result(20, 3, 7));
+    let t2 = t2.expect("counted from the known cost");
+    assert_eq!(t2.input_tokens, 20);
+    assert!(close(t2.cost_usd, 0.15));
+}
+
+/// A new session has spent nothing: its first turn's cost is what the session reported, and a
+/// turn whose cost is never reported is free (0.0), not unknown.
+#[test]
+fn a_new_session_and_an_unpriced_turn_have_known_turn_usage() {
+    let mut p = ready();
+    let (_, t) = finished(&mut p, 1, "a", &prompt_tokens_result(10, 2, 5));
+    let t = t.expect("no cost reported: 0.0 is the answer");
+    assert_eq!(t.cost_usd, 0.0);
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.25,"currency":"USD"}}"#,
+    );
+    let (_, t) = finished(&mut p, 2, "b", &prompt_tokens_result(4, 1, 0));
+    assert!(close(t.expect("known").cost_usd, 0.25));
+}
+
+/// No usage in the prompt result means no turn usage (the tokens are not known), and the
+/// session's cumulative tokens do not move; the next turn still reports its own tokens.
+#[test]
+fn a_prompt_result_without_usage_has_no_turn_usage() {
+    let mut p = ready();
+    let (u, t) = finished(
+        &mut p,
+        1,
+        "a",
+        r#"{"jsonrpc":"2.0","id":ID,"result":{"stopReason":"end_turn"}}"#,
+    );
+    assert_eq!(t, None);
+    assert_eq!(u.input_tokens, 0);
+    let (u, t) = finished(&mut p, 2, "b", &prompt_tokens_result(4, 1, 0));
+    assert_eq!(t.expect("own tokens").input_tokens, 4);
+    assert_eq!(u.input_tokens, 4);
+}
+
+/// A session cost that falls is not a usage: the turn's cost is unknown, not negative.
+#[test]
+fn a_falling_session_cost_gives_no_negative_turn_usage() {
+    let mut p = ready();
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":50,"size":200,"cost":{"amount":0.5,"currency":"USD"}}"#,
+    );
+    finished(&mut p, 1, "a", &prompt_tokens_result(10, 2, 0));
+    cost_update(
+        &mut p,
+        r#"{"sessionUpdate":"usage_update","used":60,"size":200,"cost":{"amount":0.3,"currency":"USD"}}"#,
+    );
+    let (_, t) = finished(&mut p, 2, "b", &prompt_tokens_result(10, 2, 0));
+    assert_eq!(t, None);
 }

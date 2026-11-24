@@ -1394,6 +1394,7 @@ mod tests {
                     was_interrupted: false,
                     num_turns: 1,
                     usage: Default::default(),
+                    turn_usage: None,
                     per_model: Default::default(),
                     reply: Some(format!("{M} failure")),
                     origin: Some(wasit_core::TurnOrigin {

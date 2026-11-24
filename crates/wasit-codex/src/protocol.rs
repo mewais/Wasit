@@ -154,6 +154,12 @@ pub struct CodexProtocol {
     gates: Vec<PendingGate>,
     tools: HashMap<String, String>,
     total_usage: Usage,
+    /// Whether a `thread/tokenUsage/updated` has been seen in this process.
+    usage_known: bool,
+    /// The thread's total as of the last moment no turn of ours was running: the baseline the
+    /// next turn's usage is counted from. `None` while the thread's total is unknown (a resumed
+    /// or forked thread, before codex reports its total); a fresh thread starts at zero.
+    usage_base: Option<Usage>,
     /// The open request in flight is a `thread/resume`: its result carries the thread's earlier
     /// turns.
     resuming: bool,
@@ -186,6 +192,8 @@ impl CodexProtocol {
             gates: Vec::new(),
             tools: HashMap::new(),
             total_usage: Usage::default(),
+            usage_known: false,
+            usage_base: Some(Usage::default()),
             resuming: false,
             compact_requested: false,
         }
@@ -243,6 +251,7 @@ impl CodexProtocol {
             params["model"] = json!(m);
         }
         self.resuming = false;
+        self.usage_base = Some(Usage::default());
         self.request(Req::ThreadOpen, "thread/start", params)
     }
 
@@ -250,6 +259,7 @@ impl CodexProtocol {
     /// [`Self::on_thread_open`]. The source thread is never written to.
     fn thread_fork(&mut self, parent: &str) -> OutLine {
         self.resuming = false;
+        self.usage_base = None;
         self.request(
             Req::ThreadOpen,
             "thread/fork",
@@ -263,6 +273,7 @@ impl CodexProtocol {
             params["model"] = json!(m);
         }
         self.resuming = true;
+        self.usage_base = None;
         self.request(Req::ThreadOpen, "thread/resume", params)
     }
 
@@ -748,11 +759,13 @@ impl CodexProtocol {
                 if unacknowledged {
                     step.events.push(refused(input, &message));
                 }
+                let turn_usage = self.close_turn_usage();
                 step.events.push(AgentEvent::TurnCompleted {
                     end_reason: Some(EndReason::ExecutionError),
                     was_interrupted: false,
                     num_turns: 0,
                     usage: self.total_usage.clone(),
+                    turn_usage,
                     per_model: HashMap::new(),
                     reply: Some(message),
                     origin: None,
@@ -884,6 +897,10 @@ impl CodexProtocol {
                 let tu = params.get("tokenUsage").cloned().unwrap_or(Value::Null);
                 let total = tu.get("total").cloned().unwrap_or(Value::Null);
                 self.total_usage = token_usage(&total);
+                self.usage_known = true;
+                if self.active_turn.is_none() && !self.turn_pending {
+                    self.usage_base = Some(self.total_usage.clone());
+                }
                 let window = u(&tu, "modelContextWindow");
                 let context_pct = (window > 0).then(|| {
                     let last = tu.get("last").cloned().unwrap_or(Value::Null);
@@ -994,6 +1011,19 @@ impl CodexProtocol {
         }
     }
 
+    /// The turn that just ended, counted from the thread total it started at; then the baseline
+    /// moves to the total now (the next turn starts from it). `None` when the start is unknown.
+    fn close_turn_usage(&mut self) -> Option<Usage> {
+        let turn = self
+            .usage_base
+            .as_ref()
+            .and_then(|base| self.total_usage.since(base));
+        if self.usage_base.is_some() || self.usage_known {
+            self.usage_base = Some(self.total_usage.clone());
+        }
+        turn
+    }
+
     fn on_turn_completed(&mut self, params: &Value) -> Step {
         let turn = params.get("turn").cloned().unwrap_or(Value::Null);
         let status = s(&turn, "status");
@@ -1028,11 +1058,13 @@ impl CodexProtocol {
                 reason: None,
             });
         }
+        let turn_usage = self.close_turn_usage();
         step.events.push(AgentEvent::TurnCompleted {
             end_reason,
             was_interrupted: interrupted,
             num_turns: 0,
             usage: self.total_usage.clone(),
+            turn_usage,
             per_model: HashMap::new(),
             reply,
             origin: None,

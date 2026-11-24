@@ -118,6 +118,11 @@ pub struct AcpProtocol {
     /// cumulative for the whole session (kilo sums every assistant message's cost), and the
     /// prompt result carries no cost, so every `TurnCompleted` reports this value.
     session_cost: Option<f64>,
+    /// The tokens of this process's prompts, summed (a prompt's `usage` is that prompt's own).
+    session_tokens: Usage,
+    /// The session cost as of the last turn's end: the baseline the next turn's cost is counted
+    /// from. A new session starts at zero; a loaded one is unknown until a cost is reported.
+    cost_base: Option<f64>,
 }
 
 impl AcpProtocol {
@@ -146,6 +151,8 @@ impl AcpProtocol {
             prompt_embedded: false,
             subagents_started: HashSet::new(),
             session_cost: None,
+            session_tokens: Usage::default(),
+            cost_base: None,
         }
     }
 
@@ -234,6 +241,9 @@ impl AcpProtocol {
             self.tools.clear();
             self.subagents.clear();
             self.subagents_started.clear();
+        } else {
+            // A new session has spent nothing yet; a loaded one's cost is not known from here.
+            self.cost_base = Some(0.0);
         }
         self.loading = false;
         if let Some(id) = opt_s(result, "sessionId") {
@@ -501,11 +511,13 @@ impl AcpProtocol {
                         error: Some(message.clone()),
                     });
                 }
+                let (usage, turn_usage) = self.close_turn(&Value::Null);
                 step.events.push(AgentEvent::TurnCompleted {
                     end_reason: Some(EndReason::ExecutionError),
                     was_interrupted: false,
                     num_turns: 0,
-                    usage: self.turn_usage(&Value::Null),
+                    usage,
+                    turn_usage,
                     per_model: HashMap::new(),
                     reply: Some(message),
                     origin: None,
@@ -552,11 +564,13 @@ impl AcpProtocol {
                 reason: None,
             });
         }
+        let (usage, turn_usage) = self.close_turn(&usage);
         step.events.push(AgentEvent::TurnCompleted {
             end_reason,
             was_interrupted: cancelled,
             num_turns: 0,
-            usage: self.turn_usage(&usage),
+            usage,
+            turn_usage,
             per_model: HashMap::new(),
             reply: None,
             origin: None,
@@ -565,17 +579,47 @@ impl AcpProtocol {
         step
     }
 
-    /// A turn's usage: the tokens of `tokens` (a prompt result's `usage`, or `Null`) and the
-    /// session's cost as last reported. Every `TurnCompleted` is cumulative, so a turn that
-    /// reports no cost of its own keeps the known one rather than reporting zero.
-    fn turn_usage(&self, tokens: &Value) -> Usage {
-        Usage {
+    /// Closes a turn's usage: `tokens` is the prompt result's `usage` (`Null` when the prompt
+    /// produced none). Returns the cumulative usage for the process and this turn's own usage.
+    ///
+    /// The turn's tokens are the prompt's own; the turn's cost is the session cost's growth since
+    /// the previous turn ended. Where that baseline is unknown (a loaded session whose cost was
+    /// never reported before this turn) the turn has no usage it can state, so it is `None`.
+    fn close_turn(&mut self, tokens: &Value) -> (Usage, Option<Usage>) {
+        let prompt = tokens.is_object().then(|| Usage {
             input_tokens: u(tokens, "inputTokens"),
             output_tokens: u(tokens, "outputTokens"),
             cache_read_tokens: u(tokens, "cachedReadTokens"),
             cache_creation_tokens: u(tokens, "cachedWriteTokens"),
-            cost_usd: self.session_cost.unwrap_or(0.0),
+            cost_usd: 0.0,
+        });
+        // Cost not reported at all means no cost was spent: 0.0, as `Usage` documents.
+        let turn_cost = match (self.cost_base, self.session_cost) {
+            (Some(base), Some(now)) => (now >= base).then_some(now - base),
+            (Some(_), None) | (None, None) => Some(0.0),
+            (None, Some(_)) => None,
+        };
+        if let Some(p) = &prompt {
+            self.session_tokens.input_tokens += p.input_tokens;
+            self.session_tokens.output_tokens += p.output_tokens;
+            self.session_tokens.cache_read_tokens += p.cache_read_tokens;
+            self.session_tokens.cache_creation_tokens += p.cache_creation_tokens;
         }
+        let turn = match (prompt, turn_cost) {
+            (Some(p), Some(cost)) => Some(Usage {
+                cost_usd: cost,
+                ..p
+            }),
+            _ => None,
+        };
+        if self.session_cost.is_some() {
+            self.cost_base = self.session_cost;
+        }
+        let cumulative = Usage {
+            cost_usd: self.session_cost.unwrap_or(0.0),
+            ..self.session_tokens.clone()
+        };
+        (cumulative, turn)
     }
 
     /// Events for a changed `configOptions` set (only what changed).

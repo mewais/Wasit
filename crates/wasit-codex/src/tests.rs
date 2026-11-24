@@ -3,7 +3,7 @@ use serde_json::json;
 use wasit_core::{
     AgentEvent, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
     GateDecision, GateRequest, InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef,
-    SlashCommandInfo, Step,
+    SlashCommandInfo, Step, Usage,
 };
 
 fn w(step: &Step) -> Vec<Value> {
@@ -1798,4 +1798,132 @@ fn a_declined_file_change_carries_no_diff() {
     assert!(
         matches!(&ev[0], AgentEvent::ToolCallFinished { ok: false, parts, .. } if parts.is_empty())
     );
+}
+
+/// Codex's `thread/tokenUsage/updated` `total`: the thread's running totals.
+fn token_total(input: u64, output: u64, cached: u64) -> String {
+    json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+        "total": {"totalTokens": input + output, "inputTokens": input, "cachedInputTokens": cached,
+                  "cacheWriteInputTokens": 0, "outputTokens": output, "reasoningOutputTokens": 0},
+        "last": {"totalTokens": 0}}}})
+    .to_string()
+}
+
+/// Runs one turn of prompt `input` on thread `t1`, whose usage the thread reports as the total
+/// `(input, output, cached)`. Returns the `usage` and `turn_usage` of its `TurnCompleted`.
+fn codex_turn(
+    p: &mut CodexProtocol,
+    input: u64,
+    turn: &str,
+    total: (u64, u64, u64),
+) -> (Usage, Option<Usage>) {
+    let s = sent(p.encode(InputId(input), Command::prompt("go")));
+    let id = w(&s)[0]["id"].as_u64().unwrap();
+    p.on_line(&format!(
+        r#"{{"id":{id},"result":{{"turn":{{"id":"{turn}","status":"inProgress","items":[]}}}}}}"#
+    ));
+    p.on_line(&format!(
+        r#"{{"method":"turn/started","params":{{"threadId":"t1","turn":{{"id":"{turn}"}}}}}}"#
+    ));
+    p.on_line(&token_total(total.0, total.1, total.2));
+    let ev = p.on_line(&format!(r#"{{"method":"turn/completed","params":{{"turn":{{"id":"{turn}","status":"completed","items":[]}}}}}}"#)).events;
+    completed(&ev)
+}
+
+fn completed(ev: &[AgentEvent]) -> (Usage, Option<Usage>) {
+    match ev
+        .iter()
+        .find(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+    {
+        Some(AgentEvent::TurnCompleted {
+            usage, turn_usage, ..
+        }) => (usage.clone(), turn_usage.clone()),
+        _ => panic!("no TurnCompleted in {ev:?}"),
+    }
+}
+
+/// A protocol past the handshake that resumed thread `t1`, without any turn yet.
+fn resumed() -> CodexProtocol {
+    let mut p = CodexProtocol::new();
+    p.start(&SpawnSpec {
+        resume: ResumeMode::Resume("t1".into()),
+        ..SpawnSpec::default()
+    });
+    p.on_line(r#"{"id":1,"result":{}}"#);
+    p.on_line(r#"{"id":3,"result":{"thread":{"id":"t1"},"model":"m","cwd":"/c"}}"#);
+    p
+}
+
+fn usage_of(input: u64, output: u64, cached: u64) -> Usage {
+    Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cached,
+        ..Usage::default()
+    }
+}
+
+/// The thread's total is cumulative: a turn's own usage is what the total grew by during it,
+/// and the turns add up to the cumulative `usage`. Codex reports no cost.
+#[test]
+fn turn_usage_is_each_turns_own_and_sums_to_the_cumulative_usage() {
+    let mut p = ready();
+    let (u1, t1) = codex_turn(&mut p, 102, "u1", (100, 10, 40));
+    assert_eq!(u1, usage_of(100, 10, 40));
+    assert_eq!(t1, Some(usage_of(100, 10, 40)));
+    let (u2, t2) = codex_turn(&mut p, 103, "u2", (250, 25, 90));
+    assert_eq!(u2, usage_of(250, 25, 90));
+    let t2 = t2.expect("turn 2 usage");
+    assert_eq!(t2, usage_of(150, 15, 50));
+    let t1 = t1.unwrap();
+    assert_eq!(
+        (
+            t1.input_tokens + t2.input_tokens,
+            t1.output_tokens + t2.output_tokens,
+            t1.cache_read_tokens + t2.cache_read_tokens
+        ),
+        (u2.input_tokens, u2.output_tokens, u2.cache_read_tokens)
+    );
+    assert_eq!(u2.cost_usd, 0.0);
+}
+
+/// A resumed thread keeps its total, which codex reports before the resumed turn starts: the
+/// turn is counted from that total, not from zero.
+#[test]
+fn resumed_thread_counts_its_turn_from_the_total_reported_before_it() {
+    let mut p = resumed();
+    p.on_line(&token_total(100, 10, 40));
+    let (u, t) = codex_turn(&mut p, 102, "u1", (150, 15, 50));
+    assert_eq!(u, usage_of(150, 15, 50));
+    assert_eq!(t, Some(usage_of(50, 5, 10)));
+}
+
+/// A resumed thread whose total codex did not report before the turn: the turn's usage is not
+/// known, and the turn after it is counted from the total it ends with.
+#[test]
+fn resumed_thread_without_a_known_total_has_no_turn_usage_until_one_is_known() {
+    let mut p = resumed();
+    let (u, t) = codex_turn(&mut p, 102, "u1", (150, 15, 50));
+    assert_eq!(u, usage_of(150, 15, 50));
+    assert_eq!(t, None);
+    let (_, t) = codex_turn(&mut p, 103, "u2", (200, 20, 60));
+    assert_eq!(t, Some(usage_of(50, 5, 10)));
+}
+
+/// Usage never goes negative: a resumed process whose total is below the old process's starts
+/// from the total it resumed with, and a total that falls during a turn is unknown, not a
+/// negative turn.
+#[test]
+fn a_new_generation_or_a_falling_total_never_gives_negative_turn_usage() {
+    let mut old = ready();
+    codex_turn(&mut old, 102, "u1", (500, 50, 200));
+    let mut restarted = resumed();
+    restarted.on_line(&token_total(100, 10, 40));
+    let (_, t) = codex_turn(&mut restarted, 102, "u1", (120, 12, 45));
+    assert_eq!(t, Some(usage_of(20, 2, 5)));
+
+    let mut p = resumed();
+    p.on_line(&token_total(500, 50, 200));
+    let (_, t) = codex_turn(&mut p, 102, "u1", (400, 40, 150));
+    assert_eq!(t, None, "a total that fell is not a usage");
 }

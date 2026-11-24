@@ -1763,6 +1763,9 @@ impl Core {
                 was_interrupted,
                 num_turns,
                 usage,
+                // Per-turn usage is not folded into the session yet: the session keeps the
+                // cumulative `usage` as before.
+                turn_usage: _,
                 per_model,
                 reply,
                 origin,

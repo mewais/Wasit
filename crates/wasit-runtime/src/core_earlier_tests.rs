@@ -450,6 +450,7 @@ fn history_never_changes_live_state_even_when_it_holds_a_turn_end() {
                     cost_usd: 9.5,
                     ..Default::default()
                 },
+                turn_usage: None,
                 per_model: Default::default(),
                 reply: Some("x".into()),
                 origin: None,
