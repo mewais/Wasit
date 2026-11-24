@@ -37,8 +37,12 @@ pub mod machine;
 mod manager;
 pub mod media;
 mod note;
+#[allow(dead_code)] // B5a: the export job (B5b) is not yet wired to the redactor
+mod redact;
 mod replay;
 mod scrub;
+#[allow(dead_code)] // B6a: the find job (B6b) is not yet wired to the matcher
+mod search;
 mod service;
 #[doc(hidden)]
 pub mod stats;

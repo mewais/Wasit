@@ -1,0 +1,95 @@
+{
+  "cases": [
+    {
+      "name": "assistant delta",
+      "event": {"cursor": 1, "t": 1000, "kind": "agent", "event": {"type": "assistant_delta", "text": "Hello wörld"}},
+      "expect": [{"field": "assistant_text", "text": "Hello wörld"}]
+    },
+    {
+      "name": "empty assistant delta has no find text",
+      "event": {"cursor": 2, "t": 1001, "kind": "agent", "event": {"type": "assistant_delta", "text": ""}},
+      "expect": []
+    },
+    {
+      "name": "user prompt",
+      "event": {"cursor": 3, "t": 1002, "kind": "input", "input": 3, "command": {"command": "prompt", "text": "Find the CAFÉ bug"}, "status": {"status": "sent"}},
+      "expect": [{"field": "user_text", "text": "Find the CAFÉ bug"}]
+    },
+    {
+      "name": "slash command is not searched",
+      "event": {"cursor": 4, "t": 1003, "kind": "input", "input": 4, "command": {"command": "run_slash", "name": "compact", "args": "keep the plan"}, "status": {"status": "sent"}},
+      "expect": []
+    },
+    {
+      "name": "reasoning",
+      "event": {"cursor": 5, "t": 1004, "kind": "agent", "event": {"type": "thinking_delta", "text": "Considering options"}},
+      "expect": [{"field": "thinking", "text": "Considering options"}]
+    },
+    {
+      "name": "tool call input: string values, not keys or numbers",
+      "event": {"cursor": 6, "t": 1005, "kind": "agent", "event": {"type": "tool_call_started", "name": "Bash", "call_id": "c1", "input": {"command": "ls -la", "description": "list files", "timeout": 5000}}},
+      "expect": [
+        {"field": "tool_input", "text": "ls -la"},
+        {"field": "tool_input", "text": "list files"}
+      ]
+    },
+    {
+      "name": "tool result object: string values in order, empty ones skipped",
+      "event": {"cursor": 7, "t": 1006, "kind": "agent", "event": {"type": "tool_call_finished", "call_id": "c1", "name": "Bash", "ok": true, "result": {"stdout": "a.txt\nb.txt", "stderr": ""}}},
+      "expect": [{"field": "tool_result", "text": "a.txt\nb.txt"}]
+    },
+    {
+      "name": "tool result string",
+      "event": {"cursor": 8, "t": 1007, "kind": "agent", "event": {"type": "tool_call_finished", "call_id": "c2", "name": "Read", "ok": true, "result": "done"}},
+      "expect": [{"field": "tool_result", "text": "done"}]
+    },
+    {
+      "name": "tool progress: input replaced and content text",
+      "event": {"cursor": 9, "t": 1008, "kind": "agent", "event": {"type": "tool_call_updated", "call_id": "c1", "name": "Bash", "input": {"command": "pwd"}, "content": [{"text": "partial output"}]}},
+      "expect": [
+        {"field": "tool_input", "text": "pwd"},
+        {"field": "tool_result", "text": "partial output"}
+      ]
+    },
+    {
+      "name": "runtime notice",
+      "event": {"cursor": 10, "t": 1009, "kind": "notice", "message": "retrying in 3s"},
+      "expect": [{"field": "notice", "text": "retrying in 3s"}]
+    },
+    {
+      "name": "agent notice",
+      "event": {"cursor": 11, "t": 1010, "kind": "agent", "event": {"type": "notice", "message": "rate limited"}},
+      "expect": [{"field": "notice", "text": "rate limited"}]
+    },
+    {
+      "name": "history user message is searched as its wrapped event",
+      "event": {"cursor": 12, "t": 1011, "kind": "agent", "event": {"type": "history", "event": {"type": "user_message", "text": "earlier question"}}},
+      "expect": [{"field": "user_text", "text": "earlier question"}]
+    },
+    {
+      "name": "subagent text is searched as its wrapped event",
+      "event": {"cursor": 13, "t": 1012, "kind": "agent", "event": {"type": "scoped", "scope": {"call_id": "c1"}, "event": {"type": "assistant_delta", "text": "sub-agent says"}}},
+      "expect": [{"field": "assistant_text", "text": "sub-agent says"}]
+    },
+    {
+      "name": "user content and assistant content: text parts only",
+      "event": {"cursor": 14, "t": 1013, "kind": "agent", "event": {"type": "user_content", "parts": [{"type": "text", "text": "see attached"}]}},
+      "expect": [{"field": "user_text", "text": "see attached"}]
+    },
+    {
+      "name": "spawn has no find text",
+      "event": {"cursor": 15, "t": 1014, "kind": "spawned", "generation": 1, "argv": ["claude", "--resume"]},
+      "expect": []
+    },
+    {
+      "name": "stderr has no find text",
+      "event": {"cursor": 16, "t": 1015, "kind": "stderr", "text": "warning text"},
+      "expect": []
+    },
+    {
+      "name": "usage update has no find text",
+      "event": {"cursor": 17, "t": 1016, "kind": "agent", "event": {"type": "usage_update", "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_tokens": 0, "cache_creation_tokens": 0, "cost_usd": 0.0}}},
+      "expect": []
+    }
+  ]
+}
