@@ -614,6 +614,19 @@ impl Core {
         }
     }
 
+    /// Shared constructor for actor and replay: builds a fresh core and applies optional mode hints.
+    pub(crate) fn for_session(
+        desc: Arc<dyn DriverDescriptor>,
+        meta: &SessionMeta,
+        mode_hints: Option<Vec<wasit_core::SessionMode>>,
+    ) -> Self {
+        let mut core = Core::new(desc, meta);
+        if let Some(m) = mode_hints {
+            core.hint_modes(m);
+        }
+        core
+    }
+
     /// Set the user-given display name (not journaled: it lives in `session.json`).
     pub(crate) fn set_display_name(&mut self, name: Option<String>) {
         self.snap.display_name = name;

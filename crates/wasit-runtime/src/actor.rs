@@ -407,8 +407,11 @@ impl Actor {
 
     pub(crate) fn new(init: ActorInit) -> Self {
         let meta = init.file.meta();
-        let mut core = Core::new(init.desc.clone(), &meta);
-        core.hint_modes(init.cfg.mode_hints.get(&meta.driver));
+        let core = Core::for_session(
+            init.desc.clone(),
+            &meta,
+            Some(init.cfg.mode_hints.get(&meta.driver)),
+        );
         let (file_tx, file_rx) = mpsc::unbounded_channel();
         let writer = tokio::spawn(persist(init.dir.clone(), init.file.clone(), file_rx));
         let source = adopt_source(init.dir.clone(), init.cfg.session_run_dir(&init.dir), 1);
@@ -2210,12 +2213,13 @@ mod tests {
     async fn a_prompt_to_a_session_that_cannot_be_continued_says_why_and_starts_nothing() {
         let (mut a, _s) = ended();
         // The agent cannot resume what it never stored (a session of an older build, no id).
-        a.core = Core::new(
+        a.core = Core::for_session(
             wasit_claude::descriptor(),
             &SessionMeta {
                 conversation: Conversation::Unknown,
                 ..a.file.meta()
             },
+            None,
         );
         a.core.apply(&Record {
             seq: 1,

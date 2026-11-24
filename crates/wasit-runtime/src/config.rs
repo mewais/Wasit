@@ -160,6 +160,8 @@ pub struct RuntimeConfig {
     pub subscriber_queue: usize,
     /// Filled by a [`crate::Discovery`] made with [`crate::DiscoveryConfig::from_runtime`].
     pub mode_hints: ModeHints,
+    /// Build string used for derivations (event log key).
+    pub derivation: String,
     /// The home directory a leading `~` of a working directory stands for. `None`: the home of
     /// the user the daemon runs as (`HOME`, on Windows `USERPROFILE`, as the host's base
     /// environment has it).
@@ -182,6 +184,7 @@ impl RuntimeConfig {
             event_tail: 2048,
             subscriber_queue: 1024,
             mode_hints: ModeHints::default(),
+            derivation: "dev".into(),
             home: None,
             history: crate::history::HistoryConfig::default(),
         }
