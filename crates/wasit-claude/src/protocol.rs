@@ -378,6 +378,12 @@ impl ClaudeProtocol {
                     ..Step::default()
                 })
             }
+            Command::Compact => Err(DriverError::Unsupported {
+                operation: "compact".into(),
+            }),
+            Command::RunShell { .. } => Err(DriverError::Unsupported {
+                operation: "run_shell".into(),
+            }),
             Command::Shutdown => {
                 self.phase = Phase::Closed;
                 let events = std::mem::take(&mut self.queue)
@@ -770,11 +776,11 @@ impl ClaudeProtocol {
                 let m = v.get("compact_metadata").cloned().unwrap_or(Value::Null);
                 vec![AgentEvent::Compaction {
                     info: CompactionInfo {
-                        trigger: s(&m, "trigger").to_string(),
-                        pre_tokens: u(&m, "pre_tokens"),
-                        post_tokens: u(&m, "post_tokens"),
-                        cumulative_dropped_tokens: u(&m, "cumulative_dropped_tokens"),
-                        duration_ms: u(&m, "duration_ms"),
+                        trigger: Some(s(&m, "trigger").to_string()),
+                        pre_tokens: Some(u(&m, "pre_tokens")),
+                        post_tokens: Some(u(&m, "post_tokens")),
+                        cumulative_dropped_tokens: Some(u(&m, "cumulative_dropped_tokens")),
+                        duration_ms: Some(u(&m, "duration_ms")),
                     },
                 }]
             }

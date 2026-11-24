@@ -98,7 +98,11 @@ fn summary(events: &[AgentEvent]) -> Vec<String> {
                     ..
                 } => format!("result {name} {call_id} ok={ok} parts={}", parts.len()),
                 AgentEvent::Compaction { info } => {
-                    format!("compaction {} {}", info.trigger, info.pre_tokens)
+                    format!(
+                        "compaction {} {}",
+                        info.trigger.as_deref().unwrap_or(""),
+                        info.pre_tokens.unwrap_or(0)
+                    )
                 }
                 other => panic!("unexpected {other:?}"),
             };

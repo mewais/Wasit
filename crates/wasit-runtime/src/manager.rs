@@ -377,7 +377,7 @@ impl SessionManager {
         // prompt loses nothing. Chosen here, journaled with the start, never drawn again.
         let native_session_id = match &resume {
             ResumeMode::Fresh => desc.chosen_session_id(fastrand::u128(..).to_le_bytes()),
-            ResumeMode::Continue | ResumeMode::Resume(_) => None,
+            ResumeMode::Continue | ResumeMode::Resume(_) | ResumeMode::Fork(_) => None,
         };
         let mut spec = SpawnSpec {
             cwd,

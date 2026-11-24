@@ -109,6 +109,17 @@ pub struct DriverCapabilities {
     /// before it.
     #[serde(default)]
     pub earlier_history: HistoryDelivery,
+    /// `ResumeMode::Fork(id)` starts a new conversation that copies the one `id` names, leaving
+    /// that one unchanged.
+    #[serde(default)]
+    pub fork: bool,
+    /// `Command::Compact` compacts the conversation's context.
+    #[serde(default)]
+    pub compact: bool,
+    /// `Command::RunShell` runs a shell command in the session's working directory through the
+    /// agent CLI's own shell (its output is reported as [`AgentEvent::LocalShell`]).
+    #[serde(default)]
+    pub run_shell: bool,
 }
 
 /// Everything the runtime needs to know about one CLI. Implemented by each
@@ -306,6 +317,9 @@ mod tests {
                 prompt_while_busy: BusyPrompt::QueuedByProtocol,
                 stop_task: false,
                 earlier_history: HistoryDelivery::None,
+                fork: false,
+                compact: false,
+                run_shell: false,
             }
         }
         fn new_protocol(&self) -> Box<dyn Protocol> {
@@ -331,5 +345,49 @@ mod tests {
             r.register(Arc::new(Fake("a"))),
             Err(RegistryError::DuplicateDriver("a".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn old_capability_json_without_the_new_fields_reads_them_as_false() {
+        let caps = DriverCapabilities {
+            interrupt: true,
+            set_model: true,
+            set_mode: true,
+            slash_commands: true,
+            permission_gates: true,
+            questions: true,
+            plan_gate: true,
+            usage: true,
+            cost: true,
+            resume: true,
+            continue_latest: true,
+            streaming_output: true,
+            prompt_while_busy: BusyPrompt::QueuedByProtocol,
+            stop_task: true,
+            earlier_history: HistoryDelivery::Wire,
+            fork: true,
+            compact: true,
+            run_shell: true,
+        };
+        let mut json = serde_json::to_value(caps).unwrap();
+        assert_eq!(json["fork"], true);
+        assert_eq!(json["compact"], true);
+        assert_eq!(json["run_shell"], true);
+        assert_eq!(
+            serde_json::from_value::<DriverCapabilities>(json.clone()).unwrap(),
+            caps
+        );
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("fork");
+        obj.remove("compact");
+        obj.remove("run_shell");
+        let old: DriverCapabilities = serde_json::from_value(json).unwrap();
+        assert!(!old.fork && !old.compact && !old.run_shell);
+        assert!(old.interrupt && old.stop_task);
     }
 }

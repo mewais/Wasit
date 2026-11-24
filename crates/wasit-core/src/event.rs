@@ -280,20 +280,36 @@ pub struct PlanEntry {
 }
 
 /// Context-compaction metadata (claude `system/compact_boundary`).
+///
+/// Every part is optional: a CLI reports only what it knows, and a driver that does not report a
+/// figure leaves it `None` rather than guessing `0`. Clients render the parts that are present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct CompactionInfo {
-    #[serde(default)]
-    pub trigger: String,
-    #[serde(default)]
-    pub pre_tokens: u64,
-    #[serde(default)]
-    pub post_tokens: u64,
-    #[serde(default)]
-    pub cumulative_dropped_tokens: u64,
-    #[serde(default)]
-    pub duration_ms: u64,
+    /// What started the compaction (claude: `manual` or `auto`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_dropped_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// Who ran a [`AgentEvent::LocalShell`] command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LocalShellOrigin {
+    /// Run through the agent CLI's own shell for a user command ([`Command::RunShell`]).
+    #[default]
+    Driver,
+    /// Run by the host on the user's behalf, outside the agent.
+    Host,
 }
 
 /// Rate-limit status (claude `rate_limit_event`).
@@ -1130,6 +1146,23 @@ pub enum AgentEvent {
     /// Context compaction.
     Compaction { info: CompactionInfo },
 
+    /// A shell command the user ran from the client (`!`), not one the agent ran. `output` is
+    /// what it printed, cut to the retained limit when `output_truncated`.
+    LocalShell {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// `None` when the command did not exit normally (killed, or no code reported).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        output: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        output_truncated: bool,
+        #[serde(default)]
+        origin: LocalShellOrigin,
+    },
+
     /// Provider rate-limit status.
     RateLimitNotice { info: RateLimitInfo },
 
@@ -1360,5 +1393,78 @@ mod tests {
         assert_eq!(back, g);
         assert_eq!(back.request_id(), "wasl-spawn-r1");
         assert!(back.choice("allow_once").is_some());
+    }
+}
+
+#[cfg(test)]
+mod b0_shape_tests {
+    use super::*;
+
+    #[test]
+    fn compaction_parts_are_optional_and_absent_ones_are_not_written() {
+        assert_eq!(
+            serde_json::to_value(CompactionInfo::default()).unwrap(),
+            serde_json::json!({})
+        );
+        let old: CompactionInfo = serde_json::from_value(serde_json::json!({
+            "trigger": "manual",
+            "pre_tokens": 5000,
+            "post_tokens": 1200,
+            "cumulative_dropped_tokens": 0,
+            "duration_ms": 42
+        }))
+        .unwrap();
+        assert_eq!(
+            old,
+            CompactionInfo {
+                trigger: Some("manual".into()),
+                pre_tokens: Some(5000),
+                post_tokens: Some(1200),
+                cumulative_dropped_tokens: Some(0),
+                duration_ms: Some(42),
+            }
+        );
+        let partial: CompactionInfo =
+            serde_json::from_value(serde_json::json!({"pre_tokens": 7})).unwrap();
+        assert_eq!(partial.pre_tokens, Some(7));
+        assert_eq!(partial.trigger, None);
+    }
+
+    #[test]
+    fn local_shell_has_its_wire_shape_and_round_trips() {
+        let ev = AgentEvent::LocalShell {
+            command: "echo hi".into(),
+            cwd: Some("/w".into()),
+            exit_code: Some(0),
+            output: "hi\n".into(),
+            output_truncated: false,
+            origin: LocalShellOrigin::Host,
+        };
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::json!({
+                "type": "local_shell",
+                "command": "echo hi",
+                "cwd": "/w",
+                "exit_code": 0,
+                "output": "hi\n",
+                "origin": "host"
+            })
+        );
+        let back: AgentEvent = serde_json::from_value(serde_json::to_value(&ev).unwrap()).unwrap();
+        assert_eq!(back, ev);
+        // Killed by a signal: no exit code, output cut at the limit.
+        let killed = AgentEvent::LocalShell {
+            command: "sleep 9".into(),
+            cwd: None,
+            exit_code: None,
+            output: String::new(),
+            output_truncated: true,
+            origin: LocalShellOrigin::Driver,
+        };
+        let v = serde_json::to_value(&killed).unwrap();
+        assert_eq!(v["output_truncated"], true);
+        assert!(v.get("exit_code").is_none() && v.get("cwd").is_none());
+        assert_eq!(serde_json::from_value::<AgentEvent>(v).unwrap(), killed);
     }
 }

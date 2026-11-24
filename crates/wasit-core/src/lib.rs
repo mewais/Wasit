@@ -50,9 +50,10 @@ pub use discovery::{
 };
 pub use event::{
     AgentEvent, BackgroundTask, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind,
-    GateDecision, GateReason, GateRequest, InputDropReason, McpServerInfo, ModelInfo, ModelUsage,
-    PlanEntry, QuestionAnswer, QuestionOption, QuestionPrompt, RateLimitInfo, Scope, SessionMode,
-    SlashCommandInfo, SpawnGate, TaskUsage, TurnBinding, TurnOrigin, TurnTrigger, Usage,
+    GateDecision, GateReason, GateRequest, InputDropReason, LocalShellOrigin, McpServerInfo,
+    ModelInfo, ModelUsage, PlanEntry, QuestionAnswer, QuestionOption, QuestionPrompt,
+    RateLimitInfo, Scope, SessionMode, SlashCommandInfo, SpawnGate, TaskUsage, TurnBinding,
+    TurnOrigin, TurnTrigger, Usage,
 };
 pub use history::{
     FileProblem, HistoryDelivery, HistoryFailure, HistoryLimits, HistoryParse, HistoryParser,

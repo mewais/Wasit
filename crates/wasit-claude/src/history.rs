@@ -509,11 +509,11 @@ fn convert(
                     &mut c,
                     AgentEvent::Compaction {
                         info: CompactionInfo {
-                            trigger: s(&m, "trigger").to_string(),
-                            pre_tokens: n("preTokens"),
-                            post_tokens: n("postTokens"),
-                            cumulative_dropped_tokens: n("cumulativeDroppedTokens"),
-                            duration_ms: n("durationMs"),
+                            trigger: Some(s(&m, "trigger").to_string()),
+                            pre_tokens: Some(n("preTokens")),
+                            post_tokens: Some(n("postTokens")),
+                            cumulative_dropped_tokens: Some(n("cumulativeDroppedTokens")),
+                            duration_ms: Some(n("durationMs")),
                         },
                     },
                 );

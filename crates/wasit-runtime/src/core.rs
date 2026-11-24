@@ -1137,6 +1137,9 @@ impl Core {
             ResumeMode::Fresh => (StartResume::Fresh, None),
             ResumeMode::Continue => (StartResume::Continue, None),
             ResumeMode::Resume(id) => (StartResume::Resume, Some(id.clone())),
+            // Not produced before the fork capability is wired (its start mode gets its own
+            // record then); until then a fork is reported as the new conversation it becomes.
+            ResumeMode::Fork(_) => (StartResume::Fresh, None),
         };
         em.push(SessionEventKind::Started {
             generation: self.snap.generation,
@@ -1905,6 +1908,7 @@ impl Core {
             // Never reaches here: `step` keeps history out of the reducer.
             | AgentEvent::History { .. }
             | AgentEvent::ProcessExited { .. }
+            | AgentEvent::LocalShell { .. }
             | AgentEvent::InputSent { .. }
             | AgentEvent::InputAcknowledged { .. }
             | AgentEvent::Unknown { .. } => {}

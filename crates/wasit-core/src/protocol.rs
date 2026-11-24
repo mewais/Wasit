@@ -143,6 +143,18 @@ pub enum Command {
     /// [`DriverCapabilities::stop_task`](crate::DriverCapabilities::stop_task). The agent reports
     /// the end of the task as [`AgentEvent::TaskEnded`](crate::AgentEvent::TaskEnded).
     StopTask { task_id: String },
+    /// Compact the conversation's context. Needs
+    /// [`DriverCapabilities::compact`](crate::DriverCapabilities::compact).
+    Compact,
+    /// Run a shell command in the session's working directory, as the user's own `!` command.
+    /// Needs [`DriverCapabilities::run_shell`](crate::DriverCapabilities::run_shell). The field
+    /// is `line` because `command` is the serde tag. `timeout_ms` `None` means the CLI's default.
+    /// The result is reported as [`AgentEvent::LocalShell`](crate::AgentEvent::LocalShell).
+    RunShell {
+        line: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
     /// End the session gracefully (close stdin).
     Shutdown,
 }
@@ -167,6 +179,8 @@ impl Command {
             Command::SetMode { .. } => "set_mode",
             Command::RunSlash { .. } => "run_slash",
             Command::StopTask { .. } => "stop_task",
+            Command::Compact => "compact",
+            Command::RunShell { .. } => "run_shell",
             Command::Shutdown => "shutdown",
         }
     }
@@ -210,4 +224,47 @@ pub trait Protocol: Send {
     /// queued behind a running turn). A pure query of the protocol state; the
     /// runtime derives its `Starting → Idle` transition from it.
     fn is_ready(&self) -> bool;
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn compact_and_run_shell_have_their_wire_shapes() {
+        assert_eq!(
+            serde_json::to_value(Command::Compact).unwrap(),
+            serde_json::json!({"command": "compact"})
+        );
+        let run = Command::RunShell {
+            line: "ls -la".into(),
+            timeout_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&run).unwrap(),
+            serde_json::json!({"command": "run_shell", "line": "ls -la"})
+        );
+        let timed = Command::RunShell {
+            line: "make".into(),
+            timeout_ms: Some(5000),
+        };
+        assert_eq!(
+            serde_json::to_value(&timed).unwrap(),
+            serde_json::json!({"command": "run_shell", "line": "make", "timeout_ms": 5000})
+        );
+        for cmd in [Command::Compact, run, timed] {
+            let back: Command =
+                serde_json::from_value(serde_json::to_value(&cmd).unwrap()).unwrap();
+            assert_eq!(back, cmd);
+        }
+        assert_eq!(Command::Compact.name(), "compact");
+        assert_eq!(
+            Command::RunShell {
+                line: String::new(),
+                timeout_ms: None
+            }
+            .name(),
+            "run_shell"
+        );
+    }
 }

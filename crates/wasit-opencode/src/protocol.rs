@@ -194,6 +194,19 @@ impl AcpProtocol {
                 };
             }
             ResumeMode::Fresh => self.session_new(),
+            // Nothing asks for a fork before the fork capability is implemented: start a new
+            // session and say so, rather than loading (and so writing to) the source.
+            ResumeMode::Fork(_) => {
+                let line = self.session_new();
+                return Step {
+                    events: vec![AgentEvent::CommandRejected {
+                        command: "fork".into(),
+                        message: "forking is not supported; started a new session".into(),
+                    }],
+                    write: vec![line],
+                    close_stdin: false,
+                };
+            }
         };
         Step {
             write: vec![line],
@@ -327,6 +340,16 @@ impl AcpProtocol {
             Command::SetMode { mode } => {
                 let line = self.set_option(Req::SetMode, "mode", &mode);
                 step.write.push(line);
+            }
+            Command::Compact => {
+                return Err(DriverError::Unsupported {
+                    operation: "compact".into(),
+                })
+            }
+            Command::RunShell { .. } => {
+                return Err(DriverError::Unsupported {
+                    operation: "run_shell".into(),
+                })
             }
             Command::Shutdown => {
                 self.phase = Phase::Closed;

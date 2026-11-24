@@ -1349,3 +1349,26 @@ fn a_huge_session_title_is_bounded() {
     assert!(s[0].title.ends_with(CUT));
     assert_eq!(s[1].title, "short");
 }
+
+#[test]
+fn compact_and_run_shell_are_unsupported() {
+    let mut p = ready();
+    assert_eq!(
+        p.encode(InputId(130), Command::Compact),
+        Err(DriverError::Unsupported {
+            operation: "compact".into()
+        })
+    );
+    assert_eq!(
+        p.encode(
+            InputId(131),
+            Command::RunShell {
+                line: "ls".into(),
+                timeout_ms: None
+            }
+        ),
+        Err(DriverError::Unsupported {
+            operation: "run_shell".into()
+        })
+    );
+}

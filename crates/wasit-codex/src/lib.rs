@@ -82,6 +82,9 @@ impl DriverDescriptor for CodexDescriptor {
             prompt_while_busy: BusyPrompt::Steered,
             stop_task: false,
             earlier_history: HistoryDelivery::Wire,
+            fork: false,
+            compact: false,
+            run_shell: false,
         }
     }
 

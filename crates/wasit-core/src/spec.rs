@@ -21,6 +21,9 @@ pub enum ResumeMode {
     /// Resume a specific prior conversation by its native id (claude session
     /// UUID, codex thread id, ACP session id).
     Resume(String),
+    /// Start a new conversation that copies the prior one named by its native id, leaving that
+    /// conversation unchanged. Needs [`DriverCapabilities::fork`](crate::DriverCapabilities::fork).
+    Fork(String),
 }
 
 /// A file a [`ConfigRenderer`](crate::ConfigRenderer) wants written into the
@@ -162,5 +165,21 @@ impl SpawnSpec {
     /// (`cwd`, else `"."`).
     pub fn cwd_or_dot(&self) -> &str {
         self.cwd.as_deref().unwrap_or(".")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_has_its_wire_shape_and_round_trips() {
+        let fork = ResumeMode::Fork("u-1".into());
+        assert_eq!(
+            serde_json::to_value(&fork).unwrap(),
+            serde_json::json!({"fork": "u-1"})
+        );
+        let back: ResumeMode = serde_json::from_value(serde_json::json!({"fork": "u-1"})).unwrap();
+        assert_eq!(back, fork);
     }
 }

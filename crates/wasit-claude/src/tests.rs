@@ -608,7 +608,7 @@ fn compaction_and_rate_limit() {
     let (mut p, _) = ready();
     let ev = p.on_line(r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":5000}}"#).events;
     assert!(
-        matches!(&ev[0], AgentEvent::Compaction { info } if info.trigger == "manual" && info.pre_tokens == 5000)
+        matches!(&ev[0], AgentEvent::Compaction { info } if info.trigger.as_deref() == Some("manual") && info.pre_tokens == Some(5000))
     );
     let ev = p.on_line(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":7,"rateLimitType":"seven_day","isUsingOverage":false}}"#).events;
     assert!(matches!(&ev[0], AgentEvent::RateLimitNotice { info } if info.resets_at == 7));
@@ -1855,4 +1855,27 @@ fn a_huge_first_prompt_becomes_a_bounded_title() {
     assert_eq!(project.chars().count(), limits::PATH_CHARS);
     assert!(project.ends_with(CUT));
     assert_eq!(s[1].project.as_deref(), Some("/p"));
+}
+
+#[test]
+fn compact_and_run_shell_are_unsupported() {
+    let (mut p, _) = ready();
+    assert_eq!(
+        p.encode(InputId(130), Command::Compact),
+        Err(wasit_core::DriverError::Unsupported {
+            operation: "compact".into()
+        })
+    );
+    assert_eq!(
+        p.encode(
+            InputId(131),
+            Command::RunShell {
+                line: "ls".into(),
+                timeout_ms: None
+            }
+        ),
+        Err(wasit_core::DriverError::Unsupported {
+            operation: "run_shell".into()
+        })
+    );
 }

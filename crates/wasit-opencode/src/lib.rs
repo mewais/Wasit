@@ -138,6 +138,9 @@ impl DriverDescriptor for AcpDescriptor {
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
             stop_task: false,
             earlier_history: HistoryDelivery::Wire,
+            fork: false,
+            compact: false,
+            run_shell: false,
         }
     }
 

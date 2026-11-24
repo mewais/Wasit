@@ -94,6 +94,9 @@ impl DriverDescriptor for ClaudeDescriptor {
             }
             ResumeMode::Continue => argv.push("--continue".to_string()),
             ResumeMode::Resume(id) => argv.extend(["--resume".to_string(), id.clone()]),
+            // Not produced before the fork capability is implemented; until then a fork starts
+            // with no conversation flags (never `--resume`, which would write to the source).
+            ResumeMode::Fork(_) => {}
         }
         // Writes the title into claude's own transcript (`custom-title`, `agent-name`; verified
         // with 2.1.293 in this mode).
@@ -125,6 +128,9 @@ impl DriverDescriptor for ClaudeDescriptor {
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
             stop_task: true,
             earlier_history: HistoryDelivery::Storage,
+            fork: false,
+            compact: false,
+            run_shell: false,
         }
     }
 

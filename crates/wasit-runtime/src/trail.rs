@@ -639,10 +639,10 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
             error: ErrorInfo::foreign(Code::st("notice"), message),
         },
         AgentEvent::Compaction { info } => TrailEntry::AgentCompaction {
-            pre_tokens: info.pre_tokens,
-            post_tokens: info.post_tokens,
-            duration_ms: info.duration_ms,
-            trigger: non_empty(&info.trigger).map(Code::new),
+            pre_tokens: info.pre_tokens.unwrap_or(0),
+            post_tokens: info.post_tokens.unwrap_or(0),
+            duration_ms: info.duration_ms.unwrap_or(0),
+            trigger: info.trigger.as_deref().and_then(non_empty).map(Code::new),
         },
         AgentEvent::RateLimitNotice { info } => TrailEntry::AgentRateLimited {
             resets_at: info.resets_at,
@@ -674,6 +674,9 @@ fn project_agent(event: &AgentEvent) -> Option<TrailEntry> {
         | AgentEvent::PlanUpdated { .. }
         | AgentEvent::ModelsUpdated { .. }
         | AgentEvent::SlashCommandsUpdated { .. }
+        // A local shell's output is content the user ran, not a trail fact (it is journaled
+        // whole by the session, not projected here).
+        | AgentEvent::LocalShell { .. }
         | AgentEvent::ProcessExited { .. } => return None,
     })
 }
@@ -720,7 +723,9 @@ fn applied(
             target = Some(Ident::new(name));
         }
         Command::StopTask { task_id } => target = Some(Ident::new(task_id)),
-        Command::Interrupt | Command::Shutdown => {}
+        // Only the length of the line is kept, as for a prompt: it is the user's own shell text.
+        Command::RunShell { line, .. } => n_chars = chars(line),
+        Command::Interrupt | Command::Compact | Command::Shutdown => {}
     }
     // Why a command was not accepted is worded by the protocol or the runtime from what the
     // command named; only its length and fingerprint are kept.

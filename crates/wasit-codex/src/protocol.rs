@@ -203,6 +203,19 @@ impl CodexProtocol {
                 json!({"cwd": cwd, "limit": 1}),
             ),
             ResumeMode::Fresh => self.thread_start(),
+            // Nothing asks for a fork before the fork capability is implemented: start a new
+            // conversation and say so, rather than resuming (and so writing to) the source.
+            ResumeMode::Fork(_) => {
+                let open = self.thread_start();
+                return Step {
+                    events: vec![AgentEvent::CommandRejected {
+                        command: "fork".into(),
+                        message: "forking is not supported yet; started a new conversation".into(),
+                    }],
+                    write: vec![open],
+                    ..Step::default()
+                };
+            }
         };
         write.push(open);
         Step {
@@ -362,6 +375,16 @@ impl CodexProtocol {
             Command::StopTask { .. } => {
                 return Err(DriverError::Unsupported {
                     operation: "stop_task".into(),
+                })
+            }
+            Command::Compact => {
+                return Err(DriverError::Unsupported {
+                    operation: "compact".into(),
+                })
+            }
+            Command::RunShell { .. } => {
+                return Err(DriverError::Unsupported {
+                    operation: "run_shell".into(),
                 })
             }
             Command::Interrupt => return Ok(self.interrupt()),

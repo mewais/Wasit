@@ -1388,3 +1388,26 @@ fn a_huge_first_prompt_becomes_a_bounded_title() {
         limits::PATH_CHARS
     );
 }
+
+#[test]
+fn compact_and_run_shell_are_unsupported() {
+    let mut p = ready();
+    assert_eq!(
+        p.encode(InputId(130), Command::Compact),
+        Err(DriverError::Unsupported {
+            operation: "compact".into()
+        })
+    );
+    assert_eq!(
+        p.encode(
+            InputId(131),
+            Command::RunShell {
+                line: "ls".into(),
+                timeout_ms: Some(1000)
+            }
+        ),
+        Err(DriverError::Unsupported {
+            operation: "run_shell".into()
+        })
+    );
+}
