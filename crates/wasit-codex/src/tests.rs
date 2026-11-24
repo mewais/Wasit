@@ -1,9 +1,9 @@
 use super::*;
 use serde_json::json;
 use wasit_core::{
-    AgentEvent, Command, CompactionInfo, DriverError, Encoded, EndReason, GateDecision,
-    GateRequest, InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, SlashCommandInfo,
-    Step,
+    AgentEvent, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
+    GateDecision, GateRequest, InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef,
+    SlashCommandInfo, Step,
 };
 
 fn w(step: &Step) -> Vec<Value> {
@@ -1753,4 +1753,49 @@ fn compact_before_the_handshake_waits_for_the_thread() {
     assert!(w(&step)
         .iter()
         .any(|l| l["method"] == "thread/compact/start" && l["params"] == json!({"threadId":"t1"})));
+}
+
+/// A `fileChange` item's changes are diff parts on its result, one per change, and only when the
+/// item completed (a declined one wrote nothing).
+#[test]
+fn file_change_items_carry_one_diff_per_change() {
+    let mut p = ready();
+    let started = p.on_line(r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"f1","status":"inProgress","changes":[{"path":"/w/a.rs","kind":{"type":"update","move_path":null},"diff":"@@\n-x\n+y\n"},{"path":"/w/n.txt","kind":{"type":"add"},"diff":"new\n"}]}}}"#).events;
+    assert!(
+        matches!(&started[0], AgentEvent::ToolCallStarted { name, call_id, .. } if name == "apply_patch" && call_id == "f1")
+    );
+    let ev = p.on_line(r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"f1","status":"completed","changes":[{"path":"/w/a.rs","kind":{"type":"update","move_path":null},"diff":"@@\n-x\n+y\n"},{"path":"/w/n.txt","kind":{"type":"add"},"diff":"new\n"}]}}}"#).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::ToolCallFinished {
+            call_id: "f1".into(),
+            name: "apply_patch".into(),
+            ok: true,
+            result: None,
+            parts: vec![
+                ContentPart::Diff {
+                    path: "/w/a.rs".into(),
+                    old_text: Some("x\n".into()),
+                    new_text: "y\n".into(),
+                    hunk: Some("@@\n-x\n+y\n".into()),
+                },
+                ContentPart::Diff {
+                    path: "/w/n.txt".into(),
+                    old_text: None,
+                    new_text: "new\n".into(),
+                    hunk: None,
+                },
+            ],
+        }]
+    );
+}
+
+#[test]
+fn a_declined_file_change_carries_no_diff() {
+    let mut p = ready();
+    p.on_line(r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"f2","status":"inProgress","changes":[]}}}"#);
+    let ev = p.on_line(r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"f2","status":"declined","changes":[{"path":"/w/n.txt","kind":{"type":"add"},"diff":"new\n"}]}}}"#).events;
+    assert!(
+        matches!(&ev[0], AgentEvent::ToolCallFinished { ok: false, parts, .. } if parts.is_empty())
+    );
 }

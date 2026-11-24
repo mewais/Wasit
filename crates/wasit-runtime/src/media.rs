@@ -165,7 +165,7 @@ fn externalize_part(p: &mut ContentPart, blobs: &mut Vec<(String, Vec<u8>)>) {
             ..
         } => (source, Some((width, height))),
         ContentPart::File { source, .. } => (source, None),
-        ContentPart::Text { .. } => return,
+        ContentPart::Text { .. } | ContentPart::Diff { .. } => return,
     };
     let MediaSource::Inline { data } = source else {
         return;

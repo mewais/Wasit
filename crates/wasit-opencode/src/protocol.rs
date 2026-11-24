@@ -904,12 +904,13 @@ impl AcpProtocol {
         let parts = tool_parts(&content);
         if terminal {
             self.tools.remove(&id);
+            let ok = status == "completed";
             return vec![AgentEvent::ToolCallFinished {
                 call_id: id,
                 name,
-                ok: status == "completed",
+                ok,
                 result: (!content.is_empty()).then_some(Value::Array(content)),
-                parts,
+                parts: without_diffs_unless(parts, ok),
             }];
         }
         // The arguments come in an update (the start carries only `cwd`, say).
@@ -955,7 +956,7 @@ impl AcpProtocol {
                 call_id: id.to_string(),
                 name: name.unwrap_or_else(|| "subagent".into()),
                 ok: status == "completed",
-                parts: tool_parts(&content),
+                parts: without_diffs_unless(tool_parts(&content), status == "completed"),
                 result: (!content.is_empty()).then_some(Value::Array(content)),
             });
         }
@@ -1141,9 +1142,34 @@ fn uri_source(uri: &str) -> MediaSource {
 fn tool_parts(content: &[Value]) -> Vec<ContentPart> {
     content
         .iter()
-        .filter(|c| s(c, "type") == "content")
-        .filter_map(|c| c.get("content").and_then(acp_part))
+        .filter_map(|c| match s(c, "type") {
+            "content" => c.get("content").and_then(acp_part),
+            "diff" => acp_diff(c),
+            _ => None,
+        })
         .collect()
+}
+
+/// An ACP `diff` block (`{"type":"diff","path","oldText","newText"}`) as a diff part; `oldText`
+/// is absent or null for a file the call created.
+fn acp_diff(block: &Value) -> Option<ContentPart> {
+    Some(ContentPart::Diff {
+        path: opt_s(block, "path")?,
+        old_text: block
+            .get("oldText")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        new_text: block.get("newText").and_then(Value::as_str)?.to_string(),
+        hunk: None,
+    })
+}
+
+/// Drops the diff parts of a call that did not complete: a failed edit changed nothing.
+fn without_diffs_unless(mut parts: Vec<ContentPart>, completed: bool) -> Vec<ContentPart> {
+    if !completed {
+        parts.retain(|p| !matches!(p, ContentPart::Diff { .. }));
+    }
+    parts
 }
 
 /// The `session/prompt` blocks for a prompt: the text, then each attachment as an `image`

@@ -605,3 +605,80 @@ fn the_window_is_one_budget_for_the_main_file_and_the_subagents() {
         )
     );
 }
+
+/// An edit made in a resumed transcript: the diff is on the result the user record carries, and
+/// a failed one has none.
+#[test]
+fn edits_in_a_transcript_carry_their_diffs_on_the_result() {
+    // Each record is the child of the one before it: the chain is the conversation.
+    let call = |id: &str, parent: Option<&str>, name: &str, input: Value| {
+        line(
+            json!({"type":"assistant","uuid":format!("a-{id}"),"parentUuid":parent,"isSidechain":false,
+            "timestamp":"2026-11-22T10:00:01.000Z",
+            "message":{"id":format!("m-{id}"),"role":"assistant","content":[
+                {"type":"tool_use","id":id,"name":name,"input":input}]}}),
+        )
+    };
+    let result = |id: &str, parent: &str, is_error: bool| {
+        line(
+            json!({"type":"user","uuid":format!("u-{id}"),"parentUuid":parent,"isSidechain":false,
+            "timestamp":"2026-11-22T10:00:02.000Z",
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,
+                "content":"done","is_error":is_error}]}}),
+        )
+    };
+    let lines = vec![
+        call(
+            "e1",
+            None,
+            "Edit",
+            json!({"file_path":"/w/a.rs","old_string":"x","new_string":"y"}),
+        ),
+        result("e1", "a-e1", false),
+        call(
+            "e2",
+            Some("u-e1"),
+            "Edit",
+            json!({"file_path":"/w/a.rs","old_string":"p","new_string":"q"}),
+        ),
+        result("e2", "a-e2", true),
+        call(
+            "w1",
+            Some("u-e2"),
+            "Write",
+            json!({"file_path":"/w/n.txt","content":"new\n"}),
+        ),
+        result("w1", "a-w1", false),
+    ];
+    let r = parse_lines(&lines, HistoryLimits::default()).unwrap();
+    let parts_of = |want: &str| -> Vec<ContentPart> {
+        r.events
+            .iter()
+            .find_map(|e| match inner(e).0 {
+                AgentEvent::ToolCallFinished { call_id, parts, .. } if call_id == want => {
+                    Some(parts.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result for {want}"))
+    };
+    assert_eq!(
+        parts_of("e1"),
+        vec![ContentPart::Diff {
+            path: "/w/a.rs".into(),
+            old_text: Some("x".into()),
+            new_text: "y".into(),
+            hunk: None,
+        }]
+    );
+    assert!(parts_of("e2").is_empty());
+    assert_eq!(
+        parts_of("w1"),
+        vec![ContentPart::Diff {
+            path: "/w/n.txt".into(),
+            old_text: None,
+            new_text: "new\n".into(),
+            hunk: None,
+        }]
+    );
+}

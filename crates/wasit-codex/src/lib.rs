@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod changes;
 mod protocol;
 
 use std::sync::Arc;

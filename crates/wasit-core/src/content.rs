@@ -58,6 +58,23 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         uri: Option<String>,
     },
+    /// A file edit a tool call made, for the transcript to show as a diff. Attached to the
+    /// call's result parts by the driver, only when it knows the edit and the edit applied; a
+    /// call without one is shown by its input and result alone.
+    Diff {
+        /// The file the edit changed, as the CLI named it.
+        path: String,
+        /// The text the edit replaced; `None` when the file was created (or wholly rewritten
+        /// without the old text being known).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old_text: Option<String>,
+        /// The text the edit put in place of `old_text` (the whole new content for a create).
+        new_text: String,
+        /// The unified-diff hunks as the CLI gave them, when it gave a patch rather than the
+        /// two texts. For such a part `old_text` / `new_text` are the hunks' old and new lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hunk: Option<String>,
+    },
 }
 
 impl ContentPart {
@@ -589,5 +606,63 @@ mod tests {
             serde_json::json!({"type":"image","mime":"image/png","source":{"source":"blob","id":"ab","size":3},"width":1})
         );
         assert_eq!(serde_json::from_value::<ContentPart>(v).unwrap(), p);
+    }
+}
+
+#[cfg(test)]
+mod diff_part_tests {
+    use super::*;
+
+    #[test]
+    fn diff_serializes_tagged_and_omits_absent_texts() {
+        let create = ContentPart::Diff {
+            path: "/w/new.txt".into(),
+            old_text: None,
+            new_text: "hi".into(),
+            hunk: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&create).unwrap(),
+            serde_json::json!({"type":"diff","path":"/w/new.txt","new_text":"hi"})
+        );
+    }
+
+    #[test]
+    fn diff_round_trips_with_every_field_set() {
+        let edit = ContentPart::Diff {
+            path: "/w/a.rs".into(),
+            old_text: Some("x".into()),
+            new_text: "y".into(),
+            hunk: Some("@@\n-x\n+y\n".into()),
+        };
+        let v = serde_json::to_value(&edit).unwrap();
+        assert_eq!(serde_json::from_value::<ContentPart>(v).unwrap(), edit);
+    }
+
+    #[test]
+    fn diff_round_trips_without_optional_fields_present_in_json() {
+        let v = serde_json::json!({"type":"diff","path":"/w/a","new_text":""});
+        let p: ContentPart = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            p,
+            ContentPart::Diff {
+                path: "/w/a".into(),
+                old_text: None,
+                new_text: String::new(),
+                hunk: None,
+            }
+        );
+    }
+
+    #[test]
+    fn existing_text_and_file_parts_still_parse() {
+        let text: ContentPart =
+            serde_json::from_value(serde_json::json!({"type":"text","text":"t"})).unwrap();
+        assert_eq!(text, ContentPart::Text { text: "t".into() });
+        let file: ContentPart = serde_json::from_value(
+            serde_json::json!({"type":"file","source":{"source":"path","path":"/a"}}),
+        )
+        .unwrap();
+        assert!(matches!(file, ContentPart::File { .. }));
     }
 }

@@ -55,6 +55,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::edit::edit_diffs;
 use serde_json::{json, Value};
 use wasit_core::content::{path_reference_text, COMMON_IMAGE_MIMES};
 use wasit_core::wire::{opt_s, s, u};
@@ -175,6 +176,8 @@ pub struct ClaudeProtocol {
     /// Pending gates in arrival order.
     gates: Vec<(String, GateKind)>,
     tool_names: HashMap<String, String>,
+    /// The file edits of each tool call not yet finished, attached to its result.
+    tool_diffs: HashMap<String, Vec<ContentPart>>,
     last_usage_message: Option<String>,
     context_window: Option<u64>,
     /// The session's reported slash commands include `compact` (from the `initialize` response or
@@ -209,6 +212,7 @@ impl ClaudeProtocol {
             model: None,
             gates: Vec::new(),
             tool_names: HashMap::new(),
+            tool_diffs: HashMap::new(),
             last_usage_message: None,
             context_window: None,
             compact_listed: false,
@@ -914,6 +918,10 @@ impl ClaudeProtocol {
                     let call_id = s(block, "id").to_string();
                     let name = s(block, "name").to_string();
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
+                    let diffs = edit_diffs(&name, &input);
+                    if !diffs.is_empty() {
+                        self.tool_diffs.insert(call_id.clone(), diffs);
+                    }
                     self.tool_names.insert(call_id.clone(), name.clone());
                     let is_subagent = name == "Task" || name == "Agent";
                     let subagent_model = if is_subagent {
@@ -970,19 +978,25 @@ impl ClaudeProtocol {
             if s(block, "type") == "tool_result" {
                 let call_id = s(block, "tool_use_id").to_string();
                 let name = self.tool_names.remove(&call_id).unwrap_or_default();
-                let parts = block
+                let mut parts: Vec<ContentPart> = block
                     .get("content")
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(claude_part).collect())
                     .unwrap_or_default();
+                let ok = !block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                // A failed edit changed nothing: its diff is not shown.
+                let diffs = self.tool_diffs.remove(&call_id).unwrap_or_default();
+                if ok {
+                    parts.extend(diffs);
+                }
                 out.push(
                     AgentEvent::ToolCallFinished {
                         call_id,
                         name,
-                        ok: !block
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
+                        ok,
                         result: block.get("content").cloned(),
                         parts,
                     }

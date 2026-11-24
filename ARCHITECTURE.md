@@ -219,7 +219,8 @@ Lifecycle facts, each decided in one place on the session's host:
 ### 3.4 Images and files
 
 - **One model** (`wasit-core::content`): `ContentPart` = text | image {mime, source, dims} |
-  file {source, name, mime, uri}; `MediaSource` = inline (protocol → runtime only) | blob {sha256,
+  file {source, name, mime, uri} | diff {path, old_text?, new_text, hunk?} (a file edit a tool
+  call made, attached to its result by the driver when it applied); `MediaSource` = inline (protocol → runtime only) | blob {sha256,
   size} | url | path. Carried by `ToolCallUpdated/Finished.parts`, `AssistantContent`,
   `UserContent`; prompts carry `Attachment`s; descriptors say what they take (`PromptInput`).
 - **Blobs**: the pure core decodes inline media, names it by SHA-256, replaces it by a blob ref and

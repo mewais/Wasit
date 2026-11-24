@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 use wasit_core::{
-    AgentEvent, Command, DriverError, Encoded, EndReason, GateDecision, GateRequest,
+    AgentEvent, Command, ContentPart, DriverError, Encoded, EndReason, GateDecision, GateRequest,
     InputDropReason, InputId, QuestionAnswer, ResumeMode, SkillRef, Step,
 };
 
@@ -1370,5 +1370,44 @@ fn compact_and_run_shell_are_unsupported() {
         Err(DriverError::Unsupported {
             operation: "run_shell".into()
         })
+    );
+}
+
+/// An ACP `diff` content block is a diff part of the call's result; a failed call keeps none.
+#[test]
+fn acp_diff_blocks_become_diff_parts_of_the_result() {
+    let mut p = ready();
+    p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"d","title":"edit","kind":"edit","status":"pending","rawInput":{}}}}"#);
+    let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"d","status":"completed","content":[{"type":"diff","path":"/w/a.rs","oldText":"x","newText":"y"},{"type":"diff","path":"/w/n.txt","oldText":null,"newText":"new\n"}]}}}"#).events;
+    assert_eq!(
+        ev,
+        vec![AgentEvent::ToolCallFinished {
+            call_id: "d".into(),
+            name: "edit".into(),
+            ok: true,
+            result: Some(json!([
+                {"type":"diff","path":"/w/a.rs","oldText":"x","newText":"y"},
+                {"type":"diff","path":"/w/n.txt","oldText":null,"newText":"new\n"}
+            ])),
+            parts: vec![
+                ContentPart::Diff {
+                    path: "/w/a.rs".into(),
+                    old_text: Some("x".into()),
+                    new_text: "y".into(),
+                    hunk: None,
+                },
+                ContentPart::Diff {
+                    path: "/w/n.txt".into(),
+                    old_text: None,
+                    new_text: "new\n".into(),
+                    hunk: None,
+                },
+            ],
+        }]
+    );
+    p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"f","title":"edit","kind":"edit","status":"pending","rawInput":{}}}}"#);
+    let ev = p.on_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"f","status":"failed","content":[{"type":"diff","path":"/w/a.rs","oldText":"x","newText":"y"}]}}}"#).events;
+    assert!(
+        matches!(&ev[0], AgentEvent::ToolCallFinished { ok: false, parts, .. } if parts.is_empty())
     );
 }

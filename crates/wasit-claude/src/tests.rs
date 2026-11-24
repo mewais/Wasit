@@ -1,8 +1,8 @@
 use super::*;
 use serde_json::json;
 use wasit_core::{
-    AgentEvent, Command, Encoded, EndReason, GateDecision, GateRequest, InputId, McpServerConfig,
-    McpTransport, PluginRef, QuestionAnswer, SkillRef, Step, TurnTrigger,
+    AgentEvent, Command, ContentPart, Encoded, EndReason, GateDecision, GateRequest, InputId,
+    McpServerConfig, McpTransport, PluginRef, QuestionAnswer, SkillRef, Step, TurnTrigger,
 };
 
 /// `system/init`, printed at the start of every turn.
@@ -1991,4 +1991,64 @@ fn compact_during_the_handshake_is_decided_by_the_listing() {
         step.events
     );
     assert!(step.write.is_empty());
+}
+
+/// Edits are shown as diff parts on the call's result, only when the call succeeded.
+#[test]
+fn edit_tool_results_carry_their_diffs() {
+    let (mut p, _) = ready();
+    p.on_line(r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/w/a.rs","old_string":"x","new_string":"y"}}]}}"#);
+    let ev = p.on_line(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"e1","content":"ok"}]}}"#).events;
+    assert_eq!(
+        ev[0],
+        AgentEvent::ToolCallFinished {
+            call_id: "e1".into(),
+            name: "Edit".into(),
+            ok: true,
+            result: Some(json!("ok")),
+            parts: vec![ContentPart::Diff {
+                path: "/w/a.rs".into(),
+                old_text: Some("x".into()),
+                new_text: "y".into(),
+                hunk: None,
+            }],
+        }
+    );
+}
+
+#[test]
+fn multi_edit_and_write_results_carry_one_diff_per_edit_or_file() {
+    let (mut p, _) = ready();
+    p.on_line(r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"m1","name":"MultiEdit","input":{"file_path":"/w/a.rs","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}},{"type":"tool_use","id":"w1","name":"Write","input":{"file_path":"/w/n.txt","content":"new\n"}}]}}"#);
+    let ev = p.on_line(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"m1","content":"ok"}]}}"#).events;
+    let AgentEvent::ToolCallFinished { parts, .. } = &ev[0] else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(parts.len(), 2);
+    let ev = p.on_line(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"w1","content":"ok"}]}}"#).events;
+    assert_eq!(
+        ev[0],
+        AgentEvent::ToolCallFinished {
+            call_id: "w1".into(),
+            name: "Write".into(),
+            ok: true,
+            result: Some(json!("ok")),
+            parts: vec![ContentPart::Diff {
+                path: "/w/n.txt".into(),
+                old_text: None,
+                new_text: "new\n".into(),
+                hunk: None,
+            }],
+        }
+    );
+}
+
+#[test]
+fn a_failed_edit_carries_no_diff() {
+    let (mut p, _) = ready();
+    p.on_line(r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"e2","name":"Edit","input":{"file_path":"/w/a.rs","old_string":"x","new_string":"y"}}]}}"#);
+    let ev = p.on_line(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"e2","content":"no match","is_error":true}]}}"#).events;
+    assert!(
+        matches!(&ev[0], AgentEvent::ToolCallFinished { ok: false, parts, .. } if parts.is_empty())
+    );
 }

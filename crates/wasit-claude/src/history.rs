@@ -33,6 +33,7 @@ use wasit_core::{
     HistoryParse, HistoryParser, HistoryReport, Scope,
 };
 
+use crate::edit::edit_diffs;
 use crate::protocol::claude_part;
 
 /// Record types that are bookkeeping, not conversation.
@@ -266,6 +267,8 @@ impl ClaudeHistory {
         self.report.messages += shown;
         let mut out = Vec::new();
         let mut names: HashMap<String, String> = HashMap::new();
+        // The file edits of the calls seen so far, attached to their results.
+        let mut edits: HashMap<String, Vec<ContentPart>> = HashMap::new();
         for &i in &chain[start..] {
             let Some(st) = self.stream_mut(key) else {
                 return out;
@@ -275,13 +278,35 @@ impl ClaudeHistory {
                 let mut call = None;
                 if let AgentEvent::History { event, .. } = &mut ev {
                     match event.as_mut() {
-                        AgentEvent::ToolCallStarted { name, call_id, .. } => {
+                        AgentEvent::ToolCallStarted {
+                            name,
+                            call_id,
+                            input,
+                            ..
+                        } => {
                             names.insert(call_id.clone(), name.clone());
+                            let diffs = edit_diffs(name.as_str(), input);
+                            if !diffs.is_empty() {
+                                edits.insert(call_id.clone(), diffs);
+                            }
                             call = Some(call_id.clone());
                         }
-                        AgentEvent::ToolCallFinished { name, call_id, .. } if name.is_empty() => {
-                            if let Some(n) = names.get(call_id) {
-                                name.clone_from(n);
+                        AgentEvent::ToolCallFinished {
+                            name,
+                            call_id,
+                            ok,
+                            parts,
+                            ..
+                        } => {
+                            if name.is_empty() {
+                                if let Some(n) = names.get(call_id) {
+                                    name.clone_from(n);
+                                }
+                            }
+                            // A failed edit changed nothing: its diff is not shown.
+                            let diffs = edits.remove(call_id).unwrap_or_default();
+                            if *ok {
+                                parts.extend(diffs);
                             }
                         }
                         _ => {}

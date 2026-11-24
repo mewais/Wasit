@@ -44,6 +44,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::changes::change_diffs;
 use serde_json::{json, Value};
 use wasit_core::content::{base_name, path_reference_text, sniff_mime, COMMON_IMAGE_MIMES};
 use wasit_core::wire::{
@@ -1155,12 +1156,18 @@ fn tool_finished(item: &Value, id: String, name: String) -> AgentEvent {
         .filter(|v| !v.is_null())
         .or_else(|| item.get("result").filter(|v| !v.is_null()))
         .cloned();
+    let ok = status == "completed" && exit_ok;
+    let mut parts = item_parts(item);
+    // A change that was declined or failed was not written: its diff is not shown.
+    if ok {
+        parts.extend(change_diffs(item));
+    }
     AgentEvent::ToolCallFinished {
         call_id: id,
         name,
-        ok: status == "completed" && exit_ok,
+        ok,
         result,
-        parts: item_parts(item),
+        parts,
     }
 }
 

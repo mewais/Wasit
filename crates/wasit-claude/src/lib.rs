@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod edit;
 mod history;
 mod protocol;
 
