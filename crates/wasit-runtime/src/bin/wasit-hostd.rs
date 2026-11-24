@@ -234,6 +234,7 @@ fn endpoint(a: &Args) -> Endpoint {
 fn runtime_config(a: &Args) -> Result<RuntimeConfig, String> {
     let launcher = ShimLauncher::current_exe("shim").map_err(|e| e.to_string())?;
     let mut cfg = RuntimeConfig::new(a.data.clone(), launcher);
+    cfg.derivation = BUILD.to_string();
     for (d, p) in &a.driver_bin {
         let id = DriverId::new(d.clone());
         cfg.registry.get(&id).map_err(|e| e.to_string())?;

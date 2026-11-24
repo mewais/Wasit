@@ -8,12 +8,14 @@
 //! of it.
 
 use std::collections::VecDeque;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tokio::fs::{self, OpenOptions};
 use tokio::sync::mpsc;
-use wasit_core::DriverDescriptor;
-use wasit_shim::ShimState;
+use wasit_core::{DriverDescriptor, SessionMode};
+use wasit_shim::{journal::sorted_ndjson, ShimState};
 
 use crate::core::{Core, SessionMeta};
 use crate::eventlog::EventLog;
@@ -63,8 +65,9 @@ pub(crate) async fn snapshot(
     run_dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
     meta: &SessionMeta,
+    mode_hints: &[SessionMode],
 ) -> Result<SessionSnapshot, String> {
-    let mut core = Core::for_session(desc, meta, None);
+    let mut core = Core::for_session(desc, meta, Some(mode_hints.to_vec()));
     run(dir, &mut core, None, false, |_| true).await?;
     if !core.process_ended() {
         match wasit_shim::probe_at(dir, run_dir).await {
@@ -88,17 +91,11 @@ pub(crate) async fn build(
     run_dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
     meta: &SessionMeta,
+    mode_hints: &[SessionMode],
     log: &EventLog,
 ) -> Result<(), String> {
-    let last_cursor = log
-        .page_back(None, 1, None, |_| true)
-        .await
-        .map_err(|e| e.to_string())?
-        .0
-        .pop()
-        .map(|e| e.cursor)
-        .unwrap_or(0);
-    let mut core = Core::for_session(desc, meta, None);
+    let last_cursor = last_cursor(&log.paths()).await.map_err(|e| e.to_string())?;
+    let mut core = Core::for_session(desc, meta, Some(mode_hints.to_vec()));
     let mut last_seq = 0u64;
     let mut stream = match wasit_shim::read_journal(dir, 1).await {
         Ok(s) => s,
@@ -141,16 +138,45 @@ pub(crate) async fn build(
         }
     }
 
-    let journal_len = std::fs::metadata(dir.join("journal.ndjson"))
+    let journal_len = fs::metadata(dir.join("journal.ndjson"))
+        .await
         .map(|m| m.len())
         .unwrap_or(0);
     log.seal(core.snapshot().clone(), journal_len, last_seq)
         .map_err(|e| e.to_string())
 }
 
+async fn last_cursor(paths: &crate::eventlog::Paths) -> io::Result<u64> {
+    async fn read(path: &Path) -> io::Result<u64> {
+        let f = match OpenOptions::new().read(true).open(path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let len = f.metadata().await?.len();
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut stdf = f.into_std().await;
+        let good = sorted_ndjson::complete_len(&mut stdf, len)?;
+        if good == 0 {
+            return Ok(0);
+        }
+        let start = sorted_ndjson::line_start_before(&mut stdf, good)?;
+        let line = sorted_ndjson::read_range(&mut stdf, start, good - 1)?;
+        let ev: SessionEvent = serde_json::from_slice(&line).map_err(crate::eventlog::json_err)?;
+        Ok(ev.cursor)
+    }
+
+    let a = read(&paths.events).await?;
+    let b = read(&paths.earlier).await?;
+    Ok(a.max(b))
+}
+
 /// The last `limit` of what `pick` makes of the events with `cursor < before`, oldest first,
 /// and whether older ones exist. One replay serves every kind of page: history picks the events
 /// themselves, the trail their projection.
+#[allow(clippy::too_many_arguments)]
 async fn window<T>(
     dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
@@ -158,9 +184,10 @@ async fn window<T>(
     before: Option<u64>,
     limit: usize,
     earlier: bool,
+    mode_hints: &[SessionMode],
     mut pick: impl FnMut(SessionEvent) -> Option<T>,
 ) -> Result<(Vec<T>, bool), String> {
-    let mut core = Core::for_session(desc, meta, None);
+    let mut core = Core::for_session(desc, meta, Some(mode_hints.to_vec()));
     let mut window: VecDeque<T> = VecDeque::with_capacity(limit.min(4096));
     let mut has_more = false;
     run(dir, &mut core, before.map(cursor_seq), earlier, |e| {
@@ -181,6 +208,7 @@ async fn window<T>(
 
 /// The last `limit` events with `cursor < before`; with `earlier`, the last `limit` items of the
 /// conversation's earlier history instead.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn history(
     dir: &Path,
     desc: Arc<dyn DriverDescriptor>,
@@ -189,8 +217,9 @@ pub(crate) async fn history(
     limit: usize,
     scope: HistoryScope,
     earlier: bool,
+    mode_hints: &[SessionMode],
 ) -> Result<HistoryPage, String> {
-    let (events, has_more) = window(dir, desc, meta, before, limit, earlier, |e| {
+    let (events, has_more) = window(dir, desc, meta, before, limit, earlier, mode_hints, |e| {
         scope.admits(&e).then_some(e)
     })
     .await?;
@@ -204,8 +233,9 @@ pub(crate) async fn trail(
     meta: &SessionMeta,
     before: Option<u64>,
     limit: usize,
+    mode_hints: &[SessionMode],
 ) -> Result<TrailPage, String> {
-    let (entries, has_more) = window(dir, desc, meta, before, limit, false, |e| {
+    let (entries, has_more) = window(dir, desc, meta, before, limit, false, mode_hints, |e| {
         crate::trail::item(&e)
     })
     .await?;
@@ -220,10 +250,11 @@ pub(crate) fn events_between(
     meta: SessionMeta,
     after: Option<u64>,
     below: u64,
+    mode_hints: Vec<SessionMode>,
 ) -> mpsc::Receiver<Result<SessionEvent, String>> {
     let (tx, rx) = mpsc::channel(256);
     tokio::spawn(async move {
-        let mut core = Core::for_session(desc, &meta, None);
+        let mut core = Core::for_session(desc, &meta, Some(mode_hints));
         // The replay is synchronous per record; hand events over through a small buffer so
         // backpressure from the consumer applies between records.
         let mut buf: Vec<SessionEvent> = Vec::new();

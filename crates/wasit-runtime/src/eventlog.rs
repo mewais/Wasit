@@ -53,11 +53,11 @@ enum LogMsg {
 }
 
 #[derive(Clone)]
-struct Paths {
-    dir: PathBuf,
-    events: PathBuf,
-    earlier: PathBuf,
-    meta: PathBuf,
+pub(crate) struct Paths {
+    pub(crate) dir: PathBuf,
+    pub(crate) events: PathBuf,
+    pub(crate) earlier: PathBuf,
+    pub(crate) meta: PathBuf,
 }
 
 impl Paths {
@@ -140,6 +140,10 @@ impl EventLog {
 
     pub fn written(&self) -> watch::Receiver<u64> {
         self.written.clone()
+    }
+
+    pub(crate) fn paths(&self) -> Paths {
+        self.paths.clone()
     }
 
     pub fn submitted(&self) -> u64 {
@@ -625,7 +629,7 @@ fn stream_start(path: &Path, after: Option<u64>) -> io::Result<(u64, u64)> {
     Ok((start, good))
 }
 
-fn json_err(e: serde_json::Error) -> io::Error {
+pub(crate) fn json_err(e: serde_json::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("bad record ({:?} at column {})", e.classify(), e.column()),

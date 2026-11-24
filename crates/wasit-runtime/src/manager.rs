@@ -503,12 +503,14 @@ impl SessionManager {
             let permits = self.inner.replays.clone();
             let w = watch_tx.clone();
             let sid = id.clone();
+            let hints = self.inner.cfg.mode_hints.get(&meta.driver);
+            let meta_clone = meta.clone();
             let loader = tokio::spawn(async move {
                 // The semaphore is never closed.
                 let Ok(_permit) = permits.acquire_owned().await else {
                     return;
                 };
-                match replay::snapshot(&dir2, &run2, desc2, &meta).await {
+                match replay::snapshot(&dir2, &run2, desc2, &meta_clone, &hints).await {
                     Ok(s) => {
                         let s = Arc::new(s);
                         w.send_replace(s.clone());
@@ -992,7 +994,8 @@ impl SessionManager {
                 return Ok(p);
             }
         }
-        replay::history(&dir, desc, &meta, before, limit, scope, earlier)
+        let hints = self.inner.cfg.mode_hints.get(&meta.driver);
+        replay::history(&dir, desc, &meta, before, limit, scope, earlier, &hints)
             .await
             .map_err(RuntimeError::Io)
     }
@@ -1032,7 +1035,8 @@ impl SessionManager {
                 return Ok(p);
             }
         }
-        replay::trail(&dir, desc, &meta, before, limit)
+        let hints = self.inner.cfg.mode_hints.get(&meta.driver);
+        replay::trail(&dir, desc, &meta, before, limit, &hints)
             .await
             .map_err(RuntimeError::Io)
     }
@@ -1055,7 +1059,8 @@ impl SessionManager {
         };
         let head = match r.replay_below {
             Some(below) => {
-                let rx = replay::events_between(dir, desc, meta, from, below);
+                let hints = self.inner.cfg.mode_hints.get(&meta.driver);
+                let rx = replay::events_between(dir, desc, meta, from, below, hints);
                 futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
                         .await
