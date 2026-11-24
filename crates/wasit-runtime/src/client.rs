@@ -21,6 +21,9 @@ use crate::wire::{
     RenameSession, RuntimeError, SearchPage, SearchRequest, SessionEvent, SessionId, SessionList,
     SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
 };
+use crate::wire::{
+    ExportChunk, ExportEvent, ExportReadRequest, ExportRef, ExportRequest, ExportStarted,
+};
 
 /// A failed client call.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -331,6 +334,25 @@ impl RuntimeClient {
         .await
     }
 
+    /// `session.export.start`: starts writing a session's conversation export; its progress is
+    /// on [`RuntimeClient::subscribe_export`].
+    pub async fn export_start(&self, req: ExportRequest) -> Result<ExportStarted, ClientError> {
+        self.call(methods::SESSION_EXPORT_START, req).await
+    }
+
+    /// `session.export.cancel`: asks a running export to stop (see the wire docs).
+    pub async fn export_cancel(&self, export_id: &str) -> Result<Ack, ClientError> {
+        let req = ExportRef {
+            export_id: export_id.to_owned(),
+        };
+        self.call(methods::SESSION_EXPORT_CANCEL, req).await
+    }
+
+    /// `session.export.read`: a chunk of a finished export's file (see [`ExportReadRequest`]).
+    pub async fn export_read(&self, req: ExportReadRequest) -> Result<ExportChunk, ClientError> {
+        self.call(methods::SESSION_EXPORT_READ, req).await
+    }
+
     /// `session.search`: one page of hits (see [`SearchRequest`]); continue it with the page's
     /// `next` as `resume`.
     pub async fn search(&self, req: SearchRequest) -> Result<SearchPage, ClientError> {
@@ -531,6 +553,19 @@ impl RuntimeClient {
     }
 
     /// A session's events strictly after `from` (from the beginning when `None`).
+    /// The progress of an export after `from` (see [`ExportEvent`]).
+    pub fn subscribe_export(
+        &self,
+        export_id: &str,
+        from: Option<u64>,
+    ) -> TypedSubscription<ExportEvent> {
+        self.durable(
+            topics::session_export(export_id),
+            serde_json::Value::Null,
+            from.map(Cursor::from_u64),
+        )
+    }
+
     pub fn subscribe_session(
         &self,
         id: &SessionId,

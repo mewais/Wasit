@@ -76,6 +76,9 @@ pub mod methods {
     pub const SESSION_SNAPSHOT: &str = "session.snapshot";
     pub const SESSION_HISTORY: &str = "session.history";
     pub const SESSION_SEARCH: &str = "session.search";
+    pub const SESSION_EXPORT_START: &str = "session.export.start";
+    pub const SESSION_EXPORT_CANCEL: &str = "session.export.cancel";
+    pub const SESSION_EXPORT_READ: &str = "session.export.read";
     pub const SESSION_TRAIL_PAGE: &str = "session.trail.page";
     pub const SESSION_COMMAND: &str = "session.command";
     pub const SESSION_ATTACHMENT_PUT: &str = "session.attachment.put";
@@ -95,6 +98,8 @@ pub mod topics {
     pub const SESSION_EVENTS_PREFIX: &str = "session.events:";
     /// Prefix of the per-session trail topic (the content-free projection of the events).
     pub const SESSION_TRAIL_PREFIX: &str = "session.trail:";
+    /// Prefix of the progress topic of one conversation export (see [`super::ExportEvent`]).
+    pub const SESSION_EXPORT_PREFIX: &str = "session.export:";
 
     /// The event topic of one session.
     pub fn session_events(id: &str) -> String {
@@ -104,6 +109,11 @@ pub mod topics {
     /// The trail topic of one session.
     pub fn session_trail(id: &str) -> String {
         format!("{SESSION_TRAIL_PREFIX}{id}")
+    }
+
+    /// The progress topic of one export.
+    pub fn session_export(export_id: &str) -> String {
+        format!("{SESSION_EXPORT_PREFIX}{export_id}")
     }
 }
 
@@ -1232,6 +1242,125 @@ pub struct SearchPage {
     pub next: Option<String>,
     /// Bytes of event-log records this page examined.
     pub scanned_bytes: u64,
+}
+
+/// The formats of a conversation export (see [`ExportRequest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ExportFormat {
+    /// NDJSON: a manifest line, then one line per event. Written as `export-<id>.ndjson`.
+    Json,
+    /// A minimal Markdown transcript of the conversation. Written as `export-<id>.md`.
+    Markdown,
+}
+
+/// The default tool-output cap of an export: 64 KiB.
+pub const DEFAULT_TOOL_OUTPUT_CAP: u32 = 64 << 10;
+/// The largest tool-output cap an export accepts: 16 MiB.
+pub const MAX_TOOL_OUTPUT_CAP: u32 = 16 << 20;
+/// The most bytes one `session.export.read` returns: 1 MiB.
+pub const MAX_EXPORT_READ: u32 = 1 << 20;
+
+fn yes() -> bool {
+    true
+}
+
+fn default_tool_output_cap() -> u32 {
+    DEFAULT_TOOL_OUTPUT_CAP
+}
+
+/// `session.export.start`: export a session's conversation, one file per format, under the
+/// session's `exports/` directory. One export per session runs at a time.
+///
+/// Reads the derived event log only, forward, and never starts an actor. Secrets are redacted on
+/// a best-effort basis; the reply of the finished export ([`ExportEvent::Done`]) counts them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExportRequest {
+    pub session: SessionId,
+    /// The formats to write: each at most once, at least one.
+    pub formats: Vec<ExportFormat>,
+    /// Whether the events of subagents' conversations are included (default: no).
+    #[serde(default)]
+    pub include_subagents: bool,
+    /// Whether the conversation's earlier history is included, before the session's own events
+    /// (default: yes).
+    #[serde(default = "yes")]
+    pub include_earlier: bool,
+    /// Tool outputs longer than this many bytes are cut to it (`1..=MAX_TOOL_OUTPUT_CAP`;
+    /// default [`DEFAULT_TOOL_OUTPUT_CAP`]).
+    #[serde(default = "default_tool_output_cap")]
+    pub tool_output_cap: u32,
+}
+
+/// Reply of `session.export.start`: the id of the export, whose progress is on the topic
+/// [`topics::session_export`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExportStarted {
+    pub export_id: String,
+}
+
+/// `session.export.cancel`: stops a running export (a finished one is left as it is).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExportRef {
+    pub export_id: String,
+}
+
+/// `session.export.read`: `len` bytes of a finished export's file, from `offset`. Give `format`
+/// when the export wrote more than one file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExportReadRequest {
+    pub export_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<ExportFormat>,
+    pub offset: u64,
+    /// Bytes to read: `1..=MAX_EXPORT_READ`.
+    pub len: u32,
+}
+
+/// Reply of `session.export.read`: the bytes at `offset`, base64 (standard alphabet). `eof` is
+/// set when they reach the end of the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExportChunk {
+    pub offset: u64,
+    /// The file's size in bytes.
+    pub total: u64,
+    pub eof: bool,
+    pub data: String,
+}
+
+/// One file an export wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ExportFile {
+    pub format: ExportFormat,
+    /// The file's path on the host.
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// What the progress topic of an export carries, in order: any number of `progress`, then one
+/// `done` or one `failed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ExportEvent {
+    /// Records read so far (every record of the log, including those left out) and bytes
+    /// written to the files so far.
+    Progress { events_done: u64, bytes: u64 },
+    /// The export is complete: its files, and the redactions made per kind (the JSON pass's
+    /// count when JSON was written, else the Markdown pass's).
+    Done {
+        files: Vec<ExportFile>,
+        redactions: BTreeMap<String, u64>,
+    },
+    /// The export stopped: `reason` is `cancelled` after a cancel, else what went wrong.
+    Failed { reason: String },
 }
 
 /// `session.trail.page`: the trail entries with `cursor < before` (all when `None`), the last

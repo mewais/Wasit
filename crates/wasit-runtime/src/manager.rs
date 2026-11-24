@@ -28,6 +28,7 @@ use crate::config::RuntimeConfig;
 use crate::core::{blank_snapshot, SessionMeta};
 use crate::diag::{self, Intent};
 use crate::eventlog::{EventLog, LogFile, LogView, Scan};
+use crate::export::{self, Exports, Header, Job, Plan};
 use crate::host::HostFeed;
 use crate::replay;
 use crate::search::{self, Query, Resume};
@@ -40,6 +41,7 @@ use crate::wire::{
     RuntimeError, SearchDirection, SearchHit, SearchPage, SearchPart, SearchRequest, SessionEvent,
     SessionId, SessionSnapshot, TrailPage, TrailRequest,
 };
+use crate::wire::{ExportChunk, ExportEvent, ExportReadRequest, ExportRequest, ExportStarted};
 
 /// Bound on a user-given display name.
 const DISPLAY_NAME_CHARS: usize = 200;
@@ -106,6 +108,8 @@ struct Inner {
     /// log with the entry left in the map) against other restarts and against `delete`: two
     /// writers must never own one log, and a directory is never removed under a restart.
     restarts: tokio::sync::Mutex<()>,
+    /// The conversation exports, by id (see [`crate::export`]).
+    exports: Exports,
 }
 
 impl Drop for Inner {
@@ -317,6 +321,7 @@ impl SessionManager {
                 feed_task,
                 replays: Arc::new(Semaphore::new(REPLAY_CONCURRENCY)),
                 restarts: tokio::sync::Mutex::new(()),
+                exports: Exports::default(),
             }),
         })
     }
@@ -1408,6 +1413,60 @@ impl SessionManager {
             })
             .await?;
         Ok(TrailPage { entries, has_more })
+    }
+
+    /// `session.export.start`: starts writing the export of a session (see [`ExportRequest`]).
+    /// The session's log is opened for reads; no actor is started. The export runs in the
+    /// background; its progress is on the topic [`crate::wire::topics::session_export`].
+    pub async fn export_start(&self, r: ExportRequest) -> Result<ExportStarted, RuntimeError> {
+        let plan = Plan::new(&r)?;
+        let header = Header::of(&self.snapshot(&r.session)?);
+        let dir = self
+            .known_session_dir(&r.session)
+            .ok_or_else(|| RuntimeError::SessionNotFound(r.session.to_string()))?;
+        let view = self.log_view(&r.session).await?;
+        let job = self.inner.exports.start(&r.session)?;
+        let task = job.clone();
+        tokio::spawn(async move {
+            let outcome = export::run(task.clone(), view, plan, header, dir).await;
+            task.finish(outcome);
+        });
+        Ok(ExportStarted {
+            export_id: job.id.clone(),
+        })
+    }
+
+    /// `session.export.cancel`: asks a running export to stop; it then removes what it wrote
+    /// and reports `failed` with the reason `cancelled`. A finished export is left as it is.
+    pub fn export_cancel(&self, export_id: &str) -> Result<(), RuntimeError> {
+        self.export_job(export_id)?.cancel();
+        Ok(())
+    }
+
+    /// The progress events of an export after `from` (exclusive), each with its index as cursor.
+    pub fn export_subscribe(
+        &self,
+        export_id: &str,
+        from: Option<u64>,
+    ) -> Result<EventStream<(u64, ExportEvent)>, RuntimeError> {
+        let job = self.export_job(export_id)?;
+        Ok(EventStream::new(export::stream(job, from)))
+    }
+
+    /// `session.export.read`: a chunk of a finished export's file (see [`ExportReadRequest`]).
+    pub async fn export_read(&self, r: ExportReadRequest) -> Result<ExportChunk, RuntimeError> {
+        let file = self.export_job(&r.export_id)?.file(r.format)?;
+        let path = std::path::PathBuf::from(file.path);
+        tokio::task::spawn_blocking(move || export::read_chunk(&path, r.offset, r.len))
+            .await
+            .expect("spawn_blocking panicked")
+    }
+
+    fn export_job(&self, export_id: &str) -> Result<Arc<Job>, RuntimeError> {
+        self.inner
+            .exports
+            .get(export_id)
+            .ok_or_else(|| RuntimeError::InvalidRequest(format!("no such export: {export_id}")))
     }
 
     /// `session.search`: the hits of a request's query in the session's event log (see

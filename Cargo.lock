@@ -821,6 +821,7 @@ name = "wasit-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "fastrand",
  "futures",
  "serde",

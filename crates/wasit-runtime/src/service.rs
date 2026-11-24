@@ -23,6 +23,7 @@ use crate::wire::{
     HostInfo, InventoryRequest, LocalShellRequest, RefreshRequest, RenameSession, RuntimeError,
     SearchRequest, SessionId, SessionList, SessionRef, TrailRequest,
 };
+use crate::wire::{ExportReadRequest, ExportRef, ExportRequest};
 
 /// How long `host.environment.test` waits for discovery after the setup ran (a test then
 /// answers within the setup deadline plus this, well inside a client's request deadline).
@@ -270,6 +271,19 @@ impl Service for RuntimeService {
                 let r: SearchRequest = params(p)?;
                 ok(m.search_request(r).await.map_err(runtime_err)?)
             }
+            methods::SESSION_EXPORT_START => {
+                let r: ExportRequest = params(p)?;
+                ok(m.export_start(r).await.map_err(runtime_err)?)
+            }
+            methods::SESSION_EXPORT_CANCEL => {
+                let r: ExportRef = params(p)?;
+                m.export_cancel(&r.export_id).map_err(runtime_err)?;
+                ok(Ack {})
+            }
+            methods::SESSION_EXPORT_READ => {
+                let r: ExportReadRequest = params(p)?;
+                ok(m.export_read(r).await.map_err(runtime_err)?)
+            }
             methods::SESSION_TRAIL_PAGE => {
                 let r: TrailRequest = params(p)?;
                 ok(m.trail_request(r).await.map_err(runtime_err)?)
@@ -355,6 +369,27 @@ impl Service for RuntimeService {
                 .map(|item| match item {
                     Ok(ev) => serde_json::to_value(&ev)
                         .map(|v| (Cursor::from_u64(ev.cursor), v))
+                        .map_err(|e| close_reason(StreamEnd::Error(e.to_string()))),
+                    Err(e) => Err(close_reason(e)),
+                })
+                .boxed());
+        }
+        if let Some(export_id) = topic.strip_prefix(topics::SESSION_EXPORT_PREFIX) {
+            let after = match from.as_ref() {
+                None => None,
+                Some(c) => Some(
+                    c.as_u64()
+                        .ok_or_else(|| RpcError::invalid_params(format!("bad cursor {c}")))?,
+                ),
+            };
+            let s = self
+                .manager
+                .export_subscribe(export_id, after)
+                .map_err(runtime_err)?;
+            return Ok(s
+                .map(|item| match item {
+                    Ok((c, ev)) => serde_json::to_value(&ev)
+                        .map(|v| (Cursor::from_u64(c), v))
                         .map_err(|e| close_reason(StreamEnd::Error(e.to_string()))),
                     Err(e) => Err(close_reason(e)),
                 })
