@@ -29,6 +29,7 @@
 //! | [`methods::SESSION_ATTACHMENT_PUT`] | [`crate::media::AttachmentPut`] | [`crate::media::AttachmentPutReply`] |
 //! | [`methods::SESSION_FILE_READ`] | [`crate::media::FileReadRequest`] | [`crate::media::FileChunk`] |
 //! | [`methods::SESSION_FILES_STAT`] | [`crate::media::FilesStatRequest`] | [`crate::media::FilesStatReply`] |
+//! | [`methods::SESSION_LOCAL_SHELL`] | [`LocalShellRequest`] | [`Ack`] |
 //! | [`methods::DIAG_SOURCES`] | — | [`DiagSources`] (served by [`crate::DiagService`], routes [`DIAG_ROUTES`]) |
 //! | [`methods::DIAG_READ`] | [`DiagReadRequest`] | [`DiagChunk`] (served by [`crate::DiagService`]) |
 //!
@@ -79,6 +80,7 @@ pub mod methods {
     pub const SESSION_ATTACHMENT_PUT: &str = "session.attachment.put";
     pub const SESSION_FILE_READ: &str = "session.file.read";
     pub const SESSION_FILES_STAT: &str = "session.files.stat";
+    pub const SESSION_LOCAL_SHELL: &str = "session.local_shell";
     pub const DIAG_SOURCES: &str = "diag.sources";
     pub const DIAG_READ: &str = "diag.read";
 }
@@ -1190,6 +1192,54 @@ pub struct TrailPage {
 pub struct CommandRequest {
     pub id: SessionId,
     pub command: Command,
+}
+
+/// What a shell command the host ran for the user printed and exited with (`session.local_shell`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct LocalShellRecord {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// `None` when the command did not exit normally (killed, or no code reported).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub output: String,
+    /// The output was cut before it reached the runtime.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_truncated: bool,
+}
+
+impl LocalShellRecord {
+    /// The most output the journal keeps for one command. The runtime cuts longer output here,
+    /// so one record stays well inside the shim's record bound.
+    pub const OUTPUT_MAX: usize = 1024 * 1024;
+
+    /// The record with its output cut to [`Self::OUTPUT_MAX`] bytes on a character boundary;
+    /// cut output is marked `output_truncated`.
+    pub fn capped(mut self) -> Self {
+        if self.output.len() > Self::OUTPUT_MAX {
+            let cut = (0..=Self::OUTPUT_MAX)
+                .rev()
+                .find(|&i| self.output.is_char_boundary(i))
+                .unwrap_or(0);
+            self.output.truncate(cut);
+            self.output_truncated = true;
+        }
+        self
+    }
+}
+
+/// `session.local_shell`: journal a shell command the host ran for the user (`!`) after it
+/// finished, as a `local_shell` event of the session (origin `host`). A session whose process
+/// is not running refuses it with [`CommandError::NotRunning`]: nothing can journal it then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct LocalShellRequest {
+    pub session: SessionId,
+    #[serde(flatten)]
+    pub shell: LocalShellRecord,
 }
 
 /// A command the session accepted.

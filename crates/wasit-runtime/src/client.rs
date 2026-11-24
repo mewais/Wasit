@@ -17,8 +17,9 @@ use crate::wire::{
     methods, topics, Ack, CommandError, CommandOutcome, CommandReply, CommandRequest,
     CreateSession, CreateSessionReply, DiagChunk, DiagReadRequest, DiagSources, DiagTailEvent,
     DiagTailParams, ForkSession, HistoryPage, HistoryRequest, HistoryScope, HostEvent, HostInfo,
-    InventoryReply, InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionEvent,
-    SessionId, SessionList, SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
+    InventoryReply, InventoryRequest, LocalShellRecord, LocalShellRequest, RefreshRequest,
+    RenameSession, RuntimeError, SessionEvent, SessionId, SessionList, SessionRef, SessionSnapshot,
+    TrailItem, TrailPage, TrailRequest,
 };
 
 /// A failed client call.
@@ -394,6 +395,25 @@ impl RuntimeClient {
             )
             .await?;
         Ok(r.outcome)
+    }
+
+    /// `session.local_shell`: journal a shell command the host ran for the user (see
+    /// [`SessionManager::local_shell`](crate::SessionManager::local_shell)).
+    pub async fn local_shell(
+        &self,
+        session: &SessionId,
+        shell: LocalShellRecord,
+    ) -> Result<(), ClientError> {
+        let _: Ack = self
+            .call(
+                methods::SESSION_LOCAL_SHELL,
+                LocalShellRequest {
+                    session: session.clone(),
+                    shell,
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     /// `session.attachment.put`: one chunk of an upload.

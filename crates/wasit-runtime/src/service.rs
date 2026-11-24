@@ -20,8 +20,8 @@ use crate::stream::StreamEnd;
 use crate::wire::{
     methods, topics, Ack, CommandError, CommandReply, CommandRequest, ConfigureEnvironment,
     CreateSession, CreateSessionReply, DriverSummary, EnvironmentTest, ForkSession, HistoryRequest,
-    HostInfo, InventoryRequest, RefreshRequest, RenameSession, RuntimeError, SessionId,
-    SessionList, SessionRef, TrailRequest,
+    HostInfo, InventoryRequest, LocalShellRequest, RefreshRequest, RenameSession, RuntimeError,
+    SessionId, SessionList, SessionRef, TrailRequest,
 };
 
 /// How long `host.environment.test` waits for discovery after the setup ran (a test then
@@ -289,6 +289,13 @@ impl Service for RuntimeService {
             methods::SESSION_FILES_STAT => {
                 let r: crate::media::FilesStatRequest = params(p)?;
                 ok(m.files_stat(&r).await.map_err(runtime_err)?)
+            }
+            methods::SESSION_LOCAL_SHELL => {
+                let r: LocalShellRequest = params(p)?;
+                m.local_shell(&r.session, r.shell)
+                    .await
+                    .map_err(command_err)?;
+                ok(Ack {})
             }
             other => Err(RpcError::method_not_found(other)),
         }

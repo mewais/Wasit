@@ -98,6 +98,22 @@ pub(crate) enum RuntimeNote {
     EarlierEnd { report: HistoryReport },
     /// The import failed.
     EarlierFailed { reason: EarlierUnavailable },
+    /// A shell command the host ran for the user (`session.local_shell`, after it finished),
+    /// journaled as [`AgentEvent::LocalShell`] with origin `host`. The output is already capped
+    /// by the caller. `token` names the requester, answered once the core applies the note, so
+    /// the event is in the journal before the request returns.
+    LocalShell {
+        token: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        output: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        output_truncated: bool,
+    },
 }
 
 impl RuntimeNote {
@@ -273,9 +289,39 @@ mod tests {
             RuntimeNote::EarlierFailed {
                 reason: EarlierUnavailable::FormatNotUnderstood { record: 2 },
             },
+            RuntimeNote::LocalShell {
+                token: "t".into(),
+                command: "ls".into(),
+                cwd: Some("/w".into()),
+                exit_code: Some(0),
+                output: "a\n".into(),
+                output_truncated: true,
+            },
+            RuntimeNote::LocalShell {
+                token: "t".into(),
+                command: "sleep 9".into(),
+                cwd: None,
+                exit_code: None,
+                output: String::new(),
+                output_truncated: false,
+            },
         ] {
             assert_eq!(classify(&n.to_value()), NoteKind::Runtime(n));
         }
+        // An optional part that is absent stays absent on the wire.
+        let v = RuntimeNote::LocalShell {
+            token: "t".into(),
+            command: "ls".into(),
+            cwd: None,
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+        }
+        .to_value();
+        assert_eq!(
+            v,
+            serde_json::json!({"wasit": "local_shell", "token": "t", "command": "ls", "output": ""})
+        );
         assert_eq!(
             classify(&serde_json::json!({"stdin": "closed"})),
             NoteKind::StdinClosed

@@ -44,8 +44,8 @@ use crate::note::{EarlierPlan, RuntimeNote};
 use crate::store::{self, SessionFile};
 use crate::stream::Subscriber;
 use crate::wire::{
-    CommandError, CommandOutcome, NotContinuable, Phase, RuntimeError, SessionEvent, SessionId,
-    SessionSnapshot,
+    CommandError, CommandOutcome, LocalShellRecord, NotContinuable, Phase, RuntimeError,
+    SessionEvent, SessionId, SessionSnapshot,
 };
 
 /// Bound on commands awaiting their journal round trip, and on messages deferred while the
@@ -70,6 +70,11 @@ pub(crate) enum Msg {
     /// Raise or withdraw an external gate (see [`RuntimeNote::RaiseGate`]).
     Gate {
         op: GateOp,
+        reply: CommandReply,
+    },
+    /// Journal a shell command the host ran (see [`RuntimeNote::LocalShell`]).
+    LocalShell {
+        shell: Box<LocalShellRecord>,
         reply: CommandReply,
     },
     Stop {
@@ -1232,6 +1237,7 @@ impl Actor {
                 reply,
             } => self.command(command, trace, reply),
             Msg::Gate { op, reply } => self.gate(op, reply),
+            Msg::LocalShell { shell, reply } => self.local_shell(*shell, reply),
             Msg::Stop { reply } => {
                 if let Some(w) = self.continuation.waiting() {
                     // The process this stops is not there yet: the stop is journaled as soon as
@@ -1537,6 +1543,9 @@ impl Actor {
             Msg::Gate { op, reply } => {
                 self.refuse(&Intent::new(op.name(), None), reply, CommandError::Busy)
             }
+            Msg::LocalShell { reply, .. } => {
+                self.refuse(&Intent::new("local_shell", None), reply, CommandError::Busy)
+            }
             Msg::Stop { reply } | Msg::Continue { reply } | Msg::Rename { reply, .. } => {
                 let _ = reply.send(Err(RuntimeError::Busy("session is loading".into())));
                 // requester may have given up
@@ -1572,6 +1581,52 @@ impl Actor {
         .to_value();
         self.push_op(Op::Note {
             data,
+            token: Some(tok.clone()),
+            attach: false,
+        });
+        self.pending.insert(
+            tok,
+            Pending {
+                reply: Reply::Command(reply),
+                continued: false,
+                note_failed: None,
+                deadline: Instant::now() + self.cfg.timeouts.command,
+                intent: Some(intent),
+            },
+        );
+    }
+
+    /// Journal a host-run shell command. Refused when no process runs, like an external gate:
+    /// the shim that journals the note is gone (or refuses it) once the process has ended.
+    fn local_shell(&mut self, shell: LocalShellRecord, reply: CommandReply) {
+        let intent = Intent::new("local_shell", None);
+        if !self.core.process_running() {
+            let reason = format!("the session is {}", self.core.snapshot().phase.name());
+            self.refuse(&intent, reply, CommandError::NotRunning { reason });
+            return;
+        }
+        if self.pending.len() >= MAX_PENDING {
+            self.refuse(&intent, reply, CommandError::Busy);
+            return;
+        }
+        let tok = token();
+        let LocalShellRecord {
+            command,
+            cwd,
+            exit_code,
+            output,
+            output_truncated,
+        } = shell;
+        self.push_op(Op::Note {
+            data: RuntimeNote::LocalShell {
+                token: tok.clone(),
+                command,
+                cwd,
+                exit_code,
+                output,
+                output_truncated,
+            }
+            .to_value(),
             token: Some(tok.clone()),
             attach: false,
         });

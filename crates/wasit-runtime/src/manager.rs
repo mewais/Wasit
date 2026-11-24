@@ -35,8 +35,8 @@ use crate::stream::EventStream;
 use crate::subscribe::Feed;
 use crate::wire::{
     page_budget, CommandError, CommandOutcome, CreateSession, CreateSessionReply, ForkedFrom,
-    HistoryPage, HistoryRequest, HistoryScope, HostEvent, Phase, ResumeRequest, RuntimeError,
-    SessionEvent, SessionId, SessionSnapshot, TrailPage, TrailRequest,
+    HistoryPage, HistoryRequest, HistoryScope, HostEvent, LocalShellRecord, Phase, ResumeRequest,
+    RuntimeError, SessionEvent, SessionId, SessionSnapshot, TrailPage, TrailRequest,
 };
 
 /// Bound on a user-given display name.
@@ -183,6 +183,18 @@ fn fork_source(
             snap.id
         ))
     })
+}
+
+/// How a request to a session's actor that failed before the actor answered is reported.
+fn ask_error(e: RuntimeError) -> CommandError {
+    match e {
+        RuntimeError::SessionNotFound(id) => CommandError::SessionNotFound { id },
+        RuntimeError::Busy(_) => CommandError::Busy,
+        RuntimeError::Timeout(_) => CommandError::Timeout,
+        e => CommandError::Rejected {
+            reason: e.to_string(),
+        },
+    }
 }
 
 fn io_err(what: &str, e: impl std::fmt::Display) -> RuntimeError {
@@ -1138,15 +1150,31 @@ impl SessionManager {
         .await
     }
 
+    /// Journal a shell command the host ran for the user, after it finished (`session.local_shell`).
+    /// The event is in the journal, and on the session's streams, when this answers `Ok`. Output
+    /// longer than [`LocalShellRecord::OUTPUT_MAX`] is cut here. `NotRunning` when no process
+    /// runs: nothing journals it then.
+    pub async fn local_shell(
+        &self,
+        id: &SessionId,
+        shell: LocalShellRecord,
+    ) -> Result<(), CommandError> {
+        if shell.command.trim().is_empty() {
+            return Err(CommandError::Rejected {
+                reason: "the command is empty".into(),
+            });
+        }
+        let shell = Box::new(shell.capped());
+        match self.ask(id, |reply| Msg::LocalShell { shell, reply }).await {
+            Ok(r) => r.map(|_| ()),
+            Err(e) => Err(ask_error(e)),
+        }
+    }
+
     async fn gate_op(&self, id: &SessionId, op: GateOp) -> Result<(), CommandError> {
         match self.ask(id, |reply| Msg::Gate { op, reply }).await {
             Ok(r) => r.map(|_| ()),
-            Err(RuntimeError::SessionNotFound(id)) => Err(CommandError::SessionNotFound { id }),
-            Err(RuntimeError::Busy(_)) => Err(CommandError::Busy),
-            Err(RuntimeError::Timeout(_)) => Err(CommandError::Timeout),
-            Err(e) => Err(CommandError::Rejected {
-                reason: e.to_string(),
-            }),
+            Err(e) => Err(ask_error(e)),
         }
     }
 

@@ -16,7 +16,9 @@ use wasit_core::Command;
 use wasit_fake_cli::scenario::{BackgroundStep, Scenario, Step, Turn};
 use wasit_fake_cli::transcript::{Content, SubagentSpec, Transcript};
 use wasit_runtime::testing::build_event_log;
-use wasit_runtime::wire::{HistoryScope, Phase, ResumeRequest, SessionEvent, SessionId};
+use wasit_runtime::wire::{
+    HistoryScope, LocalShellRecord, Phase, ResumeRequest, SessionEvent, SessionId,
+};
 use wasit_runtime::{SessionManager, MAX_HISTORY_PAGE};
 
 const ID: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
@@ -408,4 +410,52 @@ async fn event_log_matches_replay_when_shim_is_lost() {
     assert_journal_len(&sealed, &paths.journal);
 
     assert_logs_match("lost-shim", &mgr, d.path(), &id).await;
+}
+
+/// A host-run shell command is in the derived log exactly as a replay of the journal writes it:
+/// the actor's sealed log, its offline build and the offline replay agree byte for byte.
+#[tokio::test]
+async fn event_log_matches_replay_with_local_shell() {
+    let d = TempDir::new();
+    let mgr = manager(d.path()).await;
+    let scenario = Scenario::builder().turn(base_turn("codex")).build();
+    let mut req = create(d.path(), "codex", &scenario);
+    req.first_prompt = Some("start".into());
+    req.cwd = Some(project(d.path()));
+    let id = mgr.create(req).await.unwrap().id;
+    wait_turns(&mgr, &id, 1).await;
+    wait_snapshot(&mgr, &id, "idle", |s| s.phase == Phase::Idle).await;
+    mgr.local_shell(
+        &id,
+        LocalShellRecord {
+            command: "ls".into(),
+            cwd: Some(project(d.path())),
+            exit_code: Some(0),
+            output: "alpha\nbeta\n".into(),
+            output_truncated: false,
+        },
+    )
+    .await
+    .unwrap();
+    mgr.local_shell(
+        &id,
+        LocalShellRecord {
+            command: "sleep 9".into(),
+            cwd: None,
+            exit_code: None,
+            output: "partial".into(),
+            output_truncated: true,
+        },
+    )
+    .await
+    .unwrap();
+    mgr.stop(&id).await.unwrap();
+    wait_snapshot(&mgr, &id, "stopped", |s| !s.phase.is_live()).await;
+
+    let paths = log_paths(d.path(), &id);
+    let sealed = sealed_meta(&mgr, &id, &paths).await;
+    assert_journal_len(&sealed, &paths.journal);
+    let derived = String::from_utf8_lossy(&read_bytes(&paths.events)).into_owned();
+    assert_eq!(derived.matches("\"type\":\"local_shell\"").count(), 2);
+    assert_logs_match("local-shell", &mgr, d.path(), &id).await;
 }

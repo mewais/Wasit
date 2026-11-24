@@ -52,8 +52,8 @@ use wasit_control::TraceId;
 use wasit_core::tasks::{self, BackgroundChange};
 use wasit_core::{
     AgentEvent, Command, DriverCapabilities, DriverDescriptor, DriverError, Encoded, GateReason,
-    InputDropReason, InputId, Protocol, ResumeMode, SavesConversation, Scope, SpawnSpec, Step,
-    TurnBinding,
+    InputDropReason, InputId, LocalShellOrigin, Protocol, ResumeMode, SavesConversation, Scope,
+    SpawnSpec, Step, TurnBinding,
 };
 use wasit_shim::{Kind, Record};
 
@@ -1077,6 +1077,29 @@ impl Core {
                 request_id,
                 reason,
             }) => self.resolve_external(token, request_id, reason, em, out),
+            NoteKind::Runtime(RuntimeNote::LocalShell {
+                token,
+                command,
+                cwd,
+                exit_code,
+                output,
+                output_truncated,
+            }) => {
+                // The host ran it outside the agent: the journal record is the only place its
+                // output lives, so it is an event here, in journal order, like any other.
+                let event = AgentEvent::LocalShell {
+                    command,
+                    cwd,
+                    exit_code,
+                    output,
+                    output_truncated,
+                    origin: LocalShellOrigin::Host,
+                };
+                let cursor = em.next_cursor();
+                self.reduce(&event, cursor, em.t);
+                em.push(SessionEventKind::Agent { event });
+                out.resolved.push((token, CommandStatus::Sent));
+            }
             NoteKind::StdinClosed => self.close_owed = false,
             NoteKind::StdinError(error) => {
                 if self.last_echoed.is_empty() {
@@ -2802,6 +2825,42 @@ mod tests {
         }
         assert_eq!(revents, events);
         assert_eq!(replay.snapshot(), live.snapshot());
+    }
+
+    /// A host-run command is an event of origin `host` at its journal position, answers its
+    /// token, and replays to the same events.
+    #[test]
+    fn local_shell_note_is_a_host_event_in_journal_order() {
+        let mut sim = Sim::new();
+        let out = sim.note(RuntimeNote::LocalShell {
+            token: "sh1".into(),
+            command: "ls".into(),
+            cwd: Some("/w".into()),
+            exit_code: Some(0),
+            output: "a\n".into(),
+            output_truncated: false,
+        });
+        assert_eq!(out.resolved, vec![("sh1".to_string(), CommandStatus::Sent)]);
+        assert_eq!(sim.events.len(), 1);
+        assert!(matches!(
+            &sim.events[0].kind,
+            SessionEventKind::Agent {
+                event: AgentEvent::LocalShell {
+                    command,
+                    cwd: Some(cwd),
+                    exit_code: Some(0),
+                    output,
+                    output_truncated: false,
+                    origin: wasit_core::LocalShellOrigin::Host,
+                },
+            } if command == "ls" && cwd == "/w" && output == "a\n"
+        ));
+        let mut replay = Core::new(sim.desc.clone(), &meta());
+        let mut revents = vec![];
+        for r in &sim.j.recs {
+            revents.extend(replay.apply(r).events);
+        }
+        assert_eq!(revents, sim.events);
     }
 
     // ── external gates bound to a turn ──────────────────────────────────────
