@@ -21,7 +21,7 @@ use crate::wire::{
     methods, topics, Ack, CommandError, CommandReply, CommandRequest, ConfigureEnvironment,
     CreateSession, CreateSessionReply, DriverSummary, EnvironmentTest, ForkSession, HistoryRequest,
     HostInfo, InventoryRequest, LocalShellRequest, RefreshRequest, RenameSession, RuntimeError,
-    SessionId, SessionList, SessionRef, TrailRequest,
+    SearchRequest, SessionId, SessionList, SessionRef, TrailRequest,
 };
 
 /// How long `host.environment.test` waits for discovery after the setup ran (a test then
@@ -265,6 +265,10 @@ impl Service for RuntimeService {
             methods::SESSION_HISTORY => {
                 let r: HistoryRequest = params(p)?;
                 ok(m.history_request(r).await.map_err(runtime_err)?)
+            }
+            methods::SESSION_SEARCH => {
+                let r: SearchRequest = params(p)?;
+                ok(m.search_request(r).await.map_err(runtime_err)?)
             }
             methods::SESSION_TRAIL_PAGE => {
                 let r: TrailRequest = params(p)?;

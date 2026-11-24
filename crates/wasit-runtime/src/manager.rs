@@ -27,16 +27,18 @@ use crate::actor::{Actor, ActorInit, GateOp, Msg};
 use crate::config::RuntimeConfig;
 use crate::core::{blank_snapshot, SessionMeta};
 use crate::diag::{self, Intent};
-use crate::eventlog::{EventLog, LogFile, LogView};
+use crate::eventlog::{EventLog, LogFile, LogView, Scan};
 use crate::host::HostFeed;
 use crate::replay;
+use crate::search::{self, Query, Resume};
 use crate::store::{self, SessionFile};
 use crate::stream::EventStream;
 use crate::subscribe::Feed;
 use crate::wire::{
     page_budget, CommandError, CommandOutcome, CreateSession, CreateSessionReply, ForkedFrom,
     HistoryPage, HistoryRequest, HistoryScope, HostEvent, LocalShellRecord, Phase, ResumeRequest,
-    RuntimeError, SessionEvent, SessionId, SessionSnapshot, TrailPage, TrailRequest,
+    RuntimeError, SearchDirection, SearchHit, SearchPage, SearchPart, SearchRequest, SessionEvent,
+    SessionId, SessionSnapshot, TrailPage, TrailRequest,
 };
 
 /// Bound on a user-given display name.
@@ -1406,6 +1408,81 @@ impl SessionManager {
             })
             .await?;
         Ok(TrailPage { entries, has_more })
+    }
+
+    /// `session.search`: the hits of a request's query in the session's event log (see
+    /// [`SearchRequest`]). The log is read once it has settled; no actor is started.
+    pub async fn search_request(&self, r: SearchRequest) -> Result<SearchPage, RuntimeError> {
+        let invalid = |why: String| RuntimeError::InvalidRequest(why);
+        let query = Query::new(&r.query, r.scope.clone(), r.kinds.as_deref()).map_err(invalid)?;
+        let resume = match r.resume.as_deref() {
+            None => None,
+            Some(token) => Some(Resume::parse(token).ok_or_else(|| {
+                RuntimeError::InvalidRequest(format!("not a resume token: {token}"))
+            })?),
+        };
+        if resume.is_some() && r.anchor.is_some() {
+            return Err(RuntimeError::InvalidRequest(
+                "give either an anchor or a resume token, not both".into(),
+            ));
+        }
+        let limit = (r.limit as usize).clamp(1, search::MAX_HITS);
+        let backward = r.direction == SearchDirection::Backward;
+        // A token's record is examined again, its hits already returned skipped: so the
+        // backward bound includes it, and the forward bound starts at it.
+        let scan = match (backward, resume, r.anchor) {
+            (true, Some(t), _) => Scan::Backward {
+                before: Some(t.cursor.saturating_add(1)),
+            },
+            (true, None, anchor) => Scan::Backward { before: anchor },
+            (false, Some(t), _) => Scan::Forward {
+                from: Some(t.cursor),
+            },
+            (false, None, anchor) => Scan::Forward {
+                from: anchor.map(|a| a.saturating_add(1)),
+            },
+        };
+        let file = match r.part {
+            SearchPart::Live => LogFile::Events,
+            SearchPart::Earlier => LogFile::Earlier,
+        };
+        let view = self.log_view(&r.session).await?;
+        let read = async {
+            view.settled().await?;
+            view.scan_records(file, scan, move |records| {
+                search::run(records, &query, limit, resume)
+            })
+            .await
+        };
+        let found = match tokio::time::timeout(self.inner.cfg.timeouts.command, read).await {
+            Err(_) => {
+                return Err(RuntimeError::Timeout(format!(
+                    "session {}'s event log is not ready",
+                    r.session
+                )))
+            }
+            Ok(res) => res.map_err(|e| {
+                io_err(&format!("search the event log of session {}", r.session), e)
+            })?,
+        };
+        let part = r.part;
+        Ok(SearchPage {
+            hits: found
+                .hits
+                .into_iter()
+                .map(|h| SearchHit {
+                    cursor: h.cursor,
+                    part,
+                    field: h.field.as_str().to_owned(),
+                    snippet: h.snippet.text,
+                    start: h.snippet.start as u32,
+                    len: (h.snippet.end - h.snippet.start) as u32,
+                    at: h.at,
+                })
+                .collect(),
+            next: found.next.map(|t| t.encode()),
+            scanned_bytes: found.scanned_bytes,
+        })
     }
 
     /// One page of a session's event log: the items `pick` makes of the records of `file` with

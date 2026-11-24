@@ -1,4 +1,4 @@
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -58,6 +58,21 @@ pub(crate) enum LogFile {
     /// The conversation's earlier history items, in cursor order.
     Earlier,
 }
+
+/// Bytes a backward scan reads per block (see [`BackwardRecords`]).
+const SCAN_BLOCK: usize = 64 * 1024;
+
+/// Where a scan of a log file starts (see [`open_scan`]). A backward scan yields the records
+/// with `cursor < before` newest first; a forward one the records with `cursor >= from` oldest
+/// first. `None` is the end of the file, or its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scan {
+    Backward { before: Option<u64> },
+    Forward { from: Option<u64> },
+}
+
+/// The records of a scan, each with the bytes it occupies in the log (its newline included).
+pub(crate) type Records = Box<dyn Iterator<Item = io::Result<(SessionEvent, u64)>>>;
 
 fn writer_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "log writer stopped")
@@ -147,6 +162,24 @@ impl LogView {
         })
         .await
         .expect("spawn_blocking panicked")
+    }
+
+    /// Runs `run` on the complete records of `file` that `scan` selects, on a blocking thread.
+    /// The records are read as `run` pulls them, in blocks, so `run` decides how far to go.
+    /// Callers settle the log first.
+    pub(crate) async fn scan_records<T: Send + 'static>(
+        &self,
+        file: LogFile,
+        scan: Scan,
+        run: impl FnOnce(Records) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let path = match file {
+            LogFile::Events => self.paths.events.clone(),
+            LogFile::Earlier => self.paths.earlier.clone(),
+        };
+        tokio::task::spawn_blocking(move || run(open_scan(&path, scan)?))
+            .await
+            .expect("spawn_blocking panicked")
     }
 }
 
@@ -848,6 +881,140 @@ fn page_back_blocking<T>(
     Ok((items, end > 0))
 }
 
+/// The records of the file at `path` that `scan` selects, from its complete records only: a torn
+/// last line is not one. A missing file has none. The records are read lazily.
+pub(crate) fn open_scan(path: &Path, scan: Scan) -> io::Result<Records> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Box::new(std::iter::empty())),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    let good = sorted_ndjson::complete_len(&mut file, len)?;
+    match scan {
+        Scan::Backward { before } => {
+            let end = match before {
+                Some(b) => sorted_ndjson::seek_sorted(path, CURSOR_PREFIX, b, good)?,
+                None => good,
+            };
+            Ok(Box::new(BackwardRecords {
+                file,
+                base: end,
+                buf: Vec::new(),
+            }))
+        }
+        Scan::Forward { from } => {
+            let start = match from {
+                Some(f) => sorted_ndjson::seek_sorted(path, CURSOR_PREFIX, f, good)?,
+                None => 0,
+            };
+            file.seek(SeekFrom::Start(start))?;
+            Ok(Box::new(ForwardRecords {
+                reader: std::io::BufReader::with_capacity(SCAN_BLOCK, file.take(good - start)),
+                line: Vec::new(),
+            }))
+        }
+    }
+}
+
+/// The records of a log file in file order. Blank lines are not records.
+fn decode(line: &[u8]) -> io::Result<Option<SessionEvent>> {
+    let body = line.strip_suffix(b"\n").unwrap_or(line);
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice(body).map(Some).map_err(json_err)
+}
+
+struct ForwardRecords {
+    reader: std::io::BufReader<std::io::Take<std::fs::File>>,
+    line: Vec<u8>,
+}
+
+impl Iterator for ForwardRecords {
+    type Item = io::Result<(SessionEvent, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            self.line.clear();
+            let n = match self.reader.read_until(b'\n', &mut self.line) {
+                Ok(0) => return None,
+                Ok(n) => n as u64,
+                Err(e) => return Some(Err(e)),
+            };
+            match decode(&self.line) {
+                Ok(Some(event)) => {
+                    crate::stats::log_bytes_read(n);
+                    return Some(Ok((event, n)));
+                }
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// The records of a file from `base` backward, read in [`SCAN_BLOCK`] blocks. `buf` holds the
+/// bytes of `[base, end)` read and not yet yielded, where `end` is the start of the last record
+/// yielded (the scan's end before that). Both ends are line boundaries.
+struct BackwardRecords {
+    file: std::fs::File,
+    base: u64,
+    buf: Vec<u8>,
+}
+
+impl BackwardRecords {
+    /// The last line of the unread bytes, newline included, or `None` at the start of the file.
+    fn line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            let body = self.buf.strip_suffix(b"\n").unwrap_or(&self.buf);
+            if let Some(i) = body.iter().rposition(|&b| b == b'\n') {
+                return Ok(Some(self.buf.split_off(i + 1)));
+            }
+            if self.base == 0 {
+                return Ok((!self.buf.is_empty()).then(|| std::mem::take(&mut self.buf)));
+            }
+            self.fill()?;
+        }
+    }
+
+    /// Prepends the block before `base` to the unread bytes.
+    fn fill(&mut self) -> io::Result<()> {
+        let n = self.base.min(SCAN_BLOCK as u64);
+        let start = self.base - n;
+        let mut block = vec![0u8; n as usize];
+        self.file.seek(SeekFrom::Start(start))?;
+        self.file.read_exact(&mut block)?;
+        block.append(&mut self.buf);
+        self.buf = block;
+        self.base = start;
+        Ok(())
+    }
+}
+
+impl Iterator for BackwardRecords {
+    type Item = io::Result<(SessionEvent, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let line = match self.line() {
+                Ok(Some(line)) => line,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            let n = line.len() as u64;
+            match decode(&line) {
+                Ok(Some(event)) => {
+                    crate::stats::log_bytes_read(n);
+                    return Some(Ok((event, n)));
+                }
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
 fn stream_start(path: &Path, after: Option<u64>) -> io::Result<(u64, u64)> {
     let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1084,6 +1251,63 @@ mod tests {
             got.push(item.unwrap().cursor);
         }
         assert_eq!(got, vec![event_cursor(3, 0), event_cursor(4, 0)]);
+    }
+
+    fn records(path: &Path, scan: Scan) -> Vec<u64> {
+        open_scan(path, scan)
+            .unwrap()
+            .map(|r| r.unwrap().0.cursor)
+            .collect()
+    }
+
+    #[test]
+    fn scans_read_every_record_in_both_directions_across_blocks() {
+        let dir = temp();
+        let path = Paths::new(dir.path()).events;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = String::new();
+        for i in 1..=3000u64 {
+            body += &(serde_json::to_string(&ev(i, &"x".repeat(100))).unwrap() + "\n");
+        }
+        // Blank lines are skipped, and the file is several blocks long.
+        body = body.replacen("\n", "\n\n", 5);
+        std::fs::write(&path, &body).unwrap();
+        assert!(body.len() > 4 * SCAN_BLOCK);
+
+        let forward = records(&path, Scan::Forward { from: None });
+        assert_eq!(forward, (1..=3000).collect::<Vec<_>>());
+        let backward = records(&path, Scan::Backward { before: None });
+        assert_eq!(backward, (1..=3000).rev().collect::<Vec<_>>());
+        assert_eq!(
+            records(&path, Scan::Backward { before: Some(10) }),
+            (1..10).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            records(&path, Scan::Forward { from: Some(2990) }),
+            (2990..=3000).collect::<Vec<_>>()
+        );
+        assert!(records(&path, Scan::Forward { from: Some(3001) }).is_empty());
+    }
+
+    #[test]
+    fn scans_skip_a_torn_last_line() {
+        let dir = temp();
+        let path = Paths::new(dir.path()).events;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = String::new();
+        for i in 1..=3u64 {
+            body += &(serde_json::to_string(&ev(i, "ok")).unwrap() + "\n");
+        }
+        let torn = serde_json::to_string(&ev(4, "torn")).unwrap();
+        body += &torn[..torn.len() / 2];
+        std::fs::write(&path, &body).unwrap();
+        assert_eq!(records(&path, Scan::Forward { from: None }), [1, 2, 3]);
+        assert_eq!(records(&path, Scan::Backward { before: None }), [3, 2, 1]);
+        assert!(records(
+            &Paths::new(dir.path()).earlier,
+            Scan::Backward { before: None }
+        )
+        .is_empty());
     }
 
     #[tokio::test]

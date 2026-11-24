@@ -44,6 +44,14 @@
       "expect": [{"field": "tool_result", "text": "done"}]
     },
     {
+      "name": "tool result: type labels are not text, the text under them is",
+      "event": {"cursor": 18, "t": 1017, "kind": "agent", "event": {"type": "tool_call_finished", "call_id": "c3", "name": "Read", "ok": true, "result": [{"type": "text", "text": "label-free body"}, {"type": "text", "text": "second block"}]}},
+      "expect": [
+        {"field": "tool_result", "text": "label-free body"},
+        {"field": "tool_result", "text": "second block"}
+      ]
+    },
+    {
       "name": "tool progress: input replaced and content text",
       "event": {"cursor": 9, "t": 1008, "kind": "agent", "event": {"type": "tool_call_updated", "call_id": "c1", "name": "Bash", "input": {"command": "pwd"}, "content": [{"text": "partial output"}]}},
       "expect": [

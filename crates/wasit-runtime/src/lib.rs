@@ -41,7 +41,6 @@ mod note;
 mod redact;
 mod replay;
 mod scrub;
-#[allow(dead_code)] // B6a: the find job (B6b) is not yet wired to the matcher
 mod search;
 mod service;
 #[doc(hidden)]

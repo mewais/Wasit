@@ -75,6 +75,7 @@ pub mod methods {
     pub const SESSIONS_RENAME: &str = "sessions.rename";
     pub const SESSION_SNAPSHOT: &str = "session.snapshot";
     pub const SESSION_HISTORY: &str = "session.history";
+    pub const SESSION_SEARCH: &str = "session.search";
     pub const SESSION_TRAIL_PAGE: &str = "session.trail.page";
     pub const SESSION_COMMAND: &str = "session.command";
     pub const SESSION_ATTACHMENT_PUT: &str = "session.attachment.put";
@@ -1149,6 +1150,88 @@ pub struct HistoryPage {
     pub events: Vec<SessionEvent>,
     /// Older events exist (page again with `before = events[0].cursor`).
     pub has_more: bool,
+}
+
+/// Which event log a search reads: the session's own events, or the earlier history of the
+/// conversation (see [`HistoryRequest::earlier`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPart {
+    #[default]
+    Live,
+    Earlier,
+}
+
+/// The order a search walks the log in: `backward` from the anchor towards the start (newest
+/// first), or `forward` towards the end (oldest first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SearchDirection {
+    #[default]
+    Backward,
+    Forward,
+}
+
+/// `session.search`: the hits of `query` in the session's transcript, from the anchor in the
+/// direction, at most `limit` (clamped to `1..=50`) per page.
+///
+/// Reads the derived event log only, never starts an actor. A page examines at most 8 MiB of
+/// records; when it stops short of the end of the log, `next` continues it. Pass the `next` of
+/// the previous page as `resume` to continue (with the same query, scope, kinds, direction
+/// and part), or give an `anchor` to start: `anchor` is an exclusive cursor, the next event
+/// before it when backward and after it when forward. Give one of the two, not both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SearchRequest {
+    pub session: SessionId,
+    pub query: String,
+    /// Which events: everything (default), the session's own transcript, or one subagent's.
+    #[serde(default, skip_serializing_if = "HistoryScope::is_all")]
+    pub scope: HistoryScope,
+    /// The fields to match, by name (`user_text`, `assistant_text`, `thinking`, `tool_input`,
+    /// `tool_result`, `notice`); every field when none is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+    #[serde(default)]
+    pub direction: SearchDirection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<u64>,
+    /// The `next` of the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    #[serde(default)]
+    pub part: SearchPart,
+    pub limit: u32,
+}
+
+/// One match: the cursor and journal time of its event, the field it is in, and a snippet of
+/// the field around it. `start` and `len` are character offsets of the match within `snippet`
+/// (so the app highlights it without a second search).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SearchHit {
+    pub cursor: u64,
+    pub part: SearchPart,
+    pub field: String,
+    pub snippet: String,
+    pub start: u32,
+    pub len: u32,
+    pub at: u64,
+}
+
+/// Result of `session.search`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    /// Resume token: send it as `resume` to continue the search. Absent when the search reached
+    /// the end of the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// Bytes of event-log records this page examined.
+    pub scanned_bytes: u64,
 }
 
 /// `session.trail.page`: the trail entries with `cursor < before` (all when `None`), the last

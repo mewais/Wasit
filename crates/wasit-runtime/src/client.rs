@@ -18,8 +18,8 @@ use crate::wire::{
     CreateSession, CreateSessionReply, DiagChunk, DiagReadRequest, DiagSources, DiagTailEvent,
     DiagTailParams, ForkSession, HistoryPage, HistoryRequest, HistoryScope, HostEvent, HostInfo,
     InventoryReply, InventoryRequest, LocalShellRecord, LocalShellRequest, RefreshRequest,
-    RenameSession, RuntimeError, SessionEvent, SessionId, SessionList, SessionRef, SessionSnapshot,
-    TrailItem, TrailPage, TrailRequest,
+    RenameSession, RuntimeError, SearchPage, SearchRequest, SessionEvent, SessionId, SessionList,
+    SessionRef, SessionSnapshot, TrailItem, TrailPage, TrailRequest,
 };
 
 /// A failed client call.
@@ -329,6 +329,12 @@ impl RuntimeClient {
             max_bytes: None,
         })
         .await
+    }
+
+    /// `session.search`: one page of hits (see [`SearchRequest`]); continue it with the page's
+    /// `next` as `resume`.
+    pub async fn search(&self, req: SearchRequest) -> Result<SearchPage, ClientError> {
+        self.call(methods::SESSION_SEARCH, req).await
     }
 
     /// `session.history` as requested: the page's options, including its byte budget
