@@ -21,6 +21,8 @@ pub(crate) const MAX_HITS: usize = 50;
 pub(crate) const SCAN_BUDGET: u64 = 8 << 20;
 /// Characters of context shown on each side of a hit.
 const RADIUS: usize = 40;
+/// Characters shown of each piece that an empty query lists (see [`Query::new`]).
+const LISTED_CHARS: usize = 80;
 
 /// The part of a session event a piece of find text came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,16 +225,32 @@ pub fn hits_in(text: &str, query: &str) -> Vec<Snippet> {
         .collect()
 }
 
+/// The snippet of a piece listed by an empty query: its first [`LISTED_CHARS`] characters, with
+/// no match (`start` and `end` are both 0).
+fn listed(text: &str) -> Snippet {
+    Snippet {
+        text: text.chars().take(LISTED_CHARS).map(visible).collect(),
+        start: 0,
+        end: 0,
+    }
+}
+
+/// A character as the snippets show it: control characters (line breaks, tabs) become spaces.
+fn visible(c: char) -> char {
+    if c.is_control() {
+        ' '
+    } else {
+        c
+    }
+}
+
 /// The characters of `chars` within `radius` characters of `span`, clipped to the text.
 fn window(chars: &[char], span: Span, radius: usize) -> Snippet {
     let end = span.end.min(chars.len());
     let start = span.start.min(end);
     let from = start.saturating_sub(radius);
     let to = (end + radius).min(chars.len());
-    let text: String = chars[from..to]
-        .iter()
-        .map(|&c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let text: String = chars[from..to].iter().map(|&c| visible(c)).collect();
     Snippet {
         text,
         start: start - from,
@@ -250,16 +268,14 @@ pub(crate) struct Query {
 }
 
 impl Query {
-    /// Validates a request: the text must not be empty, and `kinds`, when given, names at least
-    /// one known field.
+    /// Validates a request: `kinds`, when given, names at least one known field. The text may be
+    /// empty only when `kinds` is given: then every piece of those kinds is a hit (listed, see
+    /// [`matches_in`]). An empty text without kinds is refused.
     pub(crate) fn new(
         text: &str,
         scope: HistoryScope,
         kinds: Option<&[String]>,
     ) -> Result<Query, String> {
-        if text.is_empty() {
-            return Err("the query is empty".into());
-        }
         let kinds = match kinds {
             None => None,
             Some([]) => return Err("kinds names no field".into()),
@@ -270,6 +286,9 @@ impl Query {
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         };
+        if text.is_empty() && kinds.is_none() {
+            return Err("the query is empty; give kinds to list the pieces of those kinds".into());
+        }
         Ok(Query {
             text: text.to_owned(),
             scope,
@@ -319,7 +338,8 @@ pub(crate) struct ScanPage {
 }
 
 /// The hits of `query` in one event, in the order of the event's searchable pieces. An event
-/// outside the query's scope has none.
+/// outside the query's scope has none. An empty query (which has kinds, see [`Query::new`])
+/// makes every piece of those kinds a hit, listed by [`listed`].
 fn matches_in(event: &SessionEvent, query: &Query) -> Vec<Found> {
     if !query.scope.admits(event) {
         return Vec::new();
@@ -329,7 +349,12 @@ fn matches_in(event: &SessionEvent, query: &Query) -> Vec<Found> {
         if query.kinds.as_ref().is_some_and(|k| !k.contains(&field)) {
             continue;
         }
-        for snippet in hits_in(&text, &query.text) {
+        let snippets = if query.text.is_empty() {
+            vec![listed(&text)]
+        } else {
+            hits_in(&text, &query.text)
+        };
+        for snippet in snippets {
             out.push(Found {
                 cursor: event.cursor,
                 at: event.t,
@@ -703,6 +728,96 @@ mod tests {
         assert!(page.hits.is_empty());
         assert!(Query::new("x", HistoryScope::All, Some(&["nope".to_owned()])).is_err());
         assert!(Query::new("", HistoryScope::All, None).is_err());
+    }
+
+    fn prompt(cursor: u64, text: &str) -> SessionEvent {
+        serde_json::from_value(serde_json::json!({
+            "cursor": cursor,
+            "t": cursor * 10,
+            "kind": "input",
+            "input": cursor,
+            "command": {"command": "prompt", "text": text},
+            "status": {"status": "sent"},
+        }))
+        .unwrap()
+    }
+
+    fn user_message(cursor: u64, text: &str) -> SessionEvent {
+        SessionEvent {
+            cursor,
+            t: cursor * 10,
+            kind: SessionEventKind::Agent {
+                event: AgentEvent::UserMessage { text: text.into() },
+            },
+        }
+    }
+
+    #[test]
+    fn empty_query_lists_every_user_prompt_in_order_with_resume() {
+        let long = "p".repeat(90);
+        let events = vec![
+            prompt(1, "first prompt"),
+            notice(2, "not a prompt"),
+            user_message(3, "a user message of the history"),
+            sub_text(4, "c1", "assistant prose"),
+            prompt(5, &long),
+            notice(6, "another notice"),
+            prompt(7, "line one\nline two"),
+            prompt(8, "last"),
+        ];
+        let kinds = vec!["user_text".to_owned()];
+        let listing = Query::new("", HistoryScope::All, Some(&kinds)).unwrap();
+        let expected: Vec<(u64, String)> = vec![
+            (1, "first prompt".into()),
+            (3, "a user message of the history".into()),
+            (5, "p".repeat(80)),
+            (7, "line one line two".into()),
+            (8, "last".into()),
+        ];
+        for backward in [false, true] {
+            let whole = run(source(&events, backward, None), &listing, 1000, None).unwrap();
+            assert!(whole.next.is_none());
+            let mut listed_all: Vec<(u64, String)> = whole
+                .hits
+                .iter()
+                .map(|h| {
+                    assert_eq!(h.field, Field::UserText);
+                    assert_eq!((h.snippet.start, h.snippet.end), (0, 0));
+                    (h.cursor, h.snippet.text.clone())
+                })
+                .collect();
+            if backward {
+                listed_all.reverse();
+            }
+            assert_eq!(listed_all, expected, "backward {backward}");
+            for limit in 1..=expected.len() + 1 {
+                let mut got = Vec::new();
+                let mut resume = None;
+                let mut pages = 0;
+                loop {
+                    pages += 1;
+                    assert!(pages < 100, "the walk does not end");
+                    let page =
+                        run(source(&events, backward, resume), &listing, limit, resume).unwrap();
+                    assert!(page.hits.len() <= limit);
+                    got.extend(all_hits(&page));
+                    match page.next {
+                        Some(next) => resume = Some(next),
+                        None => break,
+                    }
+                }
+                assert_eq!(got, all_hits(&whole), "limit {limit} backward {backward}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_query_without_kinds_is_refused() {
+        assert!(Query::new("", HistoryScope::All, None).is_err());
+        assert!(Query::new("", HistoryScope::All, Some(&[])).is_err());
+        assert!(Query::new("", HistoryScope::All, Some(&["nope".to_owned()])).is_err());
+        let kinds = vec!["user_text".to_owned()];
+        assert!(Query::new("", HistoryScope::All, Some(&kinds)).is_ok());
     }
 
     #[test]
