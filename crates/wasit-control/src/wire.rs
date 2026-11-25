@@ -241,6 +241,8 @@ pub mod codes {
     pub const HOP_LIMIT: &str = "hop_limit";
     pub const BRIDGE_UNAVAILABLE: &str = "bridge_unavailable";
     pub const NOT_CONNECTED: &str = "not_connected";
+    /// A remote daemon's request over its link that the hub's link policy does not allow.
+    pub const LINK_REFUSED: &str = "link_refused";
 }
 
 /// Error carried in a `Response`, a `Goodbye` or a `SubscriptionClosed{Error}`.

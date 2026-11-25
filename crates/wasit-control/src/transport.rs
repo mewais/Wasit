@@ -55,7 +55,12 @@ impl Endpoint {
                 let mut tries = 0u32;
                 loop {
                     match ClientOptions::new().open(name) {
-                        Ok(c) => return Ok(Box::new(c)),
+                        Ok(c) => {
+                            // The name is predictable: refuse a server that is not this user's.
+                            use std::os::windows::io::AsRawHandle;
+                            crate::pipe_security::verify_server(c.as_raw_handle())?;
+                            return Ok(Box::new(c));
+                        }
                         Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && tries < 500 => {
                             tries += 1;
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -328,10 +333,15 @@ mod windows {
     use super::*;
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
+    use crate::pipe_security::OwnerOnly;
+
     /// Windows named pipe listener. The first instance is created with
-    /// `first_pipe_instance(true)`, so a second daemon fails to bind (single instance).
+    /// `first_pipe_instance(true)`, so a second daemon fails to bind (single instance). Every
+    /// instance carries the owner-only security descriptor (see `pipe_security`): only the
+    /// current user and SYSTEM may connect.
     pub struct NamedPipeListener {
         name: String,
+        security: OwnerOnly,
         next: NamedPipeServer,
         _lock: Option<InstanceLock>,
     }
@@ -339,15 +349,22 @@ mod windows {
     impl NamedPipeListener {
         pub fn bind(name: impl Into<String>) -> Result<Self, BindError> {
             let name = name.into();
-            let next = ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(&name)
-                .map_err(|source| BindError::Io {
-                    path: name.clone(),
-                    source,
-                })?;
+            let io_err = |source| BindError::Io {
+                path: name.clone(),
+                source,
+            };
+            let security = OwnerOnly::for_current_user().map_err(io_err)?;
+            // SAFETY: `security.attributes()` points at a SECURITY_ATTRIBUTES that lives as long
+            // as `security`, which this listener owns for as long as it creates instances.
+            let next = unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create_with_security_attributes_raw(&name, security.attributes())
+            }
+            .map_err(io_err)?;
             Ok(NamedPipeListener {
                 name,
+                security,
                 next,
                 _lock: None,
             })
@@ -369,7 +386,11 @@ mod windows {
     impl Listener for NamedPipeListener {
         async fn accept(&mut self) -> io::Result<Option<BoxDuplex>> {
             self.next.connect().await?;
-            let fresh = ServerOptions::new().create(&self.name)?;
+            // SAFETY: as in `bind`; the attributes are owned by `self`.
+            let fresh = unsafe {
+                ServerOptions::new()
+                    .create_with_security_attributes_raw(&self.name, self.security.attributes())?
+            };
             let connected = std::mem::replace(&mut self.next, fresh);
             Ok(Some(Box::new(connected)))
         }

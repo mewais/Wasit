@@ -749,11 +749,15 @@ async fn run_probe(
             spec.env.extend(ov.env.iter().cloned());
             if spec.cwd.is_none() {
                 // A throwaway session may leave traces in its project (e.g. a session record);
-                // keep them out of whatever directory the daemon runs in.
-                let scratch = std::env::temp_dir().join("wasit-discovery");
-                tokio::fs::create_dir_all(&scratch)
-                    .await
-                    .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
+                // keep them out of whatever directory the daemon runs in. The scratch directory
+                // is private to this user: a shared temporary directory would let another local
+                // user plant project config that the session then loads.
+                let scratch = tokio::task::spawn_blocking(|| {
+                    crate::machine::private_scratch_dir("wasit", "discovery")
+                })
+                .await
+                .map_err(|e| format!("discovery scratch directory: {e}"))?
+                .map_err(|e| format!("cannot prepare the discovery scratch directory: {e}"))?;
                 spec.cwd = Some(scratch.to_string_lossy().into_owned());
             }
             handshake(desc, &spec, *until, cfg.handshake_timeout).await?

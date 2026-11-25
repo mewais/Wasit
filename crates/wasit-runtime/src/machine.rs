@@ -247,6 +247,16 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// The owner-only scratch directory `name` inside the per-user runtime directory of `app`,
+/// created and checked (see [`ensure_private_dir`]). For throwaway files a session may leave
+/// behind: a predictable name in a shared temporary directory would let another local user
+/// plant what the session reads (project config, plugins) before it runs.
+pub fn private_scratch_dir(app: &str, name: &str) -> io::Result<PathBuf> {
+    let dir = runtime_dir(app, None)?.join(name);
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +304,37 @@ mod tests {
         // The default resolves somewhere private.
         let d = runtime_dir("wasit-test", None).unwrap();
         assert!(owned_private(&d, wasit_process::effective_uid()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_scratch_dir_is_owned_and_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = private_scratch_dir("wasit-test", "scratch-test").unwrap();
+        assert!(dir.ends_with("scratch-test"));
+        assert!(!dir.starts_with("/tmp/wasit-discovery"));
+        let m = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(m.is_dir());
+        assert_eq!(m.uid(), wasit_process::effective_uid());
+        assert_eq!(m.permissions().mode() & 0o777, 0o700);
+        // Reused on the next call, still private.
+        assert_eq!(
+            private_scratch_dir("wasit-test", "scratch-test").unwrap(),
+            dir
+        );
+        // Someone else's (here: a world-readable) directory at that name is refused, not used.
+        let base = runtime_dir("wasit-test", None).unwrap();
+        let planted = base.join("planted-test");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = private_scratch_dir("wasit-test", "planted-test").unwrap_err();
+        assert!(e.to_string().contains("accessible by other users"), "{e}");
+        // A symlink planted at that name is refused too.
+        let link = base.join("link-test");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(private_scratch_dir("wasit-test", "link-test").is_err());
+        let _ = std::fs::remove_dir_all(&planted);
+        let _ = std::fs::remove_file(&link);
     }
 }

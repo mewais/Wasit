@@ -457,6 +457,69 @@ impl Hub {
     }
 }
 
+/// Decides whether a request a remote daemon sends the hub over its link may run: given the
+/// method and whether it is addressed to another host (`forwarded`) rather than to the hub.
+pub type LinkPolicy = Arc<dyn Fn(&str, bool) -> bool + Send + Sync>;
+
+/// The hub's inbound service for links: serves a remote daemon's requests only when `policy`
+/// allows them, and refuses everything else with [`codes::LINK_REFUSED`] before `inner` sees it.
+///
+/// This is the boundary that keeps a compromised remote daemon from reaching the hub's own
+/// services or other hosts beyond what the daemon legitimately needs. It must sit on the link
+/// slot only: a hub's local clients are served by the unwrapped service. Subscriptions are
+/// refused outright (no remote daemon subscribes to the hub).
+pub struct LinkGate {
+    local: HostId,
+    inner: Arc<dyn Service>,
+    policy: LinkPolicy,
+}
+
+impl LinkGate {
+    /// `local`: the hub's own host id (a request addressed to it is not forwarded).
+    pub fn new(local: HostId, inner: Arc<dyn Service>, policy: LinkPolicy) -> Self {
+        LinkGate {
+            local,
+            inner,
+            policy,
+        }
+    }
+
+    fn check(&self, ctx: &CallContext, method: &str) -> Result<(), RpcError> {
+        let forwarded = ctx.host.as_ref().is_some_and(|h| *h != self.local);
+        if (self.policy)(method, forwarded) {
+            return Ok(());
+        }
+        tracing::warn!(method, forwarded, "refused a request from a remote link");
+        let target = if forwarded { " on another host" } else { "" };
+        Err(RpcError::new(
+            codes::LINK_REFUSED,
+            format!("a remote daemon may not call {method}{target}"),
+        ))
+    }
+}
+
+#[async_trait]
+impl Service for LinkGate {
+    async fn call(&self, ctx: CallContext, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.check(&ctx, method)?;
+        self.inner.call(ctx, method, params).await
+    }
+
+    async fn subscribe(
+        &self,
+        _ctx: CallContext,
+        topic: &str,
+        _params: Value,
+        _from: Option<Cursor>,
+    ) -> Result<EventStream, RpcError> {
+        tracing::warn!(topic, "refused a subscription from a remote link");
+        Err(RpcError::new(
+            codes::LINK_REFUSED,
+            format!("a remote daemon may not subscribe to {topic}"),
+        ))
+    }
+}
+
 /// `Service` that serves requests for the local host from `local` and forwards everything
 /// addressed to another host over the hub's link to it (cursor passthrough for
 /// subscriptions; a dropped link closes downstream subscriptions with `HostLost`).

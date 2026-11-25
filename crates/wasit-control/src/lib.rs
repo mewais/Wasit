@@ -16,6 +16,7 @@ mod diag;
 pub mod error;
 pub mod hub;
 pub mod mux;
+mod pipe_security;
 pub mod server;
 pub mod service;
 pub mod supervised;
@@ -36,8 +37,8 @@ pub use connection::{
 pub use diag::ConnectDiag;
 pub use error::{peer_gone, CallError, ConnClose, ConnectError};
 pub use hub::{
-    CommandConnector, HostSpec, Hub, HubConfig, HubError, LinkConnector, LinkEvent, Provisioner,
-    RoutingService,
+    CommandConnector, HostSpec, Hub, HubConfig, HubError, LinkConnector, LinkEvent, LinkGate,
+    LinkPolicy, Provisioner, RoutingService,
 };
 pub use mux::{MuxError, ServiceMux};
 pub use server::ControlServer;
