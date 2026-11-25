@@ -1,0 +1,1322 @@
+{
+ "scenario": "bg_multi",
+ "kilo_version": "7.8.8",
+ "driver_error": null,
+ "env": {
+  "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS": "true"
+ },
+ "driver_notes": [
+  {
+   "event": "start",
+   "port": 46259,
+   "env": [
+    "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+   ]
+  },
+  {
+   "event": "exit",
+   "code": null,
+   "signal": "SIGTERM"
+  },
+  {
+   "event": "stdout_closed"
+  }
+ ],
+ "snapshots": [
+  {
+   "t": 4863,
+   "label": "parent_turn_done",
+   "endpoint": "status",
+   "body": {
+    "ses_deef3cd06ffeR2O4UzeyMCavSt": {
+     "type": "busy"
+    },
+    "ses_deef3cc48ffeLts17VbhCZjLzt": {
+     "type": "busy"
+    },
+    "ses_deef3cb9effehM3G4AE8E3ET4R": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 4889,
+   "label": "parent_turn_done",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "slug": "silent-moon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582341881,
+      "updated": 1795582342021
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "slug": "crisp-falcon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342071,
+      "updated": 1795582342191
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "slug": "crisp-meadow",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342241,
+      "updated": 1795582342440
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 4894,
+   "label": "parent_turn_done",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582341894,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582342079,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cc48ffeLts17VbhCZjLzt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582342247,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cb9effehM3G4AE8E3ET4R",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 4898,
+   "label": "parent_turn_done",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 5849,
+   "label": "children_idle",
+   "endpoint": "status",
+   "body": {
+    "ses_deef3ce34ffe9SdZlkRceb3kdU": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 5858,
+   "label": "children_idle",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "slug": "silent-moon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582341881,
+      "updated": 1795582343640
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "slug": "crisp-falcon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342071,
+      "updated": 1795582343551
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "slug": "crisp-meadow",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342241,
+      "updated": 1795582343707
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 5877,
+   "label": "children_idle",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582341894,
+     "completed_at": 1795582343619,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582342079,
+     "completed_at": 1795582343544,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cc48ffeLts17VbhCZjLzt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582342247,
+     "completed_at": 1795582343678,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cb9effehM3G4AE8E3ET4R",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 5894,
+   "label": "children_idle",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "http": [
+  {
+   "t": 4863,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deef3cd06ffeR2O4UzeyMCavSt": {
+     "type": "busy"
+    },
+    "ses_deef3cc48ffeLts17VbhCZjLzt": {
+     "type": "busy"
+    },
+    "ses_deef3cb9effehM3G4AE8E3ET4R": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 4889,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/session/ses_deef3ce34ffe9SdZlkRceb3kdU/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "slug": "silent-moon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582341881,
+      "updated": 1795582342021
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "slug": "crisp-falcon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342071,
+      "updated": 1795582342191
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "slug": "crisp-meadow",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342241,
+      "updated": 1795582342440
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 4894,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deef3ce34ffe9SdZlkRceb3kdU",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582341894,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582342079,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cc48ffeLts17VbhCZjLzt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582342247,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cb9effehM3G4AE8E3ET4R",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 4898,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 5849,
+   "label": "children_idle",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deef3ce34ffe9SdZlkRceb3kdU": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 5858,
+   "label": "children_idle",
+   "method": "GET",
+   "path": "/session/ses_deef3ce34ffe9SdZlkRceb3kdU/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "slug": "silent-moon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582341881,
+      "updated": 1795582343640
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "slug": "crisp-falcon",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342071,
+      "updated": 1795582343551
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "slug": "crisp-meadow",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582342241,
+      "updated": 1795582343707
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 5877,
+   "label": "children_idle",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deef3ce34ffe9SdZlkRceb3kdU",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582341894,
+     "completed_at": 1795582343619,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cd06ffeR2O4UzeyMCavSt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cc48ffeLts17VbhCZjLzt",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582342079,
+     "completed_at": 1795582343544,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cc48ffeLts17VbhCZjLzt",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    },
+    {
+     "id": "ses_deef3cb9effehM3G4AE8E3ET4R",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582342247,
+     "completed_at": 1795582343678,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef3ce34ffe9SdZlkRceb3kdU",
+      "sessionId": "ses_deef3cb9effehM3G4AE8E3ET4R",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 5894,
+   "label": "children_idle",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "provider": [
+  {
+   "t": 3876,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "task",
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG3_SLOW]]"
+   ]
+  },
+  {
+   "t": 4067,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "glob",
+    "hold": "child"
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 4080,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "tool",
+    "name": "task",
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG3_SLOW]]"
+   ]
+  },
+  {
+   "t": 4236,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "glob",
+    "hold": "child"
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 4248,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 6,
+   "prior_tool_calls": 2,
+   "decision": {
+    "kind": "tool",
+    "name": "task",
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG3_SLOW]]"
+   ]
+  },
+  {
+   "t": 4486,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "glob",
+    "hold": "child"
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 4498,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 8,
+   "prior_tool_calls": 3,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG3_SLOW]]"
+   ]
+  },
+  {
+   "t": 4618,
+   "path": "/v1/chat/completions",
+   "role": "title",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG3_SLOW]]"
+   ]
+  },
+  {
+   "t": 5198,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "tool",
+    "name": "read",
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 5260,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "tool",
+    "name": "read",
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 5293,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "tool",
+    "name": "read",
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 5493,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 6,
+   "prior_tool_calls": 2,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 5539,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 6,
+   "prior_tool_calls": 2,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 5590,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 6,
+   "prior_tool_calls": 2,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 5774,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 10,
+   "prior_tool_calls": 3,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG3_SLOW]]"
+   ]
+  }
+ ],
+ "child_ids": [
+  "ses_deef3cd06ffeR2O4UzeyMCavSt",
+  "ses_deef3cc48ffeLts17VbhCZjLzt",
+  "ses_deef3cb9effehM3G4AE8E3ET4R"
+ ]
+}

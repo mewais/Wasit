@@ -1641,7 +1641,8 @@ fn task_frames_become_task_events() {
             usage: Some(wasit_core::TaskUsage {
                 total_tokens: 59844,
                 tool_uses: 1,
-                duration_ms: 1111
+                duration_ms: 1111,
+                ..Default::default()
             }),
         }]
     );
@@ -1665,7 +1666,8 @@ fn task_frames_become_task_events() {
             usage: Some(wasit_core::TaskUsage {
                 total_tokens: 60846,
                 tool_uses: 1,
-                duration_ms: 2533
+                duration_ms: 2533,
+                ..Default::default()
             }),
         }]
     );
@@ -1877,6 +1879,35 @@ fn compact_and_run_shell_are_unsupported() {
         Err(wasit_core::DriverError::Unsupported {
             operation: "run_shell".into()
         })
+    );
+}
+
+/// Steering a subagent is not a claude command (its subagents take no messages from the
+/// outside): `Unsupported`, and claude claims only what its task protocol gives: live state and
+/// background tasks.
+#[test]
+fn steer_subagent_is_unsupported_and_subagent_claims_are_the_task_support() {
+    let (mut p, _) = ready();
+    assert_eq!(
+        p.encode(
+            InputId(132),
+            Command::SteerSubagent {
+                task_id: "a1".into(),
+                text: "hi".into()
+            }
+        ),
+        Err(wasit_core::DriverError::Unsupported {
+            operation: "steer_subagent".into()
+        })
+    );
+    let caps = ClaudeDescriptor.capabilities().subagents;
+    assert_eq!(
+        caps,
+        wasit_core::SubagentSupport {
+            live_state: true,
+            background: true,
+            ..Default::default()
+        }
     );
 }
 

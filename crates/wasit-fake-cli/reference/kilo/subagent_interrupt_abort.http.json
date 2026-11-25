@@ -1,0 +1,1046 @@
+{
+ "scenario": "interrupt_abort",
+ "kilo_version": "7.8.8",
+ "driver_error": null,
+ "env": {
+  "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS": "true"
+ },
+ "driver_notes": [
+  {
+   "event": "start",
+   "port": 39521,
+   "env": [
+    "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+   ]
+  },
+  {
+   "event": "abort scope=session returned",
+   "status": 200
+  },
+  {
+   "event": "session/prompt resolved after abort",
+   "result": {
+    "stopReason": "cancelled",
+    "usage": {
+     "inputTokens": 0,
+     "outputTokens": 0,
+     "totalTokens": 0
+    },
+    "_meta": {}
+   }
+  },
+  {
+   "event": "exit",
+   "code": null,
+   "signal": "SIGTERM"
+  },
+  {
+   "event": "stdout_closed"
+  }
+ ],
+ "snapshots": [
+  {
+   "t": 4439,
+   "label": "bg_child_launched_held",
+   "endpoint": "status",
+   "body": {
+    "ses_deeeda5a6ffe5H1venWRGsZ2Wf": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 4450,
+   "label": "bg_child_launched_held",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582745326
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 4455,
+   "label": "bg_child_launched_held",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582745188,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 4460,
+   "label": "bg_child_launched_held",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 6467,
+   "label": "parent_busy",
+   "endpoint": "status",
+   "body": {
+    "ses_deeeda5a6ffe5H1venWRGsZ2Wf": {
+     "type": "busy"
+    },
+    "ses_deeeda69affeVgnn6nbfkc03qa": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 6472,
+   "label": "parent_busy",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582745326
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 6475,
+   "label": "parent_busy",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582745188,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 6478,
+   "label": "parent_busy",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 8507,
+   "label": "after_abort_scope_session_child_held",
+   "endpoint": "status",
+   "body": {
+    "ses_deeeda5a6ffe5H1venWRGsZ2Wf": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 8511,
+   "label": "after_abort_scope_session_child_held",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582745326
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 8513,
+   "label": "after_abort_scope_session_child_held",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582745188,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 8516,
+   "label": "after_abort_scope_session_child_held",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 9925,
+   "label": "child_idle",
+   "endpoint": "status",
+   "body": {
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 9929,
+   "label": "child_idle",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582750097
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 9931,
+   "label": "child_idle",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582745188,
+     "completed_at": 1795582750090,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 9933,
+   "label": "child_idle",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "http": [
+  {
+   "t": 4439,
+   "label": "bg_child_launched_held",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deeeda5a6ffe5H1venWRGsZ2Wf": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 4449,
+   "label": "bg_child_launched_held",
+   "method": "GET",
+   "path": "/session/ses_deeeda69affeVgnn6nbfkc03qa/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582745326
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 4455,
+   "label": "bg_child_launched_held",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deeeda69affeVgnn6nbfkc03qa",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582745188,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 4460,
+   "label": "bg_child_launched_held",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 6467,
+   "label": "parent_busy",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deeeda5a6ffe5H1venWRGsZ2Wf": {
+     "type": "busy"
+    },
+    "ses_deeeda69affeVgnn6nbfkc03qa": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 6472,
+   "label": "parent_busy",
+   "method": "GET",
+   "path": "/session/ses_deeeda69affeVgnn6nbfkc03qa/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582745326
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 6475,
+   "label": "parent_busy",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deeeda69affeVgnn6nbfkc03qa",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582745188,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 6478,
+   "label": "parent_busy",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 6501,
+   "label": "abort_parent_scope_session",
+   "method": "POST",
+   "path": "/session/ses_deeeda69affeVgnn6nbfkc03qa/abort?scope=session",
+   "status": 200,
+   "body": true
+  },
+  {
+   "t": 8507,
+   "label": "after_abort_scope_session_child_held",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deeeda5a6ffe5H1venWRGsZ2Wf": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 8511,
+   "label": "after_abort_scope_session_child_held",
+   "method": "GET",
+   "path": "/session/ses_deeeda69affeVgnn6nbfkc03qa/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582745326
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 8513,
+   "label": "after_abort_scope_session_child_held",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deeeda69affeVgnn6nbfkc03qa",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582745188,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 8516,
+   "label": "after_abort_scope_session_child_held",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 9925,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {}
+  },
+  {
+   "t": 9929,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/session/ses_deeeda69affeVgnn6nbfkc03qa/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "slug": "calm-rocket",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeeda69affeVgnn6nbfkc03qa",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582745178,
+      "updated": 1795582750097
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 9931,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deeeda69affeVgnn6nbfkc03qa",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582745188,
+     "completed_at": 1795582750090,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeeda69affeVgnn6nbfkc03qa",
+      "sessionId": "ses_deeeda5a6ffe5H1venWRGsZ2Wf",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 9933,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "provider": [
+  {
+   "t": 3898,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "task",
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 4099,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "glob",
+    "hold": "child"
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 4112,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 4176,
+   "path": "/v1/chat/completions",
+   "role": "title",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 4578,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 6,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": "parent"
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]",
+    "[[PARENT_HOLD]]"
+   ]
+  },
+  {
+   "t": 8703,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "tool",
+    "name": "read",
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 8797,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 6,
+   "prior_tool_calls": 2,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  }
+ ],
+ "child_ids": [
+  "ses_deeeda5a6ffe5H1venWRGsZ2Wf"
+ ]
+}

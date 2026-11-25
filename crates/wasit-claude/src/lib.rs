@@ -32,7 +32,8 @@ use wasit_core::{
     ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext, DiscoveryKind,
     DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput, HistoryDelivery,
     HistoryLimits, HistoryParser, McpServerConfig, McpTransport, ProbeAction, ProbeOutput,
-    PromptInput, Protocol, ResumableSession, ResumeMode, SessionMode, SpawnSpec, Unsupported,
+    PromptInput, Protocol, ResumableSession, ResumeMode, SessionMode, SpawnSpec, SubagentSupport,
+    Unsupported,
 };
 
 pub use history::ClaudeHistory;
@@ -139,6 +140,14 @@ impl DriverDescriptor for ClaudeDescriptor {
             // `ClaudeProtocol::encode` for `Command::Compact`.
             compact: true,
             run_shell: false,
+            // Claude reports each background task's progress and end live, and runs subagents and
+            // shell commands in the background (its task support). It has no steering and no
+            // per-task transcript or usage in this driver.
+            subagents: SubagentSupport {
+                live_state: true,
+                background: true,
+                ..SubagentSupport::default()
+            },
         }
     }
 

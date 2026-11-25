@@ -40,7 +40,7 @@ pub use config::{
 pub use content::{Attachment, ContentPart, FileInput, MediaSource, PromptInput};
 pub use descriptor::{
     BusyPrompt, DriverCapabilities, DriverDescriptor, DriverId, DriverRegistry, RegistryError,
-    SavesConversation,
+    SavesConversation, SubagentSupport,
 };
 pub use discovery::{
     config_listing, exec_stdout, front_matter, handshake_events, listed_files, markdown_items,
@@ -52,8 +52,8 @@ pub use event::{
     AgentEvent, BackgroundTask, ChoiceText, CompactionInfo, EndReason, GateChoice, GateChoiceKind,
     GateDecision, GateReason, GateRequest, InputDropReason, LocalShellOrigin, McpServerInfo,
     ModelInfo, ModelUsage, PlanEntry, QuestionAnswer, QuestionOption, QuestionPrompt,
-    RateLimitInfo, Scope, SessionMode, SlashCommandInfo, SpawnGate, TaskUsage, TurnBinding,
-    TurnOrigin, TurnTrigger, Usage,
+    RateLimitInfo, Scope, SessionMode, SlashCommandInfo, SpawnGate, TaskOutcome, TaskUsage,
+    TurnBinding, TurnOrigin, TurnTrigger, Usage,
 };
 pub use history::{
     FileProblem, HistoryDelivery, HistoryFailure, HistoryLimits, HistoryParse, HistoryParser,

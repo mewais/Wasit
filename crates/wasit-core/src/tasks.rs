@@ -379,6 +379,7 @@ mod tests {
                     total_tokens: 5,
                     tool_uses: 1,
                     duration_ms: 9,
+                    ..Default::default()
                 }),
             },
             7,

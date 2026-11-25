@@ -120,6 +120,32 @@ pub struct DriverCapabilities {
     /// agent CLI's own shell (its output is reported as [`AgentEvent::LocalShell`]).
     #[serde(default)]
     pub run_shell: bool,
+    /// What the driver can show and do about the subagents (tasks) the session owns.
+    #[serde(default)]
+    pub subagents: SubagentSupport,
+}
+
+/// What a driver can say about, and do with, the subagents of a session. Every field is an
+/// independent claim: `false` is honest, and a driver sets only what its protocol provides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SubagentSupport {
+    /// The events of a subagent's own conversation arrive as [`AgentEvent::Scoped`] events.
+    #[serde(default)]
+    pub transcript: bool,
+    /// The agent reports a subagent's running state while it runs (task progress, its end),
+    /// not only when it ends.
+    #[serde(default)]
+    pub live_state: bool,
+    /// The agent reports what a subagent has used ([`AgentEvent::TaskProgress`] usage).
+    #[serde(default)]
+    pub usage: bool,
+    /// `Command::SteerSubagent` sends a message to a subagent that is running.
+    #[serde(default)]
+    pub steer: bool,
+    /// Subagents can run in the background: they outlive the turn that started them.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Everything the runtime needs to know about one CLI. Implemented by each
@@ -320,6 +346,7 @@ mod tests {
                 fork: false,
                 compact: false,
                 run_shell: false,
+                subagents: SubagentSupport::default(),
             }
         }
         fn new_protocol(&self) -> Box<dyn Protocol> {
@@ -373,6 +400,13 @@ mod capability_tests {
             fork: true,
             compact: true,
             run_shell: true,
+            subagents: SubagentSupport {
+                transcript: true,
+                live_state: true,
+                usage: true,
+                steer: true,
+                background: true,
+            },
         };
         let mut json = serde_json::to_value(caps).unwrap();
         assert_eq!(json["fork"], true);
@@ -386,8 +420,31 @@ mod capability_tests {
         obj.remove("fork");
         obj.remove("compact");
         obj.remove("run_shell");
+        obj.remove("subagents");
         let old: DriverCapabilities = serde_json::from_value(json).unwrap();
         assert!(!old.fork && !old.compact && !old.run_shell);
         assert!(old.interrupt && old.stop_task);
+        assert_eq!(old.subagents, SubagentSupport::default());
+    }
+
+    /// Subagent support is a set of independent claims, each false unless a driver says so; a
+    /// capability report from before the field reads as none of them, and the wire keys are
+    /// the claim names.
+    #[test]
+    fn subagent_support_defaults_to_nothing_and_has_named_keys() {
+        assert_eq!(
+            serde_json::to_value(SubagentSupport::default()).unwrap(),
+            serde_json::json!({"transcript": false, "live_state": false, "usage": false,
+                               "steer": false, "background": false})
+        );
+        let partial: SubagentSupport =
+            serde_json::from_value(serde_json::json!({"live_state": true})).unwrap();
+        assert_eq!(
+            partial,
+            SubagentSupport {
+                live_state: true,
+                ..SubagentSupport::default()
+            }
+        );
     }
 }

@@ -746,8 +746,8 @@ pub enum TurnTrigger {
     /// The turn runs for an input of ours: `input` names it.
     Input,
     /// The agent started the turn by itself, for no input of ours (claude: after a background
-    /// task ended). The agent's own account of why, when it gives one, is
-    /// [`AgentEvent::TurnCompleted::origin`].
+    /// task ended; Kilo: delivering the result of a background task). The agent's own account of
+    /// why, when it gives one, is [`AgentEvent::TurnCompleted::origin`].
     Agent,
 }
 
@@ -786,9 +786,12 @@ pub struct Scope {
 }
 
 /// What a background task has used so far (claude `usage` of `task_progress` /
-/// `task_notification`). As the agent reports it: cumulative for the task, never added to the
-/// session's own usage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// `task_notification`; a Kilo child session's tokens and cost). As the agent reports it:
+/// cumulative for the task, never added to the session's own usage.
+///
+/// The token and cost fields are only set by drivers whose agent reports them per task; a
+/// reader that finds them `None` knows nothing about them, not that they are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub struct TaskUsage {
@@ -798,6 +801,55 @@ pub struct TaskUsage {
     pub tool_uses: u64,
     #[serde(default)]
     pub duration_ms: u64,
+    /// Prompt tokens the task sent to the model, when the agent reports them per task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Tokens the task's model responses held, when the agent reports them per task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Cost in USD of the task, when the agent reports it per task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// How a task ended, in the vocabulary every driver shares ([`AgentEvent::TaskEnded::status`]
+/// carries its [`TaskOutcome::status`] word; [`AgentEvent::TaskEnded::ok`] is
+/// [`TaskOutcome::ok`]). Drivers whose agent names the outcome itself map its word onto one of
+/// these; the runtime's own closing of tasks (`wasit_core::tasks`) keeps its words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    /// The task finished its work successfully.
+    Completed,
+    /// The task finished with an error.
+    Failed,
+    /// The task was stopped on request (the agent said so, or a stop command ended it).
+    Stopped,
+    /// The task was running when the process that owns it ended, so its real outcome is never
+    /// known: its work may have finished or not.
+    Lost,
+    /// The task was running, but the source that reports its state was lost (a dropped event
+    /// stream, a state query that failed): it may still be running. Never a guess of success.
+    Unknown,
+}
+
+impl TaskOutcome {
+    /// The status word of the outcome (what [`AgentEvent::TaskEnded::status`] carries).
+    pub fn status(self) -> &'static str {
+        match self {
+            TaskOutcome::Completed => "completed",
+            TaskOutcome::Failed => "failed",
+            TaskOutcome::Stopped => "stopped",
+            TaskOutcome::Lost => "lost",
+            TaskOutcome::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the task succeeded: only [`TaskOutcome::Completed`] does.
+    pub fn ok(self) -> bool {
+        self == TaskOutcome::Completed
+    }
 }
 
 /// One task the agent says it runs in the background right now
@@ -1345,6 +1397,7 @@ mod tests {
                 total_tokens: 1,
                 tool_uses: 2,
                 duration_ms: 3,
+                ..Default::default()
             }),
         };
         let json = serde_json::to_value(&ended).unwrap();
@@ -1354,6 +1407,79 @@ mod tests {
             serde_json::json!({"total_tokens": 1, "tool_uses": 2, "duration_ms": 3})
         );
         assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), ended);
+    }
+
+    /// The outcome vocabulary: every word is the status a `TaskEnded` carries, only `completed`
+    /// is ok, and a task ended by the old shape (no outcome words it did not know) still reads.
+    #[test]
+    fn task_outcomes_have_their_status_words_and_only_completed_is_ok() {
+        for (outcome, word) in [
+            (TaskOutcome::Completed, "completed"),
+            (TaskOutcome::Failed, "failed"),
+            (TaskOutcome::Stopped, "stopped"),
+            (TaskOutcome::Lost, "lost"),
+            (TaskOutcome::Unknown, "unknown"),
+        ] {
+            assert_eq!(outcome.status(), word);
+            assert_eq!(
+                serde_json::to_value(outcome).unwrap(),
+                serde_json::json!(word)
+            );
+            assert_eq!(
+                serde_json::from_value::<TaskOutcome>(serde_json::json!(word)).unwrap(),
+                outcome
+            );
+            assert_eq!(outcome.ok(), outcome == TaskOutcome::Completed);
+            // A `TaskEnded` built from an outcome carries its word and its ok.
+            let ended = AgentEvent::TaskEnded {
+                task_id: "c".into(),
+                call_id: None,
+                status: outcome.status().into(),
+                ok: outcome.ok(),
+                summary: None,
+                usage: None,
+            };
+            let back: AgentEvent =
+                serde_json::from_value(serde_json::to_value(&ended).unwrap()).unwrap();
+            assert_eq!(back, ended);
+        }
+        assert!(serde_json::from_value::<TaskOutcome>(serde_json::json!("killed")).is_err());
+    }
+
+    /// Per-task usage gained token and cost fields; an event from before them reads them as
+    /// unknown (`None`), not zero, and a claude-shaped usage writes no new keys.
+    #[test]
+    fn task_usage_without_the_new_fields_reads_them_as_unknown() {
+        let old: TaskUsage = serde_json::from_value(serde_json::json!({
+            "total_tokens": 5, "tool_uses": 1, "duration_ms": 9
+        }))
+        .unwrap();
+        assert_eq!(
+            old,
+            TaskUsage {
+                total_tokens: 5,
+                tool_uses: 1,
+                duration_ms: 9,
+                input_tokens: None,
+                output_tokens: None,
+                cost_usd: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(old).unwrap(),
+            serde_json::json!({"total_tokens": 5, "tool_uses": 1, "duration_ms": 9})
+        );
+        let full = TaskUsage {
+            input_tokens: Some(3),
+            output_tokens: Some(0),
+            cost_usd: Some(0.0),
+            ..old
+        };
+        let json = serde_json::to_value(full).unwrap();
+        assert_eq!(json["input_tokens"], 3);
+        assert_eq!(json["output_tokens"], 0, "a known zero is written");
+        assert_eq!(json["cost_usd"], 0.0);
+        assert_eq!(serde_json::from_value::<TaskUsage>(json).unwrap(), full);
     }
 
     /// Earlier history is wire-stable: a wrapper around the event, the time only when the agent

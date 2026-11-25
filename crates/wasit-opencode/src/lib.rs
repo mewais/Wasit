@@ -22,7 +22,7 @@ use wasit_core::{
     ConfigItem, ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext,
     DiscoveryKind, DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput,
     GeneratedFile, HistoryDelivery, McpServerConfig, McpTransport, ModelInfo, ProbeAction,
-    ProbeOutput, PromptInput, Protocol, ResumableSession, SpawnSpec, Unsupported,
+    ProbeOutput, PromptInput, Protocol, ResumableSession, SpawnSpec, SubagentSupport, Unsupported,
 };
 
 pub use protocol::{config_models, config_modes, AcpProtocol};
@@ -141,6 +141,7 @@ impl DriverDescriptor for AcpDescriptor {
             fork: false,
             compact: false,
             run_shell: false,
+            subagents: SubagentSupport::default(),
         }
     }
 

@@ -726,6 +726,11 @@ fn applied(
             target = Some(Ident::new(name));
         }
         Command::StopTask { task_id } => target = Some(Ident::new(task_id)),
+        // As for a prompt: the length of the message is kept, never its text.
+        Command::SteerSubagent { task_id, text } => {
+            n_chars = chars(text);
+            target = Some(Ident::new(task_id));
+        }
         // Only the length of the line is kept, as for a prompt: it is the user's own shell text.
         Command::RunShell { line, .. } => n_chars = chars(line),
         Command::Interrupt | Command::Compact | Command::Shutdown => {}
@@ -1501,6 +1506,7 @@ mod tests {
                         total_tokens: 9,
                         tool_uses: 2,
                         duration_ms: 30,
+                        ..Default::default()
                     }),
                 },
             }),

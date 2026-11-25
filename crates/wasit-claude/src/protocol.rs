@@ -409,6 +409,9 @@ impl ClaudeProtocol {
             Command::RunShell { .. } => Err(DriverError::Unsupported {
                 operation: "run_shell".into(),
             }),
+            Command::SteerSubagent { .. } => Err(DriverError::Unsupported {
+                operation: "steer_subagent".into(),
+            }),
             Command::Shutdown => {
                 self.phase = Phase::Closed;
                 let events = std::mem::take(&mut self.queue)
@@ -1583,6 +1586,7 @@ fn task_usage(v: &Value) -> Option<TaskUsage> {
         total_tokens: wasit_core::wire::u(u, "total_tokens"),
         tool_uses: wasit_core::wire::u(u, "tool_uses"),
         duration_ms: wasit_core::wire::u(u, "duration_ms"),
+        ..Default::default()
     })
 }
 

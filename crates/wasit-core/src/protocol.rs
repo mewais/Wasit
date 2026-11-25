@@ -143,6 +143,12 @@ pub enum Command {
     /// [`DriverCapabilities::stop_task`](crate::DriverCapabilities::stop_task). The agent reports
     /// the end of the task as [`AgentEvent::TaskEnded`](crate::AgentEvent::TaskEnded).
     StopTask { task_id: String },
+    /// Send a message to a subagent that is running now, in place: the subagent (a task the
+    /// session owns, [`TaskInfo::task_id`](crate::TaskInfo::task_id), the subagent's own
+    /// session) takes it as its next input and the session keeps owning it. Needs
+    /// [`DriverCapabilities::subagents`](crate::DriverCapabilities::subagents)`.steer`. Stopping
+    /// it is [`Command::StopTask`]. The text is the user's message to it, as the user wrote it.
+    SteerSubagent { task_id: String, text: String },
     /// Compact the conversation's context. Needs
     /// [`DriverCapabilities::compact`](crate::DriverCapabilities::compact).
     Compact,
@@ -179,6 +185,7 @@ impl Command {
             Command::SetMode { .. } => "set_mode",
             Command::RunSlash { .. } => "run_slash",
             Command::StopTask { .. } => "stop_task",
+            Command::SteerSubagent { .. } => "steer_subagent",
             Command::Compact => "compact",
             Command::RunShell { .. } => "run_shell",
             Command::Shutdown => "shutdown",
@@ -258,6 +265,31 @@ mod shape_tests {
             assert_eq!(back, cmd);
         }
         assert_eq!(Command::Compact.name(), "compact");
+    }
+
+    /// Steering is a command to a running subagent: its wire shape is pinned, and it is the
+    /// only subagent command of its own (stopping one is `StopTask`).
+    #[test]
+    fn steer_subagent_has_its_wire_shape_and_stop_is_stop_task() {
+        let steer = Command::SteerSubagent {
+            task_id: "ses_child".into(),
+            text: "use the other file".into(),
+        };
+        let json = serde_json::to_value(&steer).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"command": "steer_subagent", "task_id": "ses_child",
+                               "text": "use the other file"})
+        );
+        assert_eq!(serde_json::from_value::<Command>(json).unwrap(), steer);
+        assert_eq!(steer.name(), "steer_subagent");
+        assert_eq!(
+            serde_json::to_value(Command::StopTask {
+                task_id: "ses_child".into()
+            })
+            .unwrap(),
+            serde_json::json!({"command": "stop_task", "task_id": "ses_child"})
+        );
         assert_eq!(
             Command::RunShell {
                 line: String::new(),

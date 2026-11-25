@@ -1317,6 +1317,7 @@ impl Actor {
             Command::SetMode { .. } => !caps.set_mode,
             Command::RunSlash { .. } => !caps.slash_commands,
             Command::StopTask { .. } => !caps.stop_task,
+            Command::SteerSubagent { .. } => !caps.subagents.steer,
             Command::Compact => !caps.compact,
             Command::RunShell { .. } => !caps.run_shell,
             _ => false,

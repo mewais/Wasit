@@ -22,7 +22,7 @@ use wasit_core::{
     ConfigItem, ConfigItemKind, ConfigRenderer, ConfigSource, Discovered, DiscoveryContext,
     DiscoveryKind, DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput,
     HistoryDelivery, McpServerConfig, McpTransport, ProbeAction, ProbeOutput, PromptInput,
-    Protocol, ResumableSession, SavesConversation, SpawnSpec, Unsupported,
+    Protocol, ResumableSession, SavesConversation, SpawnSpec, SubagentSupport, Unsupported,
 };
 
 pub use protocol::{CodexProtocol, SKILL_ROOTS_OPTION};
@@ -86,6 +86,7 @@ impl DriverDescriptor for CodexDescriptor {
             fork: true,
             compact: true,
             run_shell: true,
+            subagents: SubagentSupport::default(),
         }
     }
 

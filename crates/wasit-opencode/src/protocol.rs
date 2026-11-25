@@ -342,6 +342,11 @@ impl AcpProtocol {
                     operation: "stop_task".into(),
                 })
             }
+            Command::SteerSubagent { .. } => {
+                return Err(DriverError::Unsupported {
+                    operation: "steer_subagent".into(),
+                })
+            }
             Command::Interrupt => step = self.interrupt(),
             Command::SetModel { model } => {
                 let line = self.set_option(Req::SetModel, "model", &model);

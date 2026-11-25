@@ -474,6 +474,11 @@ impl CodexProtocol {
                     operation: "stop_task".into(),
                 })
             }
+            Command::SteerSubagent { .. } => {
+                return Err(DriverError::Unsupported {
+                    operation: "steer_subagent".into(),
+                })
+            }
             Command::Compact => {
                 let line = self.compact_request();
                 step.write.push(line);

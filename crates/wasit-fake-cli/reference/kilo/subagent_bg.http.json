@@ -1,0 +1,1024 @@
+{
+ "scenario": "bg",
+ "kilo_version": "7.8.8",
+ "driver_error": null,
+ "env": {
+  "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS": "true"
+ },
+ "driver_notes": [
+  {
+   "event": "start",
+   "port": 43679,
+   "env": [
+    "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+   ]
+  },
+  {
+   "event": "session/load child",
+   "ok": true
+  },
+  {
+   "event": "child updates forwarded after gate open",
+   "withChildSessionId": 10,
+   "otherSessionId": 0
+  },
+  {
+   "event": "exit",
+   "code": null,
+   "signal": "SIGTERM"
+  },
+  {
+   "event": "stdout_closed"
+  }
+ ],
+ "snapshots": [
+  {
+   "t": 5019,
+   "label": "parent_turn_done",
+   "endpoint": "status",
+   "body": {
+    "ses_deef41713ffemDqz84K4hP7xlK": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 5029,
+   "label": "parent_turn_done",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582323097
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 5034,
+   "label": "parent_turn_done",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582322935,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 5044,
+   "label": "parent_turn_done",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 5562,
+   "label": "after_load_child_running",
+   "endpoint": "status",
+   "body": {
+    "ses_deef41713ffemDqz84K4hP7xlK": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 5568,
+   "label": "after_load_child_running",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582323097
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 5571,
+   "label": "after_load_child_running",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582322935,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 5575,
+   "label": "after_load_child_running",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 5992,
+   "label": "child_idle",
+   "endpoint": "status",
+   "body": {
+    "ses_deef4185bffeFXkCR56N2gQL5B": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 6006,
+   "label": "child_idle",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582324479
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 6011,
+   "label": "child_idle",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582322935,
+     "completed_at": 1795582324471,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 6024,
+   "label": "child_idle",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 11033,
+   "label": "settled_5s_after_child_idle",
+   "endpoint": "status",
+   "body": {
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 11038,
+   "label": "settled_5s_after_child_idle",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582324479
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 11041,
+   "label": "settled_5s_after_child_idle",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582322935,
+     "completed_at": 1795582324471,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 11045,
+   "label": "settled_5s_after_child_idle",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "http": [
+  {
+   "t": 5019,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deef41713ffemDqz84K4hP7xlK": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 5028,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/session/ses_deef4185bffeFXkCR56N2gQL5B/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582323097
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 5034,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deef4185bffeFXkCR56N2gQL5B",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582322935,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 5044,
+   "label": "parent_turn_done",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 5562,
+   "label": "after_load_child_running",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deef41713ffemDqz84K4hP7xlK": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 5568,
+   "label": "after_load_child_running",
+   "method": "GET",
+   "path": "/session/ses_deef4185bffeFXkCR56N2gQL5B/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582323097
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 5571,
+   "label": "after_load_child_running",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deef4185bffeFXkCR56N2gQL5B",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582322935,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 5575,
+   "label": "after_load_child_running",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 5992,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deef4185bffeFXkCR56N2gQL5B": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 6006,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/session/ses_deef4185bffeFXkCR56N2gQL5B/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582324479
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 6011,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deef4185bffeFXkCR56N2gQL5B",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582322935,
+     "completed_at": 1795582324471,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 6024,
+   "label": "child_idle",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 11033,
+   "label": "settled_5s_after_child_idle",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {}
+  },
+  {
+   "t": 11038,
+   "label": "settled_5s_after_child_idle",
+   "method": "GET",
+   "path": "/session/ses_deef4185bffeFXkCR56N2gQL5B/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "slug": "brave-pixel",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deef4185bffeFXkCR56N2gQL5B",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 300,
+      "output": 60,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582322924,
+      "updated": 1795582324479
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 11041,
+   "label": "settled_5s_after_child_idle",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deef4185bffeFXkCR56N2gQL5B",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deef41713ffemDqz84K4hP7xlK",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "completed",
+     "started_at": 1795582322935,
+     "completed_at": 1795582324471,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deef4185bffeFXkCR56N2gQL5B",
+      "sessionId": "ses_deef41713ffemDqz84K4hP7xlK",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 11045,
+   "label": "settled_5s_after_child_idle",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "provider": [
+  {
+   "t": 4376,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "task",
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 4611,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "glob",
+    "hold": "child"
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 4626,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 4704,
+   "path": "/v1/chat/completions",
+   "role": "title",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 5743,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "tool",
+    "name": "read",
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 5900,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 6,
+   "prior_tool_calls": 2,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 6071,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 6,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  }
+ ],
+ "child_ids": [
+  "ses_deef41713ffemDqz84K4hP7xlK"
+ ]
+}

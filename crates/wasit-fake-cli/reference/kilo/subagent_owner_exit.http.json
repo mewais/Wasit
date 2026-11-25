@@ -1,0 +1,517 @@
+{
+ "scenario": "owner_exit",
+ "kilo_version": "7.8.8",
+ "driver_error": null,
+ "env": {
+  "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS": "true"
+ },
+ "driver_notes": [
+  {
+   "event": "start",
+   "port": 33369,
+   "env": [
+    "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+   ]
+  },
+  {
+   "event": "SIGKILL kilo main pid"
+  },
+  {
+   "event": "exit",
+   "code": null,
+   "signal": "SIGKILL"
+  },
+  {
+   "event": "stdout_closed"
+  },
+  {
+   "event": "start",
+   "port": 42595,
+   "env": [
+    "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+   ]
+  },
+  {
+   "event": "restart: session/load child",
+   "result": "ok"
+  },
+  {
+   "event": "exit",
+   "code": null,
+   "signal": "SIGTERM"
+  },
+  {
+   "event": "killed kilo exit",
+   "code": null,
+   "signal": "SIGKILL"
+  },
+  {
+   "event": "stdout_closed"
+  }
+ ],
+ "snapshots": [
+  {
+   "t": 6395,
+   "label": "child_running_before_kill",
+   "endpoint": "status",
+   "body": {
+    "ses_deeee64ebffeMYM45oWt61MUC0": {
+     "type": "busy"
+    },
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 6403,
+   "label": "child_running_before_kill",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deeee64ebffeMYM45oWt61MUC0",
+     "slug": "crisp-planet",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeee65ebffegDf1vN0ZqDY13z",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582696212,
+      "updated": 1795582696369
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 6407,
+   "label": "child_running_before_kill",
+   "endpoint": "background-jobs",
+   "body": [
+    {
+     "id": "ses_deeee64ebffeMYM45oWt61MUC0",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582696223,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeee65ebffegDf1vN0ZqDY13z",
+      "sessionId": "ses_deeee64ebffeMYM45oWt61MUC0",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 6410,
+   "label": "child_running_before_kill",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 12563,
+   "label": "restart_after_load",
+   "endpoint": "status",
+   "body": {
+    "_other_sessions": 0
+   }
+  },
+  {
+   "t": 12571,
+   "label": "restart_after_load",
+   "endpoint": "children",
+   "body": [
+    {
+     "id": "ses_deeee64ebffeMYM45oWt61MUC0",
+     "slug": "crisp-planet",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeee65ebffegDf1vN0ZqDY13z",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582696212,
+      "updated": 1795582696369
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 12575,
+   "label": "restart_after_load",
+   "endpoint": "background-jobs",
+   "body": []
+  },
+  {
+   "t": 12579,
+   "label": "restart_after_load",
+   "endpoint": "permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "http": [
+  {
+   "t": 6395,
+   "label": "child_running_before_kill",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {
+    "ses_deeee64ebffeMYM45oWt61MUC0": {
+     "type": "busy"
+    }
+   }
+  },
+  {
+   "t": 6403,
+   "label": "child_running_before_kill",
+   "method": "GET",
+   "path": "/session/ses_deeee65ebffegDf1vN0ZqDY13z/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeee64ebffeMYM45oWt61MUC0",
+     "slug": "crisp-planet",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeee65ebffegDf1vN0ZqDY13z",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582696212,
+      "updated": 1795582696369
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 6407,
+   "label": "child_running_before_kill",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deeee65ebffegDf1vN0ZqDY13z",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeee64ebffeMYM45oWt61MUC0",
+     "type": "task",
+     "title": "probe subagent",
+     "status": "running",
+     "started_at": 1795582696223,
+     "completed_at": null,
+     "error": null,
+     "metadata": {
+      "parentSessionId": "ses_deeee65ebffegDf1vN0ZqDY13z",
+      "sessionId": "ses_deeee64ebffeMYM45oWt61MUC0",
+      "model": {
+       "modelID": "fake-model",
+       "providerID": "fake"
+      },
+      "background": true
+     }
+    }
+   ]
+  },
+  {
+   "t": 6410,
+   "label": "child_running_before_kill",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 12563,
+   "label": "restart_after_load",
+   "method": "GET",
+   "path": "/session/status",
+   "status": 200,
+   "body": {}
+  },
+  {
+   "t": 12571,
+   "label": "restart_after_load",
+   "method": "GET",
+   "path": "/session/ses_deeee65ebffegDf1vN0ZqDY13z/children",
+   "status": 200,
+   "body": [
+    {
+     "id": "ses_deeee64ebffeMYM45oWt61MUC0",
+     "slug": "crisp-planet",
+     "projectID": "global",
+     "directory": "$PROBE/fixture",
+     "path": "$PROBE/fixture",
+     "parentID": "ses_deeee65ebffegDf1vN0ZqDY13z",
+     "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+     },
+     "cost": 0,
+     "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+       "read": 0,
+       "write": 0
+      }
+     },
+     "title": "probe subagent (@general subagent)",
+     "agent": "general",
+     "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+     },
+     "version": "7.8.8",
+     "time": {
+      "created": 1795582696212,
+      "updated": 1795582696369
+     },
+     "permission": [
+      {
+       "permission": "suggest",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "repo_clone",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "question",
+       "pattern": "*",
+       "action": "deny"
+      },
+      {
+       "permission": "task",
+       "pattern": "*",
+       "action": "deny"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "t": 12575,
+   "label": "restart_after_load",
+   "method": "GET",
+   "path": "/kilocode/background-jobs?sessionID=ses_deeee65ebffegDf1vN0ZqDY13z",
+   "status": 200,
+   "body": []
+  },
+  {
+   "t": 12579,
+   "label": "restart_after_load",
+   "method": "GET",
+   "path": "/permission",
+   "status": 200,
+   "body": []
+  }
+ ],
+ "provider": [
+  {
+   "t": 3804,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "task",
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 4049,
+   "path": "/v1/chat/completions",
+   "role": "child",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "tool",
+    "name": "glob",
+    "hold": "child"
+   },
+   "user_markers": [
+    "[[CHILD]]",
+    "[[CHILD_SLOW]]"
+   ]
+  },
+  {
+   "t": 4062,
+   "path": "/v1/chat/completions",
+   "role": "parent",
+   "messages": 4,
+   "prior_tool_calls": 1,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  },
+  {
+   "t": 4130,
+   "path": "/v1/chat/completions",
+   "role": "title",
+   "messages": 2,
+   "prior_tool_calls": 0,
+   "decision": {
+    "kind": "text",
+    "name": null,
+    "hold": null
+   },
+   "user_markers": [
+    "[[PARENT_BG_SLOW]]"
+   ]
+  }
+ ],
+ "child_ids": [
+  "ses_deeee64ebffeMYM45oWt61MUC0"
+ ]
+}
