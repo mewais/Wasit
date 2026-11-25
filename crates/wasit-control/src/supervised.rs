@@ -570,6 +570,11 @@ async fn run(
                     };
                     Next::Provision { reason, fallback }
                 } else {
+                    // A reconnect requested while this attempt was in flight asked for a link,
+                    // and this attempt is one: it is satisfied here. Only a request made after
+                    // the link is up drops it (otherwise the link is torn down at once and
+                    // redialled for nothing).
+                    reconnect_rx.borrow_and_update();
                     attempt = 0;
                     bridge_unavailable = 0;
                     provisioned = None;

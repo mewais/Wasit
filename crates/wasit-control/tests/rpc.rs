@@ -605,6 +605,71 @@ async fn supervised_request_waits_for_link_within_caller_deadline() {
     sup.stop().await;
 }
 
+/// A reconnect requested while an attempt is in flight is satisfied by the link that attempt
+/// makes: the new link is kept, not dropped and dialled again for that same request.
+#[tokio::test]
+async fn reconnect_requested_during_an_attempt_keeps_the_link_it_makes() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    let server = ControlServer::new(Arc::new(DemoService::new("srv")), hello("srv"), cfg());
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let conn = {
+        let (server, entered, release, calls) = (
+            server.clone(),
+            entered.clone(),
+            release.clone(),
+            calls.clone(),
+        );
+        connector(move || {
+            let (server, entered, release, calls) = (
+                server.clone(),
+                entered.clone(),
+                release.clone(),
+                calls.clone(),
+            );
+            async move {
+                // Only the first attempt is held open: it is the one a reconnect lands in.
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                mem_connect(&server, ClientOptions::new(hello("sup")).config(cfg())).await
+            }
+        })
+    };
+    let states = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let log = states.clone();
+    let sup = Supervised::spawn(
+        conn,
+        SupervisedOptions {
+            on_state: Some(Arc::new(move |s: &LinkState| {
+                log.lock().unwrap().push(s.code())
+            })),
+            ..Default::default()
+        },
+    );
+    within(entered.notified()).await;
+    sup.reconnect_now();
+    release.notify_one();
+    let mut st = sup.state();
+    within(st.wait_for(|s| s.is_connected())).await.unwrap();
+    sup.stop().await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the reconnect made during the attempt must not dial a second time"
+    );
+    assert_eq!(
+        *states.lock().unwrap(),
+        ["connecting", "connected", "stopped"],
+        "the link the attempt made must not be dropped"
+    );
+}
+
 #[tokio::test]
 async fn flow_control_lets_a_large_replay_through_a_small_window_without_lag() {
     let small = ConnConfig {
