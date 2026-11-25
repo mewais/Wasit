@@ -47,3 +47,39 @@ async fn a_wait_with_no_start_in_progress_returns_at_once() {
         .await
         .expect("nothing to wait for");
 }
+
+/// A wait for a start that never ends must not take a thread of the blocking pool for as long
+/// as it lasts: with a one-thread pool, dropping the wait leaves that thread free and a second
+/// blocking task still runs while the start is in progress.
+#[test]
+fn a_dropped_wait_does_not_pin_the_blocking_pool() {
+    use futures::FutureExt;
+    let dir = scratch_dir("starting-pool");
+    let sock = dir.join("d.sock");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let first = StartingLock::try_acquire(&sock).await.unwrap();
+        // Poll the wait once (it starts waiting), then drop it while the start is still going.
+        let mut waiting = Box::pin(wait_until_started(sock.clone()));
+        assert!(
+            waiting.as_mut().now_or_never().is_none(),
+            "the start is still in progress"
+        );
+        drop(waiting);
+
+        // The one blocking-pool thread is free: a second blocking task runs now.
+        let ran = tokio::time::timeout(BOUND, tokio::task::spawn_blocking(|| 7)).await;
+        // Release the start before judging, so a failing run still ends.
+        drop(first);
+        assert_eq!(
+            ran.expect("a blocking task ran while the dropped wait was pending")
+                .expect("the blocking task finished"),
+            7
+        );
+    });
+}

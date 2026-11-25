@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::command::ExitInfo;
-use crate::connection::{ConnConfig, Connection, HelloTiming};
+use crate::connection::{ConnConfig, Connection, HelloTiming, ProgressHook};
 use crate::error::ConnectError;
 use crate::service::Service;
 use crate::transport::{BoxDuplex, Endpoint};
@@ -24,6 +24,9 @@ pub struct ClientOptions {
     /// The peer is a bridge that reports `ready` once connected to its daemon: the hello
     /// deadline starts then (see [`HelloTiming::AfterReady`]).
     pub await_ready: bool,
+    /// Told what a bridge is doing while it has not reached its daemon yet (its progress
+    /// frames). `None` ignores them.
+    pub on_progress: Option<ProgressHook>,
 }
 
 impl ClientOptions {
@@ -33,6 +36,7 @@ impl ClientOptions {
             service: None,
             config: ConnConfig::default(),
             await_ready: false,
+            on_progress: None,
         }
     }
 
@@ -101,8 +105,15 @@ impl ControlClient {
         } else {
             HelloTiming::Immediate
         };
-        let conn =
-            Connection::establish_with(io, opts.hello, opts.service, opts.config, timing).await?;
+        let conn = Connection::establish_observed(
+            io,
+            opts.hello,
+            opts.service,
+            opts.config,
+            timing,
+            opts.on_progress,
+        )
+        .await?;
         Ok(ControlClient {
             conn,
             _attachment: None,

@@ -322,6 +322,10 @@ impl CommandSpec {
     }
 }
 
+/// Longest progress step kept from a bridge: what a peer reports is shown in a link's status, so
+/// it is bounded, not trusted to be short.
+const PROGRESS_STEP_CHARS: usize = 120;
+
 /// Exit of a transport child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitInfo {
@@ -605,10 +609,18 @@ impl CommandTransport {
         let child = Arc::new(child);
         // The program is a bridge (`… bridge`): it reports ready once it reaches the daemon,
         // however long that takes; the hello deadline starts then.
-        let opts = ClientOptions {
+        let mut opts = ClientOptions {
             await_ready: true,
             ..opts
         };
+        // A traced command's progress is the attempt's step: a timed-out attempt says what the
+        // bridge was doing ("connect timed out while starting the host daemon").
+        if let Some(t) = &spec.trace {
+            let attempt = t.attempt.clone();
+            opts.on_progress = Some(Arc::new(move |step: &str| {
+                attempt.reached(step.chars().take(PROGRESS_STEP_CHARS).collect::<String>());
+            }));
+        }
         match ControlClient::connect(io, opts).await {
             Ok(c) => Ok(c.with_attachment(child.clone()).with_diagnostics(child)),
             Err(e) => Err(child.explain_handshake_failure(e).await),

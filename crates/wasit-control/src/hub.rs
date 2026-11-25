@@ -309,6 +309,7 @@ impl Hub {
             config: self.inner.cfg.conn.clone(),
             // Set by `CommandLink::connect`: its program is a bridge.
             await_ready: false,
+            on_progress: None,
         };
         let spec2 = spec.clone();
         let conn = connector_reporting(move |attempt| {

@@ -19,7 +19,7 @@ use crate::command::ChildView;
 /// What an attempt has reported so far.
 #[derive(Default)]
 struct Evidence {
-    step: Option<&'static str>,
+    step: Option<String>,
     transport: Option<ChildView>,
 }
 
@@ -77,11 +77,11 @@ impl Attempt {
         self.host.as_ref()
     }
 
-    /// The connector has reached `step`: a fixed phrase in the connector's own words that
-    /// completes "connect timed out while …" ("waiting for the host's report", "sending the
-    /// helper"). Replaces the previous step.
-    pub fn reached(&self, step: &'static str) {
-        self.evidence().step = Some(step);
+    /// The connector has reached `step`: a phrase in the connector's own words that completes
+    /// "connect timed out while …" ("waiting for the host's report", "sending the helper").
+    /// Replaces the previous step. A bridge's progress report arrives as owned text.
+    pub fn reached(&self, step: impl Into<String>) {
+        self.evidence().step = Some(step.into());
     }
 
     /// The attempt's transport command is `view` (the latest one, if the connector starts
@@ -96,7 +96,7 @@ impl Attempt {
     pub(crate) fn timed_out(&self) -> String {
         let ev = self.evidence();
         let mut text = String::from("connect timed out");
-        if let Some(step) = ev.step {
+        if let Some(step) = &ev.step {
             text.push_str(&format!(" while {step}"));
         }
         if let Some(t) = &ev.transport {

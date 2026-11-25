@@ -92,7 +92,7 @@ impl Endpoint {
 #[cfg(windows)]
 async fn wait_for_pipe(name: String) -> io::Result<()> {
     use windows_sys::Win32::System::Pipes::{WaitNamedPipeW, NMPWAIT_WAIT_FOREVER};
-    tokio::task::spawn_blocking(move || {
+    on_own_thread("wasit-pipe-wait", move || {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: `wide` is NUL-terminated and lives across the call.
         if unsafe { WaitNamedPipeW(wide.as_ptr(), NMPWAIT_WAIT_FOREVER) } == 0 {
@@ -102,7 +102,28 @@ async fn wait_for_pipe(name: String) -> io::Result<()> {
         }
     })
     .await
-    .map_err(io::Error::other)?
+}
+
+/// Run `work` on a dedicated thread and await its result.
+///
+/// Used for waits that have no bound of their own. `spawn_blocking` would pin a thread of
+/// tokio's blocking pool for as long as the wait lasts, and a wait that never ends would take
+/// that pool thread for good. Here only the wait's own thread is taken; dropping the returned
+/// future abandons the wait (the thread ends when `work` does), and the pool is untouched.
+async fn on_own_thread<T, F>(name: &str, work: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            // The receiver is gone when the waiter was dropped: nobody wants the answer.
+            let _ = tx.send(work());
+        })?;
+    rx.await
+        .map_err(|_| io::Error::other("the wait ended without an answer"))?
 }
 
 /// The local endpoint for a daemon identified by `path`: the Unix socket at `path`, or on
@@ -313,17 +334,18 @@ impl Drop for StartingLock {
 }
 
 /// Wait until no start holds the starting lock of `endpoint_path`: returns at once when none
-/// does, and when the one in progress is ready (it releases the lock then). Blocking work runs
-/// in the blocking pool; nothing is polled.
+/// does, and when the one in progress is ready (it releases the lock then). The wait has no
+/// bound of its own and runs on a dedicated thread (see `on_own_thread`), so a start that never
+/// releases its lock cannot pin tokio's blocking pool; dropping the future abandons the wait.
+/// Nothing is polled.
 pub async fn wait_until_started(endpoint_path: impl Into<PathBuf>) -> io::Result<()> {
     let path = starting_lock_path(&endpoint_path.into());
-    tokio::task::spawn_blocking(move || -> io::Result<()> {
+    on_own_thread("wasit-start-wait", move || {
         let file = open_lock_file(&path)?;
         file.lock_shared()?;
         file.unlock()
     })
     .await
-    .map_err(io::Error::other)?
 }
 
 #[derive(Debug, thiserror::Error)]

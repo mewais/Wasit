@@ -25,7 +25,7 @@ pub mod uplink;
 pub mod wire;
 
 pub use attempt::Attempt;
-pub use bridge::{bridge, BridgeError, BridgeOptions};
+pub use bridge::{bridge, BridgeError, BridgeOptions, STEP_STARTING_DAEMON};
 pub use client::{ClientOptions, ControlClient, Diagnostics, TransportFacts};
 pub use command::{
     classify_command_failure, classify_helper_exit, ChildHandle, CommandFailureKind, CommandSpec,

@@ -9,6 +9,10 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::transport::Endpoint;
 use crate::wire::{codes, encode, Frame, RpcError, DEFAULT_MAX_FRAME};
 
+/// The progress step reported while the bridge starts a daemon nobody serves yet (a
+/// [`Frame::Progress`] the dialing side records as the link's stage).
+pub const STEP_STARTING_DAEMON: &str = "starting the host daemon";
+
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
     /// After stdin ends, how long the daemon may keep writing before the bridge exits.
@@ -37,10 +41,11 @@ pub enum BridgeError {
 /// a daemon may take minutes to become ready (a slow login environment, a long startup), and
 /// that is progress, not failure. It must resolve once the daemon is ready to accept
 /// connections. The endpoint is then dialled once. Once connected, a `ready` frame is written
-/// to `stdout` before anything else: the dialling side starts its hello deadline there. If the
-/// endpoint cannot be reached, one `goodbye` frame with code `bridge_unavailable` is written
-/// instead — a single JSON line the client's handshake surfaces as
-/// [`crate::ConnectError::Refused`].
+/// to `stdout` before anything else: the dialling side starts its hello deadline there. While
+/// the daemon is being started, a [`Frame::Progress`] reporting [`STEP_STARTING_DAEMON`] is
+/// written first, so the dialling side can say what it waits for. If the endpoint cannot be
+/// reached, one `goodbye` frame with code `bridge_unavailable` is written instead — a single JSON
+/// line the client's handshake surfaces as [`crate::ConnectError::Refused`].
 ///
 /// Returns when both directions have finished.
 pub async fn bridge<R, W, F, Fut>(
@@ -58,12 +63,21 @@ where
 {
     let connected = match endpoint.connect().await {
         Ok(s) => Ok(s),
-        Err(e) if Endpoint::is_absent_error(&e) => match start_daemon().await {
-            Err(e) => Err(format!("starting the daemon failed: {e}")),
-            Ok(()) => endpoint.connect().await.map_err(|e| {
-                format!("the daemon reported ready but its endpoint is unreachable: {e}")
-            }),
-        },
+        Err(e) if Endpoint::is_absent_error(&e) => {
+            send_best_effort(
+                &mut stdout,
+                &Frame::Progress {
+                    step: STEP_STARTING_DAEMON.into(),
+                },
+            )
+            .await;
+            match start_daemon().await {
+                Err(e) => Err(format!("starting the daemon failed: {e}")),
+                Ok(()) => endpoint.connect().await.map_err(|e| {
+                    format!("the daemon reported ready but its endpoint is unreachable: {e}")
+                }),
+            }
+        }
         Err(e) => Err(e.to_string()),
     };
     let socket = match connected {
@@ -73,11 +87,7 @@ where
             let frame = Frame::Goodbye {
                 reason: RpcError::new(codes::BRIDGE_UNAVAILABLE, message.clone()),
             };
-            if let Ok(line) = encode(&frame, DEFAULT_MAX_FRAME) {
-                // Best effort: if stdout is gone there is nobody to tell.
-                let _ = stdout.write_all(&line).await;
-                let _ = stdout.flush().await;
-            }
+            send_best_effort(&mut stdout, &frame).await;
             return Err(BridgeError::Unavailable(message));
         }
     };
@@ -87,6 +97,14 @@ where
     stdout.flush().await?;
     pump(stdin, stdout, socket, opts.drain_timeout).await
 }
+/// Write `frame` to `stdout` and flush. Best effort: if stdout is gone there is nobody to tell.
+async fn send_best_effort<W: AsyncWrite + Unpin>(stdout: &mut W, frame: &Frame) {
+    if let Ok(line) = encode(frame, DEFAULT_MAX_FRAME) {
+        let _ = stdout.write_all(&line).await;
+        let _ = stdout.flush().await;
+    }
+}
+
 /// Copy both ways. When the daemon side ends, the bridge ends (its caller exits and so closes
 /// stdout, which is how the far client learns of it: shutting down a process's stdout handle
 /// does not close the descriptor). When stdin ends, the daemon gets EOF and a bounded moment

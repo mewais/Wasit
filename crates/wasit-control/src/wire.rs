@@ -407,6 +407,12 @@ pub enum Frame {
     /// The dialing side starts its hello deadline here: how long the daemon took to start is
     /// not a handshake failure.
     Ready,
+    /// Written by a bridge before its `ready`, while it waits for the daemon to start: `step` is
+    /// what it is doing, in words the dialing side records as the link's progress (a stage of
+    /// the connect attempt). Only meaningful before the hello, like `ready`.
+    Progress {
+        step: String,
+    },
 }
 
 const KNOWN_TYPES: &[&str] = &[
@@ -423,6 +429,7 @@ const KNOWN_TYPES: &[&str] = &[
     "pong",
     "goodbye",
     "ready",
+    "progress",
 ];
 
 #[derive(Debug, thiserror::Error)]

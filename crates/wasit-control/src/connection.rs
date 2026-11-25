@@ -238,6 +238,9 @@ impl std::fmt::Debug for Connection {
     }
 }
 
+/// Receives a dialed peer's progress reports (see [`Frame::Progress`]), before its hello.
+pub type ProgressHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// When the hello deadline of an outgoing handshake starts (see [`Connection::establish_with`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelloTiming {
@@ -271,6 +274,19 @@ impl Connection {
         service: Option<Arc<dyn Service>>,
         cfg: ConnConfig,
         timing: HelloTiming,
+    ) -> Result<Connection, ConnectError> {
+        Self::establish_observed(io, hello, service, cfg, timing, None).await
+    }
+
+    /// [`Connection::establish_with`] that also reports the peer's `progress` frames (before its
+    /// hello) to `progress`. Nothing else about the handshake changes.
+    pub(crate) async fn establish_observed(
+        io: BoxDuplex,
+        hello: Hello,
+        service: Option<Arc<dyn Service>>,
+        cfg: ConnConfig,
+        timing: HelloTiming,
+        progress: Option<ProgressHook>,
     ) -> Result<Connection, ConnectError> {
         let (r, mut w) = tokio::io::split(io);
         let mut reader = FrameReader::new(r, cfg.max_frame);
@@ -320,6 +336,12 @@ impl Connection {
                 Ok(Some(Frame::Ready)) => {
                     if deadline.is_none() {
                         deadline = Some(Instant::now() + cfg.hello_timeout);
+                    }
+                    continue;
+                }
+                Ok(Some(Frame::Progress { step })) => {
+                    if let Some(report) = &progress {
+                        report(&step);
                     }
                     continue;
                 }
@@ -611,6 +633,7 @@ fn frame_kind(f: &Frame) -> &'static str {
     match f {
         Frame::Hello(_) => "hello",
         Frame::Ready => "ready",
+        Frame::Progress { .. } => "progress",
         Frame::Request { .. } => "request",
         Frame::Response { .. } => "response",
         Frame::Subscribe { .. } => "subscribe",
@@ -848,6 +871,8 @@ impl Inner {
             Frame::Goodbye { reason } => return Err(ConnClose::Goodbye { reason }),
             // Only meaningful before the hello (see `establish_with`): ignored afterwards.
             Frame::Ready => {}
+            // Only before the hello, like `ready`; a peer that repeats it later is ignored.
+            Frame::Progress { .. } => {}
         }
         Ok(())
     }
