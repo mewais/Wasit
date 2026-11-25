@@ -72,6 +72,8 @@ const ALLOWED_KEYS: &[&str] = &[
     "cache_read",
     "cache_write",
     "cost",
+    // The assistant message a token report belongs to (an id, not its content).
+    "message",
     "id",
     "permission",
     "jobs",
@@ -757,4 +759,89 @@ fn protocol_consumes_bridge_notifications_without_events() {
     let note = r#"{"jsonrpc":"2.0","method":"_wasit/kilo","params":{"kind":"state_lost","reason":"stream_error"}}"#;
     assert!(p.on_line(note).is_empty());
     assert!(p.on_line(&format!("{note}\n")).is_empty());
+}
+
+#[test]
+fn control_lines_are_the_inverse_of_their_parse() {
+    use super::{control_line, parse_control, Reply, Scope};
+    let cases = [
+        Command::Steer {
+            session: "ses_c".into(),
+            text: "use the other file".into(),
+        },
+        Command::Abort {
+            session: "ses_p".into(),
+            scope: Scope::Session,
+        },
+        Command::Abort {
+            session: "ses_c".into(),
+            scope: Scope::Tree,
+        },
+        Command::ReplyPermission {
+            id: "per_1".into(),
+            reply: Reply::Always,
+        },
+    ];
+    for cmd in cases {
+        let line = control_line(&cmd).0;
+        let parsed = parse_control(&line)
+            .expect("a control line")
+            .expect("parses");
+        assert_eq!(parsed, cmd, "{line}");
+    }
+}
+
+#[test]
+fn bridge_notes_are_read_by_kind_and_unknown_ones_are_none() {
+    use super::{parse_note, Job, Note};
+    let note = |v: Value| parse_note(&v);
+    assert_eq!(
+        note(json!({"kind": "session.created", "session": "ses_c", "parent": "ses_p"})),
+        Some(Note::SessionCreated {
+            session: "ses_c".into(),
+            parent: Some("ses_p".into())
+        })
+    );
+    assert_eq!(
+        note(
+            json!({"kind": "tokens", "session": "ses_c", "message": "msg_1", "input": 100.0,
+                    "output": 20.0, "reasoning": 0.0, "cache_read": 0.0, "cache_write": 0.0,
+                    "cost": 0.25})
+        ),
+        Some(Note::Tokens {
+            session: "ses_c".into(),
+            message: "msg_1".into(),
+            input: 100,
+            output: 20,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost: 0.25
+        })
+    );
+    assert_eq!(
+        note(json!({"kind": "background_jobs", "session": "ses_p",
+                    "jobs": [{"id": "ses_c", "type": "task", "status": "cancelled"}]})),
+        Some(Note::BackgroundJobs {
+            session: "ses_p".into(),
+            jobs: vec![Job {
+                id: "ses_c".into(),
+                kind: "task".into(),
+                status: "cancelled".into()
+            }]
+        })
+    );
+    assert_eq!(
+        note(
+            json!({"kind": "command_failed", "command": "steer", "reason": "http", "status": 404})
+        ),
+        Some(Note::CommandFailed {
+            command: "steer".into(),
+            reason: "http".into(),
+            status: Some(404)
+        })
+    );
+    // A kind the bridge does not send, and a note without its session, are not notes.
+    assert_eq!(note(json!({"kind": "something_new"})), None);
+    assert_eq!(note(json!({"kind": "session.idle"})), None);
 }

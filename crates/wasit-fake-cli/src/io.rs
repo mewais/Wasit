@@ -5,8 +5,23 @@
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, Write};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Puts lines on the input queue from a thread of the fake's own (a server thread answering HTTP
+/// requests for the engine). The queue closes when stdin does: after that [`Injector::inject`]
+/// refuses, instead of keeping the queue open.
+#[derive(Clone)]
+pub struct Injector(Arc<Mutex<Option<Sender<String>>>>);
+
+impl Injector {
+    /// `false` when the queue is closed (stdin ended).
+    pub fn inject(&self, line: String) -> bool {
+        let slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().is_some_and(|tx| tx.send(line).is_ok())
+    }
+}
 
 /// Result of a timed receive.
 #[derive(Debug, PartialEq, Eq)]
@@ -19,12 +34,17 @@ pub enum Recv {
 pub struct Io {
     rx: Receiver<String>,
     transcript: Option<File>,
+    inject: Injector,
 }
 
 impl Io {
     /// Take over this process's stdin.
     pub fn stdio() -> Io {
         let (tx, rx) = mpsc::channel();
+        // The reader's sender and the injector's share one slot: stdin's end clears it, so the
+        // queue disconnects (EOF) once no sender is left.
+        let slot = Arc::new(Mutex::new(Some(tx.clone())));
+        let feed = slot.clone();
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut lock = stdin.lock();
@@ -44,7 +64,8 @@ impl Io {
                     }
                 }
             }
-            // Dropping the sender is the EOF signal.
+            // Dropping the senders is the EOF signal.
+            *feed.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
         let transcript = std::env::var_os("WASIT_FAKE_TRANSCRIPT").and_then(|p| {
             std::fs::OpenOptions::new()
@@ -53,13 +74,29 @@ impl Io {
                 .open(p)
                 .ok()
         });
-        Io { rx, transcript }
+        Io {
+            rx,
+            transcript,
+            inject: Injector(slot),
+        }
+    }
+
+    /// A handle that puts lines on this process's input queue (see [`Injector`]).
+    pub fn injector(&self) -> Injector {
+        self.inject.clone()
     }
 
     fn log(&mut self, dir: &str, line: &str) {
         if let Some(f) = self.transcript.as_mut() {
             let msg: Value =
                 serde_json::from_str(line).unwrap_or_else(|_| serde_json::json!({ "_raw": line }));
+            // The fake's own plumbing (see [`Injector`]) is not part of the conversation.
+            if msg["method"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("_fake/"))
+            {
+                return;
+            }
             let entry = serde_json::json!({ "dir": dir, "msg": msg });
             // Transcript writes are best effort: a failing test log must not break the protocol.
             let _ = writeln!(f, "{entry}");

@@ -23,6 +23,7 @@ pub mod codex;
 pub mod engine;
 pub mod harness;
 pub mod io;
+pub mod kilo_http;
 pub mod mcp;
 pub mod reference;
 pub mod scenario;

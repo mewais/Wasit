@@ -255,7 +255,15 @@ pub fn main_with(args: Vec<String>) -> i32 {
             } else {
                 Flavor::Opencode
             };
+            let hub = match crate::kilo_http::start_from_argv(&args, io.injector()) {
+                Ok(hub) => hub,
+                Err(e) => {
+                    eprintln!("wasit-fake-cli: {e}");
+                    return 2;
+                }
+            };
             let mut p = Acp::new(flavor, &scenario);
+            p.attach_http(hub);
             serve(&mut p, &mut io, &mut cursor);
         }
     }

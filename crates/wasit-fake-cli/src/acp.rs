@@ -2,8 +2,25 @@
 //! JSON-RPC 2.0. Both CLIs share the implementation; they differ in identity, default model and
 //! the modes they advertise.
 
-use crate::engine::{Incoming, Outcome, Persona, TurnStats};
+use crate::engine::{Incoming, Outcome, Persona, TaskEnd, TaskIds, TurnStats};
 use crate::io::Io;
+use crate::kilo_http::{Answer, Hub, REQUEST_METHOD};
+use crate::scenario::BackgroundStep;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+/// A background `task` of a Kilo session: a child session of its parent (see
+/// [`Persona::task_started`]). Its status is what the job list reports.
+#[derive(Debug, Clone)]
+struct Child {
+    id: String,
+    parent: String,
+    title: String,
+    /// Kilo's job status word: `running`, `completed`, `error` or `cancelled`.
+    status: &'static str,
+    started_ms: u64,
+    completed_ms: Option<u64>,
+}
 use crate::reference::find_out;
 use crate::scenario::{AskStep, HistoryMessage, PlanEntry, Scenario, ToolStep};
 use crate::util::{alnum, hex, iso_from_ms, iso_now, now_ms, set};
@@ -104,6 +121,17 @@ pub struct Acp {
     sessions: Vec<Sess>,
     first_id: Option<String>,
     next_request_id: u64,
+    /// The HTTP+SSE server of `kilo acp --port` (Kilo only; see [`crate::kilo_http`]).
+    hub: Option<Arc<Hub>>,
+    /// Sessions with a turn running, as the server reports them (`GET /session/status`).
+    busy: BTreeSet<String>,
+    /// The background subagents this process started.
+    children: Vec<Child>,
+    /// The parent session while a subagent's own conversation runs ([`Persona::set_scope`]).
+    scope_parent: Option<String>,
+    /// A turn the agent started by itself (Kilo delivering a background result) is running: it
+    /// has no prompt, so it gets no `session/prompt` result.
+    driver_turn: bool,
     // Current turn.
     session: String,
     prompt_id: Value,
@@ -151,6 +179,154 @@ impl Acp {
         }
     }
 
+    /// Serve Kilo's HTTP and SSE routes too (`hub` from [`crate::kilo_http::start_from_argv`]).
+    pub fn attach_http(&mut self, hub: Option<Arc<Hub>>) {
+        self.hub = hub;
+    }
+
+    /// Publish a server event, when there is a server.
+    fn emit(&self, payload_type: &str, properties: Value) {
+        if let Some(hub) = &self.hub {
+            hub.publish(payload_type, properties);
+        }
+    }
+
+    /// A session's turn starts or ends: the status (`GET /session/status`) changes, and with
+    /// `announce` the status event and `session.idle` go out too, once per change.
+    ///
+    /// The owner's own prompt turns are not announced: the prompt's result is their end, and a
+    /// status event that reaches the bridge after that result would read as a turn of Kilo's own.
+    /// Kilo's own turns (delivering a background result) and the subagents are announced.
+    fn set_busy(&mut self, sid: &str, busy: bool, announce: bool) {
+        let changed = if busy {
+            self.busy.insert(sid.to_string())
+        } else {
+            self.busy.remove(sid)
+        };
+        if !changed || !announce {
+            return;
+        }
+        if busy {
+            self.emit(
+                "session.status",
+                json!({"sessionID": sid, "status": {"type": "busy"}}),
+            );
+        } else {
+            self.emit(
+                "session.status",
+                json!({"sessionID": sid, "status": {"type": "idle"}}),
+            );
+            self.emit("session.idle", json!({"sessionID": sid}));
+        }
+    }
+
+    /// Answer one HTTP request the server handed over (`params`: `{id, method, path, body}`).
+    /// Only the routes the kilo-bridge uses exist. An abort of the running turn's session ends
+    /// that turn and nothing else: its background children keep running (Kilo's `scope=session`).
+    /// An abort of a running child with `scope=tree` stops it: the engine ends it, and
+    /// [`Persona::control_done`] answers.
+    fn http(&mut self, io: &mut Io, params: &Value, in_turn: bool) -> Incoming {
+        let Some(hub) = self.hub.clone() else {
+            return Incoming::Handled;
+        };
+        let id = params["id"].as_u64().unwrap_or(0);
+        let target = params["path"].as_str().unwrap_or("");
+        let (route, query) = target.split_once('?').unwrap_or((target, ""));
+        let segs: Vec<&str> = route.split('/').filter(|s| !s.is_empty()).collect();
+        let method = params["method"].as_str().unwrap_or("");
+        let mut interrupt = false;
+        let answer = match (method, segs.as_slice()) {
+            ("GET", ["session", "status"]) => {
+                let map: serde_json::Map<String, Value> = self
+                    .busy
+                    .iter()
+                    .map(|s| (s.clone(), json!({"type": "busy"})))
+                    .collect();
+                Answer::json(200, &Value::Object(map))
+            }
+            ("GET", ["session", parent, "children"]) => {
+                let list: Vec<Value> = self
+                    .children
+                    .iter()
+                    .filter(|c| c.parent == *parent)
+                    .map(|c| {
+                        json!({"id": c.id, "parentID": c.parent, "projectID": "global",
+                               "title": c.title, "time": {"created": c.started_ms, "updated": c.started_ms}})
+                    })
+                    .collect();
+                Answer::json(200, &Value::Array(list))
+            }
+            ("GET", ["kilocode", "background-jobs"]) => {
+                let parent = query_value(query, "sessionID").unwrap_or("");
+                let jobs: Vec<Value> = self
+                    .children
+                    .iter()
+                    .filter(|c| c.parent == parent)
+                    .map(|c| {
+                        json!({"id": c.id, "type": "task", "title": c.title, "status": c.status,
+                               "started_at": c.started_ms, "completed_at": c.completed_ms,
+                               "error": null,
+                               "metadata": {"parentSessionId": c.parent, "sessionId": c.id}})
+                    })
+                    .collect();
+                Answer::json(200, &Value::Array(jobs))
+            }
+            ("GET", ["permission"]) => Answer::json(200, &json!([])),
+            ("POST", ["permission", _, "reply"]) => Answer::json(200, &json!(true)),
+            ("POST", ["session", sid, "abort"]) => {
+                if query_value(query, "scope") == Some("tree") && self.running_child(sid) {
+                    // Answered by `control_done`, once the engine has ended the task.
+                    return Incoming::StopTask {
+                        request: json!(id),
+                        task_id: sid.to_string(),
+                    };
+                }
+                if in_turn && *sid == self.session {
+                    interrupt = true;
+                }
+                Answer::json(200, &json!(true))
+            }
+            ("POST", ["session", sid, "prompt_async"]) => {
+                // A message to a running subagent: it reads it as its own user message. The
+                // subagent is between its steps while it runs in the background, so nothing
+                // waits for a step boundary.
+                let text = steer_text(params["body"].as_str().unwrap_or(""));
+                if let (true, Some(text)) = (self.running_child(sid), text) {
+                    self.child_user_message(io, sid, &text);
+                }
+                Answer::empty(204)
+            }
+            _ => Answer::empty(404),
+        };
+        hub.answer(id, answer);
+        if interrupt {
+            Incoming::Interrupt
+        } else {
+            Incoming::Handled
+        }
+    }
+
+    fn running_child(&self, sid: &str) -> bool {
+        self.children
+            .iter()
+            .any(|c| c.id == sid && c.status == "running")
+    }
+
+    /// A user message in a subagent's conversation: sent on its wire and kept in its session.
+    fn child_user_message(&mut self, io: &mut Io, sid: &str, text: &str) {
+        let update = json!({"sessionUpdate": "user_message_chunk",
+            "messageId": format!("msg_{}", hex(26)), "content": {"type": "text", "text": text}});
+        self.update(io, sid, update.clone());
+        if let Some(i) = self.idx(sid) {
+            self.sessions[i].replay.push(update);
+            self.sessions[i].history.push(HistoryMessage {
+                role: "user".into(),
+                text: text.to_string(),
+            });
+            self.store_session(i);
+        }
+    }
+
     pub fn new(flavor: Flavor, scenario: &Scenario) -> Acp {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -161,6 +337,11 @@ impl Acp {
             sessions: vec![],
             first_id: scenario.session_id.clone(),
             next_request_id: 0,
+            hub: None,
+            busy: BTreeSet::new(),
+            children: vec![],
+            scope_parent: None,
+            driver_turn: false,
             session: String::new(),
             prompt_id: Value::Null,
             call_id: String::new(),
@@ -354,6 +535,16 @@ impl Acp {
         });
         let i = self.sessions.len() - 1;
         self.store_session(i);
+        let (sid, title, directory) = (
+            self.sessions[i].id.clone(),
+            self.sessions[i].title.clone(),
+            cwd.to_string(),
+        );
+        self.emit(
+            "session.created",
+            json!({"sessionID": sid, "info": {"id": sid, "directory": directory, "title": title,
+                   "version": "wasit-fake"}}),
+        );
         i
     }
 
@@ -697,6 +888,25 @@ impl Acp {
 
 const REJECT_TEXT: &str = "The user rejected permission to use this specific tool call.";
 
+/// The value of `key` in a query string (`a=1&b=2`).
+fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// The text of a `prompt_async` body (`{"parts": [{"type": "text", "text": …}]}`).
+fn steer_text(body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let parts = v["parts"].as_array()?;
+    let text: Vec<&str> = parts
+        .iter()
+        .filter(|p| p["type"] == "text")
+        .filter_map(|p| p["text"].as_str())
+        .collect();
+    (!text.is_empty()).then(|| text.join("\n"))
+}
+
 fn selected_allows(body: &Value) -> bool {
     body["outcome"]["outcome"] == "selected"
         && matches!(body["outcome"]["optionId"].as_str(), Some(o) if o != "reject")
@@ -717,6 +927,9 @@ impl Persona for Acp {
         match (has_method, has_id) {
             (true, true) => self.handle_request(io, &v),
             (true, false) => {
+                if v["method"] == REQUEST_METHOD {
+                    return self.http(io, &v["params"], in_turn);
+                }
                 if v["method"] == "session/cancel" && in_turn {
                     Incoming::Interrupt
                 } else {
@@ -745,6 +958,129 @@ impl Persona for Acp {
         _id: Option<&str>,
         _stats: &mut TurnStats,
     ) {
+        let sid = self.session.clone();
+        self.set_busy(&sid, true, false);
+    }
+
+    /// Background tasks are Kilo's subagents, and need the server (their status and steering
+    /// are over HTTP).
+    fn background(&self) -> bool {
+        self.flavor == Flavor::Kilo && self.hub.is_some()
+    }
+
+    /// Kilo runs a `task` as a child session. The parent's `task` call shows the child's id at
+    /// once (`rawOutput.metadata.sessionId`), the child is announced to the server with its
+    /// parent, and it is busy until it ends.
+    fn task_started(
+        &mut self,
+        io: &mut Io,
+        task: &BackgroundStep,
+        _stats: &mut TurnStats,
+    ) -> TaskIds {
+        let parent = self.session.clone();
+        let child = format!("ses_{}", alnum(26));
+        let call_id = format!("call_{}", hex(24));
+        let title = task.description.clone();
+        let cwd = self.cwd();
+        let text = format!(
+            "<task id=\"{child}\" state=\"running\">\n<summary>Background task started</summary>\n\
+             <task_result>\nThe task is working in the background. You will be notified automatically \
+             when it finishes.\n</task_result>\n</task>"
+        );
+        let updates = [
+            json!({"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "task",
+                   "kind": "think", "status": "pending", "locations": [], "rawInput": {}}),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": "in_progress",
+                   "kind": "think", "title": title, "locations": [],
+                   "rawInput": {"description": title, "prompt": "",
+                                "subagent_type": task.subagent_type.clone().unwrap_or_else(|| "general".into()),
+                                "background": true}}),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": "completed",
+                   "title": title, "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+                   "rawOutput": {"output": text, "metadata": {"sessionId": child, "background": true}}}),
+        ];
+        for u in updates {
+            self.update(io, &parent, u.clone());
+            self.record(u);
+        }
+        let now = now_ms();
+        self.sessions.push(Sess {
+            id: child.clone(),
+            cwd: cwd.clone(),
+            title: title.clone(),
+            model: self.default_model(),
+            mode: self.default_mode(),
+            history: vec![],
+            replay: vec![],
+            created_ms: now,
+            updated_ms: now,
+        });
+        let i = self.sessions.len() - 1;
+        self.store_session(i);
+        self.emit(
+            "session.created",
+            json!({"sessionID": child, "info": {"id": child, "parentID": parent,
+                   "directory": cwd, "title": title, "version": "wasit-fake"}}),
+        );
+        self.children.push(Child {
+            id: child.clone(),
+            parent,
+            title,
+            status: "running",
+            started_ms: now,
+            completed_ms: None,
+        });
+        self.set_busy(&child, true, true);
+        TaskIds {
+            task_id: child.clone(),
+            run_id: String::new(),
+            call_id,
+            agent_id: child,
+        }
+    }
+
+    /// The subagent's own conversation runs with its session as the current one.
+    fn set_scope(&mut self, scope: Option<(&BackgroundStep, &TaskIds)>) {
+        match scope {
+            Some((_, ids)) => {
+                self.scope_parent = Some(self.session.clone());
+                self.session = ids.agent_id.clone();
+            }
+            None => {
+                if let Some(parent) = self.scope_parent.take() {
+                    self.session = parent;
+                }
+            }
+        }
+    }
+
+    /// The child ends: its job reaches its final status before the server reports it idle (the
+    /// protocol reads the job list when it hears of the idle).
+    fn task_ended(&mut self, _io: &mut Io, _task: &BackgroundStep, ids: &TaskIds, how: TaskEnd) {
+        let status = match how {
+            TaskEnd::Completed => "completed",
+            TaskEnd::Failed => "error",
+            TaskEnd::Stopped => "cancelled",
+        };
+        if let Some(c) = self.children.iter_mut().find(|c| c.id == ids.task_id) {
+            c.status = status;
+            c.completed_ms = Some(now_ms());
+        }
+        self.set_busy(&ids.task_id, false, true);
+    }
+
+    /// Kilo starts a turn of its own with the child's result: the owner is busy until it ends.
+    fn agent_turn_begin(&mut self, _io: &mut Io, _ids: &TaskIds, _stats: &mut TurnStats) {
+        self.driver_turn = true;
+        let sid = self.session.clone();
+        self.set_busy(&sid, true, true);
+    }
+
+    /// The answer to a stop (see [`Incoming::StopTask`]): the server answers the abort request.
+    fn control_done(&mut self, _io: &mut Io, request: &Value, _found: bool) {
+        if let (Some(hub), Some(id)) = (&self.hub, request.as_u64()) {
+            hub.answer(id, Answer::json(200, &json!(true)));
+        }
     }
 
     fn say(&mut self, io: &mut Io, text: &str, chunks: usize, _stats: &mut TurnStats) {
@@ -886,6 +1222,20 @@ impl Persona for Acp {
     fn turn_end(&mut self, io: &mut Io, outcome: &Outcome, stats: &mut TurnStats) {
         let u = stats.usage.clone();
         let id = self.prompt_id.clone();
+        // The session is idle before its result goes out, as Kilo reports it.
+        let sid = self.session.clone();
+        let driver = self.driver_turn;
+        self.set_busy(&sid, false, driver);
+        if std::mem::take(&mut self.driver_turn) {
+            // The turn Kilo started by itself has no prompt to answer.
+            self.usage_update(
+                io,
+                u.input_tokens + u.output_tokens,
+                u.context_window,
+                u.cost_usd,
+            );
+            return;
+        }
         match outcome {
             Outcome::Completed => {
                 self.usage_update(

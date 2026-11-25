@@ -199,6 +199,9 @@ impl Tracker {
                 m.notes.push(json!({
                     "kind": "tokens",
                     "session": session,
+                    // The assistant message the figures belong to: a message is reported
+                    // several times while it streams, and the reducer must not add them up twice.
+                    "message": str_of(info, "id").unwrap_or_default(),
                     "input": num_of(Some(tokens), "input"),
                     "output": num_of(Some(tokens), "output"),
                     "reasoning": num_of(Some(tokens), "reasoning"),
@@ -242,6 +245,127 @@ pub fn jobs_note(parent: &str, body: &Value) -> Option<Value> {
     Some(json!({"kind": "background_jobs", "session": parent, "jobs": jobs}))
 }
 
+/// One background job as the bridge reports it (`background_jobs` lists them all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub id: String,
+    /// Kilo's job type (`task` for a subagent).
+    pub kind: String,
+    /// Kilo's status word: `running`, `completed`, `error` or `cancelled`.
+    pub status: String,
+}
+
+/// A bridge notification, as the protocol reads it. What the bridge does not report (a job
+/// list that failed, a notification of another kind) is `None` from [`parse_note`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Note {
+    /// A session was created; `parent` is set for a child (a subagent's session).
+    SessionCreated {
+        session: String,
+        parent: Option<String>,
+    },
+    /// `busy`, `retry`, `idle` or `offline` (Kilo's `session.status`).
+    SessionStatus { session: String, status: String },
+    /// The session went idle (Kilo's `session.idle`).
+    SessionIdle { session: String },
+    /// One assistant message's tokens and cost, as the message reports them so far.
+    Tokens {
+        session: String,
+        message: String,
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost: f64,
+    },
+    /// A permission request is waiting for an answer (`POST /permission/{id}/reply`).
+    PermissionAsked {
+        id: String,
+        session: String,
+        permission: String,
+    },
+    /// The background jobs of `session`, as they are now.
+    BackgroundJobs { session: String, jobs: Vec<Job> },
+    /// The bridge lost the server's event stream (`connect`, `stream_closed`, `stream_error`).
+    StateLost { reason: String },
+    /// A control command succeeded (HTTP `status`).
+    CommandResult { command: String, status: u64 },
+    /// A control command failed; `status` is the HTTP status when there was one.
+    CommandFailed {
+        command: String,
+        reason: String,
+        status: Option<u64>,
+    },
+}
+
+/// Read one bridge notification's params. `None` for an unknown kind or a malformed one.
+pub fn parse_note(params: &Value) -> Option<Note> {
+    let text = |k: &str| str_of(params, k);
+    let count = |k: &str| {
+        params
+            .get(k)
+            .and_then(Value::as_f64)
+            .map_or(0, |n| n.max(0.0) as u64)
+    };
+    Some(match text("kind")?.as_str() {
+        "session.created" => Note::SessionCreated {
+            session: text("session")?,
+            parent: text("parent"),
+        },
+        "session.status" => Note::SessionStatus {
+            session: text("session")?,
+            status: text("status").unwrap_or_default(),
+        },
+        "session.idle" => Note::SessionIdle {
+            session: text("session")?,
+        },
+        "tokens" => Note::Tokens {
+            session: text("session")?,
+            message: text("message").unwrap_or_default(),
+            input: count("input"),
+            output: count("output"),
+            reasoning: count("reasoning"),
+            cache_read: count("cache_read"),
+            cache_write: count("cache_write"),
+            cost: params.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+        },
+        "permission.asked" => Note::PermissionAsked {
+            id: text("id")?,
+            session: text("session")?,
+            permission: text("permission").unwrap_or_default(),
+        },
+        "background_jobs" => Note::BackgroundJobs {
+            session: text("session")?,
+            jobs: params
+                .get("jobs")?
+                .as_array()?
+                .iter()
+                .filter_map(|j| {
+                    Some(Job {
+                        id: str_of(j, "id")?,
+                        kind: str_of(j, "type").unwrap_or_default(),
+                        status: str_of(j, "status").unwrap_or_default(),
+                    })
+                })
+                .collect(),
+        },
+        "state_lost" => Note::StateLost {
+            reason: text("reason").unwrap_or_default(),
+        },
+        "command_result" => Note::CommandResult {
+            command: text("command")?,
+            status: count("status"),
+        },
+        "command_failed" => Note::CommandFailed {
+            command: text("command")?,
+            reason: text("reason").unwrap_or_default(),
+            status: params.get("status").and_then(Value::as_u64),
+        },
+        _ => return None,
+    })
+}
+
 /// Which children an abort reaches: `Session` only the named session; `Tree` it and its children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -269,6 +393,30 @@ pub enum Command {
 }
 
 impl Command {
+    /// The params of this command's control line: the inverse of [`parse_control`].
+    pub fn to_params(&self) -> Value {
+        let scope = |s: &Scope| match s {
+            Scope::Session => "session",
+            Scope::Tree => "tree",
+        };
+        match self {
+            Command::Steer { session, text } => {
+                json!({"command": "steer", "session": session, "text": text})
+            }
+            Command::Abort { session, scope: s } => {
+                json!({"command": "abort", "session": session, "scope": scope(s)})
+            }
+            Command::ReplyPermission { id, reply } => {
+                let reply = match reply {
+                    Reply::Once => "once",
+                    Reply::Always => "always",
+                    Reply::Reject => "reject",
+                };
+                json!({"command": "reply_permission", "id": id, "reply": reply})
+            }
+        }
+    }
+
     /// The name reported in `command_result` and `command_failed`.
     pub fn name(&self) -> &'static str {
         match self {
@@ -341,6 +489,11 @@ fn check_id(id: &str) -> Result<(), String> {
     } else {
         Err("id is not a plain identifier".into())
     }
+}
+
+/// The control line that carries `cmd` to the bridge (written to the CLI's stdin).
+pub fn control_line(cmd: &Command) -> wasit_core::OutLine {
+    rpc_notification(METHOD, Some(cmd.to_params()))
 }
 
 /// Parse a stdin line: `None` when it is not a control line (it goes to `kilo acp` unchanged),
@@ -624,5 +777,11 @@ fn random_password() -> io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The subagents' state machine the protocol runs on the bridge's notifications.
+pub(crate) mod track;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod replay_tests;

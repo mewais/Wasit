@@ -43,8 +43,11 @@ use wasit_core::{
     AgentEvent, Attachment, Command, CompactionInfo, ContentPart, DriverError, Encoded, EndReason,
     GateChoice, GateChoiceKind, GateDecision, GateRequest, InputDropReason, InputId, MediaSource,
     ModelInfo, OutLine, PlanEntry, Protocol, ResumeMode, SessionMode, SlashCommandInfo, SpawnSpec,
-    Step, Usage,
+    Step, TurnTrigger, Usage,
 };
+
+use crate::subagents::track::{Effects, Tasks};
+use crate::subagents::{self, Note};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -54,7 +57,7 @@ enum Phase {
     Closed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Req {
     Initialize,
     List,
@@ -63,10 +66,12 @@ enum Req {
     SetMode,
     /// `session/prompt` for this input.
     Prompt(InputId),
+    /// `session/load` of a subagent's session, so its events and permissions reach ACP.
+    LoadChild(String),
 }
 
 impl Req {
-    fn command(self) -> &'static str {
+    fn command(&self) -> &'static str {
         match self {
             Req::Initialize => "initialize",
             Req::List => "continue",
@@ -74,6 +79,7 @@ impl Req {
             Req::SetModel => "set_model",
             Req::SetMode => "set_mode",
             Req::Prompt(_) => "prompt",
+            Req::LoadChild(_) => "load_subagent",
         }
     }
 }
@@ -114,6 +120,15 @@ pub struct AcpProtocol {
     /// `promptCapabilities` from `initialize`.
     prompt_image: bool,
     prompt_embedded: bool,
+    /// The bridge's observations are used (Kilo): subagents, background work, the steer, stop
+    /// and interrupt commands. Without it, none of them is reported and none is possible.
+    bridged: bool,
+    /// The subagents of this session (`bridged` only).
+    tasks: Tasks,
+    /// A turn the agent started by itself (Kilo delivering a background result) is running.
+    driver_turn: bool,
+    /// The running turn was interrupted by us: its end is reported as interrupted.
+    turn_interrupted: bool,
     /// The session's cost in USD as the CLI last reported it. ACP `usage_update.cost` is
     /// cumulative for the whole session (kilo sums every assistant message's cost), and the
     /// prompt result carries no cost, so every `TurnCompleted` reports this value.
@@ -128,7 +143,21 @@ pub struct AcpProtocol {
 impl AcpProtocol {
     /// `client_name` is announced in `initialize.clientInfo.name`.
     pub fn new(client_name: &'static str) -> Self {
+        Self::build(client_name, false)
+    }
+
+    /// The protocol for a CLI run behind the bridge (`kilo-bridge`): its subagents, background
+    /// work and control commands are used.
+    pub fn with_bridge(client_name: &'static str) -> Self {
+        Self::build(client_name, true)
+    }
+
+    fn build(client_name: &'static str, bridged: bool) -> Self {
         AcpProtocol {
+            bridged,
+            tasks: Tasks::default(),
+            driver_turn: false,
+            turn_interrupted: false,
             client_name,
             phase: Phase::New,
             next_id: 1,
@@ -249,6 +278,9 @@ impl AcpProtocol {
         if let Some(id) = opt_s(result, "sessionId") {
             self.session_id = Some(id);
         }
+        if let Some(id) = self.session_id.clone() {
+            self.tasks.set_parent(&id);
+        }
         let (modes, mode) = config_modes(result);
         let (models, model) = config_models(result);
         self.model = model.clone();
@@ -323,6 +355,12 @@ impl AcpProtocol {
                 request_id,
                 decision,
             } => {
+                if !self.gates.iter().any(|g| g.routing_id == request_id) {
+                    if let Some(answer) = self.tasks.answer_gate(&request_id, &decision) {
+                        step.write.push(subagents::control_line(&answer?));
+                        return Ok(step);
+                    }
+                }
                 let gate = self.take_gate(&request_id)?;
                 if let Err(detail) = check_choice(&gate.choices, &request_id, &decision) {
                     self.gates.push(gate);
@@ -337,15 +375,23 @@ impl AcpProtocol {
                     ),
                 });
             }
-            Command::StopTask { .. } => {
-                return Err(DriverError::Unsupported {
-                    operation: "stop_task".into(),
-                })
+            Command::StopTask { task_id } => {
+                if !self.bridged {
+                    return Err(DriverError::Unsupported {
+                        operation: "stop_task".into(),
+                    });
+                }
+                let cmd = self.tasks.stop_task(&task_id)?;
+                step.write.push(subagents::control_line(&cmd));
             }
-            Command::SteerSubagent { .. } => {
-                return Err(DriverError::Unsupported {
-                    operation: "steer_subagent".into(),
-                })
+            Command::SteerSubagent { task_id, text } => {
+                if !self.bridged {
+                    return Err(DriverError::Unsupported {
+                        operation: "steer_subagent".into(),
+                    });
+                }
+                let cmd = self.tasks.steer(&task_id, &text)?;
+                step.write.push(subagents::control_line(&cmd));
             }
             Command::Interrupt => step = self.interrupt(),
             Command::SetModel { model } => {
@@ -427,7 +473,9 @@ impl AcpProtocol {
                 reason: None,
             });
         }
-        if self.prompt_active && !self.cancel_sent {
+        if self.bridged {
+            step.extend(self.interrupt_bridged());
+        } else if self.prompt_active && !self.cancel_sent {
             self.cancel_sent = true;
             step.write.push(rpc_notification(
                 "session/cancel",
@@ -435,6 +483,28 @@ impl AcpProtocol {
             ));
         }
         step
+    }
+
+    /// Interrupt through the bridge. Never `session/cancel`: on Kilo that also aborts the
+    /// background subagents. The interrupt always aborts the parent session alone
+    /// (`scope=session`): its running turn ends, its background subagents keep running. Stopping
+    /// a subagent is its own Stop. With no turn running there is nothing to interrupt.
+    fn interrupt_bridged(&mut self) -> Step {
+        if !(self.prompt_active || self.driver_turn) || self.cancel_sent {
+            return Step::default();
+        }
+        let Some(sid) = self.session_id.clone() else {
+            return Step::default();
+        };
+        self.cancel_sent = true;
+        self.turn_interrupted = true;
+        Step {
+            write: vec![subagents::control_line(&subagents::Command::Abort {
+                session: sid,
+                scope: subagents::Scope::Session,
+            })],
+            ..Step::default()
+        }
     }
 
     fn drain(&mut self) -> Step {
@@ -492,6 +562,7 @@ impl AcpProtocol {
             Req::Open => self.on_opened(&result),
             Req::SetModel | Req::SetMode => events(self.on_config(&result)),
             Req::Prompt(input) => self.on_prompt_result(input, &result),
+            Req::LoadChild(session) => events(self.tasks.load_result(&session, None)),
         }
     }
 
@@ -541,6 +612,7 @@ impl AcpProtocol {
                     close_stdin: false,
                 }
             }
+            Req::LoadChild(session) => events(self.tasks.load_result(&session, Some(&message))),
             other => events(vec![AgentEvent::CommandRejected {
                 command: other.command().into(),
                 message,
@@ -675,6 +747,17 @@ impl AcpProtocol {
             .unwrap_or_default();
         let kind = s(&tool, "kind");
         let title = s(&tool, "title");
+        // A subagent's request is named by the subagent, since a gate cannot be scoped to it.
+        let owner = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|sid| self.tasks.is_child(sid))
+            .map(|sid| self.tasks.who(sid));
+        let base = if kind.is_empty() {
+            title.to_string()
+        } else {
+            format!("{kind}: {title}")
+        };
         let gate = GateRequest::Permission {
             request_id: routing_id.clone(),
             tool_name: self
@@ -687,10 +770,9 @@ impl AcpProtocol {
                 .get("rawInput")
                 .map(|r| s(r, "cwd").to_string())
                 .unwrap_or_default(),
-            explanation: if kind.is_empty() {
-                title.to_string()
-            } else {
-                format!("{kind}: {title}")
+            explanation: match owner {
+                Some(who) => format!("{who}: {base}"),
+                None => base,
             },
             choices: choices.clone(),
             raw_input: tool.get("rawInput").cloned().unwrap_or(Value::Null),
@@ -733,8 +815,35 @@ impl AcpProtocol {
             .and_then(|u| u.get("sessionUpdate"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        if let Some(child) = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|sid| self.tasks.is_child(sid))
+            .map(str::to_string)
+        {
+            // A subagent's own conversation: it never acknowledges the owner's prompt, and it
+            // never touches the owner's usage, plan or mode.
+            let update = params.get("update").cloned().unwrap_or(Value::Null);
+            let events = self.child_update(&update);
+            return self.tasks.child_events(&child, events);
+        }
         let ours = params.get("sessionId").and_then(Value::as_str) == self.session_id.as_deref();
-        let mut out = match self.awaiting_ack {
+        // The owner's own turn (Kilo delivering a background result) can show on ACP before its
+        // `busy` note comes over the bridge: the owner's update is the start of it, as the note is.
+        let working = matches!(
+            kind,
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        );
+        let mut out = if self.bridged && ours && working && !self.prompt_active && !self.loading {
+            self.owner_busy().events
+        } else {
+            Vec::new()
+        };
+        let acked = match self.awaiting_ack {
             Some(input)
                 if !self.loading
                     && ours
@@ -751,8 +860,126 @@ impl AcpProtocol {
             }
             _ => vec![],
         };
+        out.extend(acked);
         out.extend(self.update_events(params));
         out
+    }
+
+    /// The events of one update of a subagent's conversation: its messages and tool calls only.
+    fn child_update(&mut self, update: &Value) -> Vec<AgentEvent> {
+        match s(update, "sessionUpdate") {
+            kind @ ("agent_message_chunk" | "agent_thought_chunk") => chunk_events(kind, update),
+            "user_message_chunk" => {
+                let parts: Vec<ContentPart> = match text_of(update) {
+                    Some(text) => vec![ContentPart::Text { text }],
+                    None => update
+                        .get("content")
+                        .and_then(acp_part)
+                        .into_iter()
+                        .collect(),
+                };
+                if parts.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![AgentEvent::UserContent { parts }]
+                }
+            }
+            "tool_call" => self.on_tool_call(update),
+            "tool_call_update" => self.on_tool_update(update),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One bridge note. The owner's own turn is the protocol's; the subagents are the tracker's.
+    fn on_note(&mut self, params: &Value) -> Step {
+        let Some(note) = subagents::parse_note(params) else {
+            return Step::default();
+        };
+        let owner = self.session_id.clone();
+        match note {
+            Note::SessionStatus { session, status }
+                if owner.as_deref() == Some(session.as_str()) =>
+            {
+                match status.as_str() {
+                    "busy" | "retry" => self.owner_busy(),
+                    "idle" => self.owner_idle(),
+                    _ => Step::default(),
+                }
+            }
+            Note::SessionIdle { session } if owner.as_deref() == Some(session.as_str()) => {
+                self.owner_idle()
+            }
+            Note::CommandFailed {
+                command,
+                reason,
+                status,
+            } => {
+                let status = status.map(|s| format!(", HTTP {s}")).unwrap_or_default();
+                events(vec![AgentEvent::CommandRejected {
+                    command: control_name(&command).into(),
+                    message: format!("{} failed ({reason}{status})", control_name(&command)),
+                }])
+            }
+            Note::CommandResult { .. } => Step::default(),
+            Note::StateLost { .. } if self.phase == Phase::Closed => Step::default(),
+            note => {
+                let fx = self.tasks.note(note);
+                self.with_effects(fx)
+            }
+        }
+    }
+
+    /// The step for a tracker effect: its events, and a load request per child it names.
+    fn with_effects(&mut self, fx: Effects) -> Step {
+        let write = fx.load.into_iter().map(|id| self.load_child(&id)).collect();
+        Step {
+            events: fx.events,
+            write,
+            close_stdin: false,
+        }
+    }
+
+    fn load_child(&mut self, session: &str) -> OutLine {
+        let params = json!({"sessionId": session, "cwd": self.spec.cwd_or_dot(), "mcpServers": []});
+        self.request(Req::LoadChild(session.to_string()), "session/load", params)
+    }
+
+    /// The owner's session started working on its own (no prompt of ours): the turn Kilo runs to
+    /// deliver a background result. A prompt of ours is already a turn, so this is not one.
+    fn owner_busy(&mut self) -> Step {
+        if self.driver_turn || self.prompt_active || self.phase != Phase::Ready {
+            return Step::default();
+        }
+        self.driver_turn = true;
+        events(vec![AgentEvent::TurnStarted {
+            native_turn_id: None,
+            input: None,
+            trigger: TurnTrigger::Agent,
+        }])
+    }
+
+    fn owner_idle(&mut self) -> Step {
+        // The owner's idle during our prompt is not the end of the driver's turn: the prompt's
+        // result is.
+        if !self.driver_turn {
+            return Step::default();
+        }
+        self.driver_turn = false;
+        self.cancel_sent = false;
+        let interrupted = std::mem::take(&mut self.turn_interrupted);
+        let (usage, turn_usage) = self.close_turn(&Value::Null);
+        let mut step = events(vec![AgentEvent::TurnCompleted {
+            end_reason: None,
+            was_interrupted: interrupted,
+            num_turns: 0,
+            usage,
+            turn_usage,
+            per_model: HashMap::new(),
+            reply: None,
+            origin: None,
+        }]);
+        step.extend(self.drain());
+        step
     }
 
     fn update_events(&mut self, params: &Value) -> Vec<AgentEvent> {
@@ -993,10 +1220,24 @@ impl AcpProtocol {
             out.push(AgentEvent::ToolCallStarted {
                 name: name.clone().unwrap_or_else(|| "subagent".into()),
                 call_id: id.to_string(),
-                input: raw_input,
+                input: raw_input.clone(),
                 is_subagent: true,
                 subagent_model: None,
             });
+        }
+        if self.bridged {
+            // The call's description is what names its child: pair them once it is known.
+            if let Some(description) = opt_s(&raw_input, "description") {
+                let background = raw_input.get("background").and_then(Value::as_bool) == Some(true);
+                let subagent_type = opt_s(&raw_input, "subagent_type");
+                out.extend(
+                    self.tasks
+                        .task_call(id, &description, background, subagent_type),
+                );
+            }
+            if terminal {
+                out.extend(self.tasks.task_result(id, status == "completed"));
+            }
         }
         if terminal {
             self.subagents.remove(id);
@@ -1052,10 +1293,12 @@ impl Protocol for AcpProtocol {
             // The channel-B bridge's observations (and its command results): private to the
             // bridge's stdout and never ACP, so consumed here. Reducing them into state is the
             // subagent layer's job (see `subagents`).
-            Some(RpcIn::Notification { method, .. })
-                if method.starts_with(crate::subagents::METHOD) =>
-            {
-                Step::default()
+            Some(RpcIn::Notification { method, params }) if method == subagents::METHOD => {
+                if self.bridged {
+                    self.on_note(&params)
+                } else {
+                    Step::default()
+                }
             }
             _ => events(vec![AgentEvent::Unknown { raw: v }]),
         }
@@ -1113,6 +1356,15 @@ fn chunk_events(kind: &str, update: &Value) -> Vec<AgentEvent> {
             .map(|text| AgentEvent::AssistantDelta { text, message_id })
             .into_iter()
             .collect(),
+    }
+}
+
+/// The name a bridge control command goes by in the events (`CommandRejected`).
+fn control_name(command: &str) -> &str {
+    match command {
+        "steer" => "steer_subagent",
+        "reply_permission" => "answer_gate",
+        other => other,
     }
 }
 

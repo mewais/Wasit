@@ -98,6 +98,24 @@ pub fn kilo() -> Arc<dyn DriverDescriptor> {
     })
 }
 
+impl AcpDescriptor {
+    /// What the Kilo bridge lets the driver show and do about subagents: their own conversation
+    /// and live state, their usage, steering and background work. OpenCode has no bridge, so
+    /// it claims none of these.
+    fn subagent_support(&self) -> SubagentSupport {
+        match self.flavor {
+            Flavor::Kilo => SubagentSupport {
+                transcript: true,
+                live_state: true,
+                usage: true,
+                steer: true,
+                background: true,
+            },
+            Flavor::OpenCode => SubagentSupport::default(),
+        }
+    }
+}
+
 impl DriverDescriptor for AcpDescriptor {
     fn id(&self) -> DriverId {
         DriverId::new(self.flavor.id())
@@ -150,12 +168,12 @@ impl DriverDescriptor for AcpDescriptor {
             continue_latest: true,
             streaming_output: true,
             prompt_while_busy: BusyPrompt::QueuedByProtocol,
-            stop_task: false,
+            stop_task: self.flavor == Flavor::Kilo,
             earlier_history: HistoryDelivery::Wire,
             fork: false,
             compact: false,
             run_shell: false,
-            subagents: SubagentSupport::default(),
+            subagents: self.subagent_support(),
         }
     }
 
@@ -182,7 +200,10 @@ impl DriverDescriptor for AcpDescriptor {
     }
 
     fn new_protocol(&self) -> Box<dyn Protocol> {
-        Box::new(AcpProtocol::new(self.flavor.client_name()))
+        match self.flavor {
+            Flavor::Kilo => Box::new(AcpProtocol::with_bridge(self.flavor.client_name())),
+            Flavor::OpenCode => Box::new(AcpProtocol::new(self.flavor.client_name())),
+        }
     }
 
     fn discovery(&self, ctx: &DiscoveryContext) -> Vec<DiscoveryProbe> {
