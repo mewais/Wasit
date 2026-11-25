@@ -12,7 +12,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod http;
 mod protocol;
+pub mod subagents;
 
 use std::sync::Arc;
 

@@ -1049,6 +1049,14 @@ impl Protocol for AcpProtocol {
             Some(RpcIn::Notification { method, params }) if method == "session/update" => {
                 events(self.on_update(&params))
             }
+            // The channel-B bridge's observations (and its command results): private to the
+            // bridge's stdout and never ACP, so consumed here. Reducing them into state is the
+            // subagent layer's job (see `subagents`).
+            Some(RpcIn::Notification { method, .. })
+                if method.starts_with(crate::subagents::METHOD) =>
+            {
+                Step::default()
+            }
             _ => events(vec![AgentEvent::Unknown { raw: v }]),
         }
     }
