@@ -801,9 +801,11 @@ dependencies = [
 name = "wasit-opencode"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "serde_json",
  "tokio",
  "wasit-core",
+ "wasit-process",
  "wasit-smoke",
 ]
 

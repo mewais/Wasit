@@ -224,6 +224,43 @@ pub(crate) async fn write_generated(dir: &Path, spec: &SpawnSpec) -> Result<(), 
     Ok(())
 }
 
+/// The argv a session's process is started with. A driver with a [`wasit_core::Wrapper`] is
+/// started as `<host> <subcommand> -- <driver argv…>`, where the host is the program the shim is
+/// started with and the subcommand replaces the shim's (the last element of the launcher's
+/// arguments, by convention `shim`). The host then runs the wrapper itself, so no executable path
+/// is known to the driver.
+pub(crate) fn launch_argv(
+    launcher: &crate::config::ShimLauncher,
+    desc: &dyn DriverDescriptor,
+    spec: &SpawnSpec,
+) -> Result<Vec<String>, RuntimeError> {
+    let argv = desc.argv(spec);
+    let Some(wrapper) = desc.wrapper() else {
+        return Ok(argv);
+    };
+    let host = launcher
+        .program
+        .to_str()
+        .ok_or_else(|| RuntimeError::Spawn("the host program path is not UTF-8".into()))?;
+    let Some((_shim_subcommand, before)) = launcher.args.split_last() else {
+        return Err(RuntimeError::Spawn(format!(
+            "the host launcher has no subcommand to run `{}` with",
+            wrapper.subcommand
+        )));
+    };
+    let mut out = vec![host.to_string()];
+    for arg in before {
+        let arg = arg
+            .to_str()
+            .ok_or_else(|| RuntimeError::Spawn("a launcher argument is not UTF-8".into()))?;
+        out.push(arg.to_string());
+    }
+    out.push(wrapper.subcommand.to_string());
+    out.push("--".to_string());
+    out.extend(argv);
+    Ok(out)
+}
+
 /// The shim launch spec for one process generation of `spec`.
 pub(crate) fn shim_spec(
     cfg: &RuntimeConfig,
@@ -231,7 +268,7 @@ pub(crate) fn shim_spec(
     dir: &Path,
     spec: &SpawnSpec,
 ) -> Result<ShimSpec, RuntimeError> {
-    let argv = desc.argv(spec);
+    let argv = launch_argv(&cfg.launcher, desc, spec)?;
     let Some((program, args)) = argv.split_first() else {
         return Err(RuntimeError::Spawn(
             "the driver produced an empty argv".into(),
@@ -273,4 +310,38 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ShimLauncher;
+
+    #[test]
+    fn a_wrapped_driver_is_launched_through_its_host_subcommand() {
+        let spec = SpawnSpec::default();
+        let launcher = ShimLauncher::subcommand("/opt/host/wasit-hostd", "shim");
+        let kilo = wasit_opencode::kilo();
+        assert_eq!(
+            launch_argv(&launcher, kilo.as_ref(), &spec).unwrap(),
+            ["/opt/host/wasit-hostd", "kilo-bridge", "--", "kilo", "acp"]
+        );
+        // A driver without a wrapper is launched as it always was.
+        let claude = wasit_claude::descriptor();
+        assert_eq!(
+            launch_argv(&launcher, claude.as_ref(), &spec).unwrap(),
+            claude.argv(&spec)
+        );
+    }
+
+    #[test]
+    fn a_wrapper_needs_a_subcommand_in_the_launcher() {
+        let launcher = ShimLauncher::binary("/opt/host/wasit-shim");
+        let err = launch_argv(
+            &launcher,
+            wasit_opencode::kilo().as_ref(),
+            &SpawnSpec::default(),
+        );
+        assert!(matches!(err, Err(RuntimeError::Spawn(_))));
+    }
 }

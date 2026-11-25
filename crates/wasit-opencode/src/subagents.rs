@@ -8,7 +8,10 @@
 //! the shim is CLI-agnostic, so nothing in the existing pipeline can talk HTTP. A protocol cannot
 //! do it either, since it must stay pure and replayable.
 //!
-//! The choice: the CLI command becomes `wasit-kilo-bridge -- kilo acp …` ([`run_bridge`]).
+//! The choice: the session's process is `<host> kilo-bridge -- kilo acp …` ([`SUBCOMMAND`]), where
+//! the host is the daemon binary itself (the same binary that runs the shim), so a host ships one
+//! helper binary. The runtime launches it through [`Wrapper`] and [`subcommand_main`] runs
+//! [`run_bridge`].
 //! - The bridge spawns `kilo acp` with `--port <free> --hostname 127.0.0.1` and a random
 //!   `KILO_SERVER_PASSWORD`, and forwards ACP stdin and stdout unchanged.
 //! - Its own observations go into the same stdout as JSON-RPC notifications with method
@@ -25,7 +28,8 @@
 //! - **Readiness.** The SSE stream opens when the first JSON-RPC response from `kilo acp` goes by.
 //!   The recorded fixtures show `server.connected` about 12 ms after the `initialize` reply.
 //! - **Loss.** An SSE stream that closes or errors emits `state_lost`. The bridge never reconnects
-//!   and never reports the state as idle.
+//!   and never reports the state as idle. A stream that ends after the protocol closed the
+//!   bridge's stdin is a normal shutdown: no `state_lost`.
 //! - **Content-free.** Notifications carry ids, statuses, counts and token numbers. Prompts,
 //!   message text, tool input, permission patterns, job titles and metadata never leave the
 //!   bridge.
@@ -42,8 +46,9 @@
 //! {command, status}`, `command_failed {command, reason, status?}`.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,6 +58,20 @@ use serde_json::{json, Value};
 use wasit_core::wire::rpc_notification;
 
 use crate::http::{self, is_path_id, Endpoint};
+
+/// The host subcommand that runs the bridge (`<host> kilo-bridge -- kilo acp …`).
+pub const SUBCOMMAND: &str = "kilo-bridge";
+
+/// [`SUBCOMMAND`]'s entry point: `args` is the CLI argv (`kilo acp …`). Returns the exit code.
+pub fn subcommand_main(args: &[String]) -> i32 {
+    match run_bridge(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("kilo-bridge: {e}");
+            2
+        }
+    }
+}
 
 /// JSON-RPC method of every bridge notification and of every control line (in both directions).
 pub const METHOD: &str = "_wasit/kilo";
@@ -397,11 +416,17 @@ pub fn execute<W: Write>(ep: &Endpoint, cmd: &Command, out: &Out<W>) {
 
 /// Read the server's event stream until it ends, reporting every mapped event. Background jobs
 /// are fetched for the parent whose child changed. A stream that ends or fails ends the loop with
-/// `state_lost`; nothing reconnects.
-pub fn run_events<W: Write + Send>(ep: &Endpoint, out: &Out<W>) {
+/// `state_lost`, unless `closing` is set: it is set once the protocol has closed the bridge's
+/// stdin, and the CLI's server going away after that is the normal shutdown. Nothing reconnects.
+pub fn run_events<W: Write + Send>(ep: &Endpoint, out: &Out<W>, closing: &AtomicBool) {
+    let lost = |reason: &str| {
+        if !closing.load(Ordering::SeqCst) {
+            out.notify(&state_lost(reason));
+        }
+    };
     let mut stream = match http::open_events(ep, "/global/event") {
         Ok(s) => s,
-        Err(_) => return out.notify(&state_lost("connect")),
+        Err(_) => return lost("connect"),
     };
     let mut tracker = Tracker::default();
     loop {
@@ -422,8 +447,8 @@ pub fn run_events<W: Write + Send>(ep: &Endpoint, out: &Out<W>) {
                     refresh_jobs(ep, &parent, out);
                 }
             }
-            Ok(None) => return out.notify(&state_lost("stream_closed")),
-            Err(_) => return out.notify(&state_lost("stream_error")),
+            Ok(None) => return lost("stream_closed"),
+            Err(_) => return lost("stream_error"),
         }
     }
 }
@@ -450,7 +475,7 @@ pub fn run_bridge(kilo_argv: &[String]) -> io::Result<i32> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no CLI command given"))?;
     let port = free_port()?;
     let password = random_password()?;
-    let mut child = std::process::Command::new(program)
+    let mut child = wasit_process::std_command(program)
         .args(args)
         .args(["--port", &port.to_string(), "--hostname", "127.0.0.1"])
         .env("KILO_SERVER_USERNAME", USERNAME)
@@ -478,13 +503,15 @@ pub fn run_bridge(kilo_argv: &[String]) -> io::Result<i32> {
     // HTTP server is known to be listening. A CLI that exits first closes these channels.
     let (events_ready_tx, events_ready_rx) = mpsc::channel::<()>();
     let (cmds_ready_tx, cmds_ready_rx) = mpsc::channel::<()>();
+    // Set once the protocol closes stdin: from then on the CLI's exit is not a loss.
+    let closing = Arc::new(AtomicBool::new(false));
 
     {
-        let (ep, out) = (ep.clone(), out.clone());
+        let (ep, out, closing) = (ep.clone(), out.clone(), closing.clone());
         // Ends without events when the CLI never answered.
         thread::spawn(move || {
             if events_ready_rx.recv().is_ok() {
-                run_events(&ep, &*out);
+                run_events(&ep, &*out, &closing);
             }
         });
     }
@@ -508,10 +535,12 @@ pub fn run_bridge(kilo_argv: &[String]) -> io::Result<i32> {
         thread::spawn(move || forward_stdout(kilo_out, &*out, vec![events_ready_tx, cmds_ready_tx]))
     };
     {
-        let out = out.clone();
+        let (out, closing) = (out.clone(), closing.clone());
         // Not joined: it blocks on the bridge's own stdin until the shim closes it.
         thread::spawn(move || {
             forward_stdin(io::stdin().lock(), &mut kilo_in, &cmd_tx, &*out);
+            // Before `kilo_in` drops, so the CLI can only exit after this is visible.
+            closing.store(true, Ordering::SeqCst);
         });
     }
     let status = child.wait()?;
@@ -587,10 +616,11 @@ fn free_port() -> io::Result<u16> {
         .port())
 }
 
-/// 24 random bytes as hex, from the OS random source.
+/// 24 random bytes as hex, from the OS random source (`getrandom`: the same call on every
+/// platform, including Windows).
 fn random_password() -> io::Result<String> {
     let mut bytes = [0u8; 24];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(|e| io::Error::other(format!("random source: {e}")))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 

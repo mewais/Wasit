@@ -40,7 +40,7 @@ pub use config::{
 pub use content::{Attachment, ContentPart, FileInput, MediaSource, PromptInput};
 pub use descriptor::{
     BusyPrompt, DriverCapabilities, DriverDescriptor, DriverId, DriverRegistry, RegistryError,
-    SavesConversation, SubagentSupport,
+    SavesConversation, SubagentSupport, Wrapper,
 };
 pub use discovery::{
     config_listing, exec_stdout, front_matter, handshake_events, listed_files, markdown_items,

@@ -25,6 +25,7 @@ use wasit_core::{
     DiscoveryKind, DiscoveryProbe, DriverCapabilities, DriverDescriptor, DriverId, FileInput,
     GeneratedFile, HistoryDelivery, McpServerConfig, McpTransport, ModelInfo, ProbeAction,
     ProbeOutput, PromptInput, Protocol, ResumableSession, SpawnSpec, SubagentSupport, Unsupported,
+    Wrapper,
 };
 
 pub use protocol::{config_models, config_modes, AcpProtocol};
@@ -117,6 +118,17 @@ impl DriverDescriptor for AcpDescriptor {
         ];
         argv.extend(spec.extra_args.iter().cloned());
         argv
+    }
+
+    fn wrapper(&self) -> Option<Wrapper> {
+        // Kilo's channel B (the bridge) is Kilo's own HTTP routes; OpenCode is launched directly.
+        match self.flavor {
+            Flavor::Kilo => Some(Wrapper {
+                subcommand: subagents::SUBCOMMAND,
+                main: subagents::subcommand_main,
+            }),
+            Flavor::OpenCode => None,
+        }
     }
 
     fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {

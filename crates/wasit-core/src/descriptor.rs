@@ -148,6 +148,19 @@ pub struct SubagentSupport {
     pub background: bool,
 }
 
+/// A wrapper a driver runs its CLI through: a subcommand of the host binary. The runtime launches
+/// `<host> <subcommand> -- <cli argv…>` (the host is the program the shim is launched with, the
+/// subcommand taking the place of `shim`), and the host's `main` hands the CLI argv to `main`
+/// and exits with its code. A host that does not route `subcommand` cannot run the session, so a
+/// host registers every wrapper of the drivers it ships.
+#[derive(Clone, Copy, Debug)]
+pub struct Wrapper {
+    /// Name of the host subcommand, e.g. `kilo-bridge`.
+    pub subcommand: &'static str,
+    /// The wrapper's entry point; `args` is the CLI argv (element 0 is the CLI's program).
+    pub main: fn(&[String]) -> i32,
+}
+
 /// Everything the runtime needs to know about one CLI. Implemented by each
 /// driver crate; nothing outside a driver crate and the registry that lists
 /// drivers ever matches on a driver id.
@@ -180,6 +193,11 @@ pub trait DriverDescriptor: ConfigRenderer + Send + Sync {
     /// When the CLI's own storage holds a conversation (see [`SavesConversation`]).
     fn saves_conversation(&self) -> SavesConversation {
         SavesConversation::default()
+    }
+    /// The wrapper the session's process is launched through, when the CLI needs one (see
+    /// [`Wrapper`]); `None` launches the CLI itself, with [`argv`](Self::argv).
+    fn wrapper(&self) -> Option<Wrapper> {
+        None
     }
     /// The command (argv, element 0 the CLI's own name for the user's terminal; never a shell
     /// string) with which the user opens the conversation `native_session_id` in their own CLI,

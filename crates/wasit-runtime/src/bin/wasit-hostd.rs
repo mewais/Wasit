@@ -495,6 +495,13 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A driver's wrapper (the bridge of a Kilo session): the sessions this host starts launch it.
+    if let Some(code) = cmd
+        .to_str()
+        .and_then(|name| wasit_runtime::run_wrapper(name, &rest))
+    {
+        return code;
+    }
     let parsed = match parse(&rest) {
         Ok(a) => a,
         Err(e) => {

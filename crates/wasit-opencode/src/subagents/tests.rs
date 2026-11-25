@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
@@ -484,7 +485,7 @@ fn event_stream_reports_mapped_events_refreshes_jobs_and_reports_loss_on_close()
         Served::Json(200, jobs.to_string()),
     ]);
     let out = Out::new(Vec::new());
-    run_events(&ep, &out);
+    run_events(&ep, &out, &AtomicBool::new(false));
     let seen = server.join().unwrap();
 
     assert_eq!(seen[0].method, "GET");
@@ -529,7 +530,7 @@ fn dropped_event_stream_is_reported_as_lost_not_idle() {
         clean_end: false,
     }]);
     let out = Out::new(Vec::new());
-    run_events(&ep, &out);
+    run_events(&ep, &out, &AtomicBool::new(false));
     server.join().unwrap();
     let notes = read_out(&out);
     assert_eq!(kinds(&notes), ["permission.asked", "state_lost"]);
@@ -537,10 +538,23 @@ fn dropped_event_stream_is_reported_as_lost_not_idle() {
 }
 
 #[test]
+fn stream_ending_after_stdin_closed_is_a_normal_shutdown() {
+    // The CLI's server goes away once the shim has closed the bridge's stdin: no loss.
+    let (ep, server) = serve(vec![Served::Sse {
+        events: Vec::new(),
+        clean_end: false,
+    }]);
+    let out = Out::new(Vec::new());
+    run_events(&ep, &out, &AtomicBool::new(true));
+    server.join().unwrap();
+    assert!(read_out(&out).is_empty());
+}
+
+#[test]
 fn refused_event_stream_is_reported_as_lost_at_connect() {
     let (ep, server) = serve(vec![Served::Json(500, String::new())]);
     let out = Out::new(Vec::new());
-    run_events(&ep, &out);
+    run_events(&ep, &out, &AtomicBool::new(false));
     server.join().unwrap();
     assert_eq!(kinds(&read_out(&out)), ["state_lost"]);
     assert_eq!(read_out(&out)[0]["reason"], "connect");

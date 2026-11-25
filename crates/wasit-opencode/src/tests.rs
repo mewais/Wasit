@@ -403,7 +403,13 @@ fn render_config_env_json_per_flavor() {
         assert_eq!(v["plugin"], json!(["/p"]));
         assert_eq!(v["instructions"], json!(["/s/wasit-instructions.md"]));
         assert_eq!(spec.files[0].contents, "Be brief.");
+        // The descriptor's argv is the CLI's own; a wrapped flavor is launched as
+        // `<host> <wrapper> -- <argv>` by the runtime (see `wrapper` and the runtime's launch test).
         assert_eq!(d.argv(&spec), [flavor.binary(), "acp"]);
+        match flavor {
+            Flavor::Kilo => assert_eq!(d.wrapper().map(|w| w.subcommand), Some("kilo-bridge")),
+            Flavor::OpenCode => assert!(d.wrapper().is_none()),
+        }
     }
     let d = AcpDescriptor {
         flavor: Flavor::Kilo,

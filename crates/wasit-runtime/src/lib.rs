@@ -83,6 +83,25 @@ pub fn default_registry() -> DriverRegistry {
     r
 }
 
+/// Runs the host subcommand `subcommand` if a driver of this runtime launches its CLI through it
+/// (see [`wasit_core::Wrapper`]). `args` are the arguments after the subcommand; a leading `--` is
+/// dropped and the rest is the CLI argv. Returns the wrapper's exit code, or `None` when no driver
+/// has that subcommand, so the host goes on with its own. A host binary calls it first in `main`,
+/// as it does for `shim`.
+pub fn run_wrapper(subcommand: &str, args: &[String]) -> Option<std::process::ExitCode> {
+    let wrapper = default_registry()
+        .iter()
+        .find_map(|d| d.wrapper().filter(|w| w.subcommand == subcommand))?;
+    let cli = match args.first().map(String::as_str) {
+        Some("--") => &args[1..],
+        _ => args,
+    };
+    let code = (wrapper.main)(cli);
+    Some(std::process::ExitCode::from(
+        u8::try_from(code.clamp(0, 255)).unwrap_or(1),
+    ))
+}
+
 /// Test support for the derived event log (not part of the API).
 #[doc(hidden)]
 pub mod testing {

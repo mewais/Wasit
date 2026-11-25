@@ -6,7 +6,9 @@ description = "Wasit ACP drivers for OpenCode and Kilo Code: one pure Protocol, 
 
 [dependencies]
 wasit-core = { path = "../wasit-core" }
+wasit-process = { path = "../wasit-process" }
 serde_json = { workspace = true }
+getrandom = "0.4"
 
 [dev-dependencies]
 wasit-smoke = { path = "../wasit-smoke" }
