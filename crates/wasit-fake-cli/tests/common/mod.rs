@@ -157,9 +157,27 @@ impl Fake {
     }
 
     pub fn send(&mut self, v: &Value) {
-        let stdin = self.stdin.as_mut().expect("stdin open");
-        writeln!(stdin, "{v}").expect("write to fake");
-        stdin.flush().expect("flush to fake");
+        assert!(self.send_if_open(v), "the fake exited before reading {v}");
+    }
+
+    /// Sends `v`, unless the fake has already exited. The fake's stdin read end closes only when
+    /// the process exits, so a write failing with `BrokenPipe` means it is gone; a scripted exit
+    /// (a refused start) can happen before the test writes, so that case is reported, not
+    /// panicked on. Any other write error is a real failure. Returns whether `v` was delivered.
+    pub fn send_if_open(&mut self, v: &Value) -> bool {
+        let result = {
+            let stdin = self.stdin.as_mut().expect("stdin open");
+            writeln!(stdin, "{v}").and_then(|()| stdin.flush())
+        };
+        match result {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                // The child has already exited; drop the handle so further writes are impossible.
+                self.stdin = None;
+                false
+            }
+            Err(e) => panic!("write to fake: {e}"),
+        }
     }
 
     pub fn close_stdin(&mut self) {

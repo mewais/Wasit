@@ -802,7 +802,9 @@ fn claude_stores_a_conversation_with_its_first_prompt_and_resume_needs_it() {
         Some(state),
         Some(cwd),
     );
-    f.send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
+    // The fake refuses before reading any input, so it may already have exited when this is
+    // written; the assertions below (the error result, exit code 1) hold either way.
+    f.send_if_open(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize","hooks":null}}));
     // The real CLI answers with an error result for the requested id, never with the
     // initialize response; and says so on stderr.
     let line = f.recv_until(|m| m["type"] == "result").pop().unwrap();
