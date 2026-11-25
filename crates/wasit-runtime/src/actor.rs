@@ -36,7 +36,7 @@ use wasit_shim::{Error as ShimError, Record, RecordStream, ShimClient, ShimState
 
 use crate::config::RuntimeConfig;
 use crate::continuation::{Continuation, Held};
-use crate::core::{ContinuePlan, Core};
+use crate::core::{answer_request_id, ContinuePlan, Core};
 use crate::diag::{self, Intent};
 use crate::eventlog::{EventLog, LogView};
 use crate::history::ImportMsg;
@@ -763,6 +763,13 @@ impl Actor {
 
     fn on_record(&mut self, rec: Record) {
         let mut out = self.core.apply(&rec);
+        // Diagnostics for what this record changed: only a record applied live is new; a replay
+        // of the journal makes the same facts again.
+        if self.live {
+            for fact in &out.gate_facts {
+                diag::gate_fact(&self.id, fact);
+            }
+        }
         self.snapshot_dirty = true;
         for (id, bytes) in std::mem::take(&mut out.blobs) {
             crate::media::write_blob(&self.dir, id, bytes);
@@ -1340,15 +1347,24 @@ impl Actor {
             );
             return;
         }
-        if let Some(request_id) = self.core.answers_withdrawn(&command) {
-            // Also after the process ended: say why the answer did nothing.
-            self.refuse(&intent, reply, CommandError::GateWithdrawn { request_id });
-            return;
-        }
         if !self.takes_commands() {
             if continues_the_session(&command) {
                 self.continue_for(command, reply, intent);
             } else {
+                // Nothing can be journaled while no process runs, so an answer is refused here
+                // (a running session journals it: the core then says what became of it).
+                if let Some((request_id, reason)) = self.core.answers_withdrawn(&command) {
+                    diag::answer_rejected(&self.id, &request_id, "withdrawn");
+                    let err = CommandError::GateWithdrawn {
+                        request_id,
+                        reason: Some(reason),
+                    };
+                    self.refuse(&intent, reply, err);
+                    return;
+                }
+                if let Some(request_id) = answer_request_id(&command) {
+                    diag::answer_rejected(&self.id, request_id, "not_running");
+                }
                 let reason = format!("the session is {}", self.core.snapshot().phase.name());
                 self.refuse(&intent, reply, CommandError::NotRunning { reason });
             }

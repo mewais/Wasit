@@ -461,6 +461,7 @@ pub fn project(event: &SessionEvent) -> Option<TrailEntry> {
                 NoticeCode::StartIgnored => "start_ignored",
                 NoticeCode::Shim => "shim",
                 NoticeCode::UnrecognisedNote => "unrecognised_note",
+                NoticeCode::AnswerNotDelivered => "answer_not_delivered",
                 NoticeCode::Other => "other",
             }),
         },
@@ -737,7 +738,7 @@ fn applied(
         CommandStatus::Unsupported { operation } => ("unsupported", Some(operation.as_str())),
         CommandStatus::Rejected { reason } => ("rejected", Some(reason.as_str())),
         CommandStatus::NotRunning { reason } => ("not_running", Some(reason.as_str())),
-        CommandStatus::Withdrawn { request_id } => {
+        CommandStatus::Withdrawn { request_id, .. } => {
             target.get_or_insert_with(|| Ident::new(request_id));
             ("withdrawn", None)
         }

@@ -309,6 +309,69 @@ pub(crate) struct Output {
     /// the in-memory tail and the trail never see them; they are paged from the journal
     /// (`session.history {earlier: true}`).
     pub earlier: Vec<SessionEvent>,
+    /// How gates changed with this record (see [`GateFact`]).
+    pub gate_facts: Vec<GateFact>,
+}
+
+/// A change to a gate that the runtime's diagnostics report (`crate::diag`). Facts are made
+/// while a record is applied, so a replay makes the same ones: the actor reports them only for
+/// a record it applies live ([`Output::gate_facts`]). They carry ids, words and times, never
+/// the gate's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateFact {
+    /// A gate was raised: its kind and the turn binding it asked for (`turn`, `interrupt` or
+    /// `none`).
+    Raised {
+        request_id: String,
+        kind: &'static str,
+        bound_to: &'static str,
+    },
+    /// The gate was answered `ms` after it was raised.
+    Answered { request_id: String, ms: u64 },
+    /// An external gate was taken down with `reason` (its code).
+    Withdrawn { request_id: String, reason: String },
+    /// An answer to the gate was refused: `reason` is `invalid_choice`, `withdrawn`,
+    /// `not_running`, `unsupported` or `rejected` (the protocol refused it).
+    AnswerRejected {
+        request_id: String,
+        reason: &'static str,
+    },
+}
+
+/// The request id of an answer to a gate, `None` for any other command.
+pub(crate) fn answer_request_id(command: &Command) -> Option<&str> {
+    match command {
+        Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. } => {
+            Some(request_id)
+        }
+        _ => None,
+    }
+}
+
+fn gate_kind(gate: &wasit_core::GateRequest) -> &'static str {
+    use wasit_core::GateRequest;
+    match gate {
+        GateRequest::Permission { .. } => "permission",
+        GateRequest::Plan { .. } => "plan",
+        GateRequest::Question { .. } => "question",
+        GateRequest::Handoff { .. } => "handoff",
+        GateRequest::Spawn { .. } => "spawn",
+    }
+}
+
+fn binding_word(binding: Option<&TurnBinding>) -> &'static str {
+    match binding {
+        None => "none",
+        Some(TurnBinding::Interrupt { .. }) => "interrupt",
+        Some(TurnBinding::Turn { .. }) => "turn",
+    }
+}
+
+/// What the user is told when an answer arrives after its gate was withdrawn: the reason's
+/// detail for people, else its code.
+fn not_delivered_message(reason: &GateReason) -> String {
+    let why = reason.detail.as_deref().unwrap_or(&reason.code);
+    format!("your answer arrived after the request was withdrawn ({why}) and was not delivered")
 }
 
 struct Emitter {
@@ -444,9 +507,11 @@ pub(crate) struct Core {
     external: BTreeMap<String, Option<TurnBinding>>,
     /// An interrupt was applied to the turn open now (the CLI has not ended it yet).
     interrupt_applied: bool,
-    /// Request ids of external gates that were withdrawn or ended with their process (newest
+    /// External gates that were withdrawn or ended with their process, with the reason (newest
     /// last, bounded): a late answer to one is refused as [`CommandStatus::Withdrawn`].
-    withdrawn: VecDeque<String>,
+    withdrawn: VecDeque<(String, GateReason)>,
+    /// Gate changes of the record being applied, drained into its [`Output`].
+    gate_facts: Vec<GateFact>,
     /// The conversation's earlier history (see [`EarlierCore`]).
     earlier: EarlierCore,
 }
@@ -613,6 +678,7 @@ impl Core {
             external: BTreeMap::new(),
             interrupt_applied: false,
             withdrawn: VecDeque::new(),
+            gate_facts: Vec::new(),
             earlier: EarlierCore::default(),
         }
     }
@@ -772,6 +838,7 @@ impl Core {
             Kind::Exited => self.on_exited(rec, &mut em, &mut out),
             Kind::Note => self.on_note(rec, &mut em, &mut out),
         }
+        out.gate_facts = std::mem::take(&mut self.gate_facts);
         self.finish(em, &mut out, &phase_before);
         out
     }
@@ -998,14 +1065,23 @@ impl Core {
             }) => {
                 self.snap.last_activity_ms = rec.t;
                 let input = InputId(rec.seq);
-                if let Some(request_id) = self.answers_withdrawn(&command) {
-                    let status = CommandStatus::Withdrawn { request_id };
+                if let Some((request_id, reason)) = self.answers_withdrawn(&command) {
+                    let status = CommandStatus::Withdrawn {
+                        request_id,
+                        reason: Some(reason.clone()),
+                    };
                     em.push(SessionEventKind::Input {
                         input,
-                        command,
+                        command: command.clone(),
                         status: status.clone(),
                         trace,
                     });
+                    // The answer is journaled, so the session says what became of it.
+                    em.push(SessionEventKind::Notice {
+                        message: not_delivered_message(&reason),
+                        code: NoticeCode::AnswerNotDelivered,
+                    });
+                    self.note_refused_answer(&command, &status);
                     out.resolved.push((token, status));
                     return;
                 }
@@ -1272,6 +1348,7 @@ impl Core {
                 | Command::AnswerQuestion { request_id, .. }
                     if status == CommandStatus::Sent =>
                 {
+                    self.note_answered(request_id, em.t);
                     self.snap
                         .pending_gates
                         .retain(|g| g.gate.request_id() != request_id);
@@ -1286,6 +1363,7 @@ impl Core {
         if status == CommandStatus::Queued {
             push_bounded(&mut self.queued, input, MAX_OPEN_INPUTS);
         }
+        self.note_refused_answer(&command, &status);
         em.push(SessionEventKind::Input {
             input,
             command: crate::media::without_bytes(command),
@@ -1309,25 +1387,60 @@ impl Core {
 
     // ── external gates ──────────────────────────────────────────────────────
 
-    /// `command` answers an external gate that was withdrawn (and is not pending again).
-    pub(crate) fn answers_withdrawn(&self, command: &Command) -> Option<String> {
-        match command {
-            Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. }
-                if !self.external.contains_key(request_id)
-                    && self.withdrawn.iter().any(|w| w == request_id) =>
-            {
-                Some(request_id.clone())
-            }
-            _ => None,
+    /// `command` answers an external gate that was withdrawn (and is not pending again), with
+    /// the reason it was withdrawn.
+    pub(crate) fn answers_withdrawn(&self, command: &Command) -> Option<(String, GateReason)> {
+        let request_id = answer_request_id(command)?;
+        if self.external.contains_key(request_id) {
+            return None;
         }
+        self.withdrawn
+            .iter()
+            .find(|(w, _)| w == request_id)
+            .cloned()
     }
 
-    fn remember_withdrawn(&mut self, request_id: String) {
-        self.withdrawn.retain(|w| *w != request_id);
-        self.withdrawn.push_back(request_id);
+    fn remember_withdrawn(&mut self, request_id: String, reason: GateReason) {
+        self.withdrawn.retain(|(w, _)| *w != request_id);
+        self.withdrawn.push_back((request_id, reason));
         while self.withdrawn.len() > WITHDRAWN_MEMORY {
             self.withdrawn.pop_front();
         }
+    }
+
+    /// The gate `request_id` was answered at `t`: its latency, if it is pending.
+    fn note_answered(&mut self, request_id: &str, t: u64) {
+        let raised = self
+            .snap
+            .pending_gates
+            .iter()
+            .find(|g| g.gate.request_id() == request_id)
+            .map(|g| g.raised_at_ms);
+        if let Some(raised) = raised {
+            self.gate_facts.push(GateFact::Answered {
+                request_id: request_id.to_string(),
+                ms: t.saturating_sub(raised),
+            });
+        }
+    }
+
+    /// `status` refused an answer to a gate: the fact says why, by the status's word. Other
+    /// commands and accepted answers make no fact.
+    fn note_refused_answer(&mut self, command: &Command, status: &CommandStatus) {
+        let Some(request_id) = answer_request_id(command) else {
+            return;
+        };
+        let reason = match status {
+            CommandStatus::Rejected { .. } => "rejected",
+            CommandStatus::NotRunning { .. } => "not_running",
+            CommandStatus::Unsupported { .. } => "unsupported",
+            CommandStatus::Withdrawn { .. } => "withdrawn",
+            CommandStatus::Sent | CommandStatus::Queued => return,
+        };
+        self.gate_facts.push(GateFact::AnswerRejected {
+            request_id: request_id.to_string(),
+            reason,
+        });
     }
 
     /// `command` answers a pending external gate.
@@ -1365,6 +1478,10 @@ impl Core {
                 .find(|g| g.gate.request_id() == request_id)
                 .map(|g| g.gate.check(decision).map(|_| ()));
             if let Some(Err(reason)) = check {
+                self.gate_facts.push(GateFact::AnswerRejected {
+                    request_id: request_id.clone(),
+                    reason: "invalid_choice",
+                });
                 let status = CommandStatus::Rejected { reason };
                 em.push(SessionEventKind::Input {
                     input,
@@ -1379,6 +1496,7 @@ impl Core {
         if let Command::AnswerGate { request_id, .. } | Command::AnswerQuestion { request_id, .. } =
             &command
         {
+            self.note_answered(request_id, em.t);
             self.external.remove(request_id);
             self.snap
                 .pending_gates
@@ -1411,7 +1529,7 @@ impl Core {
             CommandStatus::NotRunning {
                 reason: "the process is not running".into(),
             }
-        } else if self.withdrawn.iter().any(|w| *w == rid) {
+        } else if self.withdrawn.iter().any(|(w, _)| *w == rid) {
             CommandStatus::Rejected {
                 reason: format!("the gate {rid:?} was withdrawn; raise it under a new id"),
             }
@@ -1427,6 +1545,11 @@ impl Core {
             }
         } else {
             self.external.insert(rid.clone(), None);
+            self.gate_facts.push(GateFact::Raised {
+                request_id: rid.clone(),
+                kind: gate_kind(&gate),
+                bound_to: binding_word(binding.as_ref()),
+            });
             let event = AgentEvent::GateRequested { gate };
             let cursor = em.next_cursor();
             self.reduce(&event, cursor, t);
@@ -1469,7 +1592,11 @@ impl Core {
         em: &mut Emitter,
     ) {
         self.external.remove(&request_id);
-        self.remember_withdrawn(request_id.clone());
+        self.gate_facts.push(GateFact::Withdrawn {
+            request_id: request_id.clone(),
+            reason: reason.code.clone(),
+        });
+        self.remember_withdrawn(request_id.clone(), reason.clone());
         let event = AgentEvent::GateResolved {
             request_id,
             reason: Some(reason),
@@ -1868,6 +1995,13 @@ impl Core {
             // Handled before the match: see `reduce_scoped`.
             AgentEvent::Scoped { .. } => {}
             AgentEvent::GateRequested { gate } => {
+                if !self.external.contains_key(gate.request_id()) {
+                    self.gate_facts.push(GateFact::Raised {
+                        request_id: gate.request_id().to_string(),
+                        kind: gate_kind(gate),
+                        bound_to: "none",
+                    });
+                }
                 s.pending_gates
                     .retain(|g| g.gate.request_id() != gate.request_id());
                 s.pending_gates.push(PendingGate {
@@ -1967,7 +2101,12 @@ impl Core {
         self.snap.pending_gates.clear();
         self.interrupt_applied = false;
         for request_id in std::mem::take(&mut self.external).into_keys() {
-            self.remember_withdrawn(request_id);
+            let reason = GateReason::new(GateReason::PROCESS_ENDED);
+            self.gate_facts.push(GateFact::Withdrawn {
+                request_id: request_id.clone(),
+                reason: reason.code.clone(),
+            });
+            self.remember_withdrawn(request_id, reason);
         }
         tasks::end_all(&mut self.snap.tasks, t);
         for a in self.snap.subagents.iter_mut().filter(|a| a.running) {
@@ -2751,7 +2890,8 @@ mod tests {
             vec![(
                 "a2".into(),
                 CommandStatus::Withdrawn {
-                    request_id: "x2".into()
+                    request_id: "x2".into(),
+                    reason: Some(GateReason::new("withdrawn").with_detail("the asking turn ended")),
                 }
             )]
         );
@@ -2992,13 +3132,25 @@ mod tests {
             request_id: "g1".into(),
             decision: GateDecision::choose("allow"),
         });
-        assert!(matches!(
-            out.events.last().map(|e| &e.kind),
-            Some(SessionEventKind::Input {
-                status: CommandStatus::Withdrawn { .. },
-                ..
-            })
-        ));
+        // Journaled, refused as withdrawn, and the session says the answer was not delivered.
+        let kinds: Vec<&SessionEventKind> = out.events.iter().map(|e| &e.kind).collect();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    ..,
+                    SessionEventKind::Input {
+                        status: CommandStatus::Withdrawn { .. },
+                        ..
+                    },
+                    SessionEventKind::Notice {
+                        code: NoticeCode::AnswerNotDelivered,
+                        ..
+                    }
+                ]
+            ),
+            "{kinds:?}"
+        );
         sim.assert_replay_exact();
     }
 

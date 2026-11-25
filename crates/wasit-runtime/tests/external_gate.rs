@@ -148,7 +148,8 @@ async fn external_gate_survives_restart(driver: &str) {
     assert_eq!(
         late_answer(&mgr, &id, "h-2").await,
         Err(CommandError::GateWithdrawn {
-            request_id: "h-2".into()
+            request_id: "h-2".into(),
+            reason: Some(GateReason::new("turn_ended").with_detail("the asking turn ended")),
         })
     );
     // A reason without a detail is carried as it is.
@@ -425,7 +426,11 @@ async fn bound_gate_is_resolved_by_the_interrupt(driver: &str) {
     assert_eq!(
         late_answer(&mgr, &id, "t-1").await,
         Err(CommandError::GateWithdrawn {
-            request_id: "t-1".into()
+            request_id: "t-1".into(),
+            reason: Some(
+                GateReason::new(GateReason::TURN_INTERRUPTED)
+                    .with_detail("the user interrupted the turn")
+            ),
         })
     );
 

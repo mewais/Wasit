@@ -17,6 +17,7 @@ use wasit_control::TraceId;
 use wasit_core::RegistryError;
 use wasit_diag::{Code, ErrorInfo, Ident};
 
+use crate::core::GateFact;
 use crate::wire::{CommandError, EnvSource, SessionId};
 
 wasit_diag::diag_enum! {
@@ -53,6 +54,38 @@ wasit_diag::diag_events! {
             session: Ident,
             trace: Option<TraceId>,
             kind: Code,
+        },
+        /// A gate was raised on the session: its `kind` (`permission`, `plan`, `question`,
+        /// `handoff` or `spawn`) and the turn binding it asked for (`turn`, `interrupt`, or
+        /// `none` for a gate of the CLI's protocol or one that lives on across turns).
+        #[diag(ev = "gate.raised", lvl = info)]
+        GateRaised {
+            session: Ident,
+            request_id: Ident,
+            kind: Code,
+            bound_to: Code,
+        },
+        /// The gate was answered `ms` milliseconds after it was raised.
+        #[diag(ev = "gate.answered", lvl = info)]
+        GateAnswered {
+            session: Ident,
+            request_id: Ident,
+            ms: u64,
+        },
+        /// An external gate was taken down with `reason` (the reason's code, never its detail).
+        #[diag(ev = "gate.withdrawn", lvl = info)]
+        GateWithdrawn {
+            session: Ident,
+            request_id: Ident,
+            reason: Code,
+        },
+        /// An answer to a gate was refused and did nothing: `reason` is `invalid_choice`,
+        /// `withdrawn`, `not_running`, `unsupported` or `rejected`.
+        #[diag(ev = "gate.answer_rejected", lvl = warn)]
+        GateAnswerRejected {
+            session: Ident,
+            request_id: Ident,
+            reason: Code,
         },
         /// The host's environment was captured from `source` in `ms` milliseconds.
         #[diag(ev = "env.capture", lvl = info)]
@@ -191,6 +224,50 @@ pub(crate) fn command_timeout(id: &SessionId, intent: &Intent) {
         trace: intent.trace.clone(),
         kind: Code::new(intent.kind),
     });
+}
+
+/// A gate changed state: `fact` is what the session's record made of it. Ids, words and times
+/// only: the gate's text never reaches a record.
+pub(crate) fn gate_fact(id: &SessionId, fact: &GateFact) {
+    let event = match fact {
+        GateFact::Raised {
+            request_id,
+            kind,
+            bound_to,
+        } => RuntimeEvent::GateRaised {
+            session: session(id),
+            request_id: Ident::new(request_id),
+            kind: Code::st(kind),
+            bound_to: Code::st(bound_to),
+        },
+        GateFact::Answered { request_id, ms } => RuntimeEvent::GateAnswered {
+            session: session(id),
+            request_id: Ident::new(request_id),
+            ms: *ms,
+        },
+        GateFact::Withdrawn { request_id, reason } => RuntimeEvent::GateWithdrawn {
+            session: session(id),
+            request_id: Ident::new(request_id),
+            reason: Code::new(reason),
+        },
+        GateFact::AnswerRejected { request_id, reason } => RuntimeEvent::GateAnswerRejected {
+            session: session(id),
+            request_id: Ident::new(request_id),
+            reason: Code::st(reason),
+        },
+    };
+    wasit_diag::emit(&event);
+}
+
+/// An answer to `request_id` was refused before it could be journaled, for `reason`.
+pub(crate) fn answer_rejected(id: &SessionId, request_id: &str, reason: &'static str) {
+    gate_fact(
+        id,
+        &GateFact::AnswerRejected {
+            request_id: request_id.to_string(),
+            reason,
+        },
+    );
 }
 
 /// The host's environment was captured from `source`.

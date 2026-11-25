@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use wasit_control::TraceId;
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
-    GateRequest, HistoryReport, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput,
+    GateReason, GateRequest, HistoryReport, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput,
     ResumableSession, SessionMode, SlashCommandInfo, TaskInfo, TaskUsage, TurnOrigin, TurnTrigger,
     Unsupported, Usage,
 };
@@ -678,9 +678,12 @@ pub enum CommandStatus {
     NotRunning {
         reason: String,
     },
-    /// An answer to an external gate that was withdrawn (its request is gone).
+    /// An answer to an external gate that was withdrawn (its request is gone); `reason` is why
+    /// it was withdrawn. Absent in a journal written before withdrawals carried one.
     Withdrawn {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<GateReason>,
     },
 }
 
@@ -695,8 +698,8 @@ impl CommandStatus {
             }
             CommandStatus::Rejected { reason } => Err(CommandError::Rejected { reason }),
             CommandStatus::NotRunning { reason } => Err(CommandError::NotRunning { reason }),
-            CommandStatus::Withdrawn { request_id } => {
-                Err(CommandError::GateWithdrawn { request_id })
+            CommandStatus::Withdrawn { request_id, reason } => {
+                Err(CommandError::GateWithdrawn { request_id, reason })
             }
         }
     }
@@ -800,6 +803,8 @@ pub enum NoticeCode {
     Shim,
     /// A runtime note this build does not understand.
     UnrecognisedNote,
+    /// An answer arrived after its gate was withdrawn: it was journaled but not delivered.
+    AnswerNotDelivered,
     /// Anything else.
     #[default]
     Other,
@@ -1494,8 +1499,14 @@ pub enum CommandError {
     #[error("no such session: {id}")]
     SessionNotFound { id: String },
     /// The gate was withdrawn (the request that raised it is gone); the answer did nothing.
+    /// `reason` is why it was withdrawn (absent for a journal written before withdrawals carried
+    /// one).
     #[error("the gate {request_id} is no longer needed (withdrawn)")]
-    GateWithdrawn { request_id: String },
+    GateWithdrawn {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<GateReason>,
+    },
     /// The session had ended and sending the command continues it first; the continue failed,
     /// so nothing was journaled for the command and it was not sent.
     #[error("the session had ended and could not be continued, so nothing was sent: {reason}")]
