@@ -53,7 +53,7 @@ use wasit_core::tasks::{self, BackgroundChange};
 use wasit_core::{
     AgentEvent, Command, DriverCapabilities, DriverDescriptor, DriverError, Encoded, GateReason,
     InputDropReason, InputId, LocalShellOrigin, Protocol, ResumeMode, SavesConversation, Scope,
-    SpawnSpec, Step, TurnBinding,
+    SpawnSpec, Step, TaskOutcome, TurnBinding,
 };
 use wasit_shim::{Kind, Record};
 
@@ -585,11 +585,13 @@ fn push_subagent(
         ok: None,
         task_id: None,
         agent_id: None,
+        run_id: None,
         subagent_type: input
             .get("subagent_type")
             .and_then(|d| d.as_str())
             .map(str::to_string),
         status: None,
+        outcome: None,
         ended_at_ms: None,
         tool_calls: 0,
         last_tool: None,
@@ -616,6 +618,20 @@ fn finish_subagent_call(subagents: &mut [SubagentInfo], call_id: &str, ok: bool,
     }
 }
 
+/// The shared outcome a task's status word names ([`TaskOutcome::status`]); `None` for the
+/// agent's own words the shared vocabulary does not have (`killed`, `unlisted`, …).
+fn outcome_of_status(status: &str) -> Option<TaskOutcome> {
+    [
+        TaskOutcome::Completed,
+        TaskOutcome::Failed,
+        TaskOutcome::Stopped,
+        TaskOutcome::Lost,
+        TaskOutcome::Unknown,
+    ]
+    .into_iter()
+    .find(|o| o.status() == status)
+}
+
 /// Make every subagent show what the agent's task for it says: the link is the spawning call
 /// (`TaskInfo::call_id`), and the task is the authority for whether it runs.
 fn sync_subagents(subagents: &mut [SubagentInfo], tasks: &[wasit_core::TaskInfo]) {
@@ -630,7 +646,16 @@ fn sync_subagents(subagents: &mut [SubagentInfo], tasks: &[wasit_core::TaskInfo]
         a.task_id = Some(task.task_id.clone());
         a.running = task.running;
         a.status.clone_from(&task.status);
+        // A running task has no outcome, whatever status word its updates carried.
+        a.outcome = if task.running {
+            None
+        } else {
+            task.status.as_deref().and_then(outcome_of_status)
+        };
         a.ok = if task.running { None } else { task.ok };
+        if task.run_id.is_some() {
+            a.run_id.clone_from(&task.run_id);
+        }
         a.ended_at_ms = task.ended_at_ms;
         if task.subagent_type.is_some() {
             a.subagent_type.clone_from(&task.subagent_type);
@@ -850,7 +875,7 @@ impl Core {
             return Vec::new();
         }
         let mut kinds = Vec::new();
-        for event in self.end_inputs() {
+        for event in self.end_inputs().into_iter().chain(self.lost_task_ends()) {
             self.reduce(&event, 0, self.snap.last_activity_ms);
             kinds.push(SessionEventKind::Agent { event });
         }
@@ -899,6 +924,7 @@ impl Core {
                 code: NoticeCode::PreviousGenerationUnclosed,
             });
             self.end_generation_inputs(em);
+            self.end_generation_tasks(em);
         }
         self.gen = Gen::Awaiting(Vec::new());
         self.owed.clear();
@@ -979,6 +1005,7 @@ impl Core {
             }
         }
         self.end_generation_inputs(em);
+        self.end_generation_tasks(em);
         self.earlier_generation_ended(em);
         self.owed.clear();
         self.close_owed = false;
@@ -1721,6 +1748,43 @@ impl Core {
         }
     }
 
+    /// Whether a task outlives the turn that started it and so is lost with its process: a
+    /// background task, or a sub-agent (one the tool call of a subagent spawned).
+    fn outlives_its_turn(&self, task: &wasit_core::TaskInfo) -> bool {
+        task.background
+            || task.subagent_type.is_some()
+            || self.snap.subagents.iter().any(|a| {
+                task.call_id.as_deref() == Some(a.call_id.as_str())
+                    || a.task_id.as_deref() == Some(task.task_id.as_str())
+            })
+    }
+
+    /// The `TaskEnded` events that close, as [`TaskOutcome::Lost`], the sub-agent and background
+    /// tasks still running when their process ends: their outcome is never known.
+    fn lost_task_ends(&self) -> Vec<AgentEvent> {
+        self.snap
+            .tasks
+            .iter()
+            .filter(|t| t.running && self.outlives_its_turn(t))
+            .map(|t| AgentEvent::TaskEnded {
+                task_id: t.task_id.clone(),
+                call_id: t.call_id.clone(),
+                status: TaskOutcome::Lost.status().to_string(),
+                ok: TaskOutcome::Lost.ok(),
+                summary: None,
+                usage: None,
+            })
+            .collect()
+    }
+
+    fn end_generation_tasks(&mut self, em: &mut Emitter) {
+        for event in self.lost_task_ends() {
+            let cursor = em.next_cursor();
+            self.reduce(&event, cursor, em.t);
+            em.push(SessionEventKind::Agent { event });
+        }
+    }
+
     // ── protocol output ─────────────────────────────────────────────────────
 
     /// Publish a protocol step. `input` is the command whose `encode` produced it (its lines
@@ -2112,6 +2176,8 @@ impl Core {
         for a in self.snap.subagents.iter_mut().filter(|a| a.running) {
             a.running = false;
             a.ended_at_ms = Some(t);
+            a.status = Some(TaskOutcome::Lost.status().to_string());
+            a.outcome = Some(TaskOutcome::Lost);
         }
         self.snap.background_running = 0;
     }
@@ -2463,7 +2529,7 @@ impl Core {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wasit_core::{GateDecision, TurnTrigger};
+    use wasit_core::{GateDecision, TaskOutcome, TaskUsage, TurnTrigger};
 
     fn meta() -> SessionMeta {
         SessionMeta {
@@ -4914,5 +4980,162 @@ mod tests {
             assert_eq!(anomalies(&sim), [], "{name}");
             assert!(snap.turns_completed >= 1, "{name}");
         }
+    }
+
+    // ── sub-agents and background tasks: the working rule, unknown and lost outcomes ─────────
+
+    /// The claude lines of one background subagent, `a1`, spawned by the `Agent` call `toolu_a1`.
+    fn background_subagent_spawn(sim: &mut Sim) {
+        sim.feed(Kind::Out, json!(r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_a1","name":"Agent","input":{"description":"probe","subagent_type":"general-purpose","prompt":"p"}}]}}"#));
+        sim.feed(Kind::Out, json!(r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","run_id":"r1","task_type":"local_agent","subagent_type":"general-purpose","description":"probe"}]}"#));
+        sim.feed(Kind::Out, json!(r#"{"type":"system","subtype":"task_started","task_id":"a1","run_id":"r1","tool_use_id":"toolu_a1","description":"probe","subagent_type":"general-purpose","is_backgrounded":true,"task_type":"local_agent"}"#));
+    }
+
+    /// A session whose turn started a background subagent, which is still running after the
+    /// turn completed: the session is working with no turn open.
+    fn session_with_a_background_subagent_after_its_turn() -> Sim {
+        let mut sim = sim_in_a_turn();
+        background_subagent_spawn(&mut sim);
+        sim.feed(Kind::Out, json!(RESULT_OK));
+        sim
+    }
+
+    fn subagent_ends(status: &str) -> String {
+        format!(
+            r#"{{"type":"system","subtype":"task_notification","task_id":"a1","run_id":"r1","tool_use_id":"toolu_a1","status":"{status}","summary":"done","usage":{{"total_tokens":120,"tool_uses":3,"duration_ms":1500}}}}"#
+        )
+    }
+
+    /// Working while a background subagent runs after its turn; Idle when its end arrives.
+    #[test]
+    fn a_background_subagent_keeps_the_session_working_until_its_end_arrives() {
+        let mut sim = session_with_a_background_subagent_after_its_turn();
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.turn, None, "the turn completed");
+        assert_eq!(snap.background_running, 1);
+        assert_eq!(snap.phase, Phase::Working);
+        assert!(snap.subagents[0].running);
+        assert_eq!(snap.subagents[0].run_id.as_deref(), Some("r1"));
+        assert_eq!(snap.subagents[0].outcome, None, "no outcome while it runs");
+
+        sim.feed(Kind::Out, json!(r#"{"type":"system","subtype":"task_progress","task_id":"a1","run_id":"r1","tool_use_id":"toolu_a1","description":"Running","usage":{"total_tokens":100,"tool_uses":2,"duration_ms":900},"last_tool_name":"Bash"}"#));
+        assert_eq!(
+            sim.core.snapshot().phase,
+            Phase::Working,
+            "progress does not end it"
+        );
+        // The CLI reports a status before the end frame: still running, so no outcome yet.
+        sim.feed(Kind::Out, json!(r#"{"type":"system","subtype":"task_updated","task_id":"a1","run_id":"r1","patch":{"status":"completed"}}"#));
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.phase, Phase::Working, "an update does not end it");
+        assert_eq!(snap.subagents[0].outcome, None);
+
+        sim.feed(Kind::Out, json!(subagent_ends("completed")));
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.phase, Phase::Idle);
+        assert_eq!(snap.background_running, 0);
+        let sub = &snap.subagents[0];
+        assert!(!sub.running);
+        assert_eq!(sub.outcome, Some(TaskOutcome::Completed));
+        assert_eq!(sub.ok, Some(true));
+        assert_eq!(
+            sub.tool_calls, 0,
+            "the subagent's own tool calls are scoped events"
+        );
+        assert_eq!(
+            sub.usage,
+            Some(TaskUsage {
+                total_tokens: 120,
+                tool_uses: 3,
+                duration_ms: 1500,
+                ..TaskUsage::default()
+            })
+        );
+        assert!(matches!(
+            phases(&sim).last(),
+            Some((p, PhaseCause::TaskEnded { .. })) if p == "idle"
+        ));
+        sim.assert_replay_exact();
+    }
+
+    /// `unknown` ends the task as unknown: it does not hold the session `working`.
+    #[test]
+    fn an_unknown_outcome_ends_the_task_and_does_not_hold_the_session_working() {
+        let mut sim = session_with_a_background_subagent_after_its_turn();
+        assert_eq!(sim.core.snapshot().phase, Phase::Working);
+        sim.feed(Kind::Out, json!(subagent_ends("unknown")));
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.phase, Phase::Idle);
+        assert_eq!(snap.background_running, 0);
+        assert!(!snap.tasks[0].running);
+        assert_eq!(snap.tasks[0].status.as_deref(), Some("unknown"));
+        let sub = &snap.subagents[0];
+        assert_eq!(sub.outcome, Some(TaskOutcome::Unknown));
+        assert_eq!(sub.ok, Some(false), "unknown is never a success");
+        sim.assert_replay_exact();
+    }
+
+    /// The owner process ends while its background subagent runs: the subagent's outcome is
+    /// `lost`, and the `TaskEnded` event says so.
+    #[test]
+    fn a_subagent_running_when_its_process_ends_is_lost() {
+        let mut sim = session_with_a_background_subagent_after_its_turn();
+        let at = sim.events.len();
+        sim.feed(Kind::Exited, json!({"code": 0}));
+        let snap = sim.core.snapshot();
+        assert!(matches!(
+            snap.phase,
+            Phase::Exited { .. } | Phase::Failed { .. }
+        ));
+        assert_eq!(snap.background_running, 0);
+        assert_eq!(snap.tasks[0].status.as_deref(), Some("lost"));
+        assert_eq!(snap.tasks[0].ok, Some(false));
+        let sub = &snap.subagents[0];
+        assert!(!sub.running);
+        assert_eq!(sub.outcome, Some(TaskOutcome::Lost));
+        assert_eq!(sub.status.as_deref(), Some("lost"));
+        let ends: Vec<(String, bool)> = sim.events[at..]
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::Agent {
+                    event: AgentEvent::TaskEnded { status, ok, .. },
+                } => Some((status.clone(), *ok)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, [("lost".to_string(), false)]);
+        sim.assert_replay_exact();
+    }
+
+    /// A lost subagent when the shim vanishes (no exit record): the same outcome, published.
+    #[test]
+    fn a_subagent_running_when_the_shim_is_lost_is_lost() {
+        let mut sim = session_with_a_background_subagent_after_its_turn();
+        let published = sim.core.mark_lost("the shim is gone");
+        let lost_ends = published
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind, SessionEventKind::Agent {
+                    event: AgentEvent::TaskEnded { status, .. },
+                } if status == "lost")
+            })
+            .count();
+        assert_eq!(lost_ends, 1);
+        let snap = sim.core.snapshot();
+        assert!(matches!(snap.phase, Phase::Lost { .. }));
+        assert_eq!(snap.subagents[0].outcome, Some(TaskOutcome::Lost));
+        assert!(!snap.subagents[0].running);
+    }
+
+    /// A foreground task that is neither a subagent nor background keeps its own end at the
+    /// process's end: `process_ended`, not `lost`.
+    #[test]
+    fn a_foreground_task_ends_as_process_ended_not_lost() {
+        let mut sim = sim_in_a_turn();
+        sim.feed(Kind::Out, json!(r#"{"type":"system","subtype":"task_started","task_id":"f1","tool_use_id":"toolu_f1","description":"d","is_backgrounded":false,"task_type":"local_bash"}"#));
+        sim.feed(Kind::Exited, json!({"code": 0}));
+        let snap = sim.core.snapshot();
+        assert_eq!(snap.tasks[0].status.as_deref(), Some("process_ended"));
+        assert_eq!(snap.tasks[0].ok, None);
     }
 }

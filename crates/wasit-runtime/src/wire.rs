@@ -53,8 +53,8 @@ use wasit_control::TraceId;
 use wasit_core::{
     AgentConfig, AgentEvent, Command, ConfigItem, DriverCapabilities, DriverId, EndReason,
     GateReason, GateRequest, HistoryReport, InputId, ModelInfo, ModelUsage, PlanEntry, PromptInput,
-    ResumableSession, SessionMode, SlashCommandInfo, TaskInfo, TaskUsage, TurnOrigin, TurnTrigger,
-    Unsupported, Usage,
+    ResumableSession, SessionMode, SlashCommandInfo, TaskInfo, TaskOutcome, TaskUsage, TurnOrigin,
+    TurnTrigger, Unsupported, Usage,
 };
 
 /// Method names.
@@ -331,11 +331,18 @@ pub struct SubagentInfo {
     /// The subagent's own id, from the lines it produced (`Scope::agent_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// The agent's run id for its task, when it names one ([`TaskInfo::run_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
     /// The agent's status word for how its task ended (`completed`, `failed`, `stopped`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// How it ended, once it has, in the shared vocabulary ([`TaskOutcome`]). `None` while it
+    /// runs, and for a status word that is not one of the shared outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TaskOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at_ms: Option<u64>,
     /// Tool calls the subagent made (events scoped to it).

@@ -1889,6 +1889,80 @@ mod tests {
 
     const U: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
 
+    /// A claude descriptor that says it can steer its subagents, and nothing else differs: what
+    /// the capability check of a command reads.
+    struct Steerable(Arc<dyn DriverDescriptor>);
+
+    impl wasit_core::ConfigRenderer for Steerable {
+        fn render_config(
+            &self,
+            c: &wasit_core::AgentConfig,
+            s: &mut SpawnSpec,
+        ) -> Vec<wasit_core::Unsupported> {
+            self.0.render_config(c, s)
+        }
+    }
+
+    impl DriverDescriptor for Steerable {
+        fn id(&self) -> wasit_core::DriverId {
+            self.0.id()
+        }
+        fn display_name(&self) -> &str {
+            self.0.display_name()
+        }
+        fn default_binary(&self) -> &str {
+            self.0.default_binary()
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<String> {
+            self.0.argv(spec)
+        }
+        fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
+            self.0.env(spec)
+        }
+        fn capabilities(&self) -> wasit_core::DriverCapabilities {
+            let mut caps = self.0.capabilities();
+            caps.subagents.steer = true;
+            caps
+        }
+        fn saves_conversation(&self) -> wasit_core::SavesConversation {
+            self.0.saves_conversation()
+        }
+        fn new_protocol(&self) -> Box<dyn wasit_core::Protocol> {
+            self.0.new_protocol()
+        }
+        fn discovery(&self, ctx: &wasit_core::DiscoveryContext) -> Vec<wasit_core::DiscoveryProbe> {
+            self.0.discovery(ctx)
+        }
+    }
+
+    /// Steering a subagent is refused by the capability check when the driver does not claim it;
+    /// when it does, the command goes on to the session (here, one that is not running).
+    #[tokio::test]
+    async fn steering_a_subagent_is_refused_only_when_the_driver_does_not_claim_it() {
+        let steer = || Command::SteerSubagent {
+            task_id: "a1".into(),
+            text: "change course".into(),
+        };
+        let (mut a, _s) = ended();
+        let (tx, mut rx) = oneshot::channel();
+        a.command(steer(), None, tx);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(Err(CommandError::Unsupported { operation })) if operation == "steer_subagent"
+            ),
+            "claude does not claim steering"
+        );
+
+        let (mut a, _s) = ended_with(Arc::new(Steerable(wasit_claude::descriptor())));
+        let (tx, mut rx) = oneshot::channel();
+        a.command(steer(), None, tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(Err(CommandError::NotRunning { .. }))),
+            "claimed: it reaches the session, which is not running"
+        );
+    }
+
     struct Scratch(PathBuf);
 
     impl Drop for Scratch {
@@ -1901,6 +1975,10 @@ mod tests {
     /// An actor of an ended claude session (its first process exited after a stop) with a chosen
     /// conversation id, not loading, with no I/O under way.
     fn ended() -> (Actor, Scratch) {
+        ended_with(wasit_claude::descriptor())
+    }
+
+    fn ended_with(desc: Arc<dyn DriverDescriptor>) -> (Actor, Scratch) {
         let dir =
             std::env::temp_dir().join(format!("wact-{}-{}", std::process::id(), fastrand::u32(..)));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1908,7 +1986,6 @@ mod tests {
             &dir,
             crate::config::ShimLauncher::binary("/nonexistent/wasit-shim"),
         ));
-        let desc = wasit_claude::descriptor();
         let id = SessionId("aaaaaaaaaaaa".into());
         let spec = SpawnSpec {
             native_session_id: Some(U.into()),
