@@ -2,7 +2,8 @@
 //! use a shell function the interactive startup files define (a fake module system) put an
 //! agent on PATH; variables override the setup; an agent command (`genie`, a wrapper) stands in
 //! for claude in discovery and in a session; a command that is not the agent is warned about;
-//! failing, exiting, hanging and malformed setups are reported, bounded and never hang.
+//! failing, exiting, hanging and malformed setups are reported; a hanging setup ends by the
+//! user's cancel, its processes with it.
 //! Secrets never appear in a report. One test function: the base environment is process-wide.
 #![cfg(unix)]
 
@@ -11,7 +12,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::*;
 use wasit_core::DriverId;
@@ -273,38 +274,67 @@ async fn setup_variables_and_agent_commands() {
     assert_ne!(s.exit_code, Some(0), "{s:?}");
     assert!(s.output.contains("syntax error"), "{s:?}");
 
-    // Hanging: bounded by the setup deadline, the whole group killed, the login environment.
-    let quick = HostEnv::new(CaptureOptions {
-        setup_deadline: Duration::from_millis(1500),
-        ..opts
-    });
-    let started = Instant::now();
-    let (r, _) = quick
-        .configure(
-            cfg("echo before\nsleep 300 # setup-hang-marker"),
-            "h".into(),
-            false,
-        )
-        .await;
+    // Hanging: nothing bounds a setup (a module load can take minutes). The user's cancel ends
+    // it: the whole group is killed, the report says so, the login environment is kept. The
+    // setup reports its background sleep's pid through a FIFO, so the cancel comes once it runs.
+    let fifo = d.path().join("hang.fifo");
+    mkfifo(&fifo);
+    let runner = env.clone();
+    let hang = cfg(&format!(
+        "echo before\nsleep 300 & echo \"$! \" > '{}'; wait",
+        fifo.display()
+    ));
+    let run = tokio::spawn(async move { runner.configure(hang, "h".into(), false).await });
+    let sleep_pid = read_pid(fifo).await;
+    env.cancel_capture();
+    let (r, _) = run.await.unwrap();
     let s = r.setup.unwrap();
     assert!(!s.ok && !s.applied, "{s:?}");
-    assert!(s
-        .error
-        .as_deref()
-        .unwrap_or("")
-        .contains("did not finish within 1.5 s"));
+    assert!(
+        s.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("was cancelled by the user"),
+        "{s:?}"
+    );
     assert!(s.output.contains("before"), "{s:?}");
     assert!(
-        started.elapsed() < Duration::from_secs(12),
-        "{:?}",
-        started.elapsed()
+        is_gone(sleep_pid),
+        "the cancelled setup's sleep {sleep_pid} survived"
     );
-    let ps = std::process::Command::new("pgrep")
-        .args(["-f", "setup-hang-marker"])
+    wasit_process::set_base_env(None);
+}
+
+/// A FIFO a hung setup reports its pid through: the write returns exactly when the setup runs.
+fn mkfifo(path: &Path) {
+    let st = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "mkfifo {}", path.display());
+}
+
+async fn read_pid(fifo: PathBuf) -> u32 {
+    let text = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(&fifo)),
+    )
+    .await
+    .expect("the hung setup ran")
+    .unwrap()
+    .unwrap();
+    text.trim().parse().unwrap()
+}
+
+/// Whether `pid` is no longer running (gone, or a zombie that has already died). Only ever asked
+/// about a pid a test's own setup reported.
+fn is_gone(pid: u32) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()
         .unwrap();
-    assert!(ps.stdout.is_empty(), "the hung setup survived");
-    wasit_process::set_base_env(None);
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    stat.is_empty() || stat.starts_with('Z')
 }
 
 fn assert_no_secret(r: &HostEnvironment) {

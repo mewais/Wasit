@@ -32,7 +32,7 @@ pub use command::{
     CommandTransport, ExitInfo, TransportKind, TransportTrace, CLOSED_EXIT_WAIT,
 };
 pub use connection::{
-    ConnConfig, Connection, Negotiated, RequestOpts, SubscribeOpts, Subscription,
+    ConnConfig, Connection, HelloTiming, Negotiated, RequestOpts, SubscribeOpts, Subscription,
 };
 pub use diag::ConnectDiag;
 pub use error::{peer_gone, CallError, ConnClose, ConnectError};
@@ -53,8 +53,9 @@ pub use transport::NamedPipeListener;
 #[cfg(unix)]
 pub use transport::UnixSocketListener;
 pub use transport::{
-    bind_local_exclusive, join_duplex, local_endpoint, lock_path_for, memory_pair, BindError,
-    BoxDuplex, Duplex, Endpoint, InstanceLock, Listener, LockError, StdioListener,
+    bind_local_exclusive, join_duplex, local_endpoint, lock_path_for, memory_pair,
+    starting_lock_path, wait_until_started, BindError, BoxDuplex, Duplex, Endpoint, InstanceLock,
+    Listener, LockError, StartingLock, StdioListener,
 };
 pub use uplink::{Uplink, UplinkChanges};
 pub use wire::{

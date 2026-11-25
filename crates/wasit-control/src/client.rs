@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::command::ExitInfo;
-use crate::connection::{ConnConfig, Connection};
+use crate::connection::{ConnConfig, Connection, HelloTiming};
 use crate::error::ConnectError;
 use crate::service::Service;
 use crate::transport::{BoxDuplex, Endpoint};
@@ -21,6 +21,9 @@ pub struct ClientOptions {
     /// the hub to route). `None` answers them with `method_not_found`.
     pub service: Option<Arc<dyn Service>>,
     pub config: ConnConfig,
+    /// The peer is a bridge that reports `ready` once connected to its daemon: the hello
+    /// deadline starts then (see [`HelloTiming::AfterReady`]).
+    pub await_ready: bool,
 }
 
 impl ClientOptions {
@@ -29,6 +32,7 @@ impl ClientOptions {
             hello,
             service: None,
             config: ConnConfig::default(),
+            await_ready: false,
         }
     }
 
@@ -92,7 +96,13 @@ impl std::fmt::Debug for ControlClient {
 impl ControlClient {
     /// Run the hello exchange over `io`.
     pub async fn connect(io: BoxDuplex, opts: ClientOptions) -> Result<Self, ConnectError> {
-        let conn = Connection::establish(io, opts.hello, opts.service, opts.config).await?;
+        let timing = if opts.await_ready {
+            HelloTiming::AfterReady
+        } else {
+            HelloTiming::Immediate
+        };
+        let conn =
+            Connection::establish_with(io, opts.hello, opts.service, opts.config, timing).await?;
         Ok(ControlClient {
             conn,
             _attachment: None,

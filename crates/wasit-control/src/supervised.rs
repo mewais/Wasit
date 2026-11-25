@@ -20,6 +20,7 @@ use crate::command::CommandFailureKind;
 use crate::connection::{RequestOpts, SubscribeOpts, Subscription};
 use crate::diag::{self, AttemptOutcome, ProvisionOutcome};
 use crate::error::{CallError, ConnClose, ConnectError};
+use crate::uplink::UplinkChanges;
 use crate::wire::{CloseReason, Cursor, Hello, HostId, ProtocolVersion, RpcError};
 
 /// Exponential backoff with jitter.
@@ -446,6 +447,7 @@ impl Supervised {
             current: None,
             end: None,
             subscribes: 0,
+            route: None,
             retry: 0,
         }
     }
@@ -954,10 +956,29 @@ pub struct DurableSubscription {
     current: Option<Subscription>,
     end: Option<DurableEnd>,
     subscribes: u64,
+    /// Route changes of the uplink this subscription's host is reached over, when given.
+    route: Option<UplinkChanges>,
+    /// Refused resubscribes in a row (the backoff schedule, when there is no route to watch).
     retry: u32,
 }
 
+/// Waits for the next route change, or never when there is no route source (or it is gone).
+async fn route_changed(route: &mut Option<UplinkChanges>) -> bool {
+    match route {
+        Some(r) => r.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
 impl DurableSubscription {
+    /// Resubscribe on route changes (see [`Uplink::changes`]) rather than on a backoff schedule
+    /// when the host refuses the subscription. Give it the route of the host this subscription
+    /// is for: the link to the supervised peer alone cannot tell that the host is back.
+    pub fn route_changes(mut self, changes: UplinkChanges) -> Self {
+        self.route = Some(changes);
+        self
+    }
+
     /// Next event; `Some(Err)` once for a terminal service error; `None` when ended.
     pub async fn next(&mut self) -> Option<Result<(Cursor, Value), RpcError>> {
         if self.end.is_some() {
@@ -974,6 +995,8 @@ impl DurableSubscription {
                     .from(self.last.clone());
                 opts.host = self.opts.host.clone();
                 opts.hops = self.opts.hops;
+                // Watching from before the call: a change during it is not missed.
+                let mut link = self.sup.state();
                 match client.subscribe_with(&self.topic, opts).await {
                     Ok(s) => {
                         self.current = Some(s);
@@ -986,13 +1009,32 @@ impl DurableSubscription {
                         return Some(Err(e));
                     }
                     Err(e) => {
-                        tracing::debug!(topic = %self.topic, error = %e, "resubscribe failed; backing off");
-                        self.retry = self.retry.saturating_add(1);
-                        let delay = self.sup.shared.backoff.delay_random(self.retry);
-                        tokio::select! {
-                            _ = self.sup.shared.stop.cancelled() => {}
-                            _ = tokio::time::sleep(delay) => {}
-                            _ = client.closed() => {}
+                        tracing::debug!(topic = %self.topic, error = %e, "resubscribe refused");
+                        if self.route.is_none() {
+                            // No route to watch, so nothing signals when the host is back: the
+                            // only option is the backoff schedule. Callers that can see the route
+                            // (`route_changes`) wait for it instead.
+                            self.retry = self.retry.saturating_add(1);
+                            let delay = self.sup.shared.backoff.delay_random(self.retry);
+                            tokio::select! {
+                                _ = self.sup.shared.stop.cancelled() => {}
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = client.closed() => {}
+                            }
+                        } else {
+                            // The host is unreachable: asking again before the link or the
+                            // route changed would only poll it.
+                            let route = &mut self.route;
+                            let route_gone = tokio::select! {
+                                _ = self.sup.shared.stop.cancelled() => false,
+                                _ = link.changed() => false,
+                                _ = client.closed() => false,
+                                changed = route_changed(route) => !changed,
+                            };
+                            if route_gone {
+                                // The route source is gone; nothing more will signal it.
+                                self.route = None;
+                            }
                         }
                         continue;
                     }

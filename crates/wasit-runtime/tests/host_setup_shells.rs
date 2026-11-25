@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use wasit_runtime::environment::{capture, CaptureOptions, HostEnv};
+use wasit_runtime::environment::{capture, CaptureOptions, EnvStage, HostEnv};
 use wasit_runtime::wire::{EnvSource, HostEnvConfig, SetupReport};
 
 fn exe(p: &Path, text: &str) {
@@ -536,26 +536,31 @@ async fn csh_family(dir: &Path, wrapper: &str, real_names: &[&str], tcsh: bool) 
     assert_eq!(var("FROM_SETUP").as_deref(), Some("1"), "{name}");
     gone("the secret setup");
 
-    // The deadline: the whole group is killed, the login environment is kept, the file is gone.
-    let quick = HostEnv::new(CaptureOptions {
-        setup_deadline: std::time::Duration::from_millis(1500),
-        ..opts
-    });
+    // A hanging setup ends by the user's cancel: the report says so, the login environment is
+    // kept and the setup file is gone. (The cancel comes once the setup stage has begun.)
+    let quick = HostEnv::new(opts);
     quick.refresh().await;
-    let (r, _) = quick
-        .configure(
-            cfg("setenv HUNG 1\nsleep 60"),
-            format!("{name}-hang"),
-            false,
-        )
-        .await;
+    let mut stage = quick.progress();
+    let runner = quick.clone();
+    let hang_rev = format!("{name}-hang");
+    let run = tokio::spawn(async move {
+        runner
+            .configure(cfg("setenv HUNG 1\nsleep 60"), hang_rev, false)
+            .await
+    });
+    stage
+        .wait_for(|s| *s == EnvStage::Setup)
+        .await
+        .expect("stage open");
+    quick.cancel_capture();
+    let (r, _) = run.await.unwrap();
     let s = r.setup.expect("a setup report");
     assert!(!s.ok && !s.applied, "{name}: {s:?}");
     assert!(
         s.error
             .as_deref()
             .unwrap_or_default()
-            .contains("did not finish within 1.5 s"),
+            .contains("was cancelled by the user"),
         "{name}: {s:?}"
     );
     assert_eq!(var("HUNG"), None, "{name}");

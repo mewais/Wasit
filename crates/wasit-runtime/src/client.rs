@@ -212,12 +212,19 @@ impl RuntimeClient {
         self.call(methods::HOST_ENVIRONMENT_CONFIGURE, r).await
     }
 
+    /// Cancel the environment capture or setup in progress on the host: its processes are
+    /// killed and the call that runs it reports the run as cancelled. A no-op when none runs.
+    pub async fn cancel_environment(&self) -> Result<Ack, ClientError> {
+        self.call(methods::HOST_ENVIRONMENT_CANCEL, ()).await
+    }
+
     /// Apply it again (the setup re-runs) and report what discovery then finds.
     pub async fn test_environment(
         &self,
         r: &crate::wire::ConfigureEnvironment,
     ) -> Result<crate::wire::EnvironmentTest, ClientError> {
-        // The setup's deadline plus discovery's: longer than an ordinary call.
+        // A setup has no deadline of its own, but a client's call does: this bounds the wait for
+        // the setup plus discovery, longer than an ordinary call.
         let deadline = self.deadline.max(Duration::from_secs(120));
         self.call_within(methods::HOST_ENVIRONMENT_TEST, r, deadline)
             .await

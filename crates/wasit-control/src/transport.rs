@@ -48,22 +48,21 @@ impl Endpoint {
             }
             #[cfg(windows)]
             Endpoint::NamedPipe(name) => {
+                use std::os::windows::io::AsRawHandle;
                 use tokio::net::windows::named_pipe::ClientOptions;
-                // ERROR_PIPE_BUSY: every server instance is connected right now (the listener is
-                // between accepting one client and creating the next instance). Retry briefly.
+                // ERROR_PIPE_BUSY: every server instance is connected right now. The server keeps
+                // several instances waiting, so this is brief; wait for one with `WaitNamedPipe`
+                // (no sleeps), bounded only by the caller's own deadline.
                 const ERROR_PIPE_BUSY: i32 = 231;
-                let mut tries = 0u32;
                 loop {
                     match ClientOptions::new().open(name) {
                         Ok(c) => {
                             // The name is predictable: refuse a server that is not this user's.
-                            use std::os::windows::io::AsRawHandle;
                             crate::pipe_security::verify_server(c.as_raw_handle())?;
                             return Ok(Box::new(c));
                         }
-                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && tries < 500 => {
-                            tries += 1;
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                            wait_for_pipe(name.clone()).await?;
                         }
                         Err(e) => return Err(e),
                     }
@@ -84,6 +83,26 @@ impl Endpoint {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
         )
     }
+}
+
+/// Wait (in a blocking thread) until an instance of the named pipe is free to connect to, or
+/// the pipe is gone (an error). The wait is not bounded here: the caller's deadline bounds the
+/// connect. A thread left waiting after its caller gave up ends when an instance frees up or the
+/// pipe is removed.
+#[cfg(windows)]
+async fn wait_for_pipe(name: String) -> io::Result<()> {
+    use windows_sys::Win32::System::Pipes::{WaitNamedPipeW, NMPWAIT_WAIT_FOREVER};
+    tokio::task::spawn_blocking(move || {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and lives across the call.
+        if unsafe { WaitNamedPipeW(wide.as_ptr(), NMPWAIT_WAIT_FOREVER) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// The local endpoint for a daemon identified by `path`: the Unix socket at `path`, or on
@@ -187,22 +206,26 @@ pub struct InstanceLock {
     path: PathBuf,
 }
 
+/// Open (creating it) a lock file: the file is never truncated, its content is nothing.
+fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
 impl InstanceLock {
     /// Try to take the lock without waiting.
     pub async fn try_acquire(path: impl Into<PathBuf>) -> Result<InstanceLock, LockError> {
         let path = path.into();
         let p = path.clone();
         let res = tokio::task::spawn_blocking(move || -> Result<std::fs::File, LockError> {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&p)
-                .map_err(|source| LockError::Io {
-                    path: p.clone(),
-                    source,
-                })?;
+            let file = open_lock_file(&p).map_err(|source| LockError::Io {
+                path: p.clone(),
+                source,
+            })?;
             match file.try_lock() {
                 Ok(()) => Ok(file),
                 Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Held(p)),
@@ -237,6 +260,70 @@ pub fn lock_path_for(endpoint_path: &Path) -> PathBuf {
     let mut s = endpoint_path.as_os_str().to_owned();
     s.push(".lock");
     PathBuf::from(s)
+}
+
+/// The starting lock file of an endpoint path: `<path>.starting` (see [`StartingLock`]).
+pub fn starting_lock_path(endpoint_path: &Path) -> PathBuf {
+    let mut s = endpoint_path.as_os_str().to_owned();
+    s.push(".starting");
+    PathBuf::from(s)
+}
+
+/// The lock a daemon start holds, exclusively, from before it takes the instance lock until its
+/// endpoint is bound and it is ready (then it is dropped). A process that lost the instance lock
+/// to that start waits on it with [`wait_until_started`]: the wait ends exactly when the start is
+/// ready, so the endpoint can be dialled once, with no retries.
+#[derive(Debug)]
+pub struct StartingLock {
+    _file: std::fs::File,
+}
+
+impl StartingLock {
+    /// Take the starting lock of `endpoint_path` without waiting: `LockError::Held` while another
+    /// start holds it.
+    pub async fn try_acquire(endpoint_path: impl Into<PathBuf>) -> Result<StartingLock, LockError> {
+        let path = starting_lock_path(&endpoint_path.into());
+        let p = path.clone();
+        let res = tokio::task::spawn_blocking(move || -> Result<std::fs::File, LockError> {
+            let file = open_lock_file(&p).map_err(|source| LockError::Io {
+                path: p.clone(),
+                source,
+            })?;
+            match file.try_lock() {
+                Ok(()) => Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Held(p)),
+                Err(std::fs::TryLockError::Error(source)) => Err(LockError::Io { path: p, source }),
+            }
+        })
+        .await
+        .map_err(|e| LockError::Io {
+            path,
+            source: io::Error::other(e),
+        })?;
+        Ok(StartingLock { _file: res? })
+    }
+}
+
+impl Drop for StartingLock {
+    /// Released explicitly, for the reason [`InstanceLock`] is: a fork-window copy of the file
+    /// must not keep a start "in progress" for a waiter after this process is ready.
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
+/// Wait until no start holds the starting lock of `endpoint_path`: returns at once when none
+/// does, and when the one in progress is ready (it releases the lock then). Blocking work runs
+/// in the blocking pool; nothing is polled.
+pub async fn wait_until_started(endpoint_path: impl Into<PathBuf>) -> io::Result<()> {
+    let path = starting_lock_path(&endpoint_path.into());
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let file = open_lock_file(&path)?;
+        file.lock_shared()?;
+        file.unlock()
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -335,6 +422,11 @@ mod windows {
 
     use crate::pipe_security::OwnerOnly;
 
+    /// Pipe instances kept waiting for clients. A client that finds one free connects at once;
+    /// with a single waiting instance it would find `ERROR_PIPE_BUSY` between one accept and
+    /// the creation of the next.
+    const WAITING_INSTANCES: usize = 8;
+
     /// Windows named pipe listener. The first instance is created with
     /// `first_pipe_instance(true)`, so a second daemon fails to bind (single instance). Every
     /// instance carries the owner-only security descriptor (see `pipe_security`): only the
@@ -342,8 +434,22 @@ mod windows {
     pub struct NamedPipeListener {
         name: String,
         security: OwnerOnly,
-        next: NamedPipeServer,
+        /// Instances waiting for a client; each accept replaces the one it hands out.
+        waiting: Vec<NamedPipeServer>,
         _lock: Option<InstanceLock>,
+    }
+
+    /// One pipe instance of `name`. Only the first may be created with `first`.
+    fn create_instance(
+        name: &str,
+        security: &OwnerOnly,
+        first: bool,
+    ) -> io::Result<NamedPipeServer> {
+        let mut options = ServerOptions::new();
+        options.first_pipe_instance(first);
+        // SAFETY: `security.attributes()` points at a SECURITY_ATTRIBUTES that lives as long as
+        // `security`, which the listener owns for as long as it creates instances.
+        unsafe { options.create_with_security_attributes_raw(name, security.attributes()) }
     }
 
     impl NamedPipeListener {
@@ -354,18 +460,15 @@ mod windows {
                 source,
             };
             let security = OwnerOnly::for_current_user().map_err(io_err)?;
-            // SAFETY: `security.attributes()` points at a SECURITY_ATTRIBUTES that lives as long
-            // as `security`, which this listener owns for as long as it creates instances.
-            let next = unsafe {
-                ServerOptions::new()
-                    .first_pipe_instance(true)
-                    .create_with_security_attributes_raw(&name, security.attributes())
+            let mut waiting = Vec::with_capacity(WAITING_INSTANCES);
+            waiting.push(create_instance(&name, &security, true).map_err(io_err)?);
+            for _ in 1..WAITING_INSTANCES {
+                waiting.push(create_instance(&name, &security, false).map_err(io_err)?);
             }
-            .map_err(io_err)?;
             Ok(NamedPipeListener {
                 name,
                 security,
-                next,
+                waiting,
                 _lock: None,
             })
         }
@@ -385,14 +488,17 @@ mod windows {
     #[async_trait]
     impl Listener for NamedPipeListener {
         async fn accept(&mut self) -> io::Result<Option<BoxDuplex>> {
-            self.next.connect().await?;
-            // SAFETY: as in `bind`; the attributes are owned by `self`.
-            let fresh = unsafe {
-                ServerOptions::new()
-                    .create_with_security_attributes_raw(&self.name, self.security.attributes())?
+            // The first waiting instance a client connects to. Dropping the losing connect
+            // futures loses no connection event (tokio's `connect` is cancel safe).
+            let (connected, index, losers) = {
+                let waits: Vec<_> = self.waiting.iter().map(|s| Box::pin(s.connect())).collect();
+                futures::future::select_all(waits).await
             };
-            let connected = std::mem::replace(&mut self.next, fresh);
-            Ok(Some(Box::new(connected)))
+            drop(losers);
+            connected?;
+            let fresh = create_instance(&self.name, &self.security, false)?;
+            let served = std::mem::replace(&mut self.waiting[index], fresh);
+            Ok(Some(Box::new(served)))
         }
     }
 }

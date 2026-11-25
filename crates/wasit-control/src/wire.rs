@@ -403,6 +403,10 @@ pub enum Frame {
     Goodbye {
         reason: RpcError,
     },
+    /// Written by a bridge once its stdio is connected to the daemon, before any other frame.
+    /// The dialing side starts its hello deadline here: how long the daemon took to start is
+    /// not a handshake failure.
+    Ready,
 }
 
 const KNOWN_TYPES: &[&str] = &[
@@ -418,6 +422,7 @@ const KNOWN_TYPES: &[&str] = &[
     "ping",
     "pong",
     "goodbye",
+    "ready",
 ];
 
 #[derive(Debug, thiserror::Error)]

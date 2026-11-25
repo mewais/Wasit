@@ -238,6 +238,15 @@ impl std::fmt::Debug for Connection {
     }
 }
 
+/// When the hello deadline of an outgoing handshake starts (see [`Connection::establish_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloTiming {
+    /// At once: the peer is a daemon that answers at once.
+    Immediate,
+    /// When the peer reports ready (a bridge in front of a daemon that may start slowly).
+    AfterReady,
+}
+
 impl Connection {
     /// Perform the hello exchange over `io` and start the connection tasks.
     pub async fn establish(
@@ -246,39 +255,74 @@ impl Connection {
         service: Option<Arc<dyn Service>>,
         cfg: ConnConfig,
     ) -> Result<Connection, ConnectError> {
+        Self::establish_with(io, hello, service, cfg, HelloTiming::Immediate).await
+    }
+
+    /// [`Connection::establish`] with the handshake's timing chosen by the dialer.
+    ///
+    /// With [`HelloTiming::AfterReady`] the hello deadline starts when the peer's `ready` frame
+    /// arrives: a bridge sends it once its stdio is connected to the daemon, so the time a cold
+    /// daemon takes to start (slow login, environment capture) is not a handshake failure. A
+    /// peer that speaks its hello without a `ready` frame (a daemon reached directly, an older
+    /// bridge) is taken as ready already.
+    pub async fn establish_with(
+        io: BoxDuplex,
+        hello: Hello,
+        service: Option<Arc<dyn Service>>,
+        cfg: ConnConfig,
+        timing: HelloTiming,
+    ) -> Result<Connection, ConnectError> {
         let (r, mut w) = tokio::io::split(io);
         let mut reader = FrameReader::new(r, cfg.max_frame);
         let hello_bytes = encode(&Frame::Hello(hello.clone()), cfg.max_frame)
             .map_err(|e| ConnectError::Protocol(e.to_string()))?;
-        let deadline = Instant::now() + cfg.hello_timeout;
+        // `None`: waiting for the peer's ready frame, no deadline.
+        let mut deadline = match timing {
+            HelloTiming::Immediate => Some(Instant::now() + cfg.hello_timeout),
+            HelloTiming::AfterReady => None,
+        };
 
-        let write_err = match timeout_at(deadline, async {
+        let write = async {
             w.write_all(&hello_bytes).await?;
             w.flush().await
-        })
-        .await
-        {
-            Err(_) => return Err(ConnectError::HandshakeTimeout),
-            Ok(Err(e)) => Some(ConnectError::stream_io(&e)),
-            Ok(Ok(())) => None,
+        };
+        let write_err = match deadline {
+            Some(d) => match timeout_at(d, write).await {
+                Err(_) => return Err(ConnectError::HandshakeTimeout),
+                Ok(Err(e)) => Some(ConnectError::stream_io(&e)),
+                Ok(Ok(())) => None,
+            },
+            // A hello is a few hundred bytes: writing it into the transport does not wait for
+            // the peer, whatever the peer is still doing.
+            None => write.await.err().map(|e| ConnectError::stream_io(&e)),
         };
 
         // Even if our hello could not be written, the peer may have told us why (a bridge's
         // goodbye), so read before reporting the write error.
         let theirs = loop {
-            let line = match timeout_at(deadline, reader.next_line()).await {
-                Err(_) => return Err(write_err.unwrap_or(ConnectError::HandshakeTimeout)),
-                Ok(Err(FrameError::Io(e))) => {
+            let next = match deadline {
+                Some(d) => match timeout_at(d, reader.next_line()).await {
+                    Err(_) => return Err(write_err.unwrap_or(ConnectError::HandshakeTimeout)),
+                    Ok(next) => next,
+                },
+                None => reader.next_line().await,
+            };
+            let line = match next {
+                Err(FrameError::Io(e)) => {
                     return Err(write_err.unwrap_or(ConnectError::stream_io(&e)))
                 }
-                Ok(Err(e)) => return Err(ConnectError::Protocol(e.to_string())),
-                Ok(Ok(None)) => {
-                    return Err(write_err.unwrap_or(ConnectError::ClosedDuringHandshake))
-                }
-                Ok(Ok(Some(line))) => line,
+                Err(e) => return Err(ConnectError::Protocol(e.to_string())),
+                Ok(None) => return Err(write_err.unwrap_or(ConnectError::ClosedDuringHandshake)),
+                Ok(Some(line)) => line,
             };
             match decode(&line) {
                 Ok(Some(Frame::Hello(h))) => break h,
+                Ok(Some(Frame::Ready)) => {
+                    if deadline.is_none() {
+                        deadline = Some(Instant::now() + cfg.hello_timeout);
+                    }
+                    continue;
+                }
                 Ok(Some(Frame::Goodbye { reason })) => return Err(ConnectError::Refused(reason)),
                 Ok(Some(other)) => {
                     return Err(ConnectError::Protocol(format!(
@@ -566,6 +610,7 @@ impl Connection {
 fn frame_kind(f: &Frame) -> &'static str {
     match f {
         Frame::Hello(_) => "hello",
+        Frame::Ready => "ready",
         Frame::Request { .. } => "request",
         Frame::Response { .. } => "response",
         Frame::Subscribe { .. } => "subscribe",
@@ -801,6 +846,8 @@ impl Inner {
             Frame::Ping { nonce } => self.send_soon(Frame::Pong { nonce }),
             Frame::Pong { .. } => {}
             Frame::Goodbye { reason } => return Err(ConnClose::Goodbye { reason }),
+            // Only meaningful before the hello (see `establish_with`): ignored afterwards.
+            Frame::Ready => {}
         }
         Ok(())
     }

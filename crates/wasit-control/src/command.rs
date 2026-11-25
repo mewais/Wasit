@@ -603,6 +603,12 @@ impl CommandTransport {
     ) -> Result<ControlClient, ConnectError> {
         let (io, child) = Self::spawn(spec)?;
         let child = Arc::new(child);
+        // The program is a bridge (`… bridge`): it reports ready once it reaches the daemon,
+        // however long that takes; the hello deadline starts then.
+        let opts = ClientOptions {
+            await_ready: true,
+            ..opts
+        };
         match ControlClient::connect(io, opts).await {
             Ok(c) => Ok(c.with_attachment(child.clone()).with_diagnostics(child)),
             Err(e) => Err(child.explain_handshake_failure(e).await),

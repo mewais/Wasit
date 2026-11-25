@@ -191,6 +191,11 @@ impl Service for RuntimeService {
                 }
                 ok(report)
             }
+            methods::HOST_ENVIRONMENT_CANCEL => {
+                // The run in progress reports itself cancelled; the setup's processes are killed.
+                self.env()?.cancel_capture();
+                ok(Ack {})
+            }
             methods::HOST_ENVIRONMENT_TEST => {
                 let r = self.configuration(p)?;
                 let (environment, _) = self.env()?.configure(r.config, r.revision, true).await;

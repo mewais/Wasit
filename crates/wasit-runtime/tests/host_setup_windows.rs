@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use wasit_runtime::environment::{CaptureOptions, HostEnv};
+use wasit_runtime::environment::{CaptureOptions, EnvStage, HostEnv};
 use wasit_runtime::wire::{EnvSource, EnvVar, HostEnvConfig};
 
 fn cfg(setup: &str) -> HostEnvConfig {
@@ -35,10 +35,7 @@ async fn powershell_setup() {
         assert!(st.success());
     };
     set_user("'ünï 日本 ✓'");
-    let env = HostEnv::new(CaptureOptions {
-        setup_deadline: Duration::from_secs(20),
-        ..CaptureOptions::default()
-    });
+    let env = HostEnv::new(CaptureOptions::default());
     let r = env.refresh().await;
     set_user("$null");
     assert_eq!(r.source, EnvSource::Registry, "{r:?}");
@@ -91,27 +88,34 @@ async fn powershell_setup() {
     assert_eq!(s.exit_code, Some(3));
     assert_eq!(base("HALF"), None);
 
-    // A hang is bounded.
-    let quick = HostEnv::new(CaptureOptions {
-        setup_deadline: Duration::from_secs(3),
-        ..CaptureOptions::default()
-    });
+    // A hang ends by the user's cancel, once the setup stage has begun.
+    let quick = HostEnv::new(CaptureOptions::default());
+    let mut stage = quick.progress();
+    let runner = quick.clone();
     let started = Instant::now();
-    let (r, _) = quick
-        .configure(
-            cfg("Write-Output 'before'\nStart-Sleep -Seconds 300"),
-            "5".into(),
-            false,
-        )
-        .await;
+    let run = tokio::spawn(async move {
+        runner
+            .configure(
+                cfg("Write-Output 'before'\nStart-Sleep -Seconds 300"),
+                "5".into(),
+                false,
+            )
+            .await
+    });
+    stage
+        .wait_for(|s| *s == EnvStage::Setup)
+        .await
+        .expect("stage open");
+    quick.cancel_capture();
+    let (r, _) = run.await.unwrap();
     let s = r.setup.unwrap();
     assert!(!s.ok && !s.applied, "{s:?}");
     assert!(
-        s.error.as_deref().unwrap_or("").contains("did not finish"),
+        s.error.as_deref().unwrap_or("").contains("cancelled"),
         "{s:?}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < Duration::from_secs(60),
         "{:?}",
         started.elapsed()
     );

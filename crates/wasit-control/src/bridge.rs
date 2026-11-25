@@ -11,13 +11,6 @@ use crate::wire::{codes, encode, Frame, RpcError, DEFAULT_MAX_FRAME};
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
-    /// Bound on one endpoint connect.
-    pub connect_timeout: Duration,
-    /// Bound on the caller's daemon start closure.
-    pub start_timeout: Duration,
-    /// Connect retries after the daemon was started (backoff schedule).
-    pub retries_after_start: u32,
-    pub retry_initial: Duration,
     /// After stdin ends, how long the daemon may keep writing before the bridge exits.
     pub drain_timeout: Duration,
 }
@@ -25,10 +18,6 @@ pub struct BridgeOptions {
 impl Default for BridgeOptions {
     fn default() -> Self {
         BridgeOptions {
-            connect_timeout: Duration::from_secs(5),
-            start_timeout: Duration::from_secs(20),
-            retries_after_start: 5,
-            retry_initial: Duration::from_millis(50),
             drain_timeout: Duration::from_secs(5),
         }
     }
@@ -44,10 +33,14 @@ pub enum BridgeError {
 
 /// Connect `stdin`/`stdout` to `endpoint`, byte for byte.
 ///
-/// If nobody serves the endpoint (absent or stale), `start_daemon` is awaited (bounded); it
-/// should resolve once the daemon is ready (or fail). If the endpoint still cannot be reached,
-/// one `goodbye` frame with code `bridge_unavailable` is written to `stdout` — a single JSON
-/// line the client's handshake surfaces as [`crate::ConnectError::Refused`].
+/// If nobody serves the endpoint (absent or stale), `start_daemon` is awaited and not bounded:
+/// a daemon may take minutes to become ready (a slow login environment, a long startup), and
+/// that is progress, not failure. It must resolve once the daemon is ready to accept
+/// connections. The endpoint is then dialled once. Once connected, a `ready` frame is written
+/// to `stdout` before anything else: the dialling side starts its hello deadline there. If the
+/// endpoint cannot be reached, one `goodbye` frame with code `bridge_unavailable` is written
+/// instead — a single JSON line the client's handshake surfaces as
+/// [`crate::ConnectError::Refused`].
 ///
 /// Returns when both directions have finished.
 pub async fn bridge<R, W, F, Fut>(
@@ -63,17 +56,14 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = io::Result<()>>,
 {
-    let connected = match connect_once(endpoint, &opts).await {
+    let connected = match endpoint.connect().await {
         Ok(s) => Ok(s),
-        Err(e) if Endpoint::is_absent_error(&e) => {
-            match tokio::time::timeout(opts.start_timeout, start_daemon()).await {
-                Err(_) => Err("starting the daemon timed out".to_string()),
-                Ok(Err(e)) => Err(format!("starting the daemon failed: {e}")),
-                Ok(Ok(())) => connect_after_start(endpoint, &opts)
-                    .await
-                    .map_err(|e| format!("daemon started but endpoint unreachable: {e}")),
-            }
-        }
+        Err(e) if Endpoint::is_absent_error(&e) => match start_daemon().await {
+            Err(e) => Err(format!("starting the daemon failed: {e}")),
+            Ok(()) => endpoint.connect().await.map_err(|e| {
+                format!("the daemon reported ready but its endpoint is unreachable: {e}")
+            }),
+        },
         Err(e) => Err(e.to_string()),
     };
     let socket = match connected {
@@ -91,9 +81,12 @@ where
             return Err(BridgeError::Unavailable(message));
         }
     };
+    let ready =
+        encode(&Frame::Ready, DEFAULT_MAX_FRAME).map_err(|e| io::Error::other(e.to_string()))?;
+    stdout.write_all(&ready).await?;
+    stdout.flush().await?;
     pump(stdin, stdout, socket, opts.drain_timeout).await
 }
-
 /// Copy both ways. When the daemon side ends, the bridge ends (its caller exits and so closes
 /// stdout, which is how the far client learns of it: shutting down a process's stdout handle
 /// does not close the descriptor). When stdin ends, the daemon gets EOF and a bounded moment
@@ -133,35 +126,4 @@ where
         }
     }
     Ok(())
-}
-
-async fn connect_once(
-    endpoint: &Endpoint,
-    opts: &BridgeOptions,
-) -> io::Result<crate::transport::BoxDuplex> {
-    match tokio::time::timeout(opts.connect_timeout, endpoint.connect()).await {
-        Ok(r) => r,
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
-    }
-}
-
-async fn connect_after_start(
-    endpoint: &Endpoint,
-    opts: &BridgeOptions,
-) -> io::Result<crate::transport::BoxDuplex> {
-    let mut delay = opts.retry_initial;
-    let mut last = None;
-    for attempt in 0..=opts.retries_after_start {
-        if attempt > 0 {
-            // Backoff schedule (the start closure is expected to signal readiness; this only
-            // absorbs a daemon that reports ready a moment before it listens).
-            tokio::time::sleep(delay).await;
-            delay *= 2;
-        }
-        match connect_once(endpoint, opts).await {
-            Ok(s) => return Ok(s),
-            Err(e) => last = Some(e),
-        }
-    }
-    Err(last.unwrap_or_else(|| io::Error::other("no attempt made")))
 }

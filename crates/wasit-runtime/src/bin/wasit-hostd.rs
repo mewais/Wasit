@@ -8,12 +8,16 @@
 //! wasit-hostd shim   <wasit-shim arguments>
 //! ```
 //!
-//! * `serve` takes the single-instance lock next to the socket (`<socket>.lock`), re-adopts the
-//!   sessions under `<dir>/sessions/`, prints one JSON readiness line on stdout and serves the
-//!   runtime's control methods until SIGTERM / SIGINT. Sessions keep running when it exits.
+//! * `serve` takes the starting lock (`<socket>.starting`) and then the single-instance lock next
+//!   to the socket (`<socket>.lock`), re-adopts the sessions under `<dir>/sessions/`, prints one
+//!   JSON readiness line on stdout (then releases the starting lock) and serves the runtime's
+//!   control methods until SIGTERM / SIGINT. Sessions keep running when it exits. A `serve` that
+//!   finds another instance exits with status 3 (see `bridge`).
 //!   The socket defaults to `<dir>/hostd.sock` (Windows: a named pipe derived from `<dir>`).
 //! * `bridge` pipes stdio to the daemon's socket (starting a detached `serve` with the same
-//!   options if none is running) — the command a remote hub runs over ssh.
+//!   options if none is running) — the command a remote hub runs over ssh. A `serve` that lost
+//!   the lock to a start in progress is waited for (the starting lock) and the socket is dialled
+//!   once after that start is ready.
 //! * `shim` is the per-session process holder entry (also used for the shim's own guard
 //!   re-exec), so one binary is all a host needs.
 //!
@@ -58,6 +62,9 @@ const BUILD: &str = concat!("wasit-hostd/", env!("CARGO_PKG_VERSION"));
 const BUILD_ID: &str = concat!("wasit-hostd-", env!("CARGO_PKG_VERSION"));
 /// The developer override: plain `tracing` text on stderr, and the usual panic message.
 const DEV_ENV: &str = "WASIT_LOG";
+/// `serve`'s exit status when another instance holds the lock or is starting, and when its
+/// endpoint cannot be bound (see `start_daemon`, which waits for a start in progress).
+const EXIT_ANOTHER_INSTANCE: u8 = 3;
 
 wasit_diag::diag_events! {
     /// Events of the dev/test daemon (`src` `daemon`, file `diag/daemon.ndjson`).
@@ -279,8 +286,21 @@ async fn serve(a: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Held from before the instance lock until the endpoint is bound and the readiness line is
+    // printed: a process that loses the instance lock waits for this (see `start_daemon`).
+    let starting = match wasit_control::StartingLock::try_acquire(socket_path(&a)).await {
+        Ok(l) => l,
+        Err(wasit_control::LockError::Held(_)) => return ExitCode::from(EXIT_ANOTHER_INSTANCE),
+        Err(e) => {
+            eprintln!("wasit-hostd: cannot start: {e}");
+            return ExitCode::from(3);
+        }
+    };
     let listener = match wasit_control::bind_local_exclusive(socket_path(&a)).await {
         Ok(l) => l,
+        Err(wasit_control::BindError::Lock(wasit_control::LockError::Held(_))) => {
+            return ExitCode::from(EXIT_ANOTHER_INSTANCE)
+        }
         Err(e) => {
             eprintln!("wasit-hostd: cannot listen: {e}");
             return ExitCode::from(3);
@@ -353,6 +373,7 @@ async fn serve(a: Args) -> ExitCode {
         "{}",
         serde_json::json!({"ready": true, "pid": std::process::id(), "endpoint": format!("{ep:?}")})
     );
+    drop(starting);
     emit(HostdEvent::Ready {
         pid: std::process::id(),
     });
@@ -415,7 +436,8 @@ async fn bridge(a: Args) -> ExitCode {
     let ep = endpoint(&a);
     let raw = a.raw.clone();
     let data = a.data.clone();
-    let start = move || start_daemon(raw, data);
+    let socket = socket_path(&a);
+    let start = move || start_daemon(raw, data, socket);
     match wasit_control::bridge(
         tokio::io::stdin(),
         tokio::io::stdout(),
@@ -433,9 +455,12 @@ async fn bridge(a: Args) -> ExitCode {
     }
 }
 
-/// Start `serve` detached with the same options and wait (bounded by the bridge) for its
-/// readiness line.
-async fn start_daemon(raw: Vec<String>, data: PathBuf) -> std::io::Result<()> {
+/// Start `serve` detached with the same options and wait (unbounded: a daemon may take minutes
+/// to become ready, see [`wasit_control::bridge`]) for its readiness line. A `serve` that lost
+/// the instance lock to another start exits with [`EXIT_ANOTHER_INSTANCE`] and no readiness
+/// line: then this waits for that start to be ready (the starting lock) and returns, so the
+/// bridge dials once.
+async fn start_daemon(raw: Vec<String>, data: PathBuf, socket: PathBuf) -> std::io::Result<()> {
     use std::process::Stdio;
     use tokio::io::AsyncBufReadExt;
     tokio::fs::create_dir_all(&data).await?;
@@ -462,8 +487,16 @@ async fn start_daemon(raw: Vec<String>, data: PathBuf) -> std::io::Result<()> {
     tokio::io::BufReader::new(stdout)
         .read_line(&mut line)
         .await?;
-    // EOF without a readiness line usually means another instance won the lock; the bridge's
-    // connect retries decide.
+    if line.is_empty() {
+        let status = child.wait().await?;
+        if status.code() != Some(i32::from(EXIT_ANOTHER_INSTANCE)) {
+            return Err(std::io::Error::other(format!(
+                "the daemon exited before it was ready ({status})"
+            )));
+        }
+        wasit_control::wait_until_started(socket).await?;
+        return Ok(());
+    }
     drop(child);
     Ok(())
 }

@@ -10,17 +10,23 @@
 //!
 //! Stages, in order:
 //! 1. **captured** — Unix: `$SHELL -l -i -c '<print env between unique markers>'` with stdin
-//!    closed and a deadline (output outside the markers, i.e. rc-file chatter, is ignored; the
-//!    whole process group is killed at the deadline), falling back to `-l -c`, then to this
-//!    process's environment. csh/tcsh (where `-l` must be the only argument) run `-c`, which
-//!    reads `.cshrc`/`.tcshrc`, and source `/etc/csh.login` and `~/.login` themselves. Windows: this process's environment plus the variables only the
+//!    closed (output outside the markers, i.e. rc-file chatter, is ignored), falling back to
+//!    `-l -c`, then to this process's environment. No deadline: a slow login (a module load in
+//!    an rc file, a network mount) is waited for, and the stage is visible as
+//!    [`HostEnv::progress`] (`Capturing`). Only the user's cancel ([`HostEnv::cancel_capture`])
+//!    ends it early: the process group is killed and the report says it was cancelled. A failed
+//!    capture is reported as such, never taken for a normal result. csh/tcsh (where `-l` must be
+//!    the only argument) run `-c`, which reads `.cshrc`/`.tcshrc`, and source `/etc/csh.login`
+//!    and `~/.login` themselves. Windows: this process's environment plus the variables only the
 //!    registry has (user over machine), and PATH = this process's entries, then registry
 //!    entries it lacks (a GUI's environment is a snapshot from login; installs since then are
 //!    only in the registry).
 //! 2. **setup commands** ([`HostEnvConfig::setup`]) — Unix: run by the same shell in the same
 //!    mode the capture succeeded with (so functions such as `module` that startup files define
-//!    exist), starting from the captured environment, stdin closed, between markers, with
-//!    their own deadline; the environment they leave is taken (PATH entries and variables of
+//!    exist), starting from the captured environment, stdin closed, between markers. They have
+//!    no deadline either: a `module load` on a busy cluster may take minutes. The stage is
+//!    reported as [`EnvStage::Setup`] and the user's cancel ends them (their process group is
+//!    killed; the report says they were cancelled). The environment they leave is taken (PATH entries and variables of
 //!    the capture they dropped are kept, after theirs). The lines reach the shell in a variable
 //!    and run with `eval` (POSIX shells and fish); the shell parses them first (`-n`), so a
 //!    syntax error is reported with the shell's message and nothing runs. csh and tcsh cannot
@@ -31,7 +37,7 @@
 //!    where that is true. Any other login shell (nu, elvish, xonsh, pwsh) runs the lines with
 //!    `/bin/sh`. Windows: PowerShell (`-NoProfile`) in the captured environment; its `$env:`
 //!    changes are taken. A setup that fails is reported ([`SetupReport`]); one that did not
-//!    finish (deadline, ended the shell) leaves the captured environment.
+//!    finish (cancelled, ended the shell) leaves the captured environment.
 //! 3. **variables** ([`HostEnvConfig::vars`]) — set as given (no expansion), over the above.
 //! 4. **agent commands** ([`HostEnvConfig::commands`]) — installed in [`AgentCommands`], which
 //!    discovery and session launches read.
@@ -41,9 +47,10 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
 
 use crate::config::AgentCommands;
 use crate::wire::{EnvSource, HostEnvConfig, HostEnvironment, SetupReport};
@@ -73,26 +80,44 @@ const SETUP_TAIL_BYTES: usize = 8 * 1024;
 pub struct CaptureOptions {
     /// The shell (default: `$SHELL`, else the passwd entry, else `/bin/sh`).
     pub shell: Option<PathBuf>,
-    /// Deadline of the login + interactive attempt.
-    pub interactive_deadline: Duration,
-    /// Deadline of the login-only attempt.
-    pub login_deadline: Duration,
-    /// Deadline of the setup commands (a `module load` on a busy cluster takes seconds).
-    pub setup_deadline: Duration,
     /// A private (owner-only) directory for the file a csh/tcsh setup is `source`d from
     /// (`None`: the machine's runtime directory for `wasit`, see [`crate::machine::runtime_dir`]).
     pub scratch_dir: Option<PathBuf>,
+    /// Becomes `true` when the user cancels the run (see [`HostEnv::cancel_capture`]). The
+    /// default never does.
+    pub cancel: watch::Receiver<bool>,
 }
 
 impl Default for CaptureOptions {
     fn default() -> Self {
         CaptureOptions {
             shell: None,
-            interactive_deadline: Duration::from_secs(6),
-            login_deadline: Duration::from_secs(4),
-            setup_deadline: Duration::from_secs(30),
             scratch_dir: None,
+            // The sender is dropped at once: nobody can cancel this default.
+            cancel: watch::channel(false).1,
         }
+    }
+}
+
+/// What the environment stage is doing now (see [`HostEnv::progress`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvStage {
+    Idle,
+    /// Capturing the login environment (a slow login shows up here, for as long as it runs).
+    Capturing,
+    /// Running the host's setup commands.
+    Setup,
+}
+
+/// Whether the user cancelled the run `opts` belongs to.
+fn cancelled(opts: &CaptureOptions) -> bool {
+    *opts.cancel.borrow()
+}
+
+/// Completes once the run is cancelled; never when it cannot be (its sender is gone).
+async fn cancel_requested(cancel: &mut watch::Receiver<bool>) {
+    if cancel.wait_for(|c| *c).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -119,6 +144,9 @@ pub struct HostEnv {
     stage: Arc<Mutex<Stage>>,
     running: Arc<tokio::sync::Mutex<()>>,
     commands: AgentCommands,
+    progress: Arc<watch::Sender<EnvStage>>,
+    /// Cancels the run in progress (`None` when none is).
+    cancel: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
 impl HostEnv {
@@ -128,7 +156,43 @@ impl HostEnv {
             stage: Arc::new(Mutex::new(Stage::default())),
             running: Arc::new(tokio::sync::Mutex::new(())),
             commands: AgentCommands::default(),
+            progress: Arc::new(watch::channel(EnvStage::Idle).0),
+            cancel: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// What the stage is doing now; a daemon reports `Capturing` while a slow login is waited
+    /// for.
+    pub fn progress(&self) -> watch::Receiver<EnvStage> {
+        self.progress.subscribe()
+    }
+
+    /// Cancel the run in progress (capture or setup): its processes are killed and the report
+    /// says so. Does nothing when no run is in progress.
+    pub fn cancel_capture(&self) {
+        if let Some(tx) = self
+            .cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            tx.send_replace(true);
+        }
+    }
+
+    /// Options for one run: a cancel signal of its own.
+    fn begin_run(&self) -> CaptureOptions {
+        let (tx, rx) = watch::channel(false);
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        CaptureOptions {
+            cancel: rx,
+            ..self.opts.clone()
+        }
+    }
+
+    fn end_run(&self) {
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.progress.send_replace(EnvStage::Idle);
     }
 
     /// The agent commands this stage installs; give them to the runtime configuration
@@ -158,10 +222,16 @@ impl HostEnv {
     /// environment of new processes. Concurrent calls run one after the other.
     pub async fn refresh(&self) -> HostEnvironment {
         let _g = self.running.lock().await;
-        let c = capture(&self.opts).await;
+        let opts = self.begin_run();
+        self.progress.send_replace(EnvStage::Capturing);
+        let c = capture(&opts).await;
         crate::diag::env_capture(&c.report.source, c.report.duration_ms);
-        self.stage().captured = Some(c);
-        self.apply().await
+        if !cancelled(&opts) {
+            self.stage().captured = Some(c.clone());
+        }
+        let report = self.apply(&opts, c).await;
+        self.end_run();
+        report
     }
 
     /// Apply `config` (setup commands, variables, agent commands) on top of the captured
@@ -179,7 +249,7 @@ impl HostEnv {
         // so no text it records (a setup's output, a note) can hold one.
         crate::scrub::host_secrets(&config);
         let _g = self.running.lock().await;
-        let captured = {
+        let cached = {
             let mut guard = self.stage();
             let st = &mut *guard;
             if !again && st.config == config {
@@ -191,31 +261,39 @@ impl HostEnv {
             }
             st.config = config;
             st.revision = Some(revision);
-            st.captured.is_some()
+            st.captured.clone()
         };
-        if !captured {
-            let c = capture(&self.opts).await;
-            self.stage().captured = Some(c);
-        }
-        (self.apply().await, true)
+        let opts = self.begin_run();
+        let captured = match cached {
+            Some(c) => c,
+            None => {
+                self.progress.send_replace(EnvStage::Capturing);
+                let c = capture(&opts).await;
+                if !cancelled(&opts) {
+                    self.stage().captured = Some(c.clone());
+                }
+                c
+            }
+        };
+        let report = self.apply(&opts, captured).await;
+        self.end_run();
+        (report, true)
     }
 
-    /// Run the configuration on the captured environment and install the result. The caller
-    /// holds `running`.
-    async fn apply(&self) -> HostEnvironment {
-        let (captured, config, revision) = {
+    /// Run the configuration on `captured` and install the result. The caller holds `running`
+    /// and `opts` is the run's. After a cancelled capture the setup commands do not run.
+    async fn apply(&self, opts: &CaptureOptions, captured: Captured) -> HostEnvironment {
+        let (config, revision) = {
             let st = self.stage();
-            let Some(c) = st.captured.clone() else {
-                unreachable!("apply runs after a capture");
-            };
-            (c, st.config.clone(), st.revision.clone())
+            (st.config.clone(), st.revision.clone())
         };
         let secrets = config.secrets();
         let mut vars = captured.vars.clone();
         let mut report = captured.report.clone();
-        if !config.setup.trim().is_empty() {
+        if !config.setup.trim().is_empty() && !cancelled(opts) {
+            self.progress.send_replace(EnvStage::Setup);
             let started = Instant::now();
-            let (after, mut s) = run_setup(&self.opts, &captured, &config.setup).await;
+            let (after, mut s) = run_setup(opts, &captured, &config.setup).await;
             s.duration_ms = started.elapsed().as_millis() as u64;
             s.output = scrub(&s.output, &secrets);
             s.error = s.error.map(|e| scrub(&e, &secrets));
@@ -277,7 +355,7 @@ pub fn scrub(text: &str, secrets: &[&str]) -> String {
 }
 
 /// Capture the user's environment (see the module docs). Never fails: the last resort is this
-/// process's own environment, with the reasons in `report.notes`.
+/// process's own environment, and then the report says why the login environment is missing.
 pub async fn capture(opts: &CaptureOptions) -> Captured {
     let started = Instant::now();
     let mut notes = Vec::new();
@@ -290,7 +368,17 @@ pub async fn capture(opts: &CaptureOptions) -> Captured {
         .collect();
     let (source, shell, vars) = match attempt {
         Some((src, sh, captured)) => (src, sh, merge_own(captured, &own)),
-        None => (EnvSource::Process, None, own),
+        None => {
+            notes.push(if cancelled(opts) {
+                "the login environment capture was cancelled; the daemon's own environment is in use"
+                    .into()
+            } else {
+                "the login environment could not be captured; the daemon's own environment is in use, \
+                 so agents installed through the login shell may look not installed"
+                    .into()
+            });
+            (EnvSource::Process, None, own)
+        }
     };
     let path = path_of(&vars);
     Captured {
@@ -390,27 +478,67 @@ fn nonce() -> String {
     format!("{:016x}", fastrand::u64(..))
 }
 
-/// What a bounded run produced (also when the deadline ended it).
+/// What a bounded run produced (also when a cancel ended it).
 struct Ran {
     out: String,
     err: String,
-    /// Exit code (`None`: killed by a signal, or still running at the deadline).
+    /// Exit code (`None`: killed by a signal, or still running when it was ended).
     code: Option<i32>,
-    /// The deadline passed and the process (group) was killed.
-    timed_out: bool,
+    /// The user cancelled and the process (group) was killed.
+    cancelled: bool,
     /// stderr was the same pipe as stdout (`out` holds both, in order; `err` is empty).
     merged: bool,
 }
 
-/// Run `program args…` with stdin closed and a deadline, in `env` (else this process's own
-/// environment). On the deadline the process group (Unix) or process is killed and what it
-/// printed so far is returned. `merge_stderr` (Unix): the process's stderr is its stdout (one
-/// pipe, so the two stay in order whatever the shell's own redirection syntax is).
+/// Why a run ended before its command did (`None`: it ran to its end).
+fn ended_by(r: &Ran) -> Option<String> {
+    r.cancelled.then(|| "was cancelled by the user".into())
+}
+
+/// How a run that is awaited ended.
+enum Outcome {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+}
+
+/// The process group of a run, killed when the run ends early: by the user's cancel, or by the
+/// run's future being dropped (its caller went away), so that nothing a login shell or a setup
+/// started outlives it. Disarmed once the shell has exited on its own: what it left running (a
+/// daemon an rc file starts) is the user's, not the run's.
+#[cfg(unix)]
+struct GroupGuard(Option<u32>);
+
+#[cfg(unix)]
+impl GroupGuard {
+    fn kill(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            wasit_process::kill_process_group(pgid);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Run `program args…` with stdin closed, in `env` (else this process's own environment), until
+/// it exits or `cancel` is set. Then (if it was cancelled, or its future is dropped first) the
+/// process group (Unix) or process is killed. A run has no deadline: a slow command is waited
+/// for, and only the user's cancel ends it early (what it printed so far is returned).
+/// `merge_stderr` (Unix): the process's stderr is its stdout (one pipe, so the two stay in order
+/// whatever the shell's own redirection syntax is).
 async fn run_bounded(
     program: &std::path::Path,
     args: &[String],
     env: Option<&[(String, String)]>,
-    deadline: Duration,
+    cancel: &watch::Receiver<bool>,
     merge_stderr: bool,
 ) -> Result<Ran, String> {
     use std::process::Stdio;
@@ -424,7 +552,7 @@ async fn run_bounded(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     // A new session: no controlling terminal (an interactive shell in a background group of
-    // one would be stopped by SIGTTOU), and a process group to kill at the deadline.
+    // one would be stopped by SIGTTOU), and a process group to kill on cancel.
     #[cfg(unix)]
     wasit_process::new_session(&mut cmd);
     #[cfg(unix)]
@@ -449,7 +577,10 @@ async fn run_bounded(
     // The command holds the write ends of a merged pipe: drop them, or the reader never sees
     // the end of the stream.
     drop(cmd);
-    let pid = child.id();
+    // Declared after `child`, so it is dropped first: the leader cannot have been reaped (and
+    // its id reused) while the group is still armed.
+    #[cfg(unix)]
+    let mut group = GroupGuard(child.id());
     let out = Arc::new(Mutex::new(Vec::new()));
     let err = Arc::new(Mutex::new(Vec::new()));
     let pump = |src: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
@@ -488,25 +619,32 @@ async fn run_bounded(
         .take()
         .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
     let readers = futures::future::join(pump(so, out.clone()), pump(se, err.clone()));
-    let work = async {
-        readers.await;
-        child.wait().await
-    };
-    let (code, timed_out) = match tokio::time::timeout(deadline, work).await {
-        Ok(Ok(st)) => (st.code(), false),
-        Ok(Err(e)) => return Err(format!("waiting for {}: {e}", program.display())),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(p) = pid {
-                // The shell and whatever its startup files started (it is the group leader).
-                wasit_process::kill_process_group(p);
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            // `kill_on_drop` ends the process itself when `child` goes out of scope.
-            (None, true)
+    let outcome = {
+        let work = async {
+            readers.await;
+            child.wait().await
+        };
+        let mut cancel = cancel.clone();
+        tokio::select! {
+            r = work => Outcome::Exited(r),
+            _ = cancel_requested(&mut cancel) => Outcome::Cancelled,
         }
     };
+    let cancelled = matches!(outcome, Outcome::Cancelled);
+    let code = match outcome {
+        Outcome::Exited(Ok(st)) => st.code(),
+        Outcome::Exited(Err(e)) => return Err(format!("waiting for {}: {e}", program.display())),
+        Outcome::Cancelled => {
+            // The shell and whatever its startup files and setup started (it is the group
+            // leader). Off Unix a process is ended by `kill_on_drop` when `child` goes away.
+            #[cfg(unix)]
+            group.kill();
+            None
+        }
+    };
+    // The shell exited on its own: what it left running is not this run's to end.
+    #[cfg(unix)]
+    group.disarm();
     let text = |b: &Arc<Mutex<Vec<u8>>>| {
         String::from_utf8_lossy(&b.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
     };
@@ -514,7 +652,7 @@ async fn run_bounded(
         out: text(&out),
         err: text(&err),
         code,
-        timed_out,
+        cancelled,
         merged: is_merged,
     })
 }
@@ -612,28 +750,28 @@ async fn capture_unix(
         Family::Csh => vec![(
             EnvSource::LoginShell,
             vec!["-c".to_string(), format!("{CSH_LOGIN}{script}")],
-            opts.login_deadline,
         )],
         _ => vec![
             (
                 EnvSource::LoginInteractiveShell,
                 vec!["-l".to_string(), "-i".into(), "-c".into(), script.clone()],
-                opts.interactive_deadline,
             ),
             (
                 EnvSource::LoginShell,
                 vec!["-l".to_string(), "-c".into(), script.clone()],
-                opts.login_deadline,
             ),
         ],
     };
-    for (source, args, deadline) in attempts {
+    for (source, args) in attempts {
+        if cancelled(opts) {
+            break;
+        }
         let what = format!("{} {}", shell.display(), args[..args.len() - 2].join(" "));
-        match run_bounded(&shell, &args, None, deadline, false).await {
-            Ok(r) if r.timed_out => notes.push(format!(
-                "`{what}` did not finish within {} s",
-                deadline.as_secs_f32()
-            )),
+        match run_bounded(&shell, &args, None, &opts.cancel, false).await {
+            Ok(r) if r.cancelled => {
+                notes.push(format!("`{what}` was cancelled"));
+                break;
+            }
             Ok(r) => match between(&r.out, &begin, &end).map(parse_env) {
                 Some(vars) if vars.iter().any(|(k, _)| k == "PATH") => {
                     return Some((source, Some(shell.display().to_string()), vars));
@@ -653,7 +791,6 @@ async fn capture_unix(
             Err(e) => notes.push(format!("`{what}` {e}")),
         }
     }
-    notes.push("using the daemon's own environment".into());
     None
 }
 
@@ -683,11 +820,8 @@ $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $
         script,
     ];
     let ps = PathBuf::from("powershell.exe");
-    match run_bounded(&ps, &args, None, opts.interactive_deadline, false).await {
-        Ok(r) if r.timed_out => notes.push(format!(
-            "powershell did not finish within {} s",
-            opts.interactive_deadline.as_secs_f32()
-        )),
+    match run_bounded(&ps, &args, None, &opts.cancel, false).await {
+        Ok(r) if r.cancelled => notes.push("the registry environment capture was cancelled".into()),
         Ok(Ran { out, err, .. }) => match between(&out, &begin, &end).map(parse_env) {
             Some(reg) if reg.iter().any(|(k, _)| k.eq_ignore_ascii_case("PATH")) => {
                 // This process's variables win (PowerShell's own changes are not taken); the
@@ -704,7 +838,6 @@ $o.Write("`n{begin}`n"); foreach($k in $r.Keys){{$o.Write("$k=$($r[$k])`0")}}; $
         },
         Err(e) => notes.push(format!("powershell {e}")),
     }
-    notes.push("using the daemon's own environment".into());
     None
 }
 
@@ -728,12 +861,7 @@ impl Markers {
     }
 
     /// Read a run: the environment the setup left (when it finished) and the report.
-    fn read(
-        &self,
-        r: &Ran,
-        shell: String,
-        deadline: Duration,
-    ) -> (Option<Vec<(String, String)>>, SetupReport) {
+    fn read(&self, r: &Ran, shell: String) -> (Option<Vec<(String, String)>>, SetupReport) {
         let mut rep = SetupReport {
             ok: false,
             shell,
@@ -744,13 +872,7 @@ impl Markers {
             duration_ms: 0,
         };
         let err_tail = tail_lines(&r.err, SETUP_TAIL_LINES, SETUP_TAIL_BYTES);
-        let unfinished = |what: String| {
-            if r.timed_out {
-                format!("did not finish within {} s", deadline.as_secs_f32())
-            } else {
-                what
-            }
-        };
+        let unfinished = |what: String| ended_by(r).unwrap_or(what);
         let Some(b) = r.out.find(&self.begin) else {
             rep.error = Some(unfinished(format!(
                 "the shell did not run the commands (exit status {})",
@@ -852,27 +974,14 @@ async fn run_setup(
     // left to the run itself.
     {
         let check = ["-n".to_string(), "-c".to_string(), setup.to_string()];
-        match run_bounded(
-            &shell,
-            &check,
-            Some(&captured.vars),
-            opts.setup_deadline,
-            false,
-        )
-        .await
-        {
+        match run_bounded(&shell, &check, Some(&captured.vars), &opts.cancel, false).await {
             Ok(r) if r.code == Some(0) => {}
             Ok(r) => {
                 let mut rep = start_failed(
                     format!("{} -n", shell.display()),
-                    if r.timed_out {
-                        format!(
-                            "did not finish within {} s",
-                            opts.setup_deadline.as_secs_f32()
-                        )
-                    } else {
+                    ended_by(&r).unwrap_or_else(|| {
                         "the commands have a syntax error (see the output); nothing was run".into()
-                    },
+                    }),
                 );
                 rep.exit_code = r.code;
                 rep.output = tail_lines(
@@ -896,8 +1005,8 @@ async fn run_setup(
     // a syntax error in them is their own output and exit status, not the wrapper's.
     let mut env = captured.vars.clone();
     env.push((SETUP_VAR.into(), setup.into()));
-    match run_bounded(&shell, &args, Some(&env), opts.setup_deadline, false).await {
-        Ok(r) => m.read(&r, what, opts.setup_deadline),
+    match run_bounded(&shell, &args, Some(&env), &opts.cancel, false).await {
+        Ok(r) => m.read(&r, what),
         Err(e) => (None, start_failed(what, e)),
     }
 }
@@ -914,7 +1023,7 @@ const CSH_UNCHECKED: &str =
 #[cfg(unix)]
 const SETUP_DONE_VAR: &str = "__WASIT_SETUP_DONE";
 
-/// A file of setup lines, owner-only, removed when dropped (success, failure, deadline or the
+/// A file of setup lines, owner-only, removed when dropped (success, failure, cancel or the
 /// future being dropped alike).
 #[cfg(unix)]
 struct ScratchFile(PathBuf);
@@ -989,32 +1098,26 @@ async fn run_csh_setup(
     // knows (`csh` may be either), so it is asked; if it cannot say, nothing is checked.
     let probe = ["-f".to_string(), "-c".into(), "echo $?tcsh".into()];
     let is_tcsh = matches!(
-        run_bounded(shell, &probe, Some(&captured.vars), opts.setup_deadline, false).await,
+        run_bounded(
+            shell,
+            &probe,
+            Some(&captured.vars),
+            &opts.cancel,
+            false
+        )
+        .await,
         Ok(r) if r.code == Some(0) && r.out.trim() == "1"
     );
     if is_tcsh {
         let check = ["-f".to_string(), "-n".into(), file.0.display().to_string()];
-        match run_bounded(
-            shell,
-            &check,
-            Some(&captured.vars),
-            opts.setup_deadline,
-            false,
-        )
-        .await
-        {
+        match run_bounded(shell, &check, Some(&captured.vars), &opts.cancel, false).await {
             Ok(r) if r.code == Some(0) => {}
             Ok(r) => {
                 let mut rep = start_failed(
                     format!("{what} -n"),
-                    if r.timed_out {
-                        format!(
-                            "did not finish within {} s",
-                            opts.setup_deadline.as_secs_f32()
-                        )
-                    } else {
+                    ended_by(&r).unwrap_or_else(|| {
                         "tcsh could not read the commands (see the output); nothing was run".into()
-                    },
+                    }),
                 );
                 rep.exit_code = r.code;
                 rep.output = tail_lines(
@@ -1039,11 +1142,11 @@ async fn run_csh_setup(
     let mut env = captured.vars.clone();
     env.push((SETUP_FILE_VAR.into(), file.0.display().to_string()));
     let args = ["-c".to_string(), script];
-    let ran = run_bounded(shell, &args, Some(&env), opts.setup_deadline, true).await;
+    let ran = run_bounded(shell, &args, Some(&env), &opts.cancel, true).await;
     drop(file);
     match ran {
         Ok(r) => {
-            let (mut vars, mut rep) = m.read(&r, what, opts.setup_deadline);
+            let (mut vars, mut rep) = m.read(&r, what);
             if let Some(v) = vars.as_mut() {
                 let done = v.iter().any(|(k, _)| k == SETUP_DONE_VAR);
                 v.retain(|(k, _)| k != SETUP_DONE_VAR);
@@ -1060,7 +1163,7 @@ async fn run_csh_setup(
                     ));
                 }
             }
-            if !rep.ok && !r.timed_out && r.out.contains(&m.begin) {
+            if !rep.ok && !r.cancelled && r.out.contains(&m.begin) {
                 if let Some(e) = rep.error.as_mut() {
                     e.push_str("; ");
                     e.push_str(CSH_UNCHECKED);
@@ -1126,8 +1229,8 @@ $__o.Write("`n{f}`n")"#,
     ];
     let what = "powershell -NoProfile".to_string();
     let ps = PathBuf::from("powershell.exe");
-    match run_bounded(&ps, &args, Some(&captured.vars), opts.setup_deadline, false).await {
-        Ok(r) => m.read(&r, what, opts.setup_deadline),
+    match run_bounded(&ps, &args, Some(&captured.vars), &opts.cancel, false).await {
+        Ok(r) => m.read(&r, what),
         Err(e) => (None, start_failed(what, e)),
     }
 }
@@ -1182,6 +1285,36 @@ mod tests {
         assert_eq!(f("/usr/bin/fish"), Family::Fish);
         assert_eq!(f("/usr/bin/xonsh"), Family::Foreign);
         assert_eq!(f("/bin/zsh"), Family::Posix);
+    }
+
+    /// A login shell that takes longer than the old 6 s interactive deadline (an rc file that
+    /// loads modules) still yields its environment: nothing cuts the login off.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_login_shell_is_waited_for() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Named `sh`: a POSIX shell. It sleeps, then runs the command it was given with `-c`.
+        let shell = dir.path().join("sh");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\nsleep 7\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let c = capture(&CaptureOptions {
+            shell: Some(shell),
+            ..CaptureOptions::default()
+        })
+        .await;
+        assert_eq!(
+            c.report.source,
+            EnvSource::LoginInteractiveShell,
+            "{:?}",
+            c.report
+        );
+        assert!(c.report.notes.is_empty(), "{:?}", c.report.notes);
+        assert!(!c.report.path.is_empty());
     }
 
     #[test]

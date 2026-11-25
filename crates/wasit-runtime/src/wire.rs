@@ -15,6 +15,7 @@
 //! | [`methods::HOST_ENVIRONMENT_REFRESH`] | — | [`HostEnvironment`] (re-captured; agents re-detected) |
 //! | [`methods::HOST_ENVIRONMENT_CONFIGURE`] | [`ConfigureEnvironment`] | [`HostEnvironment`] (setup, variables, agent commands applied; agents re-detected when it changed) |
 //! | [`methods::HOST_ENVIRONMENT_TEST`] | [`ConfigureEnvironment`] | [`EnvironmentTest`] (applied again, setup re-run, agents re-detected) |
+//! | [`methods::HOST_ENVIRONMENT_CANCEL`] | — | [`Ack`] (ends the capture or setup in progress; the call that runs it reports it cancelled; a no-op when none runs) |
 //! | [`methods::SESSIONS_LIST`] | — | [`SessionList`] |
 //! | [`methods::SESSIONS_CREATE`] | [`CreateSession`] | [`CreateSessionReply`] |
 //! | [`methods::SESSIONS_FORK`] | [`ForkSession`] | [`CreateSessionReply`] (the new session; its snapshot names the parent in `forked_from`) |
@@ -64,6 +65,7 @@ pub mod methods {
     pub const HOST_ENVIRONMENT_REFRESH: &str = "host.environment.refresh";
     pub const HOST_ENVIRONMENT_CONFIGURE: &str = "host.environment.configure";
     pub const HOST_ENVIRONMENT_TEST: &str = "host.environment.test";
+    pub const HOST_ENVIRONMENT_CANCEL: &str = "host.environment.cancel";
     pub const DRIVERS_INVENTORY: &str = "drivers.inventory";
     pub const DRIVERS_REFRESH: &str = "drivers.refresh";
     pub const SESSIONS_LIST: &str = "sessions.list";
@@ -125,6 +127,7 @@ pub const ROUTES: &[&str] = &[
     methods::HOST_ENVIRONMENT_REFRESH,
     methods::HOST_ENVIRONMENT_CONFIGURE,
     methods::HOST_ENVIRONMENT_TEST,
+    methods::HOST_ENVIRONMENT_CANCEL,
     topics::HOST_SESSIONS,
     "drivers.",
     "sessions.",
