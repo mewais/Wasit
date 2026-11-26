@@ -88,6 +88,14 @@ fn deadline_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The local instant a peer's relative `deadline_ms` ends at. `None` when the peer set no
+/// deadline, and also when the span cannot be represented as an `Instant` (a huge peer value):
+/// a peer must never be able to panic this process with arithmetic on its frame, and a deadline
+/// too far away to reach is, in effect, no deadline.
+fn deadline_at(deadline_ms: Option<u64>) -> Option<Instant> {
+    deadline_ms.and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)))
+}
+
 /// Options of an outgoing request.
 #[derive(Debug, Clone)]
 pub struct RequestOpts {
@@ -976,7 +984,7 @@ impl Inner {
             });
             return;
         };
-        let deadline = deadline_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        let deadline = deadline_at(deadline_ms);
         let Some(ctx) = self.context(guard, host, hops, trace, deadline) else {
             return; // closing
         };
@@ -1035,7 +1043,7 @@ impl Inner {
             });
             return;
         };
-        let deadline = deadline_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        let deadline = deadline_at(deadline_ms);
         let Some(ctx) = self.context(guard, host.clone(), hops, None, deadline) else {
             return;
         };
@@ -1386,6 +1394,100 @@ impl Drop for Subscription {
         if let Some(inner) = self.conn.upgrade() {
             if lock(&inner.subs).remove(&self.sub).is_some() {
                 inner.send_soon(Frame::Unsubscribe { sub: self.sub });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// Far enough away that no real call waits for it: a huge span either overflows to `None`
+    /// or lands here (on Linux `u64::MAX` ms is representable, about 584 million years out).
+    fn effectively_none(at: Option<Instant>) -> bool {
+        at.is_none_or(|at| at >= Instant::now() + Duration::from_secs(100 * 365 * 24 * 3600))
+    }
+
+    #[test]
+    fn no_peer_deadline_means_no_deadline() {
+        assert!(deadline_at(None).is_none());
+    }
+
+    #[test]
+    fn a_normal_peer_deadline_is_the_span_from_now() {
+        let before = Instant::now();
+        let at = deadline_at(Some(1_500)).expect("1.5 s is representable");
+        let after = Instant::now();
+        assert!(at >= before + Duration::from_millis(1_500));
+        assert!(at <= after + Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn a_zero_peer_deadline_is_now() {
+        let before = Instant::now();
+        let at = deadline_at(Some(0)).expect("zero is representable");
+        assert!(at >= before && at <= Instant::now());
+    }
+
+    #[test]
+    fn u64_max_behaves_as_no_deadline_and_does_not_panic() {
+        assert!(effectively_none(deadline_at(Some(u64::MAX))));
+        assert!(effectively_none(deadline_at(Some(u64::MAX - 1))));
+        assert!(effectively_none(deadline_at(Some(u64::MAX / 2))));
+    }
+
+    /// Edge values and a deterministic pseudo-random sweep over the whole `u64` range: every
+    /// value returns without panicking. Monotonic in the peer's span, with `None` meaning
+    /// unbounded: a longer span is never nearer than a shorter one, and once a span overflows
+    /// every longer span overflows too.
+    #[test]
+    fn edge_and_sweep_values_never_panic_and_are_monotonic() {
+        let mut values: Vec<u64> = vec![
+            0,
+            1,
+            999,
+            1_000,
+            u32::MAX as u64,
+            u64::MAX / 1_000,
+            u64::MAX / 1_000 + 1,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        // xorshift64: deterministic, covers magnitudes across the whole range.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for shift in 0..64u32 {
+            for _ in 0..8 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                values.push(x >> shift);
+            }
+        }
+        values.sort_unstable();
+        let mut last: Option<Instant> = None;
+        let mut overflowed = false;
+        for ms in values {
+            let at = deadline_at(Some(ms));
+            if overflowed {
+                assert!(
+                    at.is_none(),
+                    "{ms} ms is bounded after a shorter span overflowed"
+                );
+            }
+            match (last, at) {
+                (Some(prev), Some(cur)) => {
+                    assert!(
+                        cur >= prev,
+                        "deadline for {ms} ms ends before a shorter span"
+                    )
+                }
+                (_, None) => overflowed = true,
+                _ => {}
+            }
+            if at.is_some() {
+                last = at;
             }
         }
     }

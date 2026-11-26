@@ -1078,3 +1078,24 @@ async fn a_caller_deadline_longer_than_the_remote_answer_gets_the_answer() {
     assert_eq!(result, json!("late"));
     hub.shutdown().await;
 }
+
+/// A peer's huge `deadline_ms` (here up to `u64::MAX`) must neither panic the hub nor cut the
+/// call short: it behaves as no deadline, so the remote's answer comes back. Run concurrently,
+/// since each "late" answer takes the remote 5 s.
+#[tokio::test]
+async fn a_huge_caller_deadline_does_not_panic_and_behaves_as_none() {
+    let (hub, front) = slow_hub().await;
+    let (a, b, c) = tokio::join!(
+        raw_call(&front, "late", Some(u64::MAX)),
+        raw_call(&front, "late", Some(u64::MAX - 1)),
+        raw_call(&front, "late", Some(1 << 63)),
+    );
+    for frame in [a, b, c] {
+        let Frame::Response { result, error, .. } = frame else {
+            panic!("not a response");
+        };
+        assert_eq!(error, None);
+        assert_eq!(result, json!("late"));
+    }
+    hub.shutdown().await;
+}
