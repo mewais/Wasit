@@ -458,7 +458,7 @@ fn state_reason(s: &LinkState) -> Option<String> {
         None => text.to_owned(),
     };
     match s {
-        LinkState::Connecting | LinkState::Connected { .. } | LinkState::Stopped => None,
+        LinkState::Connecting { .. } | LinkState::Connected { .. } | LinkState::Stopped => None,
         LinkState::Provisioning { reason } => Some(match reason {
             ProvisionReason::CommandNotFound { detail } => {
                 format!("helper not installed: {detail}")
@@ -891,7 +891,10 @@ mod tests {
     #[test]
     fn state_and_close_codes_are_the_serialized_words() {
         let states = [
-            LinkState::Connecting,
+            LinkState::Connecting {
+                stage: None,
+                since_ms: 0,
+            },
             LinkState::Provisioning {
                 reason: ProvisionReason::Incompatible {
                     ours: ProtocolVersion { major: 1, minor: 0 },

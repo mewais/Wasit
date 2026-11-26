@@ -1,6 +1,7 @@
 //! A client that keeps its link up, and durable subscriptions on top of it.
 
 use std::mem::discriminant;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -14,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wasit_diag::{ErrorInfo, Ident};
 
-use crate::attempt::Attempt;
+use crate::attempt::{Attempt, StageSink};
 use crate::client::ControlClient;
 use crate::command::CommandFailureKind;
 use crate::connection::{RequestOpts, SubscribeOpts, Subscription};
@@ -102,7 +103,18 @@ pub struct ProvisionError {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LinkState {
-    Connecting,
+    /// An attempt is running. `stage` is the latest step the connector reported (see
+    /// [`Attempt::reached`]), `None` before it reports one; `since_ms` is when that step was
+    /// entered, in milliseconds since the attempt started (so it only grows within an attempt).
+    /// A consumer that does not know these fields reads `{"state":"connecting"}` as before.
+    Connecting {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        stage: Option<String>,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        since_ms: u64,
+    },
     Provisioning {
         reason: ProvisionReason,
     },
@@ -161,7 +173,7 @@ impl LinkState {
     /// The state as the word its `state` tag serializes to (`connecting`, `reconnecting`, …).
     pub fn code(&self) -> &'static str {
         match self {
-            LinkState::Connecting => "connecting",
+            LinkState::Connecting { .. } => "connecting",
             LinkState::Provisioning { .. } => "provisioning",
             LinkState::Connected { .. } => "connected",
             LinkState::Reconnecting { .. } => "reconnecting",
@@ -244,8 +256,10 @@ pub type StateCallback = Arc<dyn Fn(&LinkState) + Send + Sync>;
 #[derive(Debug, Clone)]
 pub struct SupervisedConfig {
     pub backoff: Backoff,
-    /// Bound on one connect attempt (spawn + handshake).
-    pub connect_timeout: Duration,
+    /// Bound on one connect attempt (spawn + handshake). `None`: no deadline; an attempt then
+    /// ends only on its own result, or when the link is stopped or dropped. What the attempt
+    /// reported ([`Attempt::reached`]) is still shown while it runs.
+    pub connect_timeout: Option<Duration>,
     /// Bound on one provisioning run.
     pub provision_timeout: Duration,
     /// Consecutive attempts where the far side ran but its bridge could not reach (or start)
@@ -258,7 +272,7 @@ impl Default for SupervisedConfig {
     fn default() -> Self {
         SupervisedConfig {
             backoff: Backoff::default(),
-            connect_timeout: Duration::from_secs(30),
+            connect_timeout: Some(Duration::from_secs(30)),
             provision_timeout: Duration::from_secs(300),
             bridge_unavailable_attempts: 3,
         }
@@ -291,18 +305,46 @@ struct Shared {
     on_state: Option<StateCallback>,
     diag: Option<Ident>,
     diag_host: Option<Ident>,
+    /// Serialises every publication of the link state, so a stage report and a transition
+    /// cannot interleave (see [`Shared::stage`]).
+    publish: Mutex<()>,
+    /// The number of the attempt the supervisor is running now, 0 when none is. A stage report
+    /// from an attempt that is no longer running is not published.
+    running: AtomicU64,
 }
 
 impl Shared {
     /// Publishes `s`. `why` is the text that goes with it in diagnostics when it is not the
     /// one `s` carries itself; `n` is the link's attempt number (0 before the first attempt).
     fn set(&self, s: LinkState, why: Option<&str>, n: u64) {
+        let _publishing = self.publish.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(link) = &self.diag {
             let from = self.state.borrow().clone();
             if from.code() != s.code() {
                 diag::state(link, self.diag_host.as_ref(), n, &from, &s, why);
             }
         }
+        if let Some(cb) = &self.on_state {
+            cb(&s);
+        }
+        self.state.send_replace(s);
+    }
+
+    /// Publishes that attempt `n` has reached `stage`, entered `since_ms` after it started. Only
+    /// while attempt `n` is the one running and the link is still connecting: a report that
+    /// arrives after the attempt ended (its connector was dropped, or the link moved on) is
+    /// dropped, not published over the state that replaced it.
+    fn stage(&self, n: u64, stage: &str, since_ms: u64) {
+        let _publishing = self.publish.lock().unwrap_or_else(|e| e.into_inner());
+        if self.running.load(Ordering::SeqCst) != n
+            || !matches!(*self.state.borrow(), LinkState::Connecting { .. })
+        {
+            return;
+        }
+        let s = LinkState::Connecting {
+            stage: Some(stage.to_owned()),
+            since_ms,
+        };
         if let Some(cb) = &self.on_state {
             cb(&s);
         }
@@ -366,7 +408,11 @@ impl Supervised {
     pub fn spawn(connector: Connector, opts: SupervisedOptions) -> Supervised {
         let stop = CancellationToken::new();
         let shared = Arc::new(Shared {
-            state: watch::channel(LinkState::Connecting).0,
+            state: watch::channel(LinkState::Connecting {
+                stage: None,
+                since_ms: 0,
+            })
+            .0,
             client: watch::channel(None).0,
             reconnect: watch::channel(0).0,
             stop: stop.clone(),
@@ -375,6 +421,8 @@ impl Supervised {
             on_state: opts.on_state.clone(),
             diag: opts.diag.clone(),
             diag_host: opts.diag_host.clone(),
+            publish: Mutex::new(()),
+            running: AtomicU64::new(0),
         });
         let task = tokio::spawn(run(shared.clone(), connector, opts.config, opts.hooks));
         *shared.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -537,18 +585,36 @@ async fn run(
         // Requests for a reconnect made before this attempt are satisfied by it.
         reconnect_rx.borrow_and_update();
         n += 1;
-        shared.set(LinkState::Connecting, None, n);
         let started = Instant::now();
+        // The attempt's stage reports come back here, stamped against its own start.
+        let sink: StageSink = {
+            let shared = shared.clone();
+            Arc::new(move |stage: &str, since_ms: u64| shared.stage(n, stage, since_ms))
+        };
+        shared.running.store(n, Ordering::SeqCst);
+        shared.set(
+            LinkState::Connecting {
+                stage: None,
+                since_ms: 0,
+            },
+            None,
+            n,
+        );
         if let Some(link) = &shared.diag {
             diag::attempt_begin(link, shared.diag_host.as_ref(), n);
         }
-        let this_attempt = Attempt::new(n).for_host(shared.diag_host.clone());
+        let this_attempt = Attempt::new(n)
+            .for_host(shared.diag_host.clone())
+            .reporting(started, sink);
         let res = tokio::select! {
             _ = stop.cancelled() => break,
-            r = tokio::time::timeout(cfg.connect_timeout, connector(this_attempt.clone())) => r,
+            r = bounded(cfg.connect_timeout, connector(this_attempt.clone())) => r,
         };
+        // The attempt has ended (its connector has returned or was dropped): its reports are
+        // no longer published.
+        shared.running.store(0, Ordering::SeqCst);
         let next = match res {
-            Err(_) => {
+            None => {
                 // The connector's future is gone; what it reported is the evidence.
                 last_error = this_attempt.timed_out();
                 last_why = last_error.clone();
@@ -557,7 +623,7 @@ async fn run(
                 });
                 Next::Backoff
             }
-            Ok(Ok(client)) => {
+            Some(Ok(client)) => {
                 let rejected = hooks
                     .as_ref()
                     .and_then(|h| h.check_hello(client.remote_hello()));
@@ -657,7 +723,7 @@ async fn run(
                     }
                 }
             }
-            Ok(Err(e)) => {
+            Some(Err(e)) => {
                 last_error = e.to_string();
                 last_why = diag::connect_why(&e);
                 let unavailable = matches!(
@@ -871,8 +937,18 @@ async fn run(
             Next::Provision { .. } => unreachable!("resolved above"),
         }
     }
+    shared.running.store(0, Ordering::SeqCst);
     shared.client.send_replace(None);
     shared.set(LinkState::Stopped, None, n);
+}
+
+/// Runs `f` to its result, or gives up on it after `limit` (`None`: no limit). `None` means it
+/// timed out, and `f` has been dropped.
+async fn bounded<T>(limit: Option<Duration>, f: impl std::future::Future<Output = T>) -> Option<T> {
+    match limit {
+        Some(d) => tokio::time::timeout(d, f).await.ok(),
+        None => Some(f.await),
+    }
 }
 
 async fn hold(hooks: &Option<Arc<dyn SupervisorHooks>>) -> Option<String> {

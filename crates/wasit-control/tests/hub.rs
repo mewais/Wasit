@@ -134,7 +134,7 @@ fn names(states: &[LinkState]) -> Vec<&'static str> {
     states
         .iter()
         .map(|s| match s {
-            LinkState::Connecting => "connecting",
+            LinkState::Connecting { .. } => "connecting",
             LinkState::Provisioning { .. } => "provisioning",
             LinkState::Connected { .. } => "connected",
             LinkState::Reconnecting { .. } => "reconnecting",

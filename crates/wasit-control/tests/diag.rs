@@ -157,7 +157,8 @@ impl States {
     }
 
     async fn settled(&mut self) -> LinkState {
-        self.until(|s| !matches!(s, LinkState::Connecting)).await
+        self.until(|s| !matches!(s, LinkState::Connecting { .. }))
+            .await
     }
 }
 
@@ -273,7 +274,9 @@ async fn attempt_numbers_count_every_attempt_and_are_never_reset() {
     // A drop and a reconnect after a success: the backoff counter starts again, the attempt
     // number does not.
     sup.reconnect_now();
-    states.until(|s| matches!(s, LinkState::Connecting)).await;
+    states
+        .until(|s| matches!(s, LinkState::Connecting { .. }))
+        .await;
     states.until(|s| s.is_connected()).await;
     sup.stop().await;
 
@@ -495,7 +498,7 @@ async fn every_classified_failure_is_recorded_with_its_outcome_state_and_code() 
 async fn a_connect_that_does_not_finish_is_recorded_as_a_timeout() {
     dir();
     let config = SupervisedConfig {
-        connect_timeout: Duration::from_millis(30),
+        connect_timeout: Some(Duration::from_millis(30)),
         ..slow()
     };
     let (opts, mut states) = States::options("t:timeout", config, None);
@@ -528,7 +531,7 @@ async fn a_connect_that_does_not_finish_is_recorded_as_a_timeout() {
 async fn a_connect_that_times_out_says_where_it_was_and_what_the_transport_said() {
     dir();
     let config = SupervisedConfig {
-        connect_timeout: Duration::from_secs(1),
+        connect_timeout: Some(Duration::from_secs(1)),
         ..slow()
     };
     let label = "hosts:t-timeout-evidence";
@@ -770,7 +773,12 @@ async fn every_way_provisioning_can_end_is_recorded() {
             opts,
         );
         let end = states
-            .until(|s| !matches!(s, LinkState::Connecting | LinkState::Provisioning { .. }))
+            .until(|s| {
+                !matches!(
+                    s,
+                    LinkState::Connecting { .. } | LinkState::Provisioning { .. }
+                )
+            })
             .await;
         sup.stop().await;
         assert_eq!(end.code(), c.to, "{}", c.name);
@@ -1174,7 +1182,7 @@ async fn a_helper_that_goes_away_parks_or_retries_the_same_in_either_order() {
                 argv.push("--read-hello".into());
             }
             h.add_link(HostSpec::new(host.as_str(), argv)).unwrap();
-            let state = link_state(&h, &host, |s| !matches!(s, LinkState::Connecting)).await;
+            let state = link_state(&h, &host, |s| !matches!(s, LinkState::Connecting { .. })).await;
             h.shutdown().await;
             if outcome == "park" {
                 let LinkState::Failed { reason, problem } = &state else {

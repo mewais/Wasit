@@ -11,10 +11,15 @@
 //! feeds it; nothing waits for anything.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use wasit_diag::Ident;
 
 use crate::command::ChildView;
+
+/// Receives a new stage of an attempt: the stage's words and when it was entered, in
+/// milliseconds since the attempt started. The supervisor's publishes it as the link state.
+pub(crate) type StageSink = Arc<dyn Fn(&str, u64) + Send + Sync>;
 
 /// What an attempt has reported so far.
 #[derive(Default)]
@@ -29,6 +34,10 @@ struct Evidence {
 pub struct Attempt {
     n: u64,
     host: Option<Ident>,
+    /// When the attempt started; stages are timed from it.
+    started: Instant,
+    /// Where a new stage goes when the supervisor runs the attempt; `None` when nothing reads it.
+    sink: Option<StageSink>,
     evidence: Arc<Mutex<Evidence>>,
 }
 
@@ -54,6 +63,8 @@ impl Attempt {
         Attempt {
             n,
             host: None,
+            started: Instant::now(),
+            sink: None,
             evidence: Arc::default(),
         }
     }
@@ -72,6 +83,14 @@ impl Attempt {
         self
     }
 
+    /// Makes the attempt report its stages to `sink`, timed from `started` (the supervisor's
+    /// start of the attempt).
+    pub(crate) fn reporting(mut self, started: Instant, sink: StageSink) -> Attempt {
+        self.started = started;
+        self.sink = Some(sink);
+        self
+    }
+
     /// The host the attempt's link leads to, if it leads to one.
     pub(crate) fn host(&self) -> Option<&Ident> {
         self.host.as_ref()
@@ -80,8 +99,26 @@ impl Attempt {
     /// The connector has reached `step`: a phrase in the connector's own words that completes
     /// "connect timed out while …" ("waiting for the host's report", "sending the helper").
     /// Replaces the previous step. A bridge's progress report arrives as owned text.
+    ///
+    /// A step different from the current one is a new stage: the supervisor publishes it as the
+    /// link state at once (`LinkState::Connecting` with the stage and when it was entered). The
+    /// same step again is not a new stage and changes nothing.
     pub fn reached(&self, step: impl Into<String>) {
-        self.evidence().step = Some(step.into());
+        let step = step.into();
+        // Held across the publication, so two reports of one attempt are published in the order
+        // they were made. The supervisor's publication never calls back into the attempt.
+        let mut ev = self.evidence();
+        if ev.step.as_deref() == Some(step.as_str()) {
+            return;
+        }
+        let since_ms = Instant::now()
+            .saturating_duration_since(self.started)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        if let Some(sink) = &self.sink {
+            sink(&step, since_ms);
+        }
+        ev.step = Some(step);
     }
 
     /// The attempt's transport command is `view` (the latest one, if the connector starts
