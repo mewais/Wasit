@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -889,10 +889,38 @@ async fn a_link_closed_by_the_peer_records_why_and_for_how_long_without_the_peer
 
 // ── real processes ──────────────────────────────────────────────────────────
 
+/// The command each test host runs. A host spec carries none, so the stock connector and the
+/// test's own connectors look it up here by host id (each test uses host ids of its own).
+static ARGVS: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
+
+/// Registers `argv` as the command `host` runs, then links `host`.
+fn link_argv<S: Into<String>>(
+    h: &Hub,
+    host: &str,
+    argv: impl IntoIterator<Item = S>,
+) -> Result<(), wasit_control::HubError> {
+    let argv = argv.into_iter().map(Into::into).collect();
+    ARGVS.lock().unwrap().insert(host.to_owned(), argv);
+    h.add_link(HostSpec::new(host))
+}
+
+fn argv_of(spec: &HostSpec) -> Vec<String> {
+    ARGVS
+        .lock()
+        .unwrap()
+        .get(spec.id.as_str())
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn hub(host: &str) -> Hub {
     let mut c = HubConfig::new(Hello::new("b1", host, "hub"));
     c.supervise = slow();
-    Hub::new(c, Arc::new(wasit_control::CommandConnector), None)
+    Hub::new(
+        c,
+        Arc::new(wasit_control::CommandConnector::new(argv_of)),
+        None,
+    )
 }
 
 /// Waits until `host`'s link is in a state `pred` accepts (a state stays published until the
@@ -908,7 +936,8 @@ async fn a_transport_that_exits_with_stderr_is_recorded_with_its_exit_and_scrubb
     dir();
     let host = "diag-proc-fail";
     let h = hub("diag-hub-1");
-    h.add_link(HostSpec::new(
+    link_argv(
+        &h,
         host,
         [
             demo_bin(),
@@ -917,7 +946,7 @@ async fn a_transport_that_exits_with_stderr_is_recorded_with_its_exit_and_scrubb
             "--code",
             "3",
         ],
-    ))
+    )
     .unwrap();
     let state = link_state(&h, host, |s| matches!(s, LinkState::Reconnecting { .. })).await;
     h.shutdown().await;
@@ -991,7 +1020,7 @@ impl LinkConnector for OwnConnector {
         opts: ClientOptions,
         attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
-        let cmd = CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), &attempt);
+        let cmd = CommandSpec::new(argv_of(spec)).traced(spec.diag_link(), &attempt);
         let (io, child) = CommandTransport::spawn(&cmd)?;
         attempt.reached("saying hello");
         match ControlClient::connect(io, opts).await {
@@ -1009,14 +1038,15 @@ impl LinkConnector for OwnConnector {
 async fn a_helper_that_ends_by_itself_parks_the_link_with_its_exit_and_scrubbed_words() {
     dir();
     let own: Arc<dyn LinkConnector> = Arc::new(OwnConnector);
-    let stock: Arc<dyn LinkConnector> = Arc::new(wasit_control::CommandConnector);
+    let stock: Arc<dyn LinkConnector> = Arc::new(wasit_control::CommandConnector::new(argv_of));
     let mut states = Vec::new();
     for (which, connector) in [("stock", stock), ("own", own)] {
         let host = format!("diag-helper-{which}");
         let mut c = HubConfig::new(Hello::new("b1", "diag-hub-h", "hub"));
         c.supervise = slow();
         let h = Hub::new(c, connector, None);
-        h.add_link(HostSpec::new(
+        link_argv(
+            &h,
             host.as_str(),
             [
                 demo_named("ssh"),
@@ -1025,7 +1055,7 @@ async fn a_helper_that_ends_by_itself_parks_the_link_with_its_exit_and_scrubbed_
                 "--code".into(),
                 "2".into(),
             ],
-        ))
+        )
         .unwrap();
         let state = link_state(&h, &host, |s| matches!(s, LinkState::Failed { .. })).await;
         h.shutdown().await;
@@ -1067,7 +1097,8 @@ async fn a_helper_that_ends_by_itself_parks_the_link_with_its_exit_and_scrubbed_
     // ssh's own failure is not the helper's: retried, as before.
     let host = "diag-helper-255";
     let h = hub("diag-hub-h2");
-    h.add_link(HostSpec::new(
+    link_argv(
+        &h,
         host,
         [
             demo_named("ssh"),
@@ -1076,7 +1107,7 @@ async fn a_helper_that_ends_by_itself_parks_the_link_with_its_exit_and_scrubbed_
             "--code".into(),
             "255".into(),
         ],
-    ))
+    )
     .unwrap();
     link_state(&h, host, |s| matches!(s, LinkState::Reconnecting { .. })).await;
     h.shutdown().await;
@@ -1109,7 +1140,7 @@ impl LinkConnector for OrderedConnector {
         opts: ClientOptions,
         attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
-        let cmd = CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), &attempt);
+        let cmd = CommandSpec::new(argv_of(spec)).traced(spec.diag_link(), &attempt);
         let (io, child) = CommandTransport::spawn(&cmd)?;
         if matches!(self.0, First::Write) {
             // Gone before the hello is written: awaiting the exit is the signal, not a delay.
@@ -1181,7 +1212,7 @@ async fn a_helper_that_goes_away_parks_or_retries_the_same_in_either_order() {
             if matches!(first, First::Read) {
                 argv.push("--read-hello".into());
             }
-            h.add_link(HostSpec::new(host.as_str(), argv)).unwrap();
+            link_argv(&h, host.as_str(), argv).unwrap();
             let state = link_state(&h, &host, |s| !matches!(s, LinkState::Connecting { .. })).await;
             h.shutdown().await;
             if outcome == "park" {
@@ -1210,11 +1241,7 @@ async fn an_established_transport_that_dies_records_its_exit_and_scrubbed_stderr
     dir();
     let host = "diag-proc-crash";
     let h = hub("diag-hub-2");
-    h.add_link(HostSpec::new(
-        host,
-        [demo_bin(), "serve-stdio", "--host", host],
-    ))
-    .unwrap();
+    link_argv(&h, host, [demo_bin(), "serve-stdio", "--host", host]).unwrap();
     link_state(&h, host, LinkState::is_connected).await;
     let client = h.link(&HostId::new(host)).unwrap().current().unwrap();
     // The child says something with the secret in it and dies with code 3.
@@ -1278,7 +1305,7 @@ async fn the_hub_hands_each_connector_the_links_attempt_number_and_labels_its_li
     c.supervise = slow();
     let h = Hub::new(c, Arc::new(Numbered(Arc::clone(&seen))), None);
     let host = "diag-numbered";
-    h.add_link(HostSpec::new(host, ["unused"])).unwrap();
+    h.add_link(HostSpec::new(host)).unwrap();
     link_state(&h, host, |s| {
         matches!(s, LinkState::Reconnecting { attempt: 1, .. })
     })
@@ -1539,7 +1566,7 @@ async fn routed(hub_id: &str, hosts: &[(&str, Arc<dyn Service>)]) -> Routed {
     let front = ControlServer::new(routing, Hello::new("b1", hub_id, "hub"), cfg());
     let mut st = hub.states();
     for (h, _) in &servers {
-        hub.add_link(HostSpec::new(h.clone(), ["unused"])).unwrap();
+        hub.add_link(HostSpec::new(h.clone())).unwrap();
     }
     wait_watch(&mut st, |m| {
         m.len() == servers.len() && m.values().all(LinkState::is_connected)

@@ -83,8 +83,8 @@ async fn uplink_via_server_and_via_hub_reach_other_hosts_and_signal_changes() {
 
     let mut changes = up_a.changes();
     let mut st = hub.states();
-    hub.add_link(HostSpec::new("a", ["unused"])).unwrap();
-    hub.add_link(HostSpec::new("b", ["unused"])).unwrap();
+    hub.add_link(HostSpec::new("a")).unwrap();
+    hub.add_link(HostSpec::new("b")).unwrap();
     wait_watch(&mut st, |m| {
         m.len() == 2 && m.values().all(LinkState::is_connected)
     })

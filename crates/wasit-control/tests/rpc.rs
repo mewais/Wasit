@@ -254,6 +254,7 @@ async fn server_side_lag_closes_only_that_subscription() {
             from: None,
             hops: 0,
             window: 0,
+            deadline_ms: None,
         },
         1 << 20,
     )
@@ -285,6 +286,7 @@ async fn server_side_lag_closes_only_that_subscription() {
                         params: json!("alive"),
                         hops: 0,
                         trace: None,
+                        deadline_ms: None,
                     },
                     1 << 20,
                 )

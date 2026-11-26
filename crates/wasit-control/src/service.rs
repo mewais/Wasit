@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::connection::Connection;
 use crate::wire::{CloseReason, Cursor, Hello, HostId, RpcError, TraceId};
@@ -26,6 +27,9 @@ pub struct CallContext {
     /// The user intent the request serves, when it has one (always `None` for a subscription:
     /// a subscription is not an intent).
     pub trace: Option<TraceId>,
+    /// The instant the caller stops waiting for this request, computed when the frame arrived
+    /// (`None`: the caller set no deadline). A router forwards the request with the time left.
+    pub deadline: Option<Instant>,
 }
 
 impl CallContext {

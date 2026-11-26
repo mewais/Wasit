@@ -347,6 +347,11 @@ pub enum Frame {
         /// peers that predate it, which therefore interoperate.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trace: Option<TraceId>,
+        /// How long the caller waits for the response, in milliseconds, counted from when
+        /// the frame is sent (relative, so peers need no clock agreement). Absent: the
+        /// caller set no deadline, and a router forwards the request without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_ms: Option<u64>,
     },
     Response {
         id: u64,
@@ -370,6 +375,9 @@ pub enum Frame {
         /// acknowledged with `Credit`. `0` = no flow control (queue limits only).
         #[serde(default, skip_serializing_if = "is_zero")]
         window: u32,
+        /// Bound on the wait for `subscribed`, as [`Frame::Request::deadline_ms`] is for a call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_ms: Option<u64>,
     },
     Subscribed {
         id: u64,
@@ -535,6 +543,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The caller's deadline travels as a relative span; a frame without one (an older peer's, or
+    /// a caller with none) decodes to `None`, and so does a frame that does not carry it.
+    #[test]
+    fn deadline_ms_is_read_when_present_and_absent_otherwise() {
+        let with = br#"{"type":"request","id":5,"method":"ping","deadline_ms":1500}"#;
+        match decode(with).unwrap().unwrap() {
+            Frame::Request { deadline_ms, .. } => assert_eq!(deadline_ms, Some(1500)),
+            other => panic!("{other:?}"),
+        }
+        let sub = br#"{"type":"subscribe","id":5,"topic":"t","deadline_ms":250}"#;
+        match decode(sub).unwrap().unwrap() {
+            Frame::Subscribe { deadline_ms, .. } => assert_eq!(deadline_ms, Some(250)),
+            other => panic!("{other:?}"),
+        }
+        match decode(br#"{"type":"request","id":5,"method":"ping"}"#)
+            .unwrap()
+            .unwrap()
+        {
+            Frame::Request { deadline_ms, .. } => assert_eq!(deadline_ms, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn frames_round_trip() {
         let frames = vec![
@@ -546,6 +577,7 @@ mod tests {
                 params: json!({"a": 1}),
                 hops: 2,
                 trace: None,
+                deadline_ms: None,
             },
             Frame::Request {
                 id: 4,
@@ -554,6 +586,7 @@ mod tests {
                 params: Value::Null,
                 hops: 0,
                 trace: Some(TraceId::new("u-0123456789abcdef").unwrap()),
+                deadline_ms: None,
             },
             Frame::Response {
                 id: 1,
@@ -573,6 +606,7 @@ mod tests {
                 from: Some(Cursor::from_u64(9)),
                 hops: 0,
                 window: 16,
+                deadline_ms: None,
             },
             Frame::Subscribed {
                 id: 3,
@@ -622,6 +656,7 @@ mod tests {
                 params: json!({}),
                 hops: 0,
                 trace: None,
+                deadline_ms: None,
             },
             DEFAULT_MAX_FRAME,
         )
@@ -638,6 +673,7 @@ mod tests {
                 params: json!({}),
                 hops: 1,
                 trace: Some(TraceId::new("u-0123456789abcdef").unwrap()),
+                deadline_ms: None,
             },
             DEFAULT_MAX_FRAME,
         )

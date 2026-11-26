@@ -9,14 +9,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::*;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, watch};
 use wasit_control::demo::DemoService;
+use wasit_control::wire::{self, Frame};
 use wasit_control::{
-    codes, connector, Attempt, CallError, ClientOptions, CommandFailureKind, ConnectError,
-    ControlClient, ControlServer, DurableOpts, Hello, HostId, HostSpec, Hub, HubConfig, HubError,
-    LinkConnector, LinkEvent, LinkState, ProvisionError, ProvisionReason, Provisioner, RequestOpts,
-    RoutingService, Service, SubscribeOpts, Supervised, SupervisedConfig, SupervisedOptions,
-    TraceId,
+    codes, connector, memory_pair, Attempt, CallContext, CallError, ClientOptions,
+    CommandFailureKind, ConnectError, ControlClient, ControlServer, DurableOpts, Hello, HostId,
+    HostSpec, Hub, HubConfig, HubError, LinkConnector, LinkEvent, LinkState, ProvisionError,
+    ProvisionReason, Provisioner, RequestOpts, RoutingService, RpcError, Service, SubscribeOpts,
+    Supervised, SupervisedConfig, SupervisedOptions, TraceId,
 };
 
 const D: Duration = Duration::from_secs(10);
@@ -102,7 +104,7 @@ fn daemon(host: &str, build: &str) -> ControlServer {
 }
 
 fn spec(host: &str) -> HostSpec {
-    HostSpec::new(host, ["unused"])
+    HostSpec::new(host)
 }
 
 /// Collect state transitions of `host` until `stop` matches (inclusive).
@@ -876,34 +878,31 @@ async fn a_link_announced_connected_is_usable_at_once() {
 async fn hub_links_over_real_child_processes() {
     let mut c = hub_cfg("hub", "hub-build");
     c.require_same_build = true; // no provisioner: mismatch is accepted
-    let hub = Hub::new(c, Arc::new(wasit_control::CommandConnector), None);
+                                 // Each host's command, by host id: a host spec carries none.
+    let connector = wasit_control::CommandConnector::new(|spec| match spec.id.as_str() {
+        "p1" => vec![
+            demo_bin().into(),
+            "serve-stdio".into(),
+            "--host".into(),
+            "p1".into(),
+            "--build".into(),
+            "other".into(),
+        ],
+        _ => vec![
+            "sh".into(),
+            "-c".into(),
+            "echo 'Permission denied (publickey).' >&2; exit 255".into(),
+        ],
+    });
+    let hub = Hub::new(c, Arc::new(connector), None);
     let routing: Arc<dyn Service> = Arc::new(RoutingService::new(
         hub.clone(),
         Arc::new(DemoService::new("hub")),
     ));
     hub.set_inbound_service(routing.clone());
     let mut ev = hub.events();
-    hub.add_link(HostSpec::new(
-        "p1",
-        [
-            demo_bin(),
-            "serve-stdio",
-            "--host",
-            "p1",
-            "--build",
-            "other",
-        ],
-    ))
-    .unwrap();
-    hub.add_link(HostSpec::new(
-        "broken",
-        [
-            "sh",
-            "-c",
-            "echo 'Permission denied (publickey).' >&2; exit 255",
-        ],
-    ))
-    .unwrap();
+    hub.add_link(HostSpec::new("p1")).unwrap();
+    hub.add_link(HostSpec::new("broken")).unwrap();
     let p1 = collect_until(&mut ev, "p1", LinkState::is_connected).await;
     assert_eq!(names(&p1), ["connecting", "connected"]);
     let mut st = hub.states();
@@ -956,5 +955,126 @@ async fn forwarded_subscription_closes_with_host_lost_when_the_link_drops() {
     assert!(!gui.is_closed());
     let who: String = gui.request("whoami", Value::Null, D).await.unwrap();
     assert_eq!(who, "hub");
+    hub.shutdown().await;
+}
+
+/// A remote host whose calls answer after the delay their method names: `late` after 300 ms,
+/// `forever` after 5 s (a caller's deadline of 100 ms must end it long before that).
+struct SlowHost;
+
+#[async_trait]
+impl Service for SlowHost {
+    async fn call(
+        &self,
+        _ctx: CallContext,
+        method: &str,
+        _params: Value,
+    ) -> Result<Value, RpcError> {
+        let delay = match method {
+            "late" => Duration::from_millis(300),
+            _ => Duration::from_secs(5),
+        };
+        tokio::time::sleep(delay).await;
+        Ok(json!(method))
+    }
+}
+
+/// Hub with a link to `slow` (a [`SlowHost`]); returns the hub and its front server (the hub's
+/// routing service, which a client reaches over a pipe).
+async fn slow_hub() -> (Hub, ControlServer) {
+    let mc = Arc::new(MemConnector::default());
+    mc.set_target(
+        "slow",
+        ControlServer::new(
+            Arc::new(SlowHost),
+            Hello::new("v1", "slow", "daemon"),
+            cfg(),
+        ),
+    );
+    let hub = Hub::new(hub_cfg("hub", "v1"), mc, None);
+    let routing: Arc<dyn Service> = Arc::new(RoutingService::new(
+        hub.clone(),
+        Arc::new(DemoService::new("hub")),
+    ));
+    hub.set_inbound_service(routing.clone());
+    let front = ControlServer::new(routing, Hello::new("v1", "hub", "hub"), cfg());
+    let mut st = hub.states();
+    hub.add_link(spec("slow")).unwrap();
+    wait_watch(&mut st, |m| {
+        m.len() == 1 && m.values().all(LinkState::is_connected)
+    })
+    .await;
+    (hub, front)
+}
+
+/// Sends one request frame to `front` exactly as given (`deadline_ms` as the caller set it) and
+/// returns the response. The test's own wait is not bounded by the frame's deadline: the answer
+/// (or the hub's own timeout) is what is being observed.
+async fn raw_call(front: &ControlServer, method: &str, deadline_ms: Option<u64>) -> Frame {
+    let (raw, b) = memory_pair(1 << 16);
+    front.serve_connection(b);
+    let (r, mut w) = tokio::io::split(raw);
+    let mut lines = BufReader::new(r).lines();
+    let hello_line = wire::encode(&Frame::Hello(hello("raw")), 1 << 20).unwrap();
+    w.write_all(&hello_line).await.unwrap();
+    within(lines.next_line()).await.unwrap().unwrap();
+    let req = Frame::Request {
+        id: 1,
+        host: Some("slow".into()),
+        method: method.into(),
+        params: Value::Null,
+        hops: 0,
+        trace: None,
+        deadline_ms,
+    };
+    w.write_all(&wire::encode(&req, 1 << 20).unwrap())
+        .await
+        .unwrap();
+    loop {
+        let line = within(lines.next_line()).await.unwrap().unwrap();
+        let frame = wire::decode(line.as_bytes()).unwrap().unwrap();
+        if matches!(frame, Frame::Response { id: 1, .. }) {
+            return frame;
+        }
+    }
+}
+
+/// A forwarded call whose caller set no deadline is not cut short by the hub: it waits for the
+/// remote's answer, however long that takes (the hub used to bound every forwarded call at 120 s).
+#[tokio::test]
+async fn a_forwarded_call_without_a_caller_deadline_waits_for_the_remote() {
+    let (hub, front) = slow_hub().await;
+    let Frame::Response { result, error, .. } = raw_call(&front, "late", None).await else {
+        panic!("not a response");
+    };
+    assert_eq!(error, None);
+    assert_eq!(result, json!("late"));
+    hub.shutdown().await;
+}
+
+/// A forwarded call carries the caller's deadline: the hub stops waiting for the remote when
+/// that deadline passes (it does not wait for the remote's 5 s answer), and says why.
+#[tokio::test]
+async fn a_forwarded_call_ends_at_the_callers_deadline() {
+    let (hub, front) = slow_hub().await;
+    let started = std::time::Instant::now();
+    let Frame::Response { error, .. } = raw_call(&front, "forever", Some(100)).await else {
+        panic!("not a response");
+    };
+    let elapsed = started.elapsed();
+    assert_eq!(error.map(|e| e.code), Some(codes::TIMEOUT.to_owned()));
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    hub.shutdown().await;
+}
+
+/// The same deadline does not cut short a remote answer that comes within it.
+#[tokio::test]
+async fn a_caller_deadline_longer_than_the_remote_answer_gets_the_answer() {
+    let (hub, front) = slow_hub().await;
+    let Frame::Response { result, error, .. } = raw_call(&front, "late", Some(10_000)).await else {
+        panic!("not a response");
+    };
+    assert_eq!(error, None);
+    assert_eq!(result, json!("late"));
     hub.shutdown().await;
 }

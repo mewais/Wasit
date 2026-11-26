@@ -28,8 +28,6 @@ use crate::wire::{codes, Cursor, Hello, HostId, RpcError};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSpec {
     pub id: HostId,
-    /// e.g. `["ssh", "-o", "BatchMode=yes", "host", "marsad-agent", "bridge"]`.
-    pub connect_argv: Vec<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
     /// Build the remote helper must run; `None` = the hub's own build (when
@@ -39,14 +37,9 @@ pub struct HostSpec {
 }
 
 impl HostSpec {
-    pub fn new<I, S>(id: impl Into<HostId>, argv: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
+    pub fn new(id: impl Into<HostId>) -> Self {
         HostSpec {
             id: id.into(),
-            connect_argv: argv.into_iter().map(Into::into).collect(),
             env: Vec::new(),
             expected_build: None,
         }
@@ -91,9 +84,31 @@ pub trait LinkConnector: Send + Sync + 'static {
     }
 }
 
-/// Connects by running `spec.connect_argv` and speaking over its stdio.
-#[derive(Debug, Clone, Default)]
-pub struct CommandConnector;
+/// The command a host runs, by its spec (see [`CommandConnector`]).
+type ArgvFn = Arc<dyn Fn(&HostSpec) -> Vec<String> + Send + Sync>;
+
+/// Connects by running the command its `argv` function gives for the host, and speaking over that
+/// command's stdio. The command is the product's (a host spec says only who the host is), so the
+/// product supplies it here.
+#[derive(Clone)]
+pub struct CommandConnector {
+    argv: ArgvFn,
+}
+
+impl CommandConnector {
+    /// `argv`: e.g. `["ssh", "-o", "BatchMode=yes", host, "marsad-agent", "bridge"]` for `host`.
+    pub fn new(argv: impl Fn(&HostSpec) -> Vec<String> + Send + Sync + 'static) -> Self {
+        CommandConnector {
+            argv: Arc::new(argv),
+        }
+    }
+}
+
+impl std::fmt::Debug for CommandConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandConnector").finish_non_exhaustive()
+    }
+}
 
 #[async_trait]
 impl LinkConnector for CommandConnector {
@@ -103,8 +118,7 @@ impl LinkConnector for CommandConnector {
         opts: ClientOptions,
         attempt: Attempt,
     ) -> Result<ControlClient, ConnectError> {
-        let mut cmd =
-            CommandSpec::new(spec.connect_argv.clone()).traced(spec.diag_link(), &attempt);
+        let mut cmd = CommandSpec::new((self.argv)(spec)).traced(spec.diag_link(), &attempt);
         cmd.env = spec.env.clone();
         CommandTransport::connect(&cmd, opts).await
     }
@@ -121,8 +135,6 @@ pub struct HubConfig {
     pub require_same_build: bool,
     /// Requests that have already been forwarded this many times are rejected.
     pub max_hops: u32,
-    /// Bound on a forwarded request (and on a forwarded subscribe round trip).
-    pub forward_timeout: Duration,
 }
 
 impl HubConfig {
@@ -133,7 +145,6 @@ impl HubConfig {
             supervise: SupervisedConfig::default(),
             require_same_build: true,
             max_hops: 4,
-            forward_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -537,6 +548,12 @@ impl RoutingService {
     }
 }
 
+/// The time the caller has left, for the forwarded call (`None`: the caller set no deadline, so
+/// the forwarded call has none either).
+fn forward_deadline(caller_deadline: Option<tokio::time::Instant>) -> Option<Duration> {
+    caller_deadline.map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+}
+
 /// The error a forwarded request returns. A failure of the forwarding itself (the link is gone,
 /// the deadline passed) is also handed to `record`; the remote service answering with an error
 /// is not a forwarding failure.
@@ -561,10 +578,12 @@ impl Service for RoutingService {
         match routed {
             None => self.local.call(ctx, method, params).await,
             Some(link) => {
+                // The caller's deadline, not a fixed bound: a caller that set none waits as long
+                // as the remote does (only a lost link or the caller ends the wait).
                 let opts = RequestOpts {
                     host: ctx.host.clone(),
                     hops: ctx.hops + 1,
-                    deadline: Some(self.hub.inner.cfg.forward_timeout),
+                    deadline: forward_deadline(ctx.deadline),
                     // The next hop records the same intent.
                     trace: ctx.trace.clone(),
                 };
@@ -595,9 +614,8 @@ impl Service for RoutingService {
         match routed {
             None => self.local.subscribe(ctx, topic, params, from).await,
             Some(link) => {
-                let mut opts = SubscribeOpts::new(self.hub.inner.cfg.forward_timeout)
-                    .params(params)
-                    .from(from);
+                let mut opts = SubscribeOpts::unbounded().params(params).from(from);
+                opts.deadline = forward_deadline(ctx.deadline);
                 opts.host = ctx.host.clone();
                 opts.hops = ctx.hops + 1;
                 let sub = link.subscribe_with(topic, opts).await.map_err(|e| {
@@ -610,5 +628,28 @@ impl Service for RoutingService {
                 Ok(sub.into_event_stream())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod forward_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn a_caller_without_a_deadline_forwards_without_one() {
+        assert_eq!(forward_deadline(None), None);
+    }
+
+    #[test]
+    fn a_caller_deadline_forwards_the_time_left_and_never_more() {
+        let at = tokio::time::Instant::now() + Duration::from_secs(5);
+        let left = forward_deadline(Some(at)).unwrap();
+        assert!(
+            left <= Duration::from_secs(5) && left > Duration::from_secs(4),
+            "{left:?}"
+        );
+        // A deadline already passed leaves nothing to wait for.
+        let past = tokio::time::Instant::now() - Duration::from_secs(1);
+        assert_eq!(forward_deadline(Some(past)), Some(Duration::ZERO));
     }
 }

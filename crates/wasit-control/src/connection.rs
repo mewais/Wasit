@@ -83,6 +83,11 @@ pub struct Negotiated {
     pub features: Vec<String>,
 }
 
+/// The `deadline_ms` a frame carries for `d` (saturating; the peer reads it as a relative span).
+fn deadline_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Options of an outgoing request.
 #[derive(Debug, Clone)]
 pub struct RequestOpts {
@@ -136,8 +141,8 @@ pub struct SubscribeOpts {
     pub params: Value,
     pub from: Option<Cursor>,
     pub hops: u32,
-    /// Bound on waiting for `Subscribed`.
-    pub deadline: Duration,
+    /// Bound on waiting for `Subscribed` (`None`: no deadline, as [`RequestOpts::unbounded`]).
+    pub deadline: Option<Duration>,
 }
 
 impl SubscribeOpts {
@@ -147,7 +152,18 @@ impl SubscribeOpts {
             params: Value::Null,
             from: None,
             hops: 0,
-            deadline,
+            deadline: Some(deadline),
+        }
+    }
+
+    /// No deadline of its own: only a lost link or the caller ends the wait for `Subscribed`.
+    pub fn unbounded() -> Self {
+        SubscribeOpts {
+            host: None,
+            params: Value::Null,
+            from: None,
+            hops: 0,
+            deadline: None,
         }
     }
 
@@ -514,6 +530,7 @@ impl Connection {
                 params,
                 hops: opts.hops,
                 trace: opts.trace,
+                deadline_ms: opts.deadline.map(deadline_ms),
             },
             inner.cfg.max_frame,
         )
@@ -599,6 +616,7 @@ impl Connection {
                 from: opts.from.clone(),
                 hops: opts.hops,
                 window: window(&inner.cfg),
+                deadline_ms: opts.deadline.map(deadline_ms),
             },
             inner.cfg.max_frame,
         )
@@ -609,7 +627,7 @@ impl Connection {
             lock(&inner.pending).remove(&id);
             return Err(self.lost());
         }
-        let res = timeout(opts.deadline, async {
+        let wait = async {
             if inner.out.send(bytes).await.is_err() {
                 return Err(self.lost());
             }
@@ -618,11 +636,14 @@ impl Connection {
                 Ok(Err(e)) => Err(CallError::Rpc(e)),
                 Err(_) => Err(self.lost()),
             }
-        })
-        .await;
+        };
+        let res = match opts.deadline {
+            Some(d) => timeout(d, wait).await.ok(),
+            None => Some(wait.await),
+        };
         let parts = match res {
-            Ok(r) => r?,
-            Err(_) => {
+            Some(r) => r?,
+            None => {
                 // If `Subscribed` arrives later the reader finds no pending entry and
                 // unsubscribes.
                 lock(&inner.pending).remove(&id);
@@ -773,7 +794,8 @@ impl Inner {
                 params,
                 hops,
                 trace,
-            } => self.serve_request(guard, id, host, method, params, hops, trace),
+                deadline_ms,
+            } => self.serve_request(guard, id, host, method, params, hops, trace, deadline_ms),
             Frame::Response { id, result, error } => {
                 let pending = lock(&self.pending).remove(&id);
                 let res = match error {
@@ -804,7 +826,18 @@ impl Inner {
                 from,
                 hops,
                 window,
-            } => self.serve_subscribe(guard, id, host, topic, params, from, hops, window),
+                deadline_ms,
+            } => self.serve_subscribe(
+                guard,
+                id,
+                host,
+                topic,
+                params,
+                from,
+                hops,
+                window,
+                deadline_ms,
+            ),
             Frame::Subscribed { id, sub } => {
                 let pending = lock(&self.pending).remove(&id);
                 match pending {
@@ -900,6 +933,7 @@ impl Inner {
         host: Option<HostId>,
         hops: u32,
         trace: Option<TraceId>,
+        deadline: Option<Instant>,
     ) -> Option<CallContext> {
         let guard = guard.upgrade()?;
         Some(CallContext {
@@ -910,6 +944,7 @@ impl Inner {
             host,
             hops,
             trace,
+            deadline,
         })
     }
 
@@ -923,6 +958,7 @@ impl Inner {
         params: Value,
         hops: u32,
         trace: Option<TraceId>,
+        deadline_ms: Option<u64>,
     ) {
         // The record of a traced request, written before its response is queued (so whoever
         // got the answer finds it) and never for an untraced one.
@@ -940,7 +976,8 @@ impl Inner {
             });
             return;
         };
-        let Some(ctx) = self.context(guard, host, hops, trace) else {
+        let deadline = deadline_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        let Some(ctx) = self.context(guard, host, hops, trace, deadline) else {
             return; // closing
         };
         let inner = self.clone();
@@ -987,6 +1024,7 @@ impl Inner {
         from: Option<Cursor>,
         hops: u32,
         window: u32,
+        deadline_ms: Option<u64>,
     ) {
         let Some(service) = self.service.clone() else {
             let inner = self.clone();
@@ -997,7 +1035,8 @@ impl Inner {
             });
             return;
         };
-        let Some(ctx) = self.context(guard, host.clone(), hops, None) else {
+        let deadline = deadline_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        let Some(ctx) = self.context(guard, host.clone(), hops, None, deadline) else {
             return;
         };
         let inner = self.clone();
