@@ -7,7 +7,7 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::within;
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -61,12 +61,31 @@ fn connecting(s: &LinkState) -> (Option<&str>, u64) {
     }
 }
 
+/// The current wall-clock time in epoch milliseconds.
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is before the epoch")
+        .as_millis() as u64
+}
+
+/// A stage entered at `since` must be a wall-clock epoch time: no earlier than `before` (taken
+/// before the attempt was spawned) and no later than now (it was entered before it was seen).
+fn assert_entered_between(since: u64, before: u64) {
+    let now = epoch_ms();
+    assert!(
+        before <= since && since <= now,
+        "since_ms {since} is not an epoch time between {before} (before the attempt) and {now} (now)"
+    );
+}
+
 /// With no deadline a connect that never finishes stays in `Connecting` for as long as it runs.
 /// The window is the observation that nothing ended it; the control test below shows a deadline
 /// of a fraction of it does end the same stall, so the window was long enough to matter.
 #[tokio::test]
 async fn an_attempt_without_a_deadline_never_times_out() {
     let (opts, mut states) = tap();
+    let before = epoch_ms();
     let (dropped_tx, dropped_rx) = oneshot::channel();
     let dropped: Dropped = Arc::new(Mutex::new(Some(dropped_tx)));
     let sup = Supervised::spawn(
@@ -82,7 +101,9 @@ async fn an_attempt_without_a_deadline_never_times_out() {
     );
     assert_eq!(connecting(&next_state(&mut states).await), (None, 0));
     let st = next_state(&mut states).await;
-    assert_eq!(connecting(&st), (Some("waiting for the host's report"), 0));
+    let (stage, since) = connecting(&st);
+    assert_eq!(stage, Some("waiting for the host's report"));
+    assert_entered_between(since, before);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         states.try_recv().is_err(),
@@ -102,6 +123,7 @@ async fn an_attempt_without_a_deadline_never_times_out() {
 #[tokio::test]
 async fn dropping_the_link_ends_an_attempt_without_a_deadline() {
     let (opts, mut states) = tap();
+    let before = epoch_ms();
     let (dropped_tx, dropped_rx) = oneshot::channel();
     let dropped: Dropped = Arc::new(Mutex::new(Some(dropped_tx)));
     let sup = Supervised::spawn(
@@ -117,7 +139,9 @@ async fn dropping_the_link_ends_an_attempt_without_a_deadline() {
     );
     assert_eq!(connecting(&next_state(&mut states).await), (None, 0));
     let stage = next_state(&mut states).await;
-    assert_eq!(connecting(&stage).0, Some("sending the helper"));
+    let (name, since) = connecting(&stage);
+    assert_eq!(name, Some("sending the helper"));
+    assert_entered_between(since, before);
     let dropped_at = std::time::Instant::now();
     drop(sup);
     within(dropped_rx)
@@ -168,6 +192,7 @@ async fn an_attempt_with_a_deadline_times_out_under_the_same_stall() {
 #[tokio::test]
 async fn each_stage_is_published_as_it_is_reached_with_a_non_decreasing_since() {
     let (opts, mut states) = tap();
+    let before = epoch_ms();
     let gate_one = Arc::new(Notify::new());
     let gate_two = Arc::new(Notify::new());
     let (g1, g2) = (gate_one.clone(), gate_two.clone());
@@ -203,6 +228,9 @@ async fn each_stage_is_published_as_it_is_reached_with_a_non_decreasing_since() 
         t1 <= t2 && t2 <= t3,
         "since must not decrease: {t1} {t2} {t3}"
     );
+    for t in [t1, t2, t3] {
+        assert_entered_between(t, before);
+    }
     // The duplicate "second" published nothing, and nothing else has been published since.
     assert!(
         states.try_recv().is_err(),

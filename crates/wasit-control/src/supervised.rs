@@ -104,8 +104,9 @@ pub struct ProvisionError {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LinkState {
     /// An attempt is running. `stage` is the latest step the connector reported (see
-    /// [`Attempt::reached`]), `None` before it reports one; `since_ms` is when that step was
-    /// entered, in milliseconds since the attempt started (so it only grows within an attempt).
+    /// [`Attempt::reached`]), `None` before it reports one. `since_ms` is the wall-clock time at
+    /// which that current stage was entered, in milliseconds since the Unix epoch (`0` while no
+    /// stage is reported). Within an attempt it never decreases.
     /// A consumer that does not know these fields reads `{"state":"connecting"}` as before.
     Connecting {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,7 +331,7 @@ impl Shared {
         self.state.send_replace(s);
     }
 
-    /// Publishes that attempt `n` has reached `stage`, entered `since_ms` after it started. Only
+    /// Publishes that attempt `n` has reached `stage`, entered at `since_ms` (epoch ms). Only
     /// while attempt `n` is the one running and the link is still connecting: a report that
     /// arrives after the attempt ended (its connector was dropped, or the link moved on) is
     /// dropped, not published over the state that replaced it.
@@ -586,7 +587,7 @@ async fn run(
         reconnect_rx.borrow_and_update();
         n += 1;
         let started = Instant::now();
-        // The attempt's stage reports come back here, stamped against its own start.
+        // The attempt's stage reports come back here, stamped with their wall-clock entry time.
         let sink: StageSink = {
             let shared = shared.clone();
             Arc::new(move |stage: &str, since_ms: u64| shared.stage(n, stage, since_ms))
@@ -605,7 +606,7 @@ async fn run(
         }
         let this_attempt = Attempt::new(n)
             .for_host(shared.diag_host.clone())
-            .reporting(started, sink);
+            .reporting(sink);
         let res = tokio::select! {
             _ = stop.cancelled() => break,
             r = bounded(cfg.connect_timeout, connector(this_attempt.clone())) => r,
