@@ -96,9 +96,14 @@ async fn cancel_call_ends_the_setup_that_test_environment_waits_for() {
     let disc = Discovery::new(DiscoveryConfig::from_runtime(&cfg));
     let mgr = SessionManager::new(cfg).await.unwrap();
     let svc = RuntimeService::new(mgr, disc, "host", "test-build").with_environment(env);
-    // A client deadline no setup can meet: a call that carried it would fail before the rc ran.
-    let client =
-        loopback(Arc::new(svc)).with_deadlines(Duration::from_millis(1), Duration::from_secs(10));
+    // The base client keeps the product's default deadline. The client that runs the test call
+    // is a clone of it with a 1ms deadline no setup can meet: a call that carried that deadline
+    // would fail before the rc ran. The cancel goes through the base client, so it is bounded
+    // only by the product default and never by the 1ms probe.
+    let base = loopback(Arc::new(svc));
+    let client = base
+        .clone()
+        .with_deadlines(Duration::from_millis(1), Duration::from_secs(10));
 
     let req = ConfigureEnvironment {
         config: HostEnvConfig::default(),
@@ -112,7 +117,7 @@ async fn cancel_call_ends_the_setup_that_test_environment_waits_for() {
     let (shell, sleep) = hung_pids(fifo).await;
     assert!(!run.is_finished(), "the test call ended without a cancel");
 
-    client.cancel_environment().await.expect("cancel answered");
+    base.cancel_environment().await.expect("cancel answered");
     let test = tokio::time::timeout(Duration::from_secs(30), run)
         .await
         .expect("cancel ends the test call")
