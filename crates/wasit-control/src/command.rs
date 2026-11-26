@@ -54,6 +54,11 @@ pub enum CommandFailureKind {
     /// Only decided where the transport's exit-status contract says the status is the remote
     /// program's ([`TransportKind::remote_status`]).
     HelperFailed,
+    /// The connection was lost after the sign-in went through (the host answered; ssh did not
+    /// refuse anything): the link needs the user to connect again, because a retry on its own
+    /// would ask the same prompts again. The stage it was lost at is said by the hub, which
+    /// knows it; this kind only says the connection is gone.
+    ConnectionLost,
     Other,
 }
 
@@ -74,6 +79,7 @@ impl CommandFailureKind {
             CommandFailureKind::HelperMissing => "helper_missing",
             CommandFailureKind::UnexpectedOutput => "unexpected_output",
             CommandFailureKind::HelperFailed => "helper_failed",
+            CommandFailureKind::ConnectionLost => "connection_lost",
             CommandFailureKind::Other => "other",
         }
     }
@@ -85,6 +91,7 @@ impl CommandFailureKind {
             CommandFailureKind::AuthNeeded
                 | CommandFailureKind::HostKeyUnknown
                 | CommandFailureKind::HostKeyChanged
+                | CommandFailureKind::ConnectionLost
         )
     }
 
@@ -679,6 +686,8 @@ mod tests {
         }
         assert!(K::AuthNeeded.needs_human());
         assert!(K::HostKeyChanged.needs_human());
+        assert!(K::ConnectionLost.needs_human() && !K::ConnectionLost.is_transient());
+        assert_eq!(K::ConnectionLost.code(), "connection_lost");
         assert!(!K::Unreachable.needs_human());
         for k in [
             K::UnknownDistro,
