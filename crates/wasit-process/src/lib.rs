@@ -24,6 +24,7 @@
 
 use std::ffi::OsStr;
 
+pub mod pipe_security;
 pub mod scan;
 #[cfg(windows)]
 pub mod winprobe;

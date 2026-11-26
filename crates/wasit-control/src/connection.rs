@@ -88,7 +88,9 @@ pub struct Negotiated {
 pub struct RequestOpts {
     pub host: Option<HostId>,
     pub hops: u32,
-    pub deadline: Duration,
+    /// How long to wait for the response (`None`: no deadline; the request ends with the
+    /// link, or when the caller drops the future).
+    pub deadline: Option<Duration>,
     /// The user intent the request serves; recorded by every hop that serves it.
     pub trace: Option<TraceId>,
 }
@@ -98,7 +100,19 @@ impl RequestOpts {
         RequestOpts {
             host: None,
             hops: 0,
-            deadline,
+            deadline: Some(deadline),
+            trace: None,
+        }
+    }
+
+    /// No deadline of its own: for work whose length the peer cannot bound (a host environment
+    /// setup runs as long as the user's shell and tools take). Only a lost link or the caller
+    /// ends the wait.
+    pub fn unbounded() -> Self {
+        RequestOpts {
+            host: None,
+            hops: 0,
+            deadline: None,
             trace: None,
         }
     }
@@ -510,7 +524,7 @@ impl Connection {
             lock(&inner.pending).remove(&id);
             return Err(self.lost());
         }
-        let res = timeout(opts.deadline, async {
+        let wait = async {
             if inner.out.send(bytes).await.is_err() {
                 return Err(self.lost());
             }
@@ -519,11 +533,14 @@ impl Connection {
                 Ok(Err(e)) => Err(CallError::Rpc(e)),
                 Err(_) => Err(self.lost()),
             }
-        })
-        .await;
+        };
+        let res = match opts.deadline {
+            Some(d) => timeout(d, wait).await.ok(),
+            None => Some(wait.await),
+        };
         match res {
-            Ok(r) => r,
-            Err(_) => {
+            Some(r) => r,
+            None => {
                 lock(&inner.pending).remove(&id);
                 Err(CallError::Timeout)
             }

@@ -279,6 +279,11 @@ async fn serve(a: Args) -> ExitCode {
         eprintln!("wasit-hostd: cannot create {}: {e}", a.data.display());
         return ExitCode::from(1);
     }
+    // While this daemon runs, its socket and lock directory is kept from temporary-directory
+    // cleaners that skip locked directories (the shims do the same for their sessions).
+    let _dir_guard = socket_path(&a)
+        .parent()
+        .and_then(wasit_runtime::machine::hold_dir_guard);
     let cfg = match runtime_config(&a) {
         Ok(c) => c,
         Err(e) => {

@@ -58,7 +58,7 @@ impl Endpoint {
                     match ClientOptions::new().open(name) {
                         Ok(c) => {
                             // The name is predictable: refuse a server that is not this user's.
-                            crate::pipe_security::verify_server(c.as_raw_handle())?;
+                            wasit_process::pipe_security::verify_server(c.as_raw_handle())?;
                             return Ok(Box::new(c));
                         }
                         Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
@@ -442,7 +442,7 @@ mod windows {
     use super::*;
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
-    use crate::pipe_security::OwnerOnly;
+    use wasit_process::pipe_security::OwnerOnly;
 
     /// Pipe instances kept waiting for clients. A client that finds one free connects at once;
     /// with a single waiting instance it would find `ERROR_PIPE_BUSY` between one accept and

@@ -99,7 +99,7 @@ impl Uplink {
         let opts = RequestOpts {
             host: Some(host.clone()),
             hops: 0,
-            deadline,
+            deadline: Some(deadline),
             trace: None,
         };
         conn.call(method, params, opts).await

@@ -72,30 +72,46 @@ pub(crate) async fn connect(dir: &Path) -> io::Result<(BoxRead, BoxWrite)> {
     Ok(split(s))
 }
 
+/// The pipe name is machine-wide and predictable, so every instance carries the owner-only
+/// security descriptor (only this user and SYSTEM may connect; see `wasit_process::pipe_security`).
 #[cfg(windows)]
 pub(crate) struct Listener {
     name: PathBuf,
+    security: wasit_process::pipe_security::OwnerOnly,
     next: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+#[cfg(windows)]
+fn create_instance(
+    name: &Path,
+    security: &wasit_process::pipe_security::OwnerOnly,
+    first: bool,
+) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first);
+    // SAFETY: `security.attributes()` points at a SECURITY_ATTRIBUTES that lives as long as
+    // `security`, which the listener keeps for as long as it creates instances.
+    unsafe { options.create_with_security_attributes_raw(name, security.attributes()) }
+        .map_err(|e| io::Error::new(e.kind(), format!("create pipe {}: {e}", name.display())))
 }
 
 #[cfg(windows)]
 impl Listener {
     pub(crate) fn bind(dir: &Path) -> io::Result<Self> {
-        use tokio::net::windows::named_pipe::ServerOptions;
         let name = name(dir);
-        let next = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&name)
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("create pipe {}: {e}", name.display()))
-            })?;
-        Ok(Listener { name, next })
+        let security = wasit_process::pipe_security::OwnerOnly::for_current_user()?;
+        let next = create_instance(&name, &security, true)?;
+        Ok(Listener {
+            name,
+            security,
+            next,
+        })
     }
 
     pub(crate) async fn accept(&mut self) -> io::Result<(BoxRead, BoxWrite)> {
-        use tokio::net::windows::named_pipe::ServerOptions;
         self.next.connect().await?;
-        let fresh = ServerOptions::new().create(&self.name)?;
+        let fresh = create_instance(&self.name, &self.security, false)?;
         let conn = std::mem::replace(&mut self.next, fresh);
         Ok(split(conn))
     }
@@ -115,7 +131,13 @@ pub(crate) async fn connect(dir: &Path) -> io::Result<(BoxRead, BoxWrite)> {
     let mut backoff = Duration::from_millis(5);
     loop {
         match ClientOptions::new().open(&name) {
-            Ok(c) => return Ok(split(c)),
+            Ok(c) => {
+                // The name is predictable: refuse a server that does not run as this user.
+                wasit_process::pipe_security::verify_server(
+                    std::os::windows::io::AsRawHandle::as_raw_handle(&c),
+                )?;
+                return Ok(split(c));
+            }
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 // Backoff schedule; the caller bounds the whole connect with a deadline.
                 tokio::time::sleep(backoff).await;

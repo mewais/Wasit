@@ -84,6 +84,31 @@ struct State {
     /// Entries asked to refresh while a refresh was running: it runs again when that one ends
     /// (its results came from an environment or command that has changed since).
     again: std::collections::BTreeSet<Key>,
+    /// Live subscriptions per project. A project nobody subscribes to any more has its entries
+    /// evicted (see [`Interest`]).
+    subscribers: BTreeMap<Option<String>, usize>,
+}
+
+/// One live subscription's claim on a project's inventory: dropping it (the stream ended or was
+/// dropped) releases the claim, and the last release evicts the project's entries.
+struct Interest {
+    discovery: Discovery,
+    project: Option<String>,
+}
+
+impl Drop for Interest {
+    fn drop(&mut self) {
+        let mut st = lock(&self.discovery.inner.state);
+        let left = st.subscribers.get_mut(&self.project).map(|n| {
+            *n = n.saturating_sub(1);
+            *n
+        });
+        if left == Some(0) {
+            st.subscribers.remove(&self.project);
+            st.entries.retain(|(p, _), _| *p != self.project);
+            st.again.retain(|(p, _)| *p != self.project);
+        }
+    }
 }
 
 struct Inner {
@@ -115,6 +140,7 @@ impl Discovery {
                 state: Mutex::new(State {
                     entries: BTreeMap::new(),
                     again: Default::default(),
+                    subscribers: BTreeMap::new(),
                 }),
                 version: watch::channel(0).0,
                 epoch: format!("{:x}", fastrand::u64(..) >> 16),
@@ -228,10 +254,12 @@ impl Discovery {
             // Make the first poll yield the current inventory.
             rx.mark_changed();
         }
+        // The claim is taken before the inventory is read, so the entries are kept for it.
+        let interest = self.claim(project.clone());
         // Make sure there is something to report.
         let _ = self.inventory(project.as_deref());
         let this = self.clone();
-        let s = futures::stream::unfold(rx, move |mut rx| {
+        let s = futures::stream::unfold((rx, interest), move |(mut rx, interest)| {
             let this = this.clone();
             let project = project.clone();
             let epoch = epoch.clone();
@@ -240,13 +268,27 @@ impl Discovery {
                     Ok(()) => {
                         let v = *rx.borrow_and_update();
                         let inv = this.current(project.as_deref());
-                        Some((Ok::<_, StreamEnd>((format!("{epoch}.{v}"), inv)), rx))
+                        Some((
+                            Ok::<_, StreamEnd>((format!("{epoch}.{v}"), inv)),
+                            (rx, interest),
+                        ))
                     }
                     Err(_) => None,
                 }
             }
         });
         EventStream::new(s.boxed())
+    }
+
+    fn claim(&self, project: Option<String>) -> Interest {
+        *lock(&self.inner.state)
+            .subscribers
+            .entry(project.clone())
+            .or_insert(0) += 1;
+        Interest {
+            discovery: self.clone(),
+            project,
+        }
     }
 
     fn update(&self, key: &Key, f: impl FnOnce(&mut DriverInventory)) {
@@ -780,16 +822,20 @@ async fn run_probe(
                 *head_lines,
                 count_containing.clone(),
             );
+            // Set when this probe ends for any reason (answered, timed out, or its future dropped):
+            // the walk then stops instead of running on in the background.
+            let stop = StopOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            let flag = stop.0.clone();
             let job = tokio::task::spawn_blocking(move || {
-                list_files(
-                    Path::new(&dir),
-                    &suffix,
+                let spec = Listing {
+                    suffix: &suffix,
                     recursive,
                     max_depth,
                     max_files,
                     head_lines,
-                    &count,
-                )
+                    count_containing: &count,
+                };
+                list_files(Path::new(&dir), &spec, &flag)
             });
             match tokio::time::timeout(cfg.list_timeout, job).await {
                 Err(_) => {
@@ -1009,18 +1055,49 @@ fn memfind(hay: &[u8], needle: &[u8]) -> bool {
 
 /// The newest `max_files` files of the listing [`ProbeAction::ListFiles`] describes, and how
 /// many more there were.
-fn list_files(
-    dir: &Path,
-    suffix: &str,
+/// Sets its flag when dropped (see the `ListFiles` probe).
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What [`list_files`] looks for and how much of it it reads.
+struct Listing<'a> {
+    suffix: &'a str,
     recursive: bool,
     max_depth: Option<usize>,
     max_files: usize,
     head_lines: usize,
-    count_containing: &[String],
+    count_containing: &'a [String],
+}
+
+/// The files under `dir` described by `spec`, newest first, at most `max_files` with their heads.
+/// The walk checks `stop` at every directory and entry and fails with `Interrupted` once it is
+/// set: a listing nobody waits for must not keep reading a large tree.
+fn list_files(
+    dir: &Path,
+    spec: &Listing<'_>,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<(Vec<FileHead>, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let &Listing {
+        suffix,
+        recursive,
+        max_depth,
+        max_files,
+        head_lines,
+        count_containing,
+    } = spec;
+    let interrupted = || std::io::Error::new(std::io::ErrorKind::Interrupted, "listing stopped");
     let mut found: Vec<(u64, PathBuf)> = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), 0usize)];
     while let Some((d, depth)) = stack.pop() {
+        if stop.load(Relaxed) {
+            return Err(interrupted());
+        }
         let rd = match std::fs::read_dir(&d) {
             Ok(rd) => rd,
             // A CLI that never ran has no session directory yet: nothing to list.
@@ -1031,6 +1108,9 @@ fn list_files(
             Err(_) => continue,
         };
         for ent in rd.flatten() {
+            if stop.load(Relaxed) {
+                return Err(interrupted());
+            }
             let Ok(ft) = ent.file_type() else { continue };
             let p = ent.path();
             if ft.is_dir() {
@@ -1052,19 +1132,84 @@ fn list_files(
     found.sort_by_key(|f| std::cmp::Reverse(f.0));
     let omitted = found.len().saturating_sub(max_files) as u64;
     found.truncate(max_files);
-    let files = found
-        .into_iter()
-        .map(|(modified_ms, p)| {
-            let (head, matching_lines) = read_head(&p, head_lines, count_containing);
-            FileHead {
-                path: p.to_string_lossy().into_owned(),
-                modified_ms,
-                head,
-                matching_lines,
-            }
-        })
-        .collect();
+    let mut files = Vec::with_capacity(found.len());
+    for (modified_ms, p) in found {
+        if stop.load(Relaxed) {
+            return Err(interrupted());
+        }
+        let (head, matching_lines) = read_head(&p, head_lines, count_containing);
+        files.push(FileHead {
+            path: p.to_string_lossy().into_owned(),
+            modified_ms,
+            head,
+            matching_lines,
+        });
+    }
     Ok((files, omitted))
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn projects(d: &Discovery) -> Vec<Option<String>> {
+        let mut v: Vec<Option<String>> = lock(&d.inner.state)
+            .entries
+            .keys()
+            .map(|(p, _)| p.clone())
+            .collect();
+        v.dedup();
+        v
+    }
+
+    #[tokio::test]
+    async fn the_last_subscriber_leaving_evicts_its_project_only() {
+        let d = Discovery::new(DiscoveryConfig::new(crate::default_registry()));
+        let p1 = d.subscribe(Some("p".into()), None);
+        let p2 = d.subscribe(Some("p".into()), None);
+        let q = d.subscribe(Some("q".into()), None);
+        assert!(projects(&d).contains(&Some("p".into())));
+        // Another subscriber of "p" still needs its entries.
+        drop(p1);
+        assert!(projects(&d).contains(&Some("p".into())));
+        drop(p2);
+        let left = projects(&d);
+        assert!(!left.contains(&Some("p".into())), "{left:?}");
+        assert!(left.contains(&Some("q".into())), "{left:?}");
+        drop(q);
+        assert!(projects(&d).is_empty(), "{:?}", projects(&d));
+    }
+
+    #[test]
+    fn a_stopped_listing_ends_instead_of_walking_on() {
+        let t = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            std::fs::write(t.path().join(format!("f{i}.json")), "{}").unwrap();
+        }
+        let stop = AtomicBool::new(true);
+        let spec = Listing {
+            suffix: ".json",
+            recursive: false,
+            max_depth: None,
+            max_files: 10,
+            head_lines: 1,
+            count_containing: &[],
+        };
+        let e = list_files(t.path(), &spec, &stop).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "{e}");
+        let (files, omitted) = list_files(t.path(), &spec, &AtomicBool::new(false)).unwrap();
+        assert_eq!((files.len(), omitted), (10, 40));
+    }
+
+    #[test]
+    fn dropping_the_probe_stops_its_listing() {
+        let guard = StopOnDrop(Arc::new(AtomicBool::new(false)));
+        let flag = guard.0.clone();
+        assert!(!flag.load(Ordering::Relaxed));
+        drop(guard);
+        assert!(flag.load(Ordering::Relaxed));
+    }
 }
 
 #[cfg(test)]

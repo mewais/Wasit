@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use wasit_control::{
     connector, CallError, ClientOptions, ControlClient, Cursor, DurableOpts, DurableSubscription,
-    Endpoint, Hello, HostId, RequestOpts, RpcError, Supervised, SupervisedOptions, TraceId,
+    Endpoint, Hello, HostId, RequestOpts, RpcError, Supervised, SupervisedOptions, TraceId, Uplink,
 };
 use wasit_core::{Command, DriverId};
 
@@ -100,6 +100,9 @@ pub struct RuntimeClient {
     trace: Option<TraceId>,
     deadline: Duration,
     wait_connected: Duration,
+    /// Route source of the host this client talks to through a hub (see
+    /// [`RuntimeClient::with_uplink`]).
+    uplink: Option<Uplink>,
 }
 
 impl RuntimeClient {
@@ -111,6 +114,7 @@ impl RuntimeClient {
             trace: None,
             deadline: Duration::from_secs(60),
             wait_connected: Duration::from_secs(10),
+            uplink: None,
         }
     }
 
@@ -144,6 +148,14 @@ impl RuntimeClient {
         self
     }
 
+    /// The route source of the hub this client reaches its host through. Subscriptions then
+    /// resubscribe when the route changes instead of on a backoff schedule while the host
+    /// refuses them (e.g. it is down); without it they fall back to the backoff.
+    pub fn with_uplink(mut self, uplink: Uplink) -> Self {
+        self.uplink = Some(uplink);
+        self
+    }
+
     pub fn link(&self) -> &Supervised {
         &self.link
     }
@@ -153,16 +165,22 @@ impl RuntimeClient {
         method: &str,
         params: P,
     ) -> Result<R, ClientError> {
-        self.call_within(method, params, self.deadline).await
+        self.call_within(method, params, Some(self.deadline)).await
     }
 
+    /// `deadline: None` lets the call wait as long as the link lives (see
+    /// [`RequestOpts::unbounded`]).
     async fn call_within<P: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
         params: P,
-        deadline: Duration,
+        deadline: Option<Duration>,
     ) -> Result<R, ClientError> {
-        let mut opts = RequestOpts::new(deadline).trace(self.trace.clone());
+        let base = match deadline {
+            Some(d) => RequestOpts::new(d),
+            None => RequestOpts::unbounded(),
+        };
+        let mut opts = base.trace(self.trace.clone());
         opts.host = self.host.clone();
         self.link
             .request(method, params, opts, self.wait_connected)
@@ -182,8 +200,12 @@ impl RuntimeClient {
             from,
             ..DurableOpts::default()
         };
+        let mut inner = self.link.subscribe_durable(topic, opts);
+        if let Some(uplink) = &self.uplink {
+            inner = inner.route_changes(uplink.changes());
+        }
         TypedSubscription {
-            inner: self.link.subscribe_durable(topic, opts),
+            inner,
             _t: PhantomData,
         }
     }
@@ -223,10 +245,10 @@ impl RuntimeClient {
         &self,
         r: &crate::wire::ConfigureEnvironment,
     ) -> Result<crate::wire::EnvironmentTest, ClientError> {
-        // A setup has no deadline of its own, but a client's call does: this bounds the wait for
-        // the setup plus discovery, longer than an ordinary call.
-        let deadline = self.deadline.max(Duration::from_secs(120));
-        self.call_within(methods::HOST_ENVIRONMENT_TEST, r, deadline)
+        // A setup runs as long as the host's shell and tools take, and a slow host must not fail
+        // it: no deadline here. The run ends when it finishes, when the user cancels it
+        // (`cancel_environment`), or when the link is lost.
+        self.call_within(methods::HOST_ENVIRONMENT_TEST, r, None)
             .await
     }
 

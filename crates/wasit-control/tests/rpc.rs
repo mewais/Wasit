@@ -1011,3 +1011,24 @@ mod peer_gone {
         }
     }
 }
+
+/// A request without a deadline waits for an answer longer than any bounded one would; the
+/// bounded request of the same call times out first. A slow host is not failed by a deadline the
+/// request does not need.
+#[tokio::test]
+async fn unbounded_request_outlasts_a_bounded_one() {
+    let (client, _server) = mem_pair(Arc::new(DemoService::new("srv")), "srv", cfg(), cfg()).await;
+    let bounded = client
+        .request_with::<Value>(
+            "sleep",
+            json!({ "ms": 300 }),
+            RequestOpts::new(Duration::from_millis(50)),
+        )
+        .await;
+    assert_eq!(bounded.unwrap_err(), CallError::Timeout);
+    let v = client
+        .request_with::<Value>("sleep", json!({ "ms": 300 }), RequestOpts::unbounded())
+        .await
+        .unwrap();
+    assert_eq!(v, json!("slept"));
+}

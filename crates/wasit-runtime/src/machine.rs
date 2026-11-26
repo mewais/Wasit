@@ -5,9 +5,18 @@
 //! outside it, and durable data must be keyed by the machine so two machines never adopt each
 //! other's sessions. This module answers both questions:
 //!
-//! * [`machine_key`]: a short, stable, non-secret key for this machine, derived from the OS
-//!   machine id (Linux `/etc/machine-id`, macOS `IOPlatformUUID`, Windows `MachineGuid`),
-//!   falling back to the host name. The raw id is hashed (it is meant to stay confidential).
+//! * [`machine_key`]: a short, stable key for this machine: a hash of the OS machine id (Linux
+//!   `/etc/machine-id`, macOS `IOPlatformUUID`, Windows `MachineGuid`). The raw id is hashed (it
+//!   is meant to stay confidential). Only when there is no machine id (WSL distributions without
+//!   one) is the key a hash of the kernel's host name instead. The host name is deliberately
+//!   NOT mixed in when a machine id exists: host names change with the network (macOS), and a
+//!   rename would orphan every session. No file is stored for this key either: a file under a
+//!   temporary directory could be aged out, and the key would then change and orphan every
+//!   session.
+//!
+//!   Cloned images share a machine id and so would share a key. Such a machine must be given its
+//!   own key with the `MARSAD_MACHINE_KEY` override (`[A-Za-z0-9_-]{1,40}`): the caller reads
+//!   that variable and passes it as `explicit` to [`machine_key`], which then uses it as is.
 //! * [`runtime_dir`]: a machine-local, owner-only directory for sockets and locks.
 //!
 //! Runtime directory choice (Unix), from machine facts only — never from the calling session's
@@ -17,15 +26,24 @@
 //! which would delete the sockets of shims and daemons that keep running. Without lingering:
 //! `/tmp/<app>-<uid>` (outlives logins; wiped at reboot, when every session is dead anyway).
 //! macOS: `<DARWIN_USER_TEMP_DIR>/<app>` (`getconf`; the same per-user dir as a GUI's `$TMPDIR`).
+//! The choice is recorded once per machine in the state directory and used from then on, so a
+//! running daemon's directory does not move when linger is enabled or disabled later.
 //! The directory is created 0700 and refused when it is not a real directory
-//! owned by us or is accessible by group/others. Processes holding sockets there keep a
-//! shared `flock` on their directory: systemd-tmpfiles skips locked directories when aging.
+//! owned by us or is accessible by group/others. A process holding sockets there keeps a
+//! shared `flock` on its directory ([`hold_dir_guard`]): systemd-tmpfiles skips locked
+//! directories when aging.
 //! Windows: `%LOCALAPPDATA%\<App>\run` (local, never roamed); named pipes are machine-local.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+
+/// The application whose state directory holds the recorded runtime directory choices. Fixed:
+/// every application on the machine must find the same choices. (Unix only: Windows keeps its
+/// runtime directory under `%LOCALAPPDATA%` without a recorded choice.)
+#[cfg(unix)]
+const STATE_APP: &str = "wasit";
 
 /// Characters allowed in an explicit machine key.
 fn valid_key(k: &str) -> bool {
@@ -41,8 +59,9 @@ pub fn key_from_raw(raw: &str) -> String {
     d.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// This machine's key. `explicit` (e.g. from an environment override) wins when it is a valid
-/// key (`[A-Za-z0-9_-]{1,40}`); an invalid one is an error.
+/// This machine's key. `explicit` (the `MARSAD_MACHINE_KEY` override, read by the caller) wins
+/// when it is a valid key (`[A-Za-z0-9_-]{1,40}`); an invalid one is an error. Otherwise the key
+/// is derived from this machine's facts (see the module doc).
 pub fn machine_key(explicit: Option<&str>) -> io::Result<String> {
     if let Some(k) = explicit.filter(|k| !k.is_empty()) {
         if valid_key(k) {
@@ -53,9 +72,80 @@ pub fn machine_key(explicit: Option<&str>) -> io::Result<String> {
             format!("invalid machine key {k:?} (expected [A-Za-z0-9_-]{{1,40}})"),
         ));
     }
-    match raw_machine_id() {
-        Some(raw) => Ok(key_from_raw(&raw)),
-        None => Ok(key_from_raw(&format!("host:{}", host_name()))),
+    Ok(key_from_machine_id(raw_machine_id().as_deref(), host_name))
+}
+
+/// The key for a machine whose OS machine id is `raw` (`None` when it has none). `host` is asked
+/// for the kernel host name only when there is no id, so a machine with an id never runs the
+/// host name lookup.
+fn key_from_machine_id(raw: Option<&str>, host: impl FnOnce() -> String) -> String {
+    match raw {
+        Some(raw) => key_from_raw(raw),
+        None => key_from_raw(&format!("host:{}", host())),
+    }
+}
+
+/// The outcome of [`publish`].
+#[cfg(unix)]
+enum Published {
+    /// The file was created with the content asked for.
+    Created,
+    /// The file already existed; it is left as it was.
+    Existed,
+}
+
+/// Create `path` with `content` only if it does not exist yet. The content is written to a
+/// private temporary file first and linked into place, so a reader never sees it half written
+/// and a concurrent creator can not replace it.
+#[cfg(unix)]
+fn publish(path: &Path, content: &str) -> io::Result<Published> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&tmp, format!("{content}\n"))?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(Published::Created),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Published::Existed),
+        Err(e) => Err(e),
+    }
+}
+
+/// The machine-local state directory: where the recorded runtime directory choices live. It must
+/// not be in a home directory that machines share. Windows: `%LOCALAPPDATA%\Wasit\state`; Unix:
+/// `/var/tmp/wasit-<uid>`, created 0700 and owner-checked like the runtime directory. Nothing
+/// the machine key depends on is stored here: the key is derived from machine facts only.
+pub fn state_dir() -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))?;
+        Ok(PathBuf::from(base).join("Wasit").join("state"))
+    }
+    #[cfg(unix)]
+    {
+        Ok(PathBuf::from(format!(
+            "/var/tmp/{STATE_APP}-{}",
+            wasit_process::effective_uid()
+        )))
+    }
+}
+
+/// Keeps `dir` from being aged away by a temporary-directory cleaner while the guard lives:
+/// a shared `flock` on the directory (systemd-tmpfiles skips locked directories). Best effort:
+/// a filesystem without directory locks gets no guard. Hold it for as long as the directory's
+/// sockets or locks are in use.
+pub fn hold_dir_guard(dir: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(dir).ok()?;
+        f.lock_shared().ok()?;
+        Some(f)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
     }
 }
 
@@ -102,7 +192,9 @@ fn raw_machine_id() -> Option<String> {
     }
 }
 
-/// The host name (environment, `/etc/hostname`, else `localhost`).
+/// The host name (environment, `/etc/hostname`, else `localhost`). It is the input of the machine
+/// key only when there is no machine id, and it must stay exactly as HEAD computed it (`$HOSTNAME`
+/// first) so that no existing install's key changes.
 pub fn host_name() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -141,22 +233,61 @@ fn default_runtime_dir(app: &str) -> io::Result<PathBuf> {
 
 #[cfg(unix)]
 fn default_runtime_dir(app: &str) -> io::Result<PathBuf> {
-    // Derived from facts of the machine and user only, never from the calling session's
-    // environment: a daemon started from a desktop session and a bridge started over ssh must
-    // agree on one directory (and so on one single-instance lock).
+    // The first choice on this machine is kept: lingering can change later, and a daemon running
+    // in the old directory must still be the one every process finds.
+    let state = state_dir()?;
+    recorded_choice(&state, app, || unix_runtime_dir(app))
+}
+
+/// The runtime directory `candidate` chose, as recorded in `state` for `app` by the first call
+/// on this machine (`candidate` is not called after that).
+#[cfg(unix)]
+fn recorded_choice(
+    state: &Path,
+    app: &str,
+    candidate: impl FnOnce() -> PathBuf,
+) -> io::Result<PathBuf> {
+    ensure_private_dir(state)?;
+    let file = state.join(format!("runtime-{app}"));
+    let read = |p: &Path| -> io::Result<PathBuf> {
+        let text = std::fs::read_to_string(p)?;
+        let dir = PathBuf::from(text.trim());
+        if dir.is_absolute() {
+            Ok(dir)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} does not hold a directory path", p.display()),
+            ))
+        }
+    };
+    match read(&file) {
+        Ok(dir) => return Ok(dir),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let chosen = candidate();
+    match publish(&file, &chosen.to_string_lossy())? {
+        Published::Created => Ok(chosen),
+        Published::Existed => read(&file),
+    }
+}
+
+#[cfg(unix)]
+fn unix_runtime_dir(app: &str) -> PathBuf {
     let uid = wasit_process::effective_uid();
     #[cfg(target_os = "macos")]
     if let Some(t) = darwin_user_temp_dir() {
-        return Ok(t.join(app));
+        return t.join(app);
     }
     #[cfg(not(target_os = "macos"))]
     {
         let run = PathBuf::from(format!("/run/user/{uid}"));
         if lingering(uid) && owned_private(&run, uid) {
-            return Ok(run.join(app));
+            return run.join(app);
         }
     }
-    Ok(PathBuf::from(format!("/tmp/{app}-{uid}")))
+    PathBuf::from(format!("/tmp/{app}-{uid}"))
 }
 
 /// The per-user temporary directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`), the same for every
@@ -304,6 +435,89 @@ mod tests {
         // The default resolves somewhere private.
         let d = runtime_dir("wasit-test", None).unwrap();
         assert!(owned_private(&d, wasit_process::effective_uid()));
+    }
+
+    #[test]
+    fn the_same_machine_id_gives_the_same_key_whatever_the_host_name() {
+        // Host names change (networks, renames), so they must not move a machine's key. The host
+        // name is not even asked for when there is an id.
+        let no_host = || -> String { panic!("the host name must not be consulted") };
+        let k = key_from_machine_id(Some("machine-id"), no_host);
+        assert_eq!(k, key_from_raw("machine-id"));
+        // Pinned value (SHA-256 of "wasit-machine:machine-id", first 8 bytes): the key of every
+        // install that predates the host name rule.
+        assert_eq!(k, "38bc7a7a9ead30f8");
+        // A cloned image: same id, another host name, same key (the MARSAD_MACHINE_KEY override
+        // is what separates such machines).
+        assert_eq!(
+            k,
+            key_from_machine_id(Some("machine-id"), || "box-b".to_string())
+        );
+        // Another id is another machine.
+        assert_ne!(
+            k,
+            key_from_machine_id(Some("other-id"), || "box-a".to_string())
+        );
+        // A trailing newline in the raw id (as read from a file) does not change the key.
+        assert_eq!(k, key_from_machine_id(Some("machine-id\n"), no_host));
+    }
+
+    #[test]
+    fn without_a_machine_id_the_host_name_decides() {
+        // WSL distributions without /etc/machine-id: the host name is the only fact.
+        let a = key_from_machine_id(None, || "box-a".to_string());
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, key_from_machine_id(None, || "box-b".to_string()));
+        // Exactly HEAD's derivation: the host name is namespaced under "host:" before hashing,
+        // so it can not collide with a machine id of the same text.
+        assert_eq!(a, key_from_raw("host:box-a"));
+        assert_ne!(a, key_from_raw("box-a"));
+        // Pinned value (SHA-256 of "wasit-machine:host:box-a", first 8 bytes), so an
+        // accidental change to the derivation fails here rather than orphaning installs.
+        assert_eq!(a, "f89a0c029db098aa");
+    }
+
+    #[test]
+    fn the_key_is_derived_from_this_machines_facts() {
+        let expect = key_from_machine_id(raw_machine_id().as_deref(), host_name);
+        assert_eq!(machine_key(None).unwrap(), expect);
+        assert_eq!(machine_key(None).unwrap(), machine_key(None).unwrap());
+    }
+
+    #[test]
+    fn an_explicit_key_overrides_the_derived_one() {
+        assert_eq!(machine_key(Some("clone-2")).unwrap(), "clone-2");
+        assert!(machine_key(Some("bad key")).is_err());
+        // An empty override is no override.
+        assert_eq!(machine_key(Some("")).unwrap(), machine_key(None).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_choice_is_recorded_once() {
+        // The first choice on the machine wins: a later call (linger enabled since, say) gets
+        // the recorded directory and does not even ask for a new one.
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("state");
+        let first = PathBuf::from("/tmp/app-first");
+        let got = recorded_choice(&state, "app", || first.clone()).unwrap();
+        assert_eq!(got, first);
+        let again = recorded_choice(&state, "app", || PathBuf::from("/run/user/1/app")).unwrap();
+        assert_eq!(again, first);
+        // Recorded per application.
+        let other = recorded_choice(&state, "other", || PathBuf::from("/run/user/1/other"));
+        assert_eq!(other.unwrap(), PathBuf::from("/run/user/1/other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hold_dir_guard_locks_a_directory_shared() {
+        let t = tempfile::tempdir().unwrap();
+        let guard = hold_dir_guard(t.path()).expect("a directory lock");
+        // A second shared holder is fine; the guard is released when dropped.
+        let second = hold_dir_guard(t.path()).expect("shared with the first");
+        drop(second);
+        drop(guard);
     }
 
     #[cfg(unix)]

@@ -15,12 +15,12 @@
 /// The SDDL of a pipe that only `user_sid` (a SID string such as `S-1-5-21-…`) and SYSTEM may
 /// open: a protected DACL (nothing inherited) with one full-access allow ACE for each.
 #[cfg(any(windows, test))]
-pub(crate) fn owner_only_sddl(user_sid: &str) -> String {
+pub fn owner_only_sddl(user_sid: &str) -> String {
     format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)")
 }
 
 #[cfg(windows)]
-pub(crate) use win::{verify_server, OwnerOnly};
+pub use win::{verify_server, OwnerOnly};
 
 #[cfg(windows)]
 mod win {

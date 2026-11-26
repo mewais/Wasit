@@ -564,7 +564,7 @@ impl Service for RoutingService {
                 let opts = RequestOpts {
                     host: ctx.host.clone(),
                     hops: ctx.hops + 1,
-                    deadline: self.hub.inner.cfg.forward_timeout,
+                    deadline: Some(self.hub.inner.cfg.forward_timeout),
                     // The next hop records the same intent.
                     trace: ctx.trace.clone(),
                 };

@@ -16,7 +16,6 @@ mod diag;
 pub mod error;
 pub mod hub;
 pub mod mux;
-mod pipe_security;
 pub mod server;
 pub mod service;
 pub mod supervised;

@@ -107,7 +107,7 @@ impl Service for DemoService {
                 let opts = RequestOpts {
                     host,
                     hops: ctx.hops,
-                    deadline: Duration::from_secs(20),
+                    deadline: Some(Duration::from_secs(20)),
                     trace: ctx.trace.clone(),
                 };
                 ctx.peer
